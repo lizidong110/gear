@@ -23,6 +23,7 @@
 13. **时序断言禁用绝对阈值**：只在「负载只会让它更慢」的**安全方向**用绝对下界（如「耗时应 ≥ 800ms」）；任何**上界**判断（如「必须 < 900ms」）一律改为**同一进程内的相对比较**（先量串行基线再比并行）。理由：`go test ./...` 会并行跑包，机器负载会让绝对时长抖动，制造偶发失败——而被当作「偶发」忽略的 flake，最终会侵蚀对整套测试的信任（见 §11·2026-09-13 S6a）。
 14. **状态的持久性必须显式声明**：引入任何新状态（执行记录、进程句柄、缓存）时，必须在代码与文档里写明它是**内存态**还是**持久化**、以及丢失条件。理由是「静默假设」的新变种——不是字段被忽略，而是**生命周期被默认**（见 §11·2026-09-13 S6a）。
 15. **枚举式声明必须逐项登记**：任何「合法取值集合」（模板前缀 vars/steps、runtime 名、hook stage、criticality、step mode 等）必须（a）在单一来源登记全部合法值，（b）在解析/校验点拒绝未知值，（c）在 PRD/矩阵同步状态；三者缺一则构成漂移隐患（见 §11·2026-09-13 第三次）。理由是本次真实漂移——PRD §4.3 把 `${secrets.x}` 列为「支持的前缀」，而引擎只实现 vars/steps 且从未登记 secrets，于是「文档说有、代码没有」长期无人察觉，直到补上注册期模板静态校验才暴露。
+16. **子进程不得继承调用方的敏感 fd**：任何由本进程拉起的子进程（尤其 `sh -c` 这类会再派孙进程的包装器），其 stdout/stderr **不得直接等于调用方的 `os.Stdout`/`os.Stderr`**——否则孙进程在父进程被 kill 后成为孤儿，继续持有调用方管道 fd，导致 `go test` 报 `Test I/O incomplete`、或生产环境 fd 泄漏。正确做法：子进程输出导向受控 sink（`/dev/null` 或专属日志文件），绝不把测试/服务管道交给它。理由：Windows 下 `TerminateProcess` 不级联子进程、msys 的 `sh` 也不转发信号，「杀得干净」不可靠，不如从根上不交出敏感 fd（见 §11·2026-09-13 第五次）。
 
 ---
 
@@ -273,7 +274,23 @@ gear/
 
 **覆盖率闸门实证（再次验证 F-覆盖率闸门）**
 - M5 把 `cap` 包从「无」补到 `86.7%`、engine 维持 `86.8%`，全量 `-race -cover` 闸门在 `-p 1`（串行）下绿灯；kernel 包（engine/model/registry/server）均 ≥80%。
-- 一个环境性观察：`internal/app` 的 Supervisor 测试会拉起长驻 `sh -c` 服务子进程（继承 `os.Stdout`），在**并行** `-race` 下与其他包的进程类测试争用 stdout 管道，偶发 `Test I/O incomplete`；**串行 `-p 1` 下稳定通过**。属测试编排的环境噪声，非逻辑回归——记录以免下次误判为「M5 回归」。
+- 一个环境性观察（**已纠错，见第五次**）：`internal/app` 的 Supervisor 测试会拉起长驻 `sh -c` 服务子进程，在 `-race` 全量闸门下出现 `Test I/O incomplete`。最初误判为「并行争用 stdout 管道的环境噪声、串行 `-p 1` 即通过」。实则根因是 **fd 继承**：`startProcess` 让 service 子进程 `cmd.Stdout/Stderr = os.Stdout`，`sh -c` 的孙进程（如 `sleep`）在父 `sh` 被 `Kill()` 后成为孤儿并继续持有继承来的管道 fd，导致 go test 管道在二进制退出后 60s（`WaitDelay`）仍被占用。修复见第五次变更日志（红线 16）。
+
+### 2026-09-13（第五次）· 修复 service 子进程 fd 继承导致 `Test I/O incomplete`
+
+**根因（真·不是环境噪声）**
+- `internal/engine/process.go` 的 `startProcess`（service 模式，`sh -c <entry>`）原把 `cmd.Stdout = os.Stdout; cmd.Stderr = os.Stderr`。其孙进程（如 `sleep`）在父 `sh` 被 `Process.Kill()` 后**不会被一起杀掉**（Windows 下 `TerminateProcess` 不级联子进程；msys 的 `sh` 也不转发信号），成为孤儿并继续持有调用方的 stdout/stderr fd。
+- 当该调用方是 `go test` 时，孤儿进程长期占用测试管道 → 二进制退出 60s 后 go test 仍报 `Test I/O incomplete`。该问题只在 `-race` 全量闸门（进程类测试密集、调度变慢、取消窗口被拉宽）下暴露，单独跑 `app` 包甚至 `-race` 单独跑都「碰巧」干净，故极具迷惑性。
+
+**修复（红线 16：service 子进程不得继承调用方 stdout/stderr）**
+- `process.go` 新增包级 `serviceOut`（init 时 `os.OpenFile(os.DevNull, O_WRONLY, 0)`），`startProcess` 的 `cmd.Stdout/Stderr` 统一导向 `serviceOut`。孤儿孙进程即便残留，持有的是 `/dev/null` 而非测试管道 → 泄漏消除。
+- 结构化 service 日志（按 service 落盘 / 上报 Supervisor）留待后续日志切片；本处只保证生命周期与 fd 正确性。
+- 配套收敛测试用长驻命令：`server_test.go` `Entry: "sleep 30"` → `"sleep 3"`、`supervisor_test.go` 两处 `sleep 30` → `sleep 3`（此前已改），统一缩短孤儿窗口。
+
+**结果**
+- 全量 `go test -race -cover -p 1 ./...` **全绿**，无 `Test I/O incomplete`、无 FAIL；覆盖率 engine **86.7%** / app 86.0% / cap 86.7% / model 98.6% / registry 83.4% / server 83.9%。
+- 教训：进程树级联 kill 在 Windows 上不可靠（无 POSIX 进程组），**与其依赖「杀得干净」，不如从根上不把敏感 fd 交给子进程**——输出重定向比进程树回收更稳、更跨平台。
+- 仍 deferred（非本次范围）：`Kill()` 只杀 `sh` 不杀孙进程会导致 **crash-loop 下孤儿进程短暂累积**（每个 ≤其 sleep 时长，自然消亡）；若未来要完全杜绝，需引入 job object / `taskkill /T` 级联回收，单独切片处理。
 
 ### 2026-09-13 · 实现 `when` 条件执行，新增 F6–F8 与 §0 第 10–12 条
 
