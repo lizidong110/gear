@@ -7,6 +7,9 @@
 *.test
 *.out
 
+# 测试日志落盘（scripts/gate.sh 产出，不纳入版本控制）
+/build/testlogs/
+
 # 编辑器 / OS 临时文件
 .idea/
 .vscode/
