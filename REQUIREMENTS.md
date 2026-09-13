@@ -117,8 +117,8 @@
 
 ## 覆盖率闸门（宪法）
 
-- `go test -race -cover ./...` 各包 ≥ 80%：engine / model / registry / app / **server** 已达标；cli / cmd 归 S6b（CLI 薄客户端，行为由 engine + app + server 保证）。
-- 最新实测（本轮·模板静态校验 + 运行中注销守卫）：engine **87.7%** / app 86.0% / model 98.6% / registry **83.4%** / server **83.9%**（`-race` 全绿；cli/cmd 0% 归 S6b）。registry/server 较 S6a 上行，因补了运行中守卫的包内单测（`TestDeleteToolRunningGuard` / `TestDeleteToolWhileRunning`）；engine 上行因补了 `template_test.go` / `planned_test.go`。
+- `go test -race -cover ./...` 各包 ≥ 80%：engine / model / registry / app / **server** 已达标；**cli 在 S6b 补到 75.2%**（管理面命令的成功/错误路径全覆盖，含 tool/flow/hook 全生命周期与 app 非法 --restart）；cmd/gear 仍 0%（仅 `main()` 调 `cli.Execute()` 的入口，无独立逻辑，归 S6b 收尾）。
+- 最新实测（S6b·CLI 单测）：engine **87.7%** / app 86.0% / model 98.6% / registry **83.4%** / server **83.9%** / **cli 75.2%**（`-race` 全绿）。registry/server 较 S6a 上行因运行中守卫包内单测（`TestDeleteToolRunningGuard` / `TestDeleteToolWhileRunning`）；engine 上行因 `template_test.go` / `planned_test.go`；cli 上行因本轮新增 `cli_test.go`（S6b）。
 - 闸门语义：`deferred` 需求靠「断言被拒 / 显式报错」的测试计入覆盖，确保漂移可见。
 - 回归锁：`registry_test.go` TestExampleFlowUsesDollarBrace 锁死 `${...}` 模板语法（D1）。
 - S2 新增回归锁：`supervise_test.go` TestRunFlowRejectsServiceStep（service 不得混入 flow run）、TestServiceDepGuard（service 不得被依赖）。

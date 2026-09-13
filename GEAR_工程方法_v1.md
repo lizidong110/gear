@@ -123,7 +123,7 @@ gear/
 - **S5 版本灰度**：状态机 + promote + 并发安全 + 灰度 + SemVer + lock/digest。覆盖 T-ver-01..04、T-reg-01..03。
 - **S6 REST API + CLI 补全 + AI 闭环**：§11 全量端点 + CLI 补全 + AI 生成/校验/重试。覆盖 T-srv-01..02、T-ai-01。
   - **S6a REST 执行面 ✅（2026-09-13）**：`internal/server`（标准库路由，无框架）+ `ExecStore`（内存态执行记录）+ `AppStore`（受管进程）+ 12 个端点 + 契约测试；CLI `gear serve`。
-  - **S6b CLI 补全**（待做）：`tool unregister` / `flow validate·inspect` / `exec status` / `tool promote` 等，把 REST 已有能力对齐到 CLI。
+  - **S6b CLI 测试补全**（部分完成，2026-09-13）：现有 CLI 命令（tool/flow/hook 的 register·list·show·run·remove、app run）已补单测，`cli` 包覆盖 **75.2%**（成功 + 错误路径全覆盖）。新增子命令 `tool unregister` / `flow validate·inspect` / `exec status` / `tool promote` 仍待做（需先对齐 REST 已有能力）。
   - **S6c AI 闭环**（待做，**需先决策 LLM 接入方式**）：生成 → `ValidateFlowStatic` 校验 → ≤3 次重试 → 人工确认。
 
 ---
@@ -207,7 +207,7 @@ gear/
 |---|---|---|---|
 | `internal/model` | **100.0%** | 关键路径 100% | ✅ 达标 |
 | `internal/registry` | **82.8%** | ≥80% | ✅ 达标 |
-| `internal/cli` / `cmd/gear` | 0.0% | 不在 S0 范围 | ⏭ 归 S6（D4） |
+| `internal/cli` / `cmd/gear` | cli **75.2%**（S6b）/ cmd 0.0% | cli 管理面命令全覆盖；cmd 仅 `main()` 入口 | ✅ cli 达标（S6b）；cmd ⏭ 收尾 |
 
 - `go build ./...` ✅ · `go vet ./...` ✅ · `go test -race` ✅（无竞态）
 - registry 未覆盖的 ~17% 全部是 DB 错误防御分支（`Open`/`migrate`/`upsert`/`list`/`get` 的错误返回），属难触发且非核心路径，留待注入式故障测试（进阶）。
@@ -233,6 +233,21 @@ gear/
 - `T-reg-06` 不存在 id 返回 (nil,nil)
 - `T-s0-example` 示例 YAML 用 `${vars.topic}` 而非 `{{...}}`（锁死 D1 回归）
 
+
+### 9.3 S6b 覆盖率报告（2026-09-13，`CGO_ENABLED=1 go test -race -cover ./...`）
+
+| 包 | 覆盖率 | 目标 | 结论 |
+|---|---|---|---|
+| `internal/model` | **98.6%** | 关键路径 100% | ✅ 达标 |
+| `internal/engine` | **87.7%** | ≥80% | ✅ 达标 |
+| `internal/registry` | **83.4%** | ≥80% | ✅ 达标 |
+| `internal/app` | **86.0%** | ≥80% | ✅ 达标 |
+| `internal/server` | **83.9%** | ≥80% | ✅ 达标 |
+| `internal/cli` | **75.2%** | 管理面命令全覆盖 | ✅ S6b 达标（本轮新增 cli_test.go） |
+| `cmd/gear` | 0.0% | 仅入口 | ⏭ 收尾 |
+
+- `go build ./...` ✅ · `go vet ./...` ✅ · `go test -race` ✅（无竞态）。
+- cli 本轮从 0% → 75.2%：覆盖 tool/flow/hook 全生命周期命令与 app 非法 `--restart` 错误分支；serve 执行路径（阻塞 HTTP）与 flow run 成功路径（拉起进程）因需集成环境未覆盖，归 S6b 收尾。
 
 ---
 

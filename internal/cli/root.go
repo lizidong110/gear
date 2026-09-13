@@ -12,8 +12,8 @@ import (
 
 var registryPath string
 
-// Execute 是 CLI 入口。
-func Execute() {
+// newRootCmd 构造根命令（供 CLI 入口与测试复用）。
+func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "gear",
 		Short: "Gear — 插件化自动化编排框架内核",
@@ -23,8 +23,12 @@ func Execute() {
 		"registry 数据库路径（默认 ~/.gear/registry.db）")
 
 	root.AddCommand(toolCmd(), flowCmd(), appCmd(), hookCmd(), serveCmd())
+	return root
+}
 
-	if err := root.Execute(); err != nil {
+// Execute 是 CLI 入口。
+func Execute() {
+	if err := newRootCmd().Execute(); err != nil {
 		os.Exit(1)
 	}
 }
