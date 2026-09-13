@@ -144,6 +144,15 @@ gear/
 
 > 覆盖率门槛默认可调；如你认为某包应更高/更低，在签批时改。
 
+### 5.1 测试日志落盘（避免「管道日志用完就扔」）
+
+痛点：闸门输出走管道、退出即丢；复现失败只能重跑（全量串行闸门约 90s）。两处落盘：
+
+1. **闸门全量日志**：一律用 `bash scripts/gate.sh` 跑闸门——`go test -race -cover -p 1 -v ./...` 经 `tee` 同时落盘 `build/testlogs/gate-<时间戳>.log`，并复制 `build/testlogs/latest.log`（最近一次）。失败复现直接打开 `latest.log`，**无需重跑**。查看：`bash scripts/gatelog.sh`（cat latest）/ `bash scripts/gatelog.sh list`（历史 20 份）。`build/testlogs/` 已进 `.gitignore`。
+2. **子进程原始输出**：引擎 `runProcess` 在 `cmd.Run` 错误 / stdout 为空 / JSON 解析失败三类分支，把完整原始 `stdout`+`stderr` 落盘 `os.TempDir()/gear-proc/proc-<时间戳>.log`，并在返回错误中附 `[原始输出已落盘: <路径>]`。复现「解析 stdout 失败」这类问题直接看该文件，不必重跑进程。
+
+> 仅失败分支产生文件；`service` 模式子进程输出仍按红线 16 导向 `os.DevNull`（fd 不继承调用方管道），不在此列。
+
 ---
 
 ## 6. 评审节奏（节奏规则）
@@ -321,6 +330,23 @@ gear/
 - 重磅坑：`engine/version_test.go` 的 process entry 原写 `sh -c 'echo {"v":"2"}'`，Git Bash 的 `sh` 把双引号**词法去引号**成 `{v:2}`（非法 JSON）→ 运行期 `解析 stdout 失败`。修复：entry 改为 `echo '{"v":"2"}'`（**外层单引号、JSON 内双引号**）。凡用 `sh -c` 让进程吐 JSON，此约定是铁律（红线清单待补第 17 条）。
 
 **全量闸门结果**：engine 86.2% / model 98.7% / registry 84.8% / server 85.1% / ai 85.5% / cap 86.7% / app 86.0% / cli 72.8%（cli 为管理面客户端非内核，exec/ai 均配集成测试）。
+
+### 2026-09-13（第七次）· 测试日志落盘（闸门脚本 + 引擎失败输出落盘）
+
+**触发**：用户痛点——测试输出走管道、退出即丢；复现失败只能重跑全量串行闸门（约 90s），浪费时间。
+
+**改了什么**
+- 新增 `scripts/gate.sh`：封装 `go test -race -cover -p 1 -v ./...`，经 `tee` 同时落盘 `build/testlogs/gate-<时间戳>.log` 并复制 `build/testlogs/latest.log`（最近一次）；保留最近 20 份防膨胀；退出码即闸门结果。`-v` 保证 `t.Log` 也进日志。
+- 新增 `scripts/gatelog.sh`：`cat latest` / `list` 历史 20 份。
+- `internal/engine/proclog.go` + `process.go`：`runProcess` 在 `cmd.Run` 错误 / stdout 为空 / JSON 解析失败三类分支，把完整原始 `stdout`+`stderr` 落盘 `os.TempDir()/gear-proc/proc-<时间戳>.log`，并在错误中附 `[原始输出已落盘: <路径>]`。仅失败分支触发，正常路径零文件。
+- `.gitignore` 增加 `/build/testlogs/`。
+
+**为什么**
+- 闸门/子进程输出是「用完就扔」的管道日志；失败时把原始证据留在磁盘，复现问题直接看文件，省掉重跑。
+- 与红线 16 不冲突：落盘的是一次性 `runProcess` 已捕获进内存 buffer 的字节（无 fd 继承问题）；`service` 模式子进程仍按红线 16 导向 `os.DevNull`，不在落盘范围内。
+- 注意：`procFail` 用 `fmt.Sprintf` 承载底层错误，`%w` 不适用（只有 `fmt.Errorf` 支持 `%w`）——此处只做字符串拼接，无需错误链。
+
+**结果**：单测验证 `gear-proc/` 下生成带 entry/stdout/stderr 的临时文件；全量闸门经 `gate.sh` 跑通并落盘（见 `build/testlogs/latest.log`）。
 
 ### 2026-09-13 · 实现 `when` 条件执行，新增 F6–F8 与 §0 第 10–12 条
 
