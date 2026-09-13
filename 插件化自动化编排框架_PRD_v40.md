@@ -275,7 +275,7 @@ hooks:
 
 | 能力原语 | 调用方式 | 职责 |
 |---------|---------|------|
-| http | `ctx.http.request(...)` | 任意 HTTP 请求（传输层，钉钉/微信等均基于此） |
+| http | `ctx.http.Request(method, url, body?, headers?)` | 任意 HTTP 请求（传输层，钉钉/微信等均基于此） |
 | call | `ctx.call(target, input)` | 调用另一个 Tool / Flow（唯一插件间通信通道） |
 | db | `ctx.db.query / exec` | 结构化数据读写 |
 | kv | `ctx.kv.get / put / delete` | 简单键值存储（配置 / 状态 / 缓存） |
@@ -287,6 +287,8 @@ hooks:
 - **只提供原语，不提供业务**：发邮件、接钉钉都是普通 Tool，内部通过 http 实现。
 - **capability 精确放行**：未声明的调用一律拒绝，权限遵循最小权限原则。
 - **secret 只读**：插件看不到明文存储位置，只能通过 `ctx.secret.get` 获取。
+- **未声明的原语不出现在 `ctx` 上**（lua）/ 不被注入 `ctx.capabilities`（process）：防御纵深——脚本连该字段都读不到，无法探测宿主能力边界；已声明但未提供实现的（如 `db`）调用时返回明确错误，而非静默成功。
+- **调用形态（M5 落地）**：lua 侧 `ctx.{http,call,db,kv,secret,event}`（http/db 为对象方法 `ctx.http.Request` / `ctx.db.query`；kv/secret/event 为子表方法 `ctx.kv.get` / `ctx.secret.get` / `ctx.event.notify`）；process 侧运行期以 `input.ctx.capabilities`（字符串数组）与 `input.ctx.sandbox`（bool）透传声明，供进程自检。
 
 ### 6.2 call 与 event 的边界
 

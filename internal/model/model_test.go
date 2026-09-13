@@ -303,6 +303,31 @@ func TestToolValidate(t *testing.T) {
 	})
 }
 
+// T-tool-capability：Tool.Capabilities 注册期校验（M5，最小权限，红线 15）。
+// 未知原语在注册期即拒绝，而非执行期才报错。
+func TestToolValidateCapability(t *testing.T) {
+	base := func(caps []string) *Tool {
+		return &Tool{ID: "ok", Runtime: RuntimeProcess, InputSchema: objectSchema(),
+			OutputSchema: objectSchema(), Versions: []ToolVersion{{Version: "1.0.0", State: StateStable}},
+			Capabilities: caps}
+	}
+	t.Run("合法原语", func(t *testing.T) {
+		if err := base([]string{"kv", "secret", "http"}).Validate(); err != nil {
+			t.Fatalf("合法 capability 应过: %v", err)
+		}
+	})
+	t.Run("空列表允许", func(t *testing.T) {
+		if err := base(nil).Validate(); err != nil {
+			t.Fatalf("空 capability 应过: %v", err)
+		}
+	})
+	t.Run("未知原语拒绝", func(t *testing.T) {
+		if err := base([]string{"kv", "bogus"}).Validate(); err == nil {
+			t.Fatal("未知 capability 应拒绝")
+		}
+	})
+}
+
 // T-flow-validate：Flow.Validate 守卫（F3 严格模型守卫）。
 // 不支持的字段（when/use_version）显式拒绝，而非静默忽略（RC-D）。
 // S4 起：无依赖 step 默认并行，parallel 仅为显式标注；parallel+depends_on 属误导，拒绝。

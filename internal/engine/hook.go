@@ -88,7 +88,8 @@ func (e *Engine) applyHooks(ctx context.Context, all []model.Hook, stage, toolID
 		}
 
 		hctx, cancel := context.WithTimeout(ctx, defaultExecTimeout)
-		out, err := rt.Run(hctx, tool.Entry, cur)
+		host := e.hostFor(tool)
+		out, err := rt.Run(hctx, tool.Entry, cur, host)
 		cancel()
 		if err != nil {
 			if ferr := hookFail(h, fmt.Errorf("Hook %s 执行失败: %w", h.ID, err)); ferr != nil {
@@ -160,7 +161,8 @@ func (e *Engine) runOnceStep(ctx context.Context, rc *runContext, hooks []model.
 	}
 
 	stepCtx, cancel := context.WithTimeout(ctx, defaultExecTimeout)
-	output, err = rt.Run(stepCtx, tool.Entry, input)
+	host := e.hostFor(tool)
+	output, err = rt.Run(stepCtx, tool.Entry, input, host)
 	cancel()
 	if err != nil {
 		stepErr := fmt.Errorf("step %s 执行失败: %w", step.ID, err)
@@ -200,6 +202,7 @@ func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []m
 	if err != nil {
 		return nil, fmt.Errorf("step %s: %w", step.ID, err)
 	}
+	host := e.hostFor(tool)
 
 	// 关键：service 进程是**长驻**的，不能绑在层级的 ctx 上——
 	// execLevel 在层结束时会 cancel()，若沿用该 ctx，刚拉起的 service 会被立刻杀掉。
@@ -207,7 +210,7 @@ func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []m
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("step %s 拉起 service 前已被取消: %w", step.ID, err)
 	}
-	proc, err := rt.Start(context.Background(), tool.Entry, input)
+	proc, err := rt.Start(context.Background(), tool.Entry, input, host)
 	if err != nil {
 		stepErr := fmt.Errorf("step %s 拉起 service 失败: %w", step.ID, err)
 		if hookErr := e.notifyError(ctx, hooks, tool.ID, err, input); hookErr != nil {
@@ -217,7 +220,7 @@ func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []m
 	}
 
 	return &ServiceHandle{
-		StepID: step.ID, Runtime: tool.Runtime, Proc: proc, Entry: tool.Entry, Input: input,
+		StepID: step.ID, Runtime: tool.Runtime, Proc: proc, Entry: tool.Entry, Input: input, Host: host,
 		StartedAt: time.Now(), // 供 Supervisor 判定「存活时长」以决定是否重置退避
 	}, nil
 }

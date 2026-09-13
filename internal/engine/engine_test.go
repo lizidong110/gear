@@ -167,7 +167,7 @@ func TestResolveValueComposite(t *testing.T) {
 
 // E-proc-1：process runtime 经 cat 回显 JSON。
 func TestRunProcessEcho(t *testing.T) {
-	out, err := runProcess(context.Background(), "cat", map[string]interface{}{"name": "x"})
+	out, err := runProcess(context.Background(), "cat", map[string]interface{}{"name": "x"}, nil)
 	if err != nil {
 		t.Fatalf("runProcess 失败: %v", err)
 	}

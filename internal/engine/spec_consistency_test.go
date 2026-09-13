@@ -187,7 +187,7 @@ func TestProcessRuntimeStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("process runtime 应可用: %v", err)
 	}
-	p, err := rt.Start(context.Background(), "sleep 30", map[string]interface{}{})
+	p, err := rt.Start(context.Background(), "sleep 3", map[string]interface{}{}, nil)
 	if err != nil {
 		t.Fatalf("Start 失败: %v", err)
 	}

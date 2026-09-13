@@ -206,7 +206,7 @@ func TestWhenRejectsTemplateSyntax(t *testing.T) {
 func TestWhenSkipsServiceStep(t *testing.T) {
 	reg := newTestRegistry(t)
 	defer reg.Close()
-	putTool(t, reg, procTool("sleepy", "sleep 30", objSchema(), objSchema()))
+	putTool(t, reg, procTool("sleepy", "sleep 3", objSchema(), objSchema()))
 	putFlow(t, reg, &model.Flow{ID: "f", Steps: []model.Step{
 		{ID: "keep", Call: "sleepy", Mode: "service", When: "false", Input: map[string]interface{}{}},
 	}})

@@ -293,7 +293,7 @@ func TestExecutionNotFound(t *testing.T) {
 func TestAppsLifecycle(t *testing.T) {
 	s, reg := newTestServer(t)
 	if err := reg.UpsertTool(&model.Tool{
-		ID: "sleepy", Name: "S", Runtime: model.RuntimeProcess, Entry: "sleep 30",
+		ID: "sleepy", Name: "S", Runtime: model.RuntimeProcess, Entry: "sleep 3",
 		InputSchema:  map[string]interface{}{"type": "object"},
 		OutputSchema: map[string]interface{}{"type": "object"},
 		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},

@@ -12,6 +12,7 @@ import (
 
 	"github.com/santhosh-tekuri/jsonschema/v5"
 
+	"gear/internal/cap"
 	"gear/internal/model"
 	"gear/internal/registry"
 )
@@ -24,9 +25,12 @@ const DefaultMaxParallel = 4
 type Engine struct {
 	reg         *registry.Registry
 	maxParallel int
+	// host 是宿主能力原语的实现集合（M5，PRD §6）。nil 表示不提供任何宿主能力
+	// （Tool 若声明了 capability，运行期访问会收到 ErrCapabilityUnavailable）。
+	host *cap.Providers
 }
 
-// New 构造引擎。可用 WithMaxParallel 覆盖并发上限。
+// New 构造引擎。可用 WithMaxParallel / WithHost 等选项覆盖默认行为。
 func New(reg *registry.Registry, opts ...func(*Engine)) *Engine {
 	e := &Engine{reg: reg, maxParallel: DefaultMaxParallel}
 	for _, o := range opts {
@@ -43,6 +47,21 @@ func WithMaxParallel(n int) func(*Engine) {
 		}
 		e.maxParallel = n
 	}
+}
+
+// WithHost 注入宿主能力原语实现（PRD §6 的 http/call/db/kv/secret/event）。
+// 不调用时 Engine 无宿主能力，Tool 声明的 capability 运行期会返回 ErrCapabilityUnavailable。
+func WithHost(p *cap.Providers) func(*Engine) {
+	return func(e *Engine) {
+		e.host = p
+	}
+}
+
+// hostFor 为一次执行构建宿主能力视图：按 Tool.Capabilities 精确授权，从引擎持有
+// 的宿主实现集中取原语。注册期已校验 Capabilities 合法（model.Tool.Validate），故此处忽略错误。
+func (e *Engine) hostFor(tool *model.Tool) *cap.Context {
+	grants, _ := cap.GrantsFromStrings(tool.Capabilities)
+	return cap.New(grants, e.host)
 }
 
 // RunResult 是一次 Flow 执行的结构化结果。

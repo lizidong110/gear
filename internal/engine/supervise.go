@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"gear/internal/cap"
 	"gear/internal/model"
 )
 
@@ -17,6 +18,7 @@ type ServiceHandle struct {
 	Proc      Process                // 当前（或重启后的）子进程抽象句柄
 	Entry     string                 // 重启时复用的命令
 	Input     map[string]interface{} // 已解析并校验的 input（重启时复用）
+	Host      *cap.Context           // 重启时复用的宿主能力视图（M5，按原 Tool.Capabilities 授权）
 	Restarts  int                    // 已重启次数（restart=always 时 > 0）
 	StartedAt time.Time              // 本次（重）启动时间；Supervisor 据此判断存活时长以重置退避
 }
@@ -161,7 +163,7 @@ func (e *Engine) Relaunch(h *ServiceHandle) error {
 	if err != nil {
 		return fmt.Errorf("restart step %s: %w", h.StepID, err)
 	}
-	proc, err := rt.Start(context.Background(), h.Entry, h.Input)
+	proc, err := rt.Start(context.Background(), h.Entry, h.Input, h.Host)
 	if err != nil {
 		return fmt.Errorf("restart step %s 失败: %w", h.StepID, err)
 	}

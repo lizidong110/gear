@@ -2,7 +2,9 @@
 // 这些结构体是 Tool / Flow / Hook 在内存与磁盘(YAML/SQLite)之间的唯一真相源。
 package model
 
-import "time"
+import (
+	"time"
+)
 
 // Runtime 表示 Tool 的执行运行时。
 type Runtime string
@@ -59,6 +61,9 @@ type Tool struct {
 	InputSchema map[string]interface{} `yaml:"input_schema" json:"input_schema"`
 	OutputSchema map[string]interface{} `yaml:"output_schema" json:"output_schema"`
 	Versions    []ToolVersion          `yaml:"versions" json:"versions"`
+	// Capabilities 声明该 Tool 被允许使用的宿主能力原语（PRD §6，最小权限）。
+	// 对应 ctx.* 的 http/call/db/kv/secret/event；运行期未声明的原语调用一律拒绝。
+	Capabilities []string `yaml:"capabilities" json:"capabilities"`
 }
 
 // ToolVersion 是 Tool 的一个版本条目。

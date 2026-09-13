@@ -282,7 +282,7 @@ func TestHookNoRecursion(t *testing.T) {
 func TestHookAppliesToServiceStep(t *testing.T) {
 	reg := newTestRegistry(t)
 	defer reg.Close()
-	putTool(t, reg, procTool("sleepy", "sleep 30", objSchema(), objSchema()))
+	putTool(t, reg, procTool("sleepy", "sleep 3", objSchema(), objSchema()))
 	putTool(t, reg, luaTool("tag", `return { tag = "hooked" }`, objSchema(), objSchema()))
 	putHook(t, reg, &model.Hook{ID: "hs", Target: "sleepy", Stage: model.StageBeforeStep, Action: "tag"})
 	putFlow(t, reg, &model.Flow{ID: "f", Steps: []model.Step{

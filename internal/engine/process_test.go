@@ -8,7 +8,7 @@ import (
 
 // F4：非零退出码应返回错误，且 stderr 被捕获进错误信息。
 func TestRunProcessNonZeroExit(t *testing.T) {
-	_, err := runProcess(context.Background(), "sh -c 'echo boom >&2; exit 3'", map[string]interface{}{})
+	_, err := runProcess(context.Background(), "sh -c 'echo boom >&2; exit 3'", map[string]interface{}{}, nil)
 	if err == nil {
 		t.Fatal("非零退出码应返回错误")
 	}
@@ -19,7 +19,7 @@ func TestRunProcessNonZeroExit(t *testing.T) {
 
 // F4：stderr 输出不应干扰 stdout 末行 JSON 解析。
 func TestRunProcessStderrIgnored(t *testing.T) {
-	out, err := runProcess(context.Background(), `sh -c 'echo warn >&2; echo "{\"name\":\"x\"}"'`, map[string]interface{}{})
+	out, err := runProcess(context.Background(), `sh -c 'echo warn >&2; echo "{\"name\":\"x\"}"'`, map[string]interface{}{}, nil)
 	if err != nil {
 		t.Fatalf("stderr 不应导致失败: %v", err)
 	}
@@ -30,14 +30,14 @@ func TestRunProcessStderrIgnored(t *testing.T) {
 
 // F4：stdout 为空应报错。
 func TestRunProcessEmptyStdout(t *testing.T) {
-	if _, err := runProcess(context.Background(), "true", map[string]interface{}{}); err == nil {
+	if _, err := runProcess(context.Background(), "true", map[string]interface{}{}, nil); err == nil {
 		t.Fatal("空 stdout 应报错")
 	}
 }
 
 // F4：stdout 含日志行时取末行 JSON。
 func TestRunProcessDirtyStdout(t *testing.T) {
-	out, err := runProcess(context.Background(), `sh -c 'echo "log line"; echo "{\"name\":\"x\"}"'`, map[string]interface{}{})
+	out, err := runProcess(context.Background(), `sh -c 'echo "log line"; echo "{\"name\":\"x\"}"'`, map[string]interface{}{}, nil)
 	if err != nil {
 		t.Fatalf("脏 stdout 应跳过日志行: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestRunProcessDirtyStdout(t *testing.T) {
 func TestRunProcessTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
-	if _, err := runProcess(ctx, "sleep 2", map[string]interface{}{}); err == nil {
+	if _, err := runProcess(ctx, "sleep 2", map[string]interface{}{}, nil); err == nil {
 		t.Fatal("超时命令应返回错误")
 	}
 }
@@ -59,7 +59,7 @@ func TestRunProcessTimeout(t *testing.T) {
 func TestRunProcessWithinTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := runProcess(ctx, "cat", map[string]interface{}{"name": "x"})
+	out, err := runProcess(ctx, "cat", map[string]interface{}{"name": "x"}, nil)
 	if err != nil {
 		t.Fatalf("正常命令应成功: %v", err)
 	}

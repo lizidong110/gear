@@ -88,8 +88,8 @@ gear/
 | §5.2 | 生命周期 + weight 升序（同重注册序） | engine | 单测 | T-eng-06 | 🔴 |
 | §5.3 | 插件无感知 / action 是 Tool / fail-closed / 禁止隐式依赖 | engine | 集成 | T-eng-07 | 🔴 |
 | §5.4 | 改写 input/output + 重校验；best-effort；on_error 不恢复；Hook 嵌套防重入 | engine | 集成 | T-eng-08..11 | 🔴 |
-| §6 | 宿主 6 原语 http/call/db/kv/secret/event | host | 集成 | T-host-01..06 | 🔴 |
-| §6.2 | call 与 event 边界 | host | 集成 | T-host-07 | 🔴 |
+| §6 | 宿主 6 原语 http/call/db/kv/secret/event | host | 集成 | T-host-01..06 | 🟢 M5 已落地（`internal/cap` + `engine.luaRuntime`/`processRuntime` 注入 `ctx.*`；db 原语已实现接口但宿主未提供实现，调用返回 ErrCapabilityUnavailable） |
+| §6.2 | call 与 event 边界 | host | 集成 | T-host-07 | 🟢 M5：call 经 Resolver 唯一通道、event notify/wait 同步往返，均已测 |
 | §7.1 | 状态机 draft→testing→stable→deprecated/rejected | engine/registry | 单测 | T-ver-01 | 🔴 |
 | §7.2 | 晋升显式 + operator 审计 | server/registry | 集成 | T-ver-02 | 🔴 |
 | §7.3 | 幂等 + 并发安全（写锁/CAS/版本不可变） | registry | 并发测试 | T-ver-03 | 🔴 |
@@ -110,7 +110,7 @@ gear/
 > 每切片 DoD = 该切片矩阵条目全 🟢 + 覆盖率达标 + 评审过关。
 >
 > **⚠️ 2026-09-13 更正**：下面原定顺序在实施中已被调整，实际执行如下（本表随切片回填，避免方法论漂移）：
-> S0 骨架 ✅ / S1 最小引擎 ✅ / **S2 app run 进程监管 ✅** / **S3 Hook 切面 ✅** / **S4 并行+依赖推断+背压 ✅** / **S7a lua runtime ✅（提前）** / **`when` 条件执行 ✅（本次）**；S5 版本灰度、S6 REST+AI 仍待做；`ctx.*` 宿主能力（M5）仍为架构债。
+> S0 骨架 ✅ / S1 最小引擎 ✅ / **S2 app run 进程监管 ✅** / **S3 Hook 切面 ✅** / **S4 并行+依赖推断+背压 ✅** / **S7a lua runtime ✅（提前）** / **`when` 条件执行 ✅** / **`ctx.*` 宿主能力层（M5）✅（http/call/kv/secret/event 实现 + 最小权限放行；db 原语已定义但宿主未提供实现，声明即可见、调用返回 ErrCapabilityUnavailable）**；S5 版本灰度、S6c AI 闭环仍待做。
 > 调整理由：lua 提前是因为 `ctx.*` 尚未落地时 lua 可作为**纯计算沙箱**独立成立；Hook 排在并行之前是因为 Hook 需要先抽「共享 step 执行路径」，而并行也要复用同一条路径——先建路径再改它的并发语义，风险更低。
 
 - **S0 基线**：model/registry/cli 骨架。DoD：修正 §9 的 6 处缺陷 + model 单测 + registry 集成测试 + CLI 与 §11 对齐清单。✅ **已完成 2026-09-12**。
@@ -255,6 +255,25 @@ gear/
 
 > 本文件不是一次成型的蓝图，而是**随切片演进**的宪法。每次改动必须回答三件事：触发场景 / 改了什么 / 为什么必须改。
 > 规则：新规则必须来自**真实踩到的坑**，不接受纸上推演出的规则（避免方法论自我膨胀）。
+
+### 2026-09-13（第四次）· 实现 M5：`ctx.*` 宿主能力层
+
+**M5 的设计原则（来自 PRD §6，已落进 `internal/cap`）**
+- **规则**：宿主只向 Tool 暴露 6 个跨边界原语（http/call/db/kv/secret/event）；**capability 精确放行**——未声明的调用一律拒绝，权限遵循最小权限；secret 只读；原语只提供「通道」不提供「业务」（发邮件/接钉钉都是普通 Tool，内部用 http 实现）。
+- **为什么**：这是之前反复强调的「枚举式声明必须逐项登记（红线 15）」+「注册期拒绝未知值」在能力面上的延伸。能力枚举若两处维护必漂移，故 `cap.KnownPrimitives` 是**单一来源**，`cap.GrantsFromStrings` 在解析点拒绝未知值（与 `model.Runtime` / `model.HookStage` 同一套路）。
+- **落地**：
+  - `internal/cap`：Primitive 枚举单一来源；`Context` 每个访问器先查 `Grants` 再取实现——未授权 `ErrCapabilityDenied`，已授权但宿主未提供 `ErrCapabilityUnavailable`（把「文档说有、代码无」变成可见错误）。
+  - `Runtime` 接口加 `host *cap.Context` 参数；引擎 `Engine.hostFor(tool)` 按 `tool.Capabilities` 逐次执行构建视图并沿 `runOnceStep`/`startServiceStep`/`applyHooks`/`Relaunch` 透传。
+  - **lua**：`setupLuaCapabilities` 仅注入**已声明**的原语（未声明的连字段都不出现在 `ctx` 上——比「存在但报错」更严格的防御纵深），闭包捕获授权后的实现，脚本无法绕过沙箱。
+  - **process**：`withHostCapabilities` 把 `ctx.capabilities` / `ctx.sandbox` 注入 step input 的 JSON，进程侧可做最小权限自检（进程内实时强制留待后续切片）。
+  - **db**：原语已实现接口定义，但宿主当前未提供 `Providers.DB`，故声明 `db` 的 Tool 其 `ctx.db` 可见、调用返回 `ErrCapabilityUnavailable`（明确 deferred，而非静默成功）。
+
+**M5 顺手修的真实坑（值得记一笔）**
+- `cap.Context.HTTP()` 原先在 `Providers` 为 nil 时直接 `c.prov.HTTP` → **nil 解引用 panic**。其他访问器都有 `c.prov == nil` 守卫，唯独 HTTP 漏了。修复为：无宿主即 `ErrCapabilityUnavailable`（绝不静默回退到 `http.DefaultClient` 去访问公网——最小权限的「安全默认」）。新增 `TestHTTPUnavailableWhenNoProvider` 锁死。
+
+**覆盖率闸门实证（再次验证 F-覆盖率闸门）**
+- M5 把 `cap` 包从「无」补到 `86.7%`、engine 维持 `86.8%`，全量 `-race -cover` 闸门在 `-p 1`（串行）下绿灯；kernel 包（engine/model/registry/server）均 ≥80%。
+- 一个环境性观察：`internal/app` 的 Supervisor 测试会拉起长驻 `sh -c` 服务子进程（继承 `os.Stdout`），在**并行** `-race` 下与其他包的进程类测试争用 stdout 管道，偶发 `Test I/O incomplete`；**串行 `-p 1` 下稳定通过**。属测试编排的环境噪声，非逻辑回归——记录以免下次误判为「M5 回归」。
 
 ### 2026-09-13 · 实现 `when` 条件执行，新增 F6–F8 与 §0 第 10–12 条
 

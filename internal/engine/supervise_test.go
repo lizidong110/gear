@@ -39,7 +39,7 @@ func TestRunFlowRejectsServiceStep(t *testing.T) {
 func TestSuperviseLaunchesService(t *testing.T) {
 	reg := newTestRegistry(t)
 	defer reg.Close()
-	if err := reg.UpsertTool(svcTool("sleep 30")); err != nil {
+	if err := reg.UpsertTool(svcTool("sleep 3")); err != nil {
 		t.Fatalf("注册 Tool 失败: %v", err)
 	}
 	flow := &model.Flow{ID: "s", Steps: []model.Step{
@@ -79,7 +79,7 @@ func TestSuperviseLaunchesService(t *testing.T) {
 func TestServiceDepGuard(t *testing.T) {
 	reg := newTestRegistry(t)
 	defer reg.Close()
-	if err := reg.UpsertTool(svcTool("sleep 30")); err != nil {
+	if err := reg.UpsertTool(svcTool("sleep 3")); err != nil {
 		t.Fatalf("注册 Tool 失败: %v", err)
 	}
 	if err := reg.UpsertTool(sampleTool()); err != nil {

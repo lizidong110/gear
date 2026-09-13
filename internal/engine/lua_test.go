@@ -17,7 +17,7 @@ func luaRun(t *testing.T, entry string, input map[string]interface{}) (map[strin
 	if err != nil {
 		t.Fatalf("lua runtime 应可用: %v", err)
 	}
-	return rt.Run(context.Background(), entry, input)
+	return rt.Run(context.Background(), entry, input, nil)
 }
 
 // S7a-1：once 正常 —— ctx.input 进、return table 出。
@@ -104,7 +104,7 @@ func TestLuaTimeout(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, runErr := rt.Run(ctx, `while true do end`, nil)
+		_, runErr := rt.Run(ctx, `while true do end`, nil, nil)
 		done <- runErr
 	}()
 	select {
@@ -123,7 +123,7 @@ func TestLuaServiceUnsupported(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lua runtime 应可用: %v", err)
 	}
-	if _, err := rt.Start(context.Background(), `return {}`, nil); err == nil {
+	if _, err := rt.Start(context.Background(), `return {}`, nil, nil); err == nil {
 		t.Fatal("lua Start 应报错（不支持 service）")
 	} else if !strings.Contains(err.Error(), "不支持 service") {
 		t.Fatalf("错误信息应说明不支持 service，实际: %v", err)

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"gear/internal/cap"
 )
 
 // semverRegex 匹配 SemVer：x.y.z，可选前置 v、预发布与构建元数据。
@@ -60,6 +62,10 @@ func (t Tool) Validate() error {
 		if err := v.Validate(); err != nil {
 			return fmt.Errorf("tool %s 第 %d 个 version 校验失败: %w", t.ID, i, err)
 		}
+	}
+	// capability 精确放行：注册期即拒绝未知原语，杜绝「文档说有、代码无」的漂移（红线 15）。
+	if _, err := cap.GrantsFromStrings(t.Capabilities); err != nil {
+		return fmt.Errorf("tool %s: %w", t.ID, err)
 	}
 	if err := validateSchema(t.InputSchema, "input_schema"); err != nil {
 		return err

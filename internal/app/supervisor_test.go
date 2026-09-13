@@ -94,7 +94,7 @@ func TestSuperviseRestartAlways(t *testing.T) {
 func TestSuperviseStaysAliveThenCancel(t *testing.T) {
 	reg := newTestRegistry(t)
 	defer reg.Close()
-	if err := reg.UpsertTool(svcTool("sleep 30")); err != nil {
+	if err := reg.UpsertTool(svcTool("sleep 3")); err != nil {
 		t.Fatalf("注册 Tool 失败: %v", err)
 	}
 	registerSvcFlow(t, reg, "long")
@@ -114,7 +114,7 @@ func TestSuperviseStaysAliveThenCancel(t *testing.T) {
 func TestSuperviseMaxConcurrent(t *testing.T) {
 	reg := newTestRegistry(t)
 	defer reg.Close()
-	if err := reg.UpsertTool(svcTool("sleep 30")); err != nil {
+	if err := reg.UpsertTool(svcTool("sleep 3")); err != nil {
 		t.Fatalf("注册 Tool 失败: %v", err)
 	}
 	registerSvcFlow(t, reg, "l1")
