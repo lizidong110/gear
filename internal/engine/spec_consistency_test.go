@@ -140,16 +140,16 @@ func TestRunFlowRejectsInvalidOutput(t *testing.T) {
 // S7a 起 lua 已实现（沙箱），不再属于此列；go-host / wasm 仍未实现。
 func TestRuntimeForRejectsUnimplemented(t *testing.T) {
 	for _, rt := range []model.Runtime{model.RuntimeGoHost, model.RuntimeWASM} {
-		if _, err := runtimeFor(rt); err == nil {
+		if _, err := runtimeFor(rt, ""); err == nil {
 			t.Fatalf("runtime %q 应报错（未实现），实际未报错", rt)
 		}
 	}
 	for _, rt := range []model.Runtime{model.RuntimeProcess, model.RuntimeLua} {
-		if _, err := runtimeFor(rt); err != nil {
+		if _, err := runtimeFor(rt, ""); err != nil {
 			t.Fatalf("已实现 runtime %q 应可用: %v", rt, err)
 		}
 	}
-	if _, err := runtimeFor(model.Runtime("foobar")); err == nil {
+	if _, err := runtimeFor(model.Runtime("foobar"), ""); err == nil {
 		t.Fatal("未知 runtime 应报错")
 	}
 }
@@ -183,7 +183,7 @@ func TestSpecRejectsUnimplementedRuntimeTool(t *testing.T) {
 
 // B 修复：runtimeFor(process) 返回的适配器同时实现 Run 与 Start（service 分发路径）。
 func TestProcessRuntimeStart(t *testing.T) {
-	rt, err := runtimeFor(model.RuntimeProcess)
+	rt, err := runtimeFor(model.RuntimeProcess, "")
 	if err != nil {
 		t.Fatalf("process runtime 应可用: %v", err)
 	}

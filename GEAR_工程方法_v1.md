@@ -120,7 +120,7 @@ gear/
 - **S2 app run 进程模型**：长驻 Flow（`mode: service`）、restart、信号停止、`app run --max` 闸门。✅ **已完成**（健康探针仍 deferred）。
 - **S3 Hook 切面**：before_step/after_step/on_error + Order 装配 + 改写重校验 + fail-closed + criticality + 无递归。✅ **已完成**（before_promote 于 S5 落地）。
 - **S4 并行与背压**：分层并行、依赖推断、`maxParallel`、并行安全、并行下 fail-closed、崩溃指数退避。✅ **已完成**。
-- **S7a lua runtime**：gopher-lua 沙箱（once）+ 沙箱/超时/错误测试。✅ **已完成**；**沙箱策略可配置化（REQ-LUA-SANDBOX-CONFIG）已记为后期项**。
+- **S7a lua runtime**：gopher-lua 沙箱（once）+ 沙箱/超时/错误测试。✅ **已完成**；**沙箱策略可配置化（REQ-LUA-SANDBOX-CONFIG）已落地**：引擎级 `WithSandbox(strict|permissive)`，strict 仅 base/string/table/math，permissive 额外开 coroutine，文件加载全局任何策略都禁（防逃逸）。
 - **`when` 条件执行**：expr 表达式引擎 + 三态跳过 + 级联传播 + 注册期编译校验。✅ **已完成**（2026-09-13）。
 - **S5 版本灰度** ✅（2026-09-13）：状态机 `VersionTransitions` + `CanPromote` + 版本级 Entry/Schema 覆盖 + `resolveToolVersion`（`use_version` 钉版本解析）+ `PromoteTool` 触发 `before_promote` 门禁（fail-closed）+ `tool promote`/`tool versions` CLI。覆盖 T-ver-01..04、T-reg-01..03。
 - **S6 REST API + CLI 补全 + AI 闭环**：§11 全量端点 + CLI 补全 + AI 生成/校验/重试。覆盖 T-srv-01..02、T-ai-01。

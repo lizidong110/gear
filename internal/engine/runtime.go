@@ -34,7 +34,7 @@ type Process interface {
 //
 // 「已实现」判定以 model.ImplementedRuntimes 为**唯一来源**（C），本函数不再维护第二份白名单：
 // 未知 runtime、已知但未实现的 runtime 都在此显式报错，绝不静默降级为 process。
-func runtimeFor(rt model.Runtime) (Runtime, error) {
+func runtimeFor(rt model.Runtime, policy string) (Runtime, error) {
 	if !rt.Known() {
 		return nil, fmt.Errorf("未知的 runtime: %q", rt)
 	}
@@ -45,7 +45,7 @@ func runtimeFor(rt model.Runtime) (Runtime, error) {
 	case model.RuntimeProcess:
 		return &processRuntime{}, nil
 	case model.RuntimeLua:
-		return &luaRuntime{}, nil
+		return &luaRuntime{policy: policy}, nil
 	default:
 		// 被登记为「已实现」却没有适配器 —— 内部不一致，显式暴露而非跑错分支。
 		return nil, fmt.Errorf("runtime %q 已登记为已实现但缺少适配器（内部不一致）", rt)

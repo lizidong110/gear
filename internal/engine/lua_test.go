@@ -13,7 +13,7 @@ import (
 // luaRun 是测试用的便捷封装。
 func luaRun(t *testing.T, entry string, input map[string]interface{}) (map[string]interface{}, error) {
 	t.Helper()
-	rt, err := runtimeFor(model.RuntimeLua)
+	rt, err := runtimeFor(model.RuntimeLua, "")
 	if err != nil {
 		t.Fatalf("lua runtime 应可用: %v", err)
 	}
@@ -69,6 +69,25 @@ func TestLuaSandboxEscapeBlocked(t *testing.T) {
 	}
 }
 
+// S7a-4b：沙箱策略可配置（REQ-LUA-SANDBOX-CONFIG）。permissive 档在 strict 基础上额外开放
+// coroutine/utf8（纯计算安全），但仍禁止文件加载类全局（dofile/require）—— 配置项不能关掉沙箱本身。
+func TestLuaSandboxPermissive(t *testing.T) {
+	rt, err := runtimeFor(model.RuntimeLua, SandboxPermissive)
+	if err != nil {
+		t.Fatalf("lua runtime 应可用: %v", err)
+	}
+	out, err := rt.Run(context.Background(), `return { coroutine = type(coroutine), dofile = type(dofile) }`, nil, nil)
+	if err != nil {
+		t.Fatalf("permissive Run 失败: %v", err)
+	}
+	if fmt.Sprint(out["coroutine"]) != "table" {
+		t.Fatalf("permissive 应开放 coroutine，实际 type=%v", out["coroutine"])
+	}
+	if fmt.Sprint(out["dofile"]) != "nil" {
+		t.Fatalf("permissive 仍应禁止 dofile（防逃逸），实际 type=%v", out["dofile"])
+	}
+}
+
 // S7a-5：语法错误报错。
 func TestLuaSyntaxError(t *testing.T) {
 	if _, err := luaRun(t, `return {`, nil); err == nil {
@@ -95,7 +114,7 @@ func TestLuaNoOutput(t *testing.T) {
 
 // S7a-8：死循环被超时中断（SetContext 生效，防挂死）。
 func TestLuaTimeout(t *testing.T) {
-	rt, err := runtimeFor(model.RuntimeLua)
+	rt, err := runtimeFor(model.RuntimeLua, "")
 	if err != nil {
 		t.Fatalf("lua runtime 应可用: %v", err)
 	}
@@ -119,7 +138,7 @@ func TestLuaTimeout(t *testing.T) {
 
 // S7a-9：lua 不支持 service，Start 返回明确错误。
 func TestLuaServiceUnsupported(t *testing.T) {
-	rt, err := runtimeFor(model.RuntimeLua)
+	rt, err := runtimeFor(model.RuntimeLua, "")
 	if err != nil {
 		t.Fatalf("lua runtime 应可用: %v", err)
 	}

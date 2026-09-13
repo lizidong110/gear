@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -34,17 +35,18 @@ func TestValidateTemplatesOK(t *testing.T) {
 	}
 }
 
-// T-tpl-2：PRD §4.3 声明了 ${secrets.x}，但该前缀未实现 —— 注册期必须显式拒绝，
-// 不能等到执行期才报「未知引用前缀」。（此前实测：注册放行、执行才炸。）
-func TestValidateTemplatesRejectsSecrets(t *testing.T) {
+// T-tpl-2：PRD §4.3 声明了 ${secrets.x}，现已实现（REQ-TMPL-SECRETS）——
+// 注册期**允许**该前缀（Flow 定义只存引用，明文密钥留宿主机密源，不落库）；
+// 密钥缺失在运行期解析时报错。此处断言注册期不再拒绝 secrets 引用。
+func TestValidateTemplatesAllowsSecrets(t *testing.T) {
 	f := tplFlow(nil, map[string]interface{}{"token": "${secrets.api_key}"})
-	err := validateTemplates(f)
-	if err == nil {
-		t.Fatal("${secrets.x} 当前未实现，注册期应拒绝")
+	if err := validateTemplates(f); err != nil {
+		t.Fatalf("${secrets.x} 现已实现，注册期应放行，实际: %v", err)
 	}
-	// 错误必须指向「未实现」这条事实与登记处，便于使用者判断是等待还是改写。
-	if msg := err.Error(); !strings.Contains(msg, "secrets") || !strings.Contains(msg, "REQ-TMPL-SECRETS") {
-		t.Fatalf("错误应说明 secrets 未实现并指向 REQ-TMPL-SECRETS，实际: %v", err)
+	// 但残缺引用（缺密钥名）仍应拒绝。
+	f2 := tplFlow(nil, map[string]interface{}{"token": "${secrets}"})
+	if err := validateTemplates(f2); err == nil {
+		t.Fatal("${secrets} 缺少密钥名，注册期应拒绝")
 	}
 }
 
@@ -128,6 +130,41 @@ func TestExpandStringMultipleRefs(t *testing.T) {
 	}
 }
 
+// T-tpl-9b：执行期 ${secrets.x} 从宿主 secret 源解析（REQ-TMPL-SECRETS）。
+// 明文密钥只在运行期出现，Flow 定义只存引用。
+func TestExpandStringResolvesSecrets(t *testing.T) {
+	ctx := &runContext{
+		vars:  map[string]interface{}{},
+		steps: map[string]map[string]interface{}{},
+		secretGet: func(name string) (string, error) {
+			if name == "api_key" {
+				return "s3cr3t", nil
+			}
+			return "", fmt.Errorf("secret %q 不存在", name)
+		},
+	}
+	got, err := expandString("Bearer ${secrets.api_key}", ctx)
+	if err != nil {
+		t.Fatalf("展开失败: %v", err)
+	}
+	if got != "Bearer s3cr3t" {
+		t.Fatalf("secret 未解析，实际 %q", got)
+	}
+
+	// 缺失密钥 → 运行期明确报错（不静默空值）。
+	if _, err := expandString("${secrets.missing}", ctx); err == nil {
+		t.Fatal("缺失 secret 应报错")
+	}
+}
+
+// T-tpl-9c：宿主未注入 secret 实现时，${secrets.x} 解析报错（不静默失败）。
+func TestExpandStringSecretsUnavailable(t *testing.T) {
+	ctx := &runContext{vars: map[string]interface{}{}, steps: map[string]map[string]interface{}{}}
+	if _, err := expandString("${secrets.api_key}", ctx); err == nil {
+		t.Fatal("宿主无 secret 实现时，secrets 解析应报错")
+	}
+}
+
 // T-tpl-10：未闭合模板在**依赖推断**阶段同样报错（三个消费者共用同一解析器）。
 func TestDepsRejectUnclosedTemplate(t *testing.T) {
 	steps := []model.Step{{ID: "s1", Call: "t", Input: map[string]interface{}{"a": "${steps.s1"}}}
@@ -136,8 +173,9 @@ func TestDepsRejectUnclosedTemplate(t *testing.T) {
 	}
 }
 
-// T-tpl-11：端到端——照 PRD §4.3 写 ${secrets.x} 的 Flow 在**注册期**即被拒。
-func TestSpecSecretsTemplateRejectedAtRegister(t *testing.T) {
+// T-tpl-11：端到端——照 PRD §4.3 写 ${secrets.x} 的 Flow 现在**注册期放行**
+// （REQ-TMPL-SECRETS 已实现：引用合法，密钥在执行期从宿主 secret 源解析）。
+func TestSpecSecretsTemplateAllowedAtRegister(t *testing.T) {
 	reg := newTestRegistry(t)
 	defer reg.Close()
 	putTool(t, reg, luaTool("t", `return ctx.input`, objSchema(), objSchema()))
@@ -145,16 +183,12 @@ func TestSpecSecretsTemplateRejectedAtRegister(t *testing.T) {
 		{ID: "s1", Call: "t", Input: map[string]interface{}{"x": "${vars.k}"}},
 	}})
 
-	// 照 PRD 原文写（含 ${secrets.x}）——必须是注册期错误，而非执行期。
-	bad := &model.Flow{ID: "bad", Steps: []model.Step{
+	// 含 ${secrets.x} 的 Flow 现在应通过静态校验（注册期只校验前缀合法性，不校验密钥存在性）。
+	good := &model.Flow{ID: "good", Steps: []model.Step{
 		{ID: "s1", Call: "t", Input: map[string]interface{}{"token": "${secrets.api_key}"}},
 	}}
-	err := New(reg).ValidateFlowStatic(bad)
-	if err == nil {
-		t.Fatal("含 ${secrets.x} 的 Flow 注册期应被拒绝")
-	}
-	if !strings.Contains(err.Error(), "secrets") {
-		t.Fatalf("错误应提到 secrets，实际: %v", err)
+	if err := New(reg).ValidateFlowStatic(good); err != nil {
+		t.Fatalf("含 ${secrets.x} 的 Flow 现应注册期放行，实际: %v", err)
 	}
 }
 

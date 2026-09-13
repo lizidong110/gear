@@ -24,7 +24,7 @@ func luaHost(t *testing.T, caps []string, prov *cap.Providers) *cap.Context {
 // luaRunHost 以给定宿主能力视图运行一段 Lua 源码。
 func luaRunHost(t *testing.T, entry string, input map[string]interface{}, host *cap.Context) (map[string]interface{}, error) {
 	t.Helper()
-	rt, err := runtimeFor(model.RuntimeLua)
+	rt, err := runtimeFor(model.RuntimeLua, "")
 	if err != nil {
 		t.Fatalf("lua runtime 应可用: %v", err)
 	}

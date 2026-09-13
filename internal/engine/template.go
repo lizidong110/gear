@@ -23,7 +23,7 @@ import (
 const (
 	prefixVars    = "vars"    // Flow 内部变量（已实现，§4.3）
 	prefixSteps   = "steps"   // 上游 step 的输出（已实现，§4.3）
-	prefixSecrets = "secrets" // 密钥（PRD §4.3 声明、**未实现** —— 见 REQ-TMPL-SECRETS）
+	prefixSecrets = "secrets" // 密钥（已实现，REQ-TMPL-SECRETS；执行期经宿主 secret 源解析，Flow 定义只存引用）
 )
 
 // templateRef 是一次 `${...}` 引用的解析结果（含位置，供原地替换）。
@@ -69,10 +69,6 @@ func scanTemplateRefs(s string) ([]templateRef, error) {
 // prefixErr 解释「该前缀为何不可用」——注册期校验与运行期展开**共用同一解释**，
 // 避免同一个缺陷出现两套文案（两处文案就是两处真相，改一处漏一处）。
 func prefixErr(r templateRef) error {
-	if r.Prefix == prefixSecrets {
-		return fmt.Errorf("引用前缀 %s 尚未实现（secret 原语随 ctx.* 落地，见 REQUIREMENTS.md REQ-TMPL-SECRETS）；当前仅支持 %s / %s",
-			prefixSecrets, prefixVars, prefixSteps)
-	}
 	return fmt.Errorf("未知引用前缀: %s", r.Prefix)
 }
 
@@ -114,6 +110,18 @@ func lookup(r templateRef, ctx *runContext) (interface{}, error) {
 			return nil, fmt.Errorf("step 尚未执行: %s", r.Path[0])
 		}
 		return walk(st, r.Path[1:])
+	case prefixSecrets:
+		if len(r.Path) == 0 {
+			return nil, fmt.Errorf("secrets 引用缺少密钥名: %s", r.Raw)
+		}
+		if ctx.secretGet == nil {
+			return nil, fmt.Errorf("secret 原语未提供：宿主未注入 secret 实现（见 REQ-TMPL-SECRETS），无法解析 %s", r.Raw)
+		}
+		v, err := ctx.secretGet(r.Path[0])
+		if err != nil {
+			return nil, fmt.Errorf("解析 secret %q 失败: %w", r.Path[0], err)
+		}
+		return v, nil
 	default:
 		return nil, prefixErr(r)
 	}
@@ -196,6 +204,12 @@ func validateTemplates(f *model.Flow) error {
 					if len(r.Path) == 0 {
 						return fmt.Errorf("step %s: steps 引用缺少 step id: %s", s.ID, r.Raw)
 					}
+				case prefixSecrets:
+					if len(r.Path) == 0 {
+						return fmt.Errorf("step %s: secrets 引用缺少密钥名: %s", s.ID, r.Raw)
+					}
+					// 注：secret 密钥本身**不**在注册期校验（密钥源是运行期宿主能力，
+					// 注册期无从知晓）；缺失密钥在运行期解析时报错（同 vars 的深层路径留待运行期）。
 				default:
 					return fmt.Errorf("step %s: %w", s.ID, prefixErr(r))
 				}

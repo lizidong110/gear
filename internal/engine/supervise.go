@@ -76,8 +76,9 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 	// 若将来 service 支持「运行期重读 Tool」，此处必须改为与 run() 同样的上报。
 
 	rc := &runContext{
-		vars:  flow.Vars,
-		steps: map[string]map[string]interface{}{},
+		vars:      flow.Vars,
+		steps:     map[string]map[string]interface{}{},
+		secretGet: e.secretResolver(),
 	}
 	res := &SuperviseResult{FlowID: flowID}
 	var svcMu sync.Mutex // 并行 goroutine 都会追加 service 句柄
@@ -159,7 +160,7 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 // Relaunch 重启一个已退出的 service step（restart=always 时由 Supervisor 调用）。
 // 按原 runtime 重新分发，复用 Entry 与已校验的 input，Restarts 计数 +1。
 func (e *Engine) Relaunch(h *ServiceHandle) error {
-	rt, err := runtimeFor(h.Runtime)
+	rt, err := runtimeFor(h.Runtime, e.sandboxPolicy)
 	if err != nil {
 		return fmt.Errorf("restart step %s: %w", h.StepID, err)
 	}

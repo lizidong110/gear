@@ -25,34 +25,52 @@ import (
 //
 // service：**不支持**（长驻需要 ctx.* 才能有意义；见 errLuaServiceUnsupported）。
 //
-// deferred（REQ-LUA-SANDBOX-CONFIG，后期）：当前沙箱是**硬编码严格模式**。
-// 用户已明确：拦截哪些「危险行为」应当**可配置**（有些行为可能是用户期望的），
-// 由用户自己抉择。该配置化依赖 M5 的 capability 体系，故推迟到后期实现；
-// 届时应把 luaAllowedLibs / luaForbiddenGlobals 改为来自策略配置（如 sandbox: strict|permissive
-// 或逐项 capability 白名单），而不是现在的常量。
-type luaRuntime struct{}
+// 沙箱策略可配置（REQ-LUA-SANDBOX-CONFIG，已落地）：引擎级 `WithSandbox(strict|permissive)`
+// 决定 Lua 开放哪些标准库。strict（默认）仅 base/string/table/math；permissive 额外开 coroutine。
+// 文件加载类全局（dofile/loadfile/require/module）无论何种策略一律移除 —— 配置项只能「开更多纯计算库」，
+// 不能「关掉沙箱本身」（Lua 逃逸宿主是 P0 级风险）。
+type luaRuntime struct {
+	// policy 是 Lua 沙箱档位（strict/permissive），由引擎 WithSandbox 透传（REQ-LUA-SANDBOX-CONFIG）。
+	policy string
+}
 
 // luaForbiddenGlobals 是沙箱必须从全局表移除的名字（防宿主逃逸）。
+// 无论 strict 还是 permissive，文件加载类全局一律禁止 —— 这是 Lua 逃逸宿主的主通道，
+// 配置项只允许「开更多纯计算库」，不允许「关掉沙箱本身」。
 var luaForbiddenGlobals = []string{"dofile", "loadfile", "require", "module"}
 
 // errLuaServiceUnsupported 由 Start 返回：lua 不做 service，长驻请用 process runtime。
 var errLuaServiceUnsupported = fmt.Errorf("lua runtime 不支持 service 模式（长驻需 ctx.* 宿主能力，计划 M5）；请改用 process runtime")
 
-// luaAllowedLibs 是允许加载的标准库（白名单，其余一律不开）。
-var luaAllowedLibs = []struct {
+// luaLib 是沙箱允许加载的标准库条目（白名单，其余一律不开）。
+type luaLib struct {
 	name string
 	fn   lua.LGFunction
-}{
-	{lua.BaseLibName, lua.OpenBase},
-	{lua.StringLibName, lua.OpenString},
-	{lua.TabLibName, lua.OpenTable},
-	{lua.MathLibName, lua.OpenMath},
 }
 
-// newSandboxState 构造一个只带安全库的 Lua 状态机。
-func newSandboxState() (*lua.LState, error) {
+// luaAllowedLibs 是允许加载的标准库（白名单，其余一律不开）。
+// strict（默认）：base/string/table/math（纯计算，无法接触宿主）。
+// permissive：在 strict 基础上额外开放 coroutine/utf8（仍是纯计算，无文件/网络/os 逃逸）。
+func luaAllowedLibs(policy string) []luaLib {
+	libs := []luaLib{
+		{lua.BaseLibName, lua.OpenBase},
+		{lua.StringLibName, lua.OpenString},
+		{lua.TabLibName, lua.OpenTable},
+		{lua.MathLibName, lua.OpenMath},
+	}
+	if policy == SandboxPermissive {
+		libs = append(libs,
+			luaLib{lua.CoroutineLibName, lua.OpenCoroutine},
+		)
+	}
+	return libs
+}
+
+// newSandboxState 按沙箱策略构造一个只带安全库的 Lua 状态机。
+// policy 为空或非法时退化为 strict（与引擎默认一致）。
+func newSandboxState(policy string) (*lua.LState, error) {
 	L := lua.NewState(lua.Options{SkipOpenLibs: true})
-	for _, lib := range luaAllowedLibs {
+	for _, lib := range luaAllowedLibs(policy) {
 		if err := L.CallByParam(lua.P{
 			Fn:      L.NewFunction(lib.fn),
 			NRet:    0,
@@ -268,7 +286,7 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 // Run 执行一段 Lua 源码（once 模式）。host 是本次执行的宿主能力视图（M5）：
 // 未声明的 capability 访问会返回 lua 错误（最小权限），详见 setupLuaCapabilities 的 ctx.* 暴露。
 func (l *luaRuntime) Run(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context) (map[string]interface{}, error) {
-	L, err := newSandboxState()
+	L, err := newSandboxState(l.policy)
 	if err != nil {
 		return nil, err
 	}

@@ -18,10 +18,16 @@ import (
 var defaultExecTimeout = 30 * time.Second
 
 // processRuntime 实现 Runtime 接口：外部进程，stdin 进 JSON，stdout 末行出 JSON（PRD §3.3）。
-type processRuntime struct{}
+type processRuntime struct {
+	// execID/stepID 用于把子进程日志关联到具体执行（REQ-API-LOGS / #71）；
+	// sink 为 nil 时不记日志（兼容无日志采集的调用方）。
+	execID  string
+	stepID  string
+	sink    func(stepID, stream, line string)
+}
 
 func (p *processRuntime) Run(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context) (map[string]interface{}, error) {
-	return runProcess(ctx, entry, input, host)
+	return runProcess(ctx, entry, input, host, p.execID, p.stepID, p.sink)
 }
 
 // Start 拉起一个长驻 process（service 模式），不等待其结束，返回可监管句柄。
@@ -53,7 +59,7 @@ func (e *execProcess) Wait() error { return e.cmd.Wait() }
 // 当前通过 `sh -c <entry>` 启动命令（开发环境为 Git Bash，sh 可用）。
 // 跨平台/生产化时再抽成可配置的 shell 解析器。
 // ctx 用于超时控制：超时时命令被杀死并返回错误（F4）。
-func runProcess(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context) (map[string]interface{}, error) {
+func runProcess(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context, execID, stepID string, sink func(stepID, stream, line string)) (map[string]interface{}, error) {
 	input = withHostCapabilities(input, host)
 	inBytes, err := json.Marshal(input)
 	if err != nil {
@@ -66,8 +72,15 @@ func runProcess(ctx context.Context, entry string, input map[string]interface{},
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
-		return nil, procFail(fmt.Sprintf("%v (stderr=%s)", err, stderr.String()), entry, stdout.Bytes(), stderr.Bytes())
+	runErr := cmd.Run()
+	// 无论成功失败，都把子进程每行输出上报给日志采集器（REQ-API-LOGS / #71）。
+	// 注意：仅 stdout/stderr 文本，绝不包含 input（secret 等敏感数据不落日志）。
+	if sink != nil {
+		emitLogLines(sink, stepID, "stdout", stdout.String())
+		emitLogLines(sink, stepID, "stderr", stderr.String())
+	}
+	if runErr != nil {
+		return nil, procFail(fmt.Sprintf("%v (stderr=%s)", runErr, stderr.String()), entry, stdout.Bytes(), stderr.Bytes())
 	}
 
 	last := lastNonEmptyLine(stdout.String())
@@ -80,6 +93,17 @@ func runProcess(ctx context.Context, entry string, input map[string]interface{},
 		return nil, procFail(fmt.Sprintf("解析 stdout 失败(%q): %v", last, err), entry, stdout.Bytes(), stderr.Bytes())
 	}
 	return out, nil
+}
+
+// emitLogLines 把一段输出按行上报给 sink（空行跳过）；stream 标记 stdout/stderr。
+func emitLogLines(sink func(stepID, stream, line string), stepID, stream, buf string) {
+	for _, ln := range strings.Split(buf, "\n") {
+		ln = strings.TrimRight(ln, "\r")
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		sink(stepID, stream, ln)
+	}
 }
 
 func lastNonEmptyLine(s string) string {

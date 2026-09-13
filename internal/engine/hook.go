@@ -79,7 +79,7 @@ func (e *Engine) applyHooks(ctx context.Context, all []model.Hook, stage, toolID
 			continue
 		}
 
-		rt, err := runtimeFor(tool.Runtime)
+		rt, err := runtimeFor(tool.Runtime, e.sandboxPolicy)
 		if err != nil {
 			if ferr := hookFail(h, fmt.Errorf("Hook %s: %w", h.ID, err)); ferr != nil {
 				return nil, rewritten, ferr
@@ -155,9 +155,14 @@ func (e *Engine) runOnceStep(ctx context.Context, rc *runContext, hooks []model.
 		return nil, nil, err
 	}
 
-	rt, err := runtimeFor(tool.Runtime)
+	rt, err := runtimeFor(tool.Runtime, e.sandboxPolicy)
 	if err != nil {
 		return nil, nil, fmt.Errorf("step %s: %w", step.ID, err)
+	}
+
+	// 日志采集（REQ-API-LOGS / #71）：把 process 子进程输出关联到本执行+本 step。
+	if pr, ok := rt.(*processRuntime); ok && rc.logSink != nil {
+		pr.execID, pr.stepID, pr.sink = rc.execID, step.ID, rc.logSink
 	}
 
 	stepCtx, cancel := context.WithTimeout(ctx, defaultExecTimeout)
@@ -198,7 +203,7 @@ func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []m
 		return nil, err
 	}
 
-	rt, err := runtimeFor(tool.Runtime)
+	rt, err := runtimeFor(tool.Runtime, e.sandboxPolicy)
 	if err != nil {
 		return nil, fmt.Errorf("step %s: %w", step.ID, err)
 	}

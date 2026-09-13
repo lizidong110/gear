@@ -21,18 +21,32 @@ import (
 // 防止高扇出 Flow 一次性 fork 出成百上千个进程把机器打爆（PRD §14.5）。
 const DefaultMaxParallel = 4
 
+// Lua 沙箱策略（REQ-LUA-SANDBOX-CONFIG）。「拦截哪些危险行为」由策略决定，用户自抉：
+//   - SandboxStrict（默认）：只开 base/string/table/math，禁 dofile/loadfile/require/module
+//     （纯计算，无法接触宿主；M5 的 ctx.* 原语仍按 Capabilities 最小权限放行）。
+//   - SandboxPermissive：在 strict 基础上额外开放 coroutine/utf8（纯计算安全），仍禁文件加载逃逸。
+//     不提供 none/unsafe：Lua 逃逸宿主是 P0 级风险，配置项不应能关掉沙箱本身。
+const (
+	SandboxStrict    = "strict"
+	SandboxPermissive = "permissive"
+)
+
 // Engine 持有 registry，负责把 Flow 跑起来。
 type Engine struct {
 	reg         *registry.Registry
 	maxParallel int
+	// sandboxPolicy 是 Lua 沙箱档位（strict/permissive），经 WithSandbox 设置。
+	sandboxPolicy string
 	// host 是宿主能力原语的实现集合（M5，PRD §6）。nil 表示不提供任何宿主能力
 	// （Tool 若声明了 capability，运行期访问会收到 ErrCapabilityUnavailable）。
 	host *cap.Providers
+	// logSink 是执行日志采集器（REQ-API-LOGS / #71）；nil 表示不记日志。
+	logSink LogSink
 }
 
-// New 构造引擎。可用 WithMaxParallel / WithHost 等选项覆盖默认行为。
+// New 构造引擎。可用 WithMaxParallel / WithHost / WithSandbox 等选项覆盖默认行为。
 func New(reg *registry.Registry, opts ...func(*Engine)) *Engine {
-	e := &Engine{reg: reg, maxParallel: DefaultMaxParallel}
+	e := &Engine{reg: reg, maxParallel: DefaultMaxParallel, sandboxPolicy: SandboxStrict}
 	for _, o := range opts {
 		o(e)
 	}
@@ -57,11 +71,58 @@ func WithHost(p *cap.Providers) func(*Engine) {
 	}
 }
 
+// LogSink 接收一次执行中每个 step 的运行日志行（REQ-API-LOGS / #71）。
+// 参数为 (execID, stepID, stream, line)；stream ∈ {stdout, stderr}。
+type LogSink func(execID, stepID, stream, line string)
+
+// WithLogSink 注入执行日志采集器；execID 非空时引擎上报 step 日志，供
+// GET /api/executions/{id}/logs 查询。不调用则不记日志。
+func WithLogSink(fn LogSink) func(*Engine) {
+	return func(e *Engine) {
+		e.logSink = fn
+	}
+}
+
+// WithSandbox 设置 Lua 沙箱策略（strict / permissive）。未知策略被忽略，保持默认 strict
+// （绝不静默接受一个会关掉沙箱的值）。
+func WithSandbox(policy string) func(*Engine) {
+	return func(e *Engine) {
+		switch policy {
+		case SandboxStrict, SandboxPermissive:
+			e.sandboxPolicy = policy
+		}
+	}
+}
+
 // hostFor 为一次执行构建宿主能力视图：按 Tool.Capabilities 精确授权，从引擎持有
 // 的宿主实现集中取原语。注册期已校验 Capabilities 合法（model.Tool.Validate），故此处忽略错误。
 func (e *Engine) hostFor(tool *model.Tool) *cap.Context {
 	grants, _ := cap.GrantsFromStrings(tool.Capabilities)
 	return cap.New(grants, e.host)
+}
+
+// secretResolver 返回执行期 ${secrets.x} 的解析器（REQ-TMPL-SECRETS）。
+// 宿主未注入 secret 实现时返回 nil —— 模板解析会据此显式报错，而非用空值静默替换。
+// 设计要点：Flow 定义只存 `${secrets.api_key}` 引用，明文密钥始终留在宿主 secret 源
+// （如环境变量注入的 map），绝不落库，规避「secret 经注册期定义泄露」。
+func (e *Engine) secretResolver() func(name string) (string, error) {
+	if e.host == nil || e.host.Secret == nil {
+		return nil
+	}
+	return func(name string) (string, error) {
+		return e.host.Secret.Get(name)
+	}
+}
+
+// logSinkFor 返回绑定了 execID 的 step 级日志回调；execID 为空或无 sink 时返回 nil
+// （不记日志，兼容无日志采集的调用方）。
+func (e *Engine) logSinkFor(execID string) func(stepID, stream, line string) {
+	if e.logSink == nil || execID == "" {
+		return nil
+	}
+	return func(stepID, stream, line string) {
+		e.logSink(execID, stepID, stream, line)
+	}
 }
 
 // RunResult 是一次 Flow 执行的结构化结果。
@@ -101,6 +162,14 @@ type ToolObserver func(toolIDs []string)
 // 此时若允许注销，正在跑的执行会在下次触发 Hook 时拿到 nil Tool 而中途失败。
 // 唯一可靠的判据来自运行侧，所以由引擎在快照点上报，而不是让 Registry 去猜。
 func (e *Engine) RunFlowResultObserved(flowID string, observe ToolObserver) (*RunResult, error) {
+	return e.RunFlowExec(flowID, "", observe)
+}
+
+// RunFlowExec 是 RunFlowResultObserved 的带执行 id 版本：execID 非空时，引擎会把每个
+// step 的运行日志（stdout/stderr 行）经 logSink 上报（REQ-API-LOGS / #71），供
+// `GET /api/executions/{id}/logs` 查询。execID 为空则行为与 RunFlowResultObserved 完全一致
+// （不记日志，兼容历史调用点与测试）。
+func (e *Engine) RunFlowExec(flowID, execID string, observe ToolObserver) (*RunResult, error) {
 	flow, err := e.reg.GetFlow(flowID)
 	if err != nil {
 		return nil, err
@@ -113,7 +182,7 @@ func (e *Engine) RunFlowResultObserved(flowID string, observe ToolObserver) (*Ru
 			return nil, fmt.Errorf("step %s 是 service 模式（长驻），不能用 flow run 一次性执行；请用 `app run %s` 监管", s.ID, flowID)
 		}
 	}
-	return e.run(flow, observe)
+	return e.run(flow, observe, execID)
 }
 
 // plannedToolIDs 计算一次运行可能用到的 Tool id：step 的 call ∪ 生效 Hook 的 action。
@@ -139,7 +208,7 @@ func plannedToolIDs(flow *model.Flow, hooks []model.Hook) []string {
 	return out
 }
 
-func (e *Engine) run(flow *model.Flow, observe ToolObserver) (*RunResult, error) {
+func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string) (*RunResult, error) {
 	levels, err := topoLevels(flow.Steps)
 	if err != nil {
 		return nil, err
@@ -157,8 +226,11 @@ func (e *Engine) run(flow *model.Flow, observe ToolObserver) (*RunResult, error)
 	}
 
 	rc := &runContext{
-		vars:  flow.Vars,
-		steps: map[string]map[string]interface{}{},
+		vars:      flow.Vars,
+		steps:     map[string]map[string]interface{}{},
+		secretGet: e.secretResolver(),
+		execID:    execID,
+		logSink:   e.logSinkFor(execID),
 	}
 
 	// when 跳过需要沿**有效依赖**（含推断边）传播：上游被跳过 ⇒ 下游也跳过。
@@ -288,6 +360,13 @@ type runContext struct {
 	mu    sync.Mutex
 	vars  map[string]interface{}
 	steps map[string]map[string]interface{}
+	// secretGet 是执行期 secret 解析器（REQ-TMPL-SECRETS）：从宿主 secret 源取密钥明文。
+	// nil 表示宿主未注入 secret 实现，${secrets.x} 解析时显式报错（不静默失败）。
+	secretGet func(name string) (string, error)
+	// execID 是当前执行的 id（供日志采集关联）；空表示不记日志。
+	execID string
+	// logSink 是 step 级日志回调（REQ-API-LOGS / #71）；nil 表示不记日志。
+	logSink func(stepID, stream, line string)
 }
 
 // setStep 记录一个 step 的最终 input/output（并发安全）。

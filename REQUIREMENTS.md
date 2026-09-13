@@ -82,11 +82,11 @@
 | REQ-RUNTIME-GOHOST | §3.2 | go-host runtime | `deferred`（S7 后续） | `Tool.Validate` 注册期拒 + `runtimeFor` 报错；测试 TestSpecRejectsUnimplementedRuntimeTool、TestRuntimeForRejectsUnimplemented |
 | REQ-RUNTIME-WASM | §3.2 | wasm runtime | `deferred`（V3） | 同上 |
 | REQ-LUA-SERVICE | §14.2 | lua 的 service（长驻）模式 | `deferred`（依赖 M5 ctx.*） | `luaRuntime.Start` 显式报错「不支持 service」；测试 TestLuaServiceUnsupported |
-| REQ-LUA-SANDBOX-CONFIG | §3.2 | lua 沙箱策略可配置：拦截哪些「危险行为」交给用户抉择（不是硬编码严格模式） | `deferred`（后期，依赖 M5 capability） | 用户 2026-09-12 明确要求：有些行为可能就是用户想要的，应由用户决定。当前 `luaAllowedLibs`/`luaForbiddenGlobals` 为硬编码常量；配置化后改为策略驱动（如 `sandbox: strict\|permissive` 或逐项 capability 白名单） |
+| REQ-LUA-SANDBOX-CONFIG | §3.2 | lua 沙箱策略可配置：拦截哪些「危险行为」交给用户抉择（不是硬编码严格模式） | `implemented` | 引擎级 `WithSandbox(strict\|permissive)` 透传；strict（默认）仅 base/string/table/math，permissive 额外开 coroutine；文件加载全局（dofile/loadfile/require/module）任何策略都禁（防逃逸）。`TestLuaSandboxPermissive` 覆盖。 |
 | REQ-SVC-RUNTIME | §14.2 | 非 process runtime 的 service step | `deferred` | 注册期已挡住未实现者；service 与 once 共用 `runtimeFor`，runtime 实现 Start 后自动生效 |
 | REQ-APP-HEALTH | §14.3 | service 健康检查（HTTP/命令探针） | `deferred`（S2+） | 当前仅存活（进程退出即视为不健康）；探针未实现 |
 | REQ-CONCURRENCY-CROSS | §14.5 | 跨进程的执行入口队列 / 进程池（背压排队、拒绝策略） | `deferred`（后续） | step 级并发闸门已落地（REQ-PARALLEL / REQ-APP-MAXCONC）；跨进程池尚未实现 |
-| REQ-TMPL-SECRETS | §4.3 | 模板前缀 `${secrets.x}`（secret 原语随 ctx.* 落地，M5） | `deferred`（M5） | 注册期显式拒绝未知前缀（`validateTemplates`）；测试 `engine/template_test.go`: TestValidateTemplatesRejectsSecrets、TestSpecSecretsTemplateRejectedAtRegister |
+| REQ-TMPL-SECRETS | §4.3 | 模板前缀 `${secrets.x}`（secret 原语随 ctx.* 落地，M5） | `implemented` | 执行期经宿主 secret 源解析（runContext.secretGet ← Engine.secretResolver，来自 cap.Providers.Secret）；Flow 定义只存引用、明文不落库。注册期放开该前缀（TestValidateTemplatesAllowsSecrets），密钥缺失运行期报错（TestSpecSecretsTemplateAllowedAtRegister / TestExpandStringResolvesSecrets）。注：secret 经进程 stdin/argv 暴露仍属 P0-4 风险（见 §189），本实现仅解决「引用可用」 |
 | REQ-API-PROMOTE | §11 | 版本晋升（状态机 + `before_promote` 门禁） | `implemented`（S5→REST） | CLI `gear tool promote <id> <v> <target>` 与 REST `POST /api/tools/{id}/versions/{v}/promote` 均已实现，均走 `engine.PromoteTool`（before_promote 门禁 fail-closed）；状态机语义在 `model.CanPromote` + `registry.PromoteToolVersion` 落地 |
 | REQ-API-AI | §11/§9 | AI 闭环（自然语言 → Flow）：`POST /api/ai/infer` + CLI `gear ai gen [--register]` | `implemented`（S6c） | `internal/ai`（Inferrer 接口 + Ollama 客户端 + GenerateFlow 收敛重试≤3）；`server_test.go`: TestInferFlow；`cli/ai_test.go`: TestAIGenPrintsYAML、TestAIGenRegister；LLM 接入方式定为本地 Ollama（qwen3.5:4b，可配置） |
 | REQ-API-LOGS | §11 | `GET /api/executions/{id}/logs` | `deferred`（需日志 Hook 产出） | 端点未实现；当前执行产物只有 RunResult |
