@@ -271,3 +271,72 @@ func TestServeCmdConstruction(t *testing.T) {
 		t.Errorf("--addr 默认值应为 127.0.0.1:8787，实为 %q", fl.DefValue)
 	}
 }
+
+// TestToolUnregister 覆盖 tool unregister 成功路径与重复 unregister 报错（§8.2 守卫）。
+func TestToolUnregister(t *testing.T) {
+	db := tempDB(t)
+	if err := runCLI(t, "tool", "register", writeTempYAML(t, validTool), "--registry", db); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := runCLI(t, "tool", "unregister", "t1", "--registry", db); err != nil {
+		t.Fatalf("unregister: %v", err)
+	}
+	if err := runCLI(t, "tool", "unregister", "t1", "--registry", db); err == nil {
+		t.Fatal("期望报错：重复 unregister 不存在的 Tool")
+	}
+}
+
+// TestToolUnregisterInUse 覆盖 §8.2 注销守卫：被 Flow 引用的 Tool 不可注销。
+func TestToolUnregisterInUse(t *testing.T) {
+	db := tempDB(t)
+	if err := runCLI(t, "tool", "register", writeTempYAML(t, validTool), "--registry", db); err != nil {
+		t.Fatalf("register tool: %v", err)
+	}
+	if err := runCLI(t, "flow", "register", writeTempYAML(t, validFlow), "--registry", db); err != nil {
+		t.Fatalf("register flow: %v", err)
+	}
+	if err := runCLI(t, "tool", "unregister", "t1", "--registry", db); err == nil {
+		t.Fatal("期望报错：Tool 被 Flow 引用，§8.2 守卫应拒")
+	}
+}
+
+// TestFlowValidateOK 覆盖 flow validate 成功路径（需被引用 Tool 存在）。
+func TestFlowValidateOK(t *testing.T) {
+	db := tempDB(t)
+	if err := runCLI(t, "tool", "register", writeTempYAML(t, validTool), "--registry", db); err != nil {
+		t.Fatalf("register tool: %v", err)
+	}
+	if err := runCLI(t, "flow", "validate", writeTempYAML(t, validFlow), "--registry", db); err != nil {
+		t.Fatalf("flow validate 应通过: %v", err)
+	}
+}
+
+// TestFlowValidateBad 覆盖 flow validate 引用缺失 Tool 的报错分支。
+func TestFlowValidateBad(t *testing.T) {
+	db := tempDB(t)
+	flow := `id: f1
+steps:
+  - id: s1
+    call: missing
+`
+	if err := runCLI(t, "flow", "validate", writeTempYAML(t, flow), "--registry", db); err == nil {
+		t.Fatal("期望报错：引用的 Tool 不存在")
+	}
+}
+
+// TestFlowInspect 覆盖 flow inspect 成功路径与不存在报错。
+func TestFlowInspect(t *testing.T) {
+	db := tempDB(t)
+	if err := runCLI(t, "tool", "register", writeTempYAML(t, validTool), "--registry", db); err != nil {
+		t.Fatalf("register tool: %v", err)
+	}
+	if err := runCLI(t, "flow", "register", writeTempYAML(t, validFlow), "--registry", db); err != nil {
+		t.Fatalf("register flow: %v", err)
+	}
+	if err := runCLI(t, "flow", "inspect", "f1", "--registry", db); err != nil {
+		t.Fatalf("flow inspect: %v", err)
+	}
+	if err := runCLI(t, "flow", "inspect", "nope", "--registry", db); err == nil {
+		t.Fatal("期望报错：Flow 不存在")
+	}
+}

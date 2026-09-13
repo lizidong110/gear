@@ -123,7 +123,7 @@ gear/
 - **S5 版本灰度**：状态机 + promote + 并发安全 + 灰度 + SemVer + lock/digest。覆盖 T-ver-01..04、T-reg-01..03。
 - **S6 REST API + CLI 补全 + AI 闭环**：§11 全量端点 + CLI 补全 + AI 生成/校验/重试。覆盖 T-srv-01..02、T-ai-01。
   - **S6a REST 执行面 ✅（2026-09-13）**：`internal/server`（标准库路由，无框架）+ `ExecStore`（内存态执行记录）+ `AppStore`（受管进程）+ 12 个端点 + 契约测试；CLI `gear serve`。
-  - **S6b CLI 测试补全**（部分完成，2026-09-13）：现有 CLI 命令（tool/flow/hook 的 register·list·show·run·remove、app run）已补单测，`cli` 包覆盖 **75.2%**（成功 + 错误路径全覆盖）。新增子命令 `tool unregister` / `flow validate·inspect` / `exec status` / `tool promote` 仍待做（需先对齐 REST 已有能力）。
+  - **S6b CLI 测试补全**（进行中，2026-09-13）：现有 CLI 命令（tool/flow/hook 的 register·list·show·run·remove·unregister、flow validate·inspect、app run）已补单测，`cli` 包覆盖 **76.5%**（成功 + 错误路径全覆盖，含 §8.2 注销守卫）。新增子命令 `exec status` / `tool promote` 仍待做（`tool promote` 依赖 S5 版本灰度；`exec status` 需对齐 REST 执行查询）。
   - **S6c AI 闭环**（待做，**需先决策 LLM 接入方式**）：生成 → `ValidateFlowStatic` 校验 → ≤3 次重试 → 人工确认。
 
 ---
@@ -207,7 +207,7 @@ gear/
 |---|---|---|---|
 | `internal/model` | **100.0%** | 关键路径 100% | ✅ 达标 |
 | `internal/registry` | **82.8%** | ≥80% | ✅ 达标 |
-| `internal/cli` / `cmd/gear` | cli **75.2%**（S6b）/ cmd 0.0% | cli 管理面命令全覆盖；cmd 仅 `main()` 入口 | ✅ cli 达标（S6b）；cmd ⏭ 收尾 |
+| `internal/cli` / `cmd/gear` | cli **76.5%**（S6b）/ cmd 0.0% | cli 管理面命令全覆盖；cmd 仅 `main()` 入口 | ✅ cli 达标（S6b）；cmd ⏭ 收尾 |
 
 - `go build ./...` ✅ · `go vet ./...` ✅ · `go test -race` ✅（无竞态）
 - registry 未覆盖的 ~17% 全部是 DB 错误防御分支（`Open`/`migrate`/`upsert`/`list`/`get` 的错误返回），属难触发且非核心路径，留待注入式故障测试（进阶）。
@@ -243,7 +243,7 @@ gear/
 | `internal/registry` | **83.4%** | ≥80% | ✅ 达标 |
 | `internal/app` | **86.0%** | ≥80% | ✅ 达标 |
 | `internal/server` | **83.9%** | ≥80% | ✅ 达标 |
-| `internal/cli` | **75.2%** | 管理面命令全覆盖 | ✅ S6b 达标（本轮新增 cli_test.go） |
+| `internal/cli` | **76.5%** | 管理面命令全覆盖 | ✅ S6b 达标（本轮新增 cli_test.go） |
 | `cmd/gear` | 0.0% | 仅入口 | ⏭ 收尾 |
 
 - `go build ./...` ✅ · `go vet ./...` ✅ · `go test -race` ✅（无竞态）。

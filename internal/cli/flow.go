@@ -13,7 +13,7 @@ import (
 
 func flowCmd() *cobra.Command {
 	c := &cobra.Command{Use: "flow", Short: "管理 Flow（通用运行单元）"}
-	c.AddCommand(flowRegisterCmd(), flowListCmd(), flowRunCmd())
+	c.AddCommand(flowRegisterCmd(), flowListCmd(), flowRunCmd(), flowValidateCmd(), flowInspectCmd())
 	return c
 }
 
@@ -99,4 +99,59 @@ func flowRunCmd() *cobra.Command {
 	c.Flags().IntVar(&maxParallel, "max-parallel", engine.DefaultMaxParallel,
 		"单个 Flow 内同时执行的 step 数上限（背压；1=退化为串行）")
 	return c
+}
+
+// flowValidateCmd 仅做静态校验、不落库（与 REST POST /api/flows 共用 ValidateFlowStatic）。
+func flowValidateCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "validate <file.yaml>",
+		Short: "静态校验一个 Flow（仅校验，不注册）",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			raw, err := os.ReadFile(args[0])
+			if err != nil {
+				return err
+			}
+			var f model.Flow
+			if err := yaml.Unmarshal(raw, &f); err != nil {
+				return fmt.Errorf("解析 YAML 失败: %w", err)
+			}
+			reg, err := openRegistry()
+			if err != nil {
+				return err
+			}
+			defer reg.Close()
+			if err := engine.New(reg).ValidateFlowStatic(&f); err != nil {
+				return fmt.Errorf("校验失败: %w", err)
+			}
+			fmt.Printf("✓ Flow %s 校验通过\n", f.ID)
+			return nil
+		},
+	}
+}
+
+// flowInspectCmd 查看 Flow 详情（类比 tool show）。
+func flowInspectCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "inspect <id>",
+		Short: "查看一个 Flow 详情",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			reg, err := openRegistry()
+			if err != nil {
+				return err
+			}
+			defer reg.Close()
+			f, err := reg.GetFlow(args[0])
+			if err != nil {
+				return err
+			}
+			if f == nil {
+				return fmt.Errorf("Flow 不存在: %s", args[0])
+			}
+			out, _ := yaml.Marshal(f)
+			fmt.Print(string(out))
+			return nil
+		},
+	}
 }

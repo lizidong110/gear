@@ -12,7 +12,7 @@ import (
 
 func toolCmd() *cobra.Command {
 	c := &cobra.Command{Use: "tool", Short: "管理 Tool（原子能力）"}
-	c.AddCommand(toolRegisterCmd(), toolListCmd(), toolShowCmd())
+	c.AddCommand(toolRegisterCmd(), toolListCmd(), toolShowCmd(), toolUnregisterCmd())
 	return c
 }
 
@@ -93,6 +93,28 @@ func toolShowCmd() *cobra.Command {
 			}
 			out, _ := yaml.Marshal(t)
 			fmt.Print(string(out))
+			return nil
+		},
+	}
+}
+
+// toolUnregisterCmd 注销 Tool，复用 registry.DeleteTool 的 §8.2 守卫
+// （被 Flow step / Hook action 引用、运行中引用均拒，错误经 ErrInUse/ErrNotFound 向上传递）。
+func toolUnregisterCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "unregister <id>",
+		Short: "注销一个 Tool（§8.2 守卫：被引用 / 运行中则拒）",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			reg, err := openRegistry()
+			if err != nil {
+				return err
+			}
+			defer reg.Close()
+			if err := reg.DeleteTool(args[0]); err != nil {
+				return err
+			}
+			fmt.Printf("✓ 已注销 Tool: %s\n", args[0])
 			return nil
 		},
 	}
