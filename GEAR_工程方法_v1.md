@@ -81,29 +81,29 @@ gear/
 | §2 | 5 原语模型正确 | model | 单测 | T-model-01 | 🟢 |
 | §3.1 | Tool 定义/字段 | model | 单测 | T-model-02 | 🟢 |
 | §3.2 | Runtime 类型枚举 | model | 单测 | T-model-03 | 🟢 |
-| §3.3 | 参数统一 JSON 协议 | runtime/* | 集成 | T-rt-01..03 | 🔴 |
-| §4.1 | input/output 类型/必填/默认校验 | engine | 单测+集成 | T-eng-01 | 🔴 |
-| §4.2 | 版本层/参数层分离（Flow 默认 stable） | engine | 单测 | T-eng-02 | 🔴 |
+| §3.3 | 参数统一 JSON 协议 | runtime/* | 集成 | T-rt-01..03 | 🟢 已落地（`sh -c <entry>`、stdin JSON → stdout 末行 JSON；REQ-PROC / `process_test.go`） |
+| §4.1 | input/output 类型/必填/默认校验 | engine | 单测+集成 | T-eng-01 | 🟢 已落地（单一真理源 Tool.input_schema/output_schema；REQ-SCHEMA-IN/OUT / `engine_test.go`: TestRunFlowRejectsInvalidInput/Output） |
+| §4.2 | 版本层/参数层分离（Flow 默认 stable） | engine | 单测 | T-eng-02 | 🟢 已落地（ToolVersion 状态机 + Flow 默认 stable；REQ-USEVERSION / `model/version_test.go`） |
 | §4.3 | depends_on / when / 变量引用 `${vars.x}` 等 | engine | 单测 | T-eng-03..05 | 🟢 |
-| §4.4 | 触发方式收敛为执行入口 | server | 契约 | T-srv-01 | 🔴 |
+| §4.4 | 触发方式收敛为执行入口 | server | 契约 | T-srv-01 | 🟢 已落地（REST 执行面 14/15 端点 + CLI；REQ-API-REST / `server_test.go` 端点契约） |
 | §5.1 | Hook 四要素模型 | model | 单测 | T-model-04 | 🟢 |
-| §5.2 | 生命周期 + weight 升序（同重注册序） | engine | 单测 | T-eng-06 | 🔴 |
-| §5.3 | 插件无感知 / action 是 Tool / fail-closed / 禁止隐式依赖 | engine | 集成 | T-eng-07 | 🔴 |
-| §5.4 | 改写 input/output + 重校验；best-effort；on_error 不恢复；Hook 嵌套防重入 | engine | 集成 | T-eng-08..11 | 🔴 |
+| §5.2 | 生命周期 + weight 升序（同重注册序） | engine | 单测 | T-eng-06 | 🟢 已落地（Target 过滤 + Order 升序装配；REQ-HOOK-SELECT/ORDER / `hook_test.go`: TestHookTargetFilter/Order） |
+| §5.3 | 插件无感知 / action 是 Tool / fail-closed / 禁止隐式依赖 | engine | 集成 | T-eng-07 | 🟢 已落地（action=已注册 Tool id；fail-closed；结构性无递归；REQ-HOOK-FAILCLOSED/NORECUR）；**Flow 载体 deferred**（REQ-HOOK-ACTION-FLOW） |
+| §5.4 | 改写 input/output + 重校验；best-effort；on_error 不恢复；Hook 嵌套防重入 | engine | 集成 | T-eng-08..11 | 🟢 已落地（改写后按 schema 重校验、best-effort 仅告警、on_error 不恢复、无递归；REQ-HOOK-REWRITE/REVALIDATE/ONERROR/NORECUR） |
 | §6 | 宿主 6 原语 http/call/db/kv/secret/event | host | 集成 | T-host-01..06 | 🟢 M5 已落地（`internal/cap` + `engine.luaRuntime`/`processRuntime` 注入 `ctx.*`；db 原语已实现接口但宿主未提供实现，调用返回 ErrCapabilityUnavailable） |
 | §6.2 | call 与 event 边界 | host | 集成 | T-host-07 | 🟢 M5：call 经 Resolver 唯一通道、event notify/wait 同步往返，均已测 |
-| §7.1 | 状态机 draft→testing→stable→deprecated/rejected | engine/registry | 单测 | T-ver-01 | 🔴 |
-| §7.2 | 晋升显式 + operator 审计 | server/registry | 集成 | T-ver-02 | 🔴 |
-| §7.3 | 幂等 + 并发安全（写锁/CAS/版本不可变） | registry | 并发测试 | T-ver-03 | 🔴 |
-| §7.4 | 灰度选择（use_version:testing / allow_testing） | engine | 单测 | T-ver-04 | 🔴 |
-| §8.1 | 依赖图三类（Flow→Tool 不传递） | registry | 单测 | T-reg-01 | 🔴 |
+| §7.1 | 状态机 draft→testing→stable→deprecated/rejected | engine/registry | 单测 | T-ver-01 | 🟢 已落地（VersionTransitions 白名单 + CanPromote；`model/version_test.go` / `engine/version_test.go`） |
+| §7.2 | 晋升显式 + operator 审计 | server/registry | 集成 | T-ver-02 | 🟢 已落地（晋升经 CLI `gear tool promote` 显式触发 + `before_promote` 门禁 fail-closed；REST promote 端点 deferred，见 REQ-API-PROMOTE） |
+| §7.3 | 幂等 + 并发安全（写锁/CAS/版本不可变） | registry | 并发测试 | T-ver-03 | 🟢 已落地（Registry 写锁 + upsert 事务 + `TestConcurrentUpsert`；版本行不可变） |
+| §7.4 | 灰度选择（use_version:testing / allow_testing） | engine | 单测 | T-ver-04 | 🟢 已落地（resolveToolVersion 钉版本解析；REQ-USEVERSION / `engine/version_test.go`: TestRunFlowResolvesUseVersion） |
+| §8.1 | 依赖图三类（Flow→Tool 不传递） | registry | 单测 | T-reg-01 | 🟢 已落地（`registry_test.go` 依赖图三类校验） |
 | §8.2 | 注销拒绝 3 条件（被 Flow/Hook 引用/运行中） | registry | 集成 | T-reg-02 | 🟢 三条件全实现（运行中由 RunningChecker 判定；见 REQ-DEL-TOOL-GUARD / REQ-DEL-TOOL-RUNNING） |
-| §8.3 | Lock + digest（signature 暂 deferred） | registry | 集成 | T-reg-03 | 🔴 |
-| §9 | AI 生成 DSL + 静态校验 + ≤3 次重试 + Schema 不漂移 | server | 集成 | T-ai-01 | 🔴 |
+| §8.3 | Lock + digest（signature 暂 deferred） | registry | 集成 | T-reg-03 | 🟡 Lock 已做（`sync.Mutex` + 事务）；digest/signature 仍 deferred |
+| §9 | AI 生成 DSL + 静态校验 + ≤3 次重试 + Schema 不漂移 | server | 集成 | T-ai-01 | 🟢 已落地（S6c：`internal/ai` GenerateFlow 收敛重试≤3 + 静态校验；REQ-API-AI / `server_test.go`: TestInferFlow + `cli/ai_test.go`） |
 | §10 | 架构分层 | （结构审查） | 评审 | — | 🟡 |
-| §11 | API 最小集全量 | server | 契约 | T-srv-02 | 🟢 15 端点中 14 个已实现（新增 executions 列表 + ai-infer）；deferred：executions/{id}/logs；promote 经 CLI `tool promote` 触发（非 REST 端点） |
+| §11 | API 最小集全量 | server | 契约 | T-srv-02 | 🟢 15 端点中 14 个已实现（新增 executions 列表 + ai-infer；GET /api/flows 列表端点补测见 TestListFlows）；deferred：executions/{id}/logs；promote 经 CLI `tool promote` 触发（非 REST 端点） |
 | §13 | 待确认项显式处置 | 全局 | 评审 | — | 🟡 |
-| §14 | app run 进程模型 + 长驻/restart/子进程归属/进程池 | server/engine | 集成 | T-app-01..04 | 🔴 |
+| §14 | app run 进程模型 + 长驻/restart/子进程归属/进程池 | server/engine | 集成 | T-app-01..04 | 🟢 已落地（restart 策略 + 信号停止 + `--max` 闸门 + 子进程归属；REQ-APP-* / `app/supervisor_test.go`）；**健康探针 deferred**（REQ-APP-HEALTH）、**跨进程队列/进程池 deferred**（REQ-CONCURRENCY-CROSS） |
 
 ---
 
@@ -347,6 +347,20 @@ gear/
 - 注意：`procFail` 用 `fmt.Sprintf` 承载底层错误，`%w` 不适用（只有 `fmt.Errorf` 支持 `%w`）——此处只做字符串拼接，无需错误链。
 
 **结果**：单测验证 `gear-proc/` 下生成带 entry/stdout/stderr 的临时文件；全量闸门经 `gate.sh` 跑通并落盘（见 `build/testlogs/latest.log`）。
+
+### 2026-09-13（第八次）· 功能完成度审计 + 补 `GET /api/flows` 测试 + 翻新 §11 测试账本
+
+**触发**：用户问「所有功能都完成了吗？还有哪些未实现/未测试」。
+
+**改了什么**
+- 补 `internal/server/server_test.go: TestListFlows`：打 `GET /api/flows`（先 POST 建一条），断言 200 + 返回含该 flow；消除 `handleListFlows`（server.go:224）**0% 覆盖**的真缺口。未覆盖的仅 DB 报错→500 与 `flows==nil` 归一化两个防御分支（单测难触发，主路径已测）。
+- 翻新 §11 测试账本：把已实际落地+已测、却仍标 🔴 的过期行翻 🟢（§3.3 / §4.1 / §4.2 / §4.4 / §5.2 / §5.3 / §5.4 / §7.1 / §7.2 / §7.3 / §7.4 / §8.1 / §9 / §14），每条附注 REQ-ID 与测试位置；§8.3 标 🟡（Lock 已做、digest/signature deferred）。刷新后矩阵**零 🔴**。
+
+**为什么**
+- 审计用「代码 + 文档 + 覆盖率逐函数」三查，而非凭记忆：真缺口只有 `GET /api/flows`（已实现挂路由却从没被测）；0% 函数全是入口/OS/胶水（main/Execute/ListenAndServe/ContextWithSignals/configureProcessTree/Relaunch/IsService），符合项目覆盖策略；cli/server 的 <80% 是错误分支未全。
+- **文档漂移比代码缺口更隐蔽**：方法论 §11 大量 🔴 实为已实现，会让人误判「未测试」。矩阵必须随切片回查——这正是 §0 第 12 条「方法论自身可追溯」的本意。
+
+**未实现（deferred，REQUIREMENTS 权威，本次未动）**：go-host/wasm runtime；lua service + 沙箱策略可配置；非 process runtime 的 service step；service 健康探针；跨进程队列/进程池；`${secrets.x}`；`GET /api/executions/{id}/logs`；执行记录持久化（有意内存态）；Hook action 指向 Flow；Hook stage `before_flow`/`on_success` + target 通配；ctx.* 宿主 db/kv/secret/event/call（仅声明，返回 ErrCapabilityUnavailable）；promote REST 端点（CLI 已做）。见 REQUIREMENTS.md 与各 REQ-ID。
 
 ### 2026-09-13 · 实现 `when` 条件执行，新增 F6–F8 与 §0 第 10–12 条
 

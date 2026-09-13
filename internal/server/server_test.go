@@ -202,6 +202,48 @@ func TestFlowsAndValidate(t *testing.T) {
 	}
 }
 
+// A-6b：GET /api/flows 列出已注册 Flow（消除 handleListFlows 0% 覆盖）。
+func TestListFlows(t *testing.T) {
+	s, reg := newTestServer(t)
+	seed(t, reg)
+	h := s.Handler()
+
+	// 空库时仍返回 200 + 空数组（seed 已注册 f1）。
+	list := doArray(t, h, "GET", "/api/flows")
+	found := map[string]bool{}
+	for _, fl := range list {
+		if id, ok := fl["id"].(string); ok {
+			found[id] = true
+		}
+	}
+	if !found["f1"] {
+		t.Fatalf("GET /api/flows 应含 seed 的 f1，实际 %v", found)
+	}
+
+	// 再注册一条，列表应增长且包含新 id。
+	newFlow := map[string]interface{}{
+		"id": "f-extra", "steps": []map[string]interface{}{
+			{"id": "s1", "call": "echo", "input": map[string]interface{}{"name": "x"}},
+		},
+	}
+	if rec, _ := do(t, h, "POST", "/api/flows", newFlow); rec.Code != http.StatusCreated {
+		t.Fatalf("保存 Flow 期望 201，实际 %d %s", rec.Code, rec.Body.String())
+	}
+	list2 := doArray(t, h, "GET", "/api/flows")
+	if len(list2) <= len(list) {
+		t.Fatalf("注册新 Flow 后列表应增长：前 %d 后 %d", len(list), len(list2))
+	}
+	ids := map[string]bool{}
+	for _, fl := range list2 {
+		if id, ok := fl["id"].(string); ok {
+			ids[id] = true
+		}
+	}
+	if !ids["f-extra"] {
+		t.Fatalf("GET /api/flows 应含新注册的 f-extra，实际 %v", ids)
+	}
+}
+
 // A-7：hooks 列出/添加。
 func TestHooks(t *testing.T) {
 	s, reg := newTestServer(t)
