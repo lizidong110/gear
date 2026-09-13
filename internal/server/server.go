@@ -41,7 +41,7 @@ type Server struct {
 	execs *ExecStore
 	mux   *http.ServeMux
 
-	// inferrer 是 AI 闭环（S6c）的推断器：默认本地 Ollama，测试 / 远端网关可注入。
+	// inferrer 是 AI 闭环（S6c）的推断器：默认线上 SiliconFlow（无 Key 回退 Ollama），测试 / 远端网关可注入。
 	inferrer ai.Inferrer
 
 	appMu  sync.Mutex
@@ -50,9 +50,9 @@ type Server struct {
 	appWG  sync.WaitGroup // 受管 app 的 goroutine 计数（Shutdown 需等其收敛）
 }
 
-// New 构造 Server（不启动监听）。AI 推断默认走本地 Ollama（S6c）。
+// New 构造 Server（不启动监听）。AI 推断默认走线上 SiliconFlow（S6c）；无 Key 回退 Ollama。
 func New(reg *registry.Registry) *Server {
-	return NewWithInferrer(reg, ai.NewOllama("", ""))
+	return NewWithInferrer(reg, ai.DefaultInferrer())
 }
 
 // NewWithInferrer 与 New 相同，但可注入自定义 Inferrer（测试 / 远端 LLM 网关用）。

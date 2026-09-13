@@ -126,7 +126,7 @@ gear/
 - **S6 REST API + CLI 补全 + AI 闭环**：§11 全量端点 + CLI 补全 + AI 生成/校验/重试。覆盖 T-srv-01..02、T-ai-01。
   - **S6a REST 执行面 ✅（2026-09-13）**：`internal/server`（标准库路由，无框架）+ `ExecStore`（内存态执行记录）+ `AppStore`（受管进程）+ 12 个端点 + 契约测试；CLI `gear serve`。
   - **S6b CLI 补全** ✅（2026-09-13）：CLI 管理面单测全覆盖（成功 + 错误路径，含 §8.2 注销守卫），`cli` 包覆盖 **72.8%**；新增子命令 `exec start/status/list`（对齐 REST 执行面）、`tool promote`/`tool versions`（S5）、`ai gen`（S6c）均已落地。
-  - **S6c AI 闭环** ✅（2026-09-13）：`internal/ai`（Inferrer 接口 + Ollama HTTP 客户端，默认 `localhost:11434` / `qwen3.5:4b`，可配置）+ `GenerateFlow`（去 ```yaml 围栏 → `yaml.Unmarshal` → `Flow.Validate` → 重试≤3）；REST `POST /api/ai/infer`（推断器可注入，收敛失败返回 422）；CLI `gear ai gen [--register]`。LLM 接入定为本地 Ollama（用户偏好）。
+  - **S6c AI 闭环** ✅（2026-09-13）：`internal/ai`（Inferrer 接口 + 线上 SiliconFlow 客户端默认 `deepseek-ai/DeepSeek-V4-Flash` / `https://api.siliconflow.cn/v1`，未设 Key 回退本地 Ollama `qwen3.5:4b`，可配置）+ `GenerateFlow`（去 ```yaml 围栏 → `yaml.Unmarshal` → `Flow.Validate` → 重试≤3）；REST `POST /api/ai/infer`（推断器可注入，收敛失败返回 422）；CLI `gear ai gen [--register]`。LLM 接入默认线上 SiliconFlow（用户本地无 Ollama）。
 
 ---
 
@@ -323,7 +323,7 @@ gear/
 - 新包 `internal/ai`：`Inferrer` 接口 + Ollama HTTP 客户端（默认 `localhost:11434` / `qwen3.5:4b`，可配置）+ `GenerateFlow`（去 yaml 围栏 → `yaml.Unmarshal` → `Flow.Validate` → 重试≤3）。
 - `server` 新增 `POST /api/ai/infer`（推断器可注入，收敛失败返回 422）；`Server` 增 `inferrer` 字段与 `NewWithInferrer`。
 - `cli` 新增 `ai gen <prompt>`（可选 `--register` 落地本地 registry）。
-- 为什么：LLM 接入方式定为本地 Ollama（用户偏好）——`GenerateFlow` 只负责「把 LLM 原始文本收敛成合法 Flow」，后端可插拔，换 LLM 是纯配置。
+- 为什么：LLM 接入方式默认线上 SiliconFlow（用户本地无 Ollama，线上才是能跑通的路径）——`GenerateFlow` 只负责「把 LLM 原始文本收敛成合法 Flow」，后端可插拔，换 LLM 是纯配置（设 `SILICONFLOW_API_KEY` 即走线上、否则回退本地 Ollama）。
 
 **关键教训（本会话）**
 - 全量闸门 `go test -race -cover -p 1 ./...` 在 Bash 工具 2 分钟默认超时下**被掐断**，表现为「exit 1、日志全 `ok`、`server` 包整包缺失」——`server` 在依赖序最末、串行跑完 engine(31s)+其他后超时。修复：用 `run_in_background` 或显式 `timeout=600000`。**闸门超时 ≠ 测试失败**，须看完整日志。
@@ -361,6 +361,27 @@ gear/
 - **文档漂移比代码缺口更隐蔽**：方法论 §11 大量 🔴 实为已实现，会让人误判「未测试」。矩阵必须随切片回查——这正是 §0 第 12 条「方法论自身可追溯」的本意。
 
 **未实现（deferred，REQUIREMENTS 权威，本次未动）**：go-host/wasm runtime；lua service + 沙箱策略可配置；非 process runtime 的 service step；service 健康探针；跨进程队列/进程池；`${secrets.x}`；`GET /api/executions/{id}/logs`；执行记录持久化（有意内存态）；Hook action 指向 Flow；Hook stage `before_flow`/`on_success` + target 通配；ctx.* 宿主 db/kv/secret/event/call（仅声明，返回 ErrCapabilityUnavailable）；promote REST 端点（CLI 已做）。见 REQUIREMENTS.md 与各 REQ-ID。
+
+### 2026-09-13（第九次）· AI 闭环改走线上 SiliconFlow（默认），强化生成 prompt
+
+**触发**：用户发现 `ai` 生成 Flow 太简单、且默认走本地 Ollama——但本机没装 Ollama，质疑「测试怎么过的」。
+
+**澄清（测试为何能过）**：`ai_test.go` 从不真连 Ollama——`TestOllamaInfer` 用 `httptest` 在内存起假 Ollama；其余 `GenerateFlow` 测试全用 `fakeInferrer`/`mockInferrer` Mock。闸门绿与「本机是否装 Ollama」无关（本就是好的测试隔离），但也因此掩盖了「默认路径实际没跑通」。
+
+**改了什么**
+- `internal/ai/ai.go` 新增 `SiliconFlowClient`（OpenAI 兼容 `/v1/chat/completions`）：默认 `deepseek-ai/DeepSeek-V4-Flash`、base `https://api.siliconflow.cn/v1`、Bearer 鉴权；API Key 取环境变量 `SILICONFLOW_API_KEY`。新增 `DefaultInferrer()`：设了 Key 走线上 SiliconFlow，否则回退本地 Ollama。
+- `server.New` 改用 `ai.DefaultInferrer()`（此前硬编码 `ai.NewOllama("", "")`），故 `gear serve` 启动即按环境选推断器。
+- 强化系统提示 `systemPromptText`：约束输出为合法/完整/可注册 Flow——必须有 id+≥1 step、call 用 kebab-case、用 `depends_on` 表达先后、`parallel: true` 标可并行、`step.input` 给具体参数值、除非单步否则给 2-4 步体现真实编排。Ollama 路径也前置该提示。
+- 兼容 DeepSeek 可能的 `<think>…</think>` 思考块：`stripThink` 先剥离再收敛。
+- 测试：`TestSiliconFlowInfer`（httptest 模拟，不联网不依赖 Key，验证请求形态+解析）；`TestSiliconFlowInferLive`（env 守卫，仅设了 Key 才真连，CI 默认跳过）。
+
+**为什么**
+- 用户本地无 Ollama，线上 AI 才是真能跑的通路；把默认从「本地优先」翻成「线上优先、本地兜底」，避免默认路径永远沉默失败。
+- 模型只保证「结构合法」，不保证「够用」——靠系统提示把"单步空 input"的退化输出抬到"多步带参数"的真实编排。
+
+**验证（真实联网）**：`SILICONFLOW_API_KEY=… go test ./internal/ai/ -run TestSiliconFlowInferLive` 实测返回 3 步 Flow（`fetch-unshipped-orders → generate-csv → send-email`，含 `depends_on` 与具体 `input`），`parseAndValidateFlow` 一次收敛成功——"太简单"问题已解决。
+
+**注意（key 不入库）**：API Key 仅经环境变量传入，绝不写入源码/配置；本机运行前需 `export SILICONFLOW_API_KEY=sk-…`（或 Windows `set`），再 `gear serve`。
 
 ### 2026-09-13 · 实现 `when` 条件执行，新增 F6–F8 与 §0 第 10–12 条
 
