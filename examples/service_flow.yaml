@@ -1,0 +1,15 @@
+id: svc
+name: Demo Service
+description: S2 示例：一个 once 步骤打日志，一个 service 步骤长驻（sleep）
+vars:
+  msg: "hello service"
+steps:
+  - id: log
+    call: hello
+    input:
+      name: "${vars.msg}"
+  - id: keep
+    call: sleeper
+    mode: service
+    depends_on: [log]
+    input: {}

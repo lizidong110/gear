@@ -1,0 +1,22 @@
+id: hello
+name: Hello Tool
+description: 回声 Tool，演示 process runtime（stdin 进 JSON，stdout 末行出 JSON）
+runtime: process
+entry: cat
+input_schema:
+  type: object
+  properties:
+    name:
+      type: string
+  required:
+    - name
+output_schema:
+  type: object
+  properties:
+    name:
+      type: string
+versions:
+  - version: 1.0.0
+    state: stable
+    digest: ""
+    note: 初始版本

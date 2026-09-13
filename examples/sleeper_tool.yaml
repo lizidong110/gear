@@ -1,0 +1,14 @@
+id: sleeper
+name: Sleeper
+description: 长驻占位服务（S2 示例）：拉起一个 sleep 进程作为 service step
+runtime: process
+entry: "sleep 300"
+input_schema:
+  type: object
+  properties: {}
+output_schema:
+  type: object
+  properties: {}
+versions:
+  - version: "1.0.0"
+    state: stable
