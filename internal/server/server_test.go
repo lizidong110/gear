@@ -385,6 +385,63 @@ func TestExecutionNotFound(t *testing.T) {
 	}
 }
 
+// A-13（REQ-API-LOGS / #71）：执行日志端点——step 的 stdout/stderr 行被采集，
+// 且按 (exec, step, stream) 关联可查；不存在的执行 → 404。
+func TestExecutionLogs(t *testing.T) {
+	s, reg := newTestServer(t)
+	seed(t, reg)
+	h := s.Handler()
+
+	// 注册一个会打印多行 stdout + 一行 stderr 的 process 工具。
+	objSchema := map[string]interface{}{"type": "object"}
+	if err := reg.UpsertTool(&model.Tool{
+		ID: "logt", Name: "logt", Runtime: model.RuntimeProcess,
+		Entry:        "echo 'boot-line'; echo '{\"ok\":true}'; echo 'warn-stderr' >&2",
+		InputSchema:  objSchema, OutputSchema: objSchema,
+		Versions: []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
+	}); err != nil {
+		t.Fatalf("注册 logt 失败: %v", err)
+	}
+	if err := reg.UpsertFlow(&model.Flow{ID: "flog", Steps: []model.Step{{ID: "s1", Call: "logt"}}}); err != nil {
+		t.Fatalf("注册 flog 失败: %v", err)
+	}
+
+	rec, out := do(t, h, "POST", "/api/executions", map[string]interface{}{"flow_id": "flog"})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("触发执行期望 202，实际 %d", rec.Code)
+	}
+	id := out["id"].(string)
+	waitStatus(t, h, id, StatusSucceeded)
+
+	logs := s.execs.Logs(id)
+	var gotStdout, gotStderr bool
+	for _, l := range logs {
+		if l.Stream == "stdout" && l.Line == "boot-line" {
+			gotStdout = true
+		}
+		if l.Stream == "stderr" && l.Line == "warn-stderr" {
+			gotStderr = true
+		}
+	}
+	if !gotStdout {
+		t.Fatalf("日志应含 stdout 行 boot-line，实际: %+v", logs)
+	}
+	if !gotStderr {
+		t.Fatalf("日志应含 stderr 行 warn-stderr，实际: %+v", logs)
+	}
+
+	// 端点：直接 GET 也应返回 200（内容已通过 s.execs.Logs 校验）。
+	rec2, _ := do(t, h, "GET", "/api/executions/"+id+"/logs", nil)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("日志端点期望 200，实际 %d", rec2.Code)
+	}
+
+	// 不存在的执行 → 404。
+	if rec3, _ := do(t, h, "GET", "/api/executions/exec_nope/logs", nil); rec3.Code != http.StatusNotFound {
+		t.Fatalf("不存在执行日志期望 404，实际 %d", rec3.Code)
+	}
+}
+
 // A-11：apps 生命周期——启动 service Flow、列出、停止。
 func TestAppsLifecycle(t *testing.T) {
 	s, reg := newTestServer(t)
@@ -454,8 +511,17 @@ func TestConcurrentExecutions(t *testing.T) {
 		}
 		waitStatus(t, h, id, StatusSucceeded)
 	}
-	if got := len(s.execs.List()); got != n {
-		t.Fatalf("应记录 %d 次执行，实际 %d", n, got)
+	// 持久化后 List 会包含历史执行（同进程内多次测试共享 SQLite 文件），
+	// 故只断言本次并发触发的 n 个 id 都在列表中，而非精确计数。
+	list := s.execs.List()
+	present := map[string]bool{}
+	for _, e := range list {
+		present[e.ID] = true
+	}
+	for _, id := range ids {
+		if !present[id] {
+			t.Fatalf("并发触发的执行 %s 未出现在执行列表中（列表共 %d 条）", id, len(list))
+		}
 	}
 }
 

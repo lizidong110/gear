@@ -37,9 +37,10 @@ type AppInstance struct {
 
 // Server 是 REST 执行面。
 type Server struct {
-	reg   *registry.Registry
-	execs *ExecStore
-	mux   *http.ServeMux
+	reg    *registry.Registry
+	execs  *ExecStore
+	engine *engine.Engine
+	mux    *http.ServeMux
 
 	// inferrer 是 AI 闭环（S6c）的推断器：默认线上 SiliconFlow（无 Key 回退 Ollama），测试 / 远端网关可注入。
 	inferrer ai.Inferrer
@@ -64,6 +65,9 @@ func NewWithInferrer(reg *registry.Registry, inf ai.Inferrer) *Server {
 		apps:     map[string]*AppInstance{},
 		inferrer: inf,
 	}
+	// 日志采集（REQ-API-LOGS / #71）：引擎执行 step 时把 stdout/stderr 行经 ExecStore 落盘，
+	// 供 GET /api/executions/{id}/logs 查询。
+	s.engine = engine.New(reg, engine.WithLogSink(s.execs.logSink()))
 	// §8.2 第三条守卫需要「运行期引用」，而运行期状态在 Server 手里 —— 由这里注入，
 	// registry 不反向依赖执行状态。
 	reg.SetRunningChecker(s.runningToolReason)
@@ -109,6 +113,8 @@ func (s *Server) Shutdown() {
 	s.appSeq = nil
 	s.appMu.Unlock()
 	s.appWG.Wait()
+	// 释放执行记录库句柄（#70 SQLite 持久化）：停机后不再查询，关闭以解锁 WAL 侧车文件。
+	_ = s.execs.Close()
 }
 
 func (s *Server) routes() {
@@ -129,6 +135,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/executions", s.handleCreateExecution)
 	s.mux.HandleFunc("GET /api/executions", s.handleListExecutions)
 	s.mux.HandleFunc("GET /api/executions/{id}", s.handleGetExecution)
+	s.mux.HandleFunc("GET /api/executions/{id}/logs", s.handleGetExecutionLogs)
 
 	s.mux.HandleFunc("POST /api/ai/infer", s.handleInfer)
 
@@ -360,11 +367,12 @@ func (s *Server) handleCreateExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rec := s.execs.Create(req.FlowID)
+		rec := s.execs.Create(req.FlowID)
 	go func() {
 		// 引擎在加载完 Flow + Hook 快照后回报「本次可能用到的 Tool」，
 		// 作为 §8.2「运行中不可注销」守卫的判据（静态引用可能已被删/改）。
-		res, runErr := engine.New(s.reg).RunFlowResultObserved(rec.FlowID, func(toolIDs []string) {
+		// RunFlowExec 带上 exec id，使 step 运行日志经 logSink 落盘（REQ-API-LOGS / #71）。
+		res, runErr := s.engine.RunFlowExec(rec.FlowID, rec.ID, func(toolIDs []string) {
 			s.execs.SetTools(rec.ID, toolIDs)
 		})
 		s.execs.Finish(rec.ID, res, runErr)
@@ -383,7 +391,18 @@ func (s *Server) handleGetExecution(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rec)
 }
 
-// handleListExecutions 返回全部执行记录（内存态，重启即失；见 ExecStore 注释）。
+// handleGetExecutionLogs 返回某次执行的 step 运行日志（stdout/stderr 行，按产生顺序）。
+// 执行记录不存在 → 404；存在但无日志 → 返回空数组（200）。
+func (s *Server) handleGetExecutionLogs(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.execs.Get(id); !ok {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("执行记录不存在: %s: %w", id, registry.ErrNotFound))
+		return
+	}
+	writeJSON(w, http.StatusOK, s.execs.Logs(id))
+}
+
+// handleListExecutions 返回全部执行记录（持久化于 SQLite，重启可恢复；见 ExecStore）。
 func (s *Server) handleListExecutions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.execs.List())
 }

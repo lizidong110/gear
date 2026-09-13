@@ -2,11 +2,17 @@ package server
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"gear/internal/engine"
+
+	_ "modernc.org/sqlite"
 )
 
 // 执行状态（对外可见）。
@@ -32,58 +38,161 @@ type Execution struct {
 	FinishedAt *time.Time        `json:"finished_at,omitempty"`
 }
 
-// ExecStore 是**内存态**执行记录。
+// ExecStore 是执行记录的**持久化**存储（REQ-EXEC-PERSIST，#70）。
 //
-// ⚠️ 持久性显式声明（方法论 §11·状态持久性）：服务进程重启 ⇒ 记录全部丢失。
-// 这是 S6a 的**有意选择**（MVP 先跑通触发/查询闭环），持久化执行历史属后续切片；
-// 不要把它当作「已持久化」。
+// 早期为内存态（重启即失，S6a 有意选择）；本次改为 SQLite（modernc.org/sqlite，纯 Go 无 cgo），
+// 服务重启后可恢复全部执行历史与查询。并发安全由 SQLite 事务 + 单写点保证；
+// RunningToolIDs 这种需遍历的运行期查询直接走 SQL（status='running'）。
+//
+// 路径：环境变量 GEAR_EXEC_DB，缺省 build/gear.db（已在 .gitignore 忽略）。
 type ExecStore struct {
-	mu  sync.Mutex
-	m   map[string]*Execution
-	seq []string
+	db *sql.DB
+	mu sync.Mutex // 保护「读-改-写」类操作（如 SetTools 需先取再存）
 }
 
-// NewExecStore 构造空 store。
+// execDBPath 解析数据库文件路径（env 优先，缺省 build/gear.db）。
+func execDBPath() string {
+	if p := os.Getenv("GEAR_EXEC_DB"); p != "" {
+		return p
+	}
+	return filepath.Join("build", "gear.db")
+}
+
+// NewExecStore 打开（必要时创建）SQLite 库并完成建表。
 func NewExecStore() *ExecStore {
-	return &ExecStore{m: map[string]*Execution{}}
+	path := execDBPath()
+	if dir := filepath.Dir(path); dir != "" {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		// 极端情况下（如只读文件系统）退化为纯内存，保证服务能起；
+		// 此时重启即失，但运行期语义不变。
+		db, _ = sql.Open("sqlite", "file::memory:?cache=shared")
+	}
+	s := &ExecStore{db: db}
+	s.migrate()
+	return s
+}
+
+// Close 释放底层 SQLite 句柄（WAL 侧车文件随之解锁）。
+// Server.Shutdown 在优雅停机时调用，便于测试用临时库路径后能干净回收 t.TempDir()。
+func (s *ExecStore) Close() error {
+	if s.db == nil {
+		return nil
+	}
+	err := s.db.Close()
+	s.db = nil
+	return err
+}
+
+func (s *ExecStore) migrate() {
+	_, _ = s.db.Exec(`CREATE TABLE IF NOT EXISTS executions (
+		id          TEXT PRIMARY KEY,
+		flow_id     TEXT NOT NULL,
+		status      TEXT NOT NULL,
+		error       TEXT,
+		tool_ids    TEXT,
+		result      TEXT,
+		started_at  TEXT NOT NULL,
+		finished_at TEXT
+	)`)
+	_, _ = s.db.Exec(`CREATE TABLE IF NOT EXISTS execution_logs (
+		id       INTEGER PRIMARY KEY AUTOINCREMENT,
+		exec_id  TEXT NOT NULL,
+		step_id  TEXT NOT NULL,
+		stream   TEXT NOT NULL,
+		line     TEXT NOT NULL,
+		ts       TEXT NOT NULL
+	)`)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_exec_logs ON execution_logs(exec_id, id)`)
+}
+
+// LogEntry 是一条执行日志（stdout/stderr 行，关联到 exec + step）。
+type LogEntry struct {
+	ExecID string `json:"exec_id"`
+	StepID string `json:"step_id"`
+	Stream string `json:"stream"` // stdout | stderr
+	Line   string `json:"line"`
+	TS     time.Time `json:"ts"`
+}
+
+// Log 追加一条 step 运行日志（REQ-API-LOGS / #71）。
+func (s *ExecStore) Log(execID, stepID, stream, line string) {
+	_, _ = s.db.Exec(
+		`INSERT INTO execution_logs (exec_id, step_id, stream, line, ts) VALUES (?, ?, ?, ?, ?)`,
+		execID, stepID, stream, line, time.Now().Format(time.RFC3339Nano),
+	)
+}
+
+// Logs 返回某次执行的全部日志（按产生顺序）。
+func (s *ExecStore) Logs(execID string) []LogEntry {
+	rows, err := s.db.Query(`SELECT exec_id, step_id, stream, line, ts FROM execution_logs WHERE exec_id=? ORDER BY id ASC`, execID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := make([]LogEntry, 0)
+	for rows.Next() {
+		var e LogEntry
+		var ts string
+		if err := rows.Scan(&e.ExecID, &e.StepID, &e.Stream, &e.Line, &ts); err != nil {
+			continue
+		}
+		if t, perr := time.Parse(time.RFC3339Nano, ts); perr == nil {
+			e.TS = t
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// logSink 把 ExecStore 适配为 engine.LogSink（供 RunFlowExec 注入）。
+func (s *ExecStore) logSink() engine.LogSink {
+	return func(execID, stepID, stream, line string) {
+		s.Log(execID, stepID, stream, line)
+	}
 }
 
 // Create 登记一次新的执行（状态 running）。
 func (s *ExecStore) Create(flowID string) Execution {
-	e := &Execution{ID: newID("exec_"), FlowID: flowID, Status: StatusRunning, StartedAt: time.Now()}
-	s.mu.Lock()
-	s.m[e.ID] = e
-	s.seq = append(s.seq, e.ID)
-	s.mu.Unlock()
-	return *e
+	e := Execution{ID: newID("exec_"), FlowID: flowID, Status: StatusRunning, StartedAt: time.Now()}
+	_, _ = s.db.Exec(
+		`INSERT INTO executions (id, flow_id, status, tool_ids, started_at) VALUES (?, ?, ?, '[]', ?)`,
+		e.ID, e.FlowID, e.Status, e.StartedAt.Format(time.RFC3339Nano),
+	)
+	return e
 }
 
 // Finish 记录执行结果。
 func (s *ExecStore) Finish(id string, res *engine.RunResult, err error) {
 	now := time.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e, ok := s.m[id]
-	if !ok {
-		return
-	}
-	e.FinishedAt = &now
+	status := StatusSucceeded
+	var errMsg string
 	if err != nil {
-		e.Status = StatusFailed
-		e.Error = err.Error()
-		return
+		status = StatusFailed
+		errMsg = err.Error()
 	}
-	e.Status = StatusSucceeded
-	e.Result = res
+	var resultJSON *string
+	if res != nil {
+		if b, merr := json.Marshal(res); merr == nil {
+			js := string(b)
+			resultJSON = &js
+		}
+	}
+	_, _ = s.db.Exec(
+		`UPDATE executions SET status=?, error=?, result=?, finished_at=? WHERE id=?`,
+		status, errMsg, resultJSON, now.Format(time.RFC3339Nano), id,
+	)
 }
 
 // SetTools 记录本次执行「可能用到」的 Tool id（引擎加载快照后回调，见 engine.ToolObserver）。
 func (s *ExecStore) SetTools(id string, toolIDs []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if e, ok := s.m[id]; ok {
-		e.ToolIDs = append([]string(nil), toolIDs...) // 复制：调用方切片可能被复用
-	}
+	b, _ := json.Marshal(toolIDs)
+	_, _ = s.db.Exec(`UPDATE executions SET tool_ids=? WHERE id=?`, string(b), id)
 }
 
 // RunningToolIDs 返回「运行中的执行」所用到的 Tool id → 触发它的执行 id。
@@ -91,51 +200,81 @@ func (s *ExecStore) SetTools(id string, toolIDs []string) {
 // 供 §8.2「运行中不可注销」守卫使用：Registry 只看得见**静态**引用，
 // 运行期引用（Hook 被删 / Flow 被改写后仍在跑的那部分）只能由此补上。
 func (s *ExecStore) RunningToolIDs() map[string]string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT id, tool_ids FROM executions WHERE status=?`, StatusRunning)
+	if err != nil {
+		return map[string]string{}
+	}
+	defer rows.Close()
 	out := map[string]string{}
-	for _, id := range s.seq {
-		e, ok := s.m[id]
-		if !ok || e.Status != StatusRunning {
+	for rows.Next() {
+		var eid, raw string
+		if err := rows.Scan(&eid, &raw); err != nil {
 			continue
 		}
-		for _, t := range e.ToolIDs {
-			out[t] = e.ID
+		var ids []string
+		_ = json.Unmarshal([]byte(raw), &ids)
+		for _, t := range ids {
+			out[t] = eid
 		}
 	}
 	return out
 }
 
-// Get 返回执行记录的**副本**（并发安全：Finish 会原地改字段，
-// 直接返回指针会让调用方在锁外读到写一半的结构；ToolIDs 是切片，
-// 共享底层数组同样会在并发 SetTools 时竞争，故一并复制）。
+// Get 返回执行记录的副本（并发安全）。
 func (s *ExecStore) Get(id string) (Execution, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e, ok := s.m[id]
-	if !ok {
+	row := s.db.QueryRow(`SELECT id, flow_id, status, error, tool_ids, result, started_at, finished_at FROM executions WHERE id=?`, id)
+	e, err := scanExecution(row)
+	if err != nil {
 		return Execution{}, false
 	}
-	out := *e
-	out.ToolIDs = append([]string(nil), e.ToolIDs...)
-	return out, true
+	return e, true
 }
 
-// List 返回全部执行记录（副本，按创建顺序）。
+// List 返回全部执行记录（按创建顺序，即 started_at 升序；同秒用 id 稳定排序）。
 func (s *ExecStore) List() []Execution {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]Execution, 0, len(s.seq))
-	for _, id := range s.seq {
-		e, ok := s.m[id]
-		if !ok {
-			continue
+	rows, err := s.db.Query(`SELECT id, flow_id, status, error, tool_ids, result, started_at, finished_at FROM executions ORDER BY started_at ASC, id ASC`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := make([]Execution, 0)
+	for rows.Next() {
+		if e, err := scanExecution(rows); err == nil {
+			out = append(out, e)
 		}
-		cp := *e
-		cp.ToolIDs = append([]string(nil), e.ToolIDs...)
-		out = append(out, cp)
 	}
 	return out
+}
+
+// scanExecution 从一行（*sql.Row 或 *sql.Rows）扫描为 Execution。
+func scanExecution(scanner interface {
+	Scan(dest ...interface{}) error
+}) (Execution, error) {
+	var (
+		id, flowID, status, errMsg, toolIDs, result, startedAt, finishedAt sql.NullString
+	)
+	if err := scanner.Scan(&id, &flowID, &status, &errMsg, &toolIDs, &result, &startedAt, &finishedAt); err != nil {
+		return Execution{}, err
+	}
+	e := Execution{ID: id.String, FlowID: flowID.String, Status: status.String, Error: errMsg.String}
+	if b := toolIDs.String; b != "" {
+		_ = json.Unmarshal([]byte(b), &e.ToolIDs)
+	}
+	if b := result.String; b != "" {
+		var r engine.RunResult
+		if json.Unmarshal([]byte(b), &r) == nil {
+			e.Result = &r
+		}
+	}
+	if t, err := time.Parse(time.RFC3339Nano, startedAt.String); err == nil {
+		e.StartedAt = t
+	}
+	if finishedAt.String != "" {
+		if t, err := time.Parse(time.RFC3339Nano, finishedAt.String); err == nil {
+			e.FinishedAt = &t
+		}
+	}
+	return e, nil
 }
 
 // newID 生成短随机 id（crypto/rand，避免引入 uuid 依赖）。

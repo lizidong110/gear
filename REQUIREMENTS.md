@@ -89,8 +89,8 @@
 | REQ-TMPL-SECRETS | §4.3 | 模板前缀 `${secrets.x}`（secret 原语随 ctx.* 落地，M5） | `implemented` | 执行期经宿主 secret 源解析（runContext.secretGet ← Engine.secretResolver，来自 cap.Providers.Secret）；Flow 定义只存引用、明文不落库。注册期放开该前缀（TestValidateTemplatesAllowsSecrets），密钥缺失运行期报错（TestSpecSecretsTemplateAllowedAtRegister / TestExpandStringResolvesSecrets）。注：secret 经进程 stdin/argv 暴露仍属 P0-4 风险（见 §189），本实现仅解决「引用可用」 |
 | REQ-API-PROMOTE | §11 | 版本晋升（状态机 + `before_promote` 门禁） | `implemented`（S5→REST） | CLI `gear tool promote <id> <v> <target>` 与 REST `POST /api/tools/{id}/versions/{v}/promote` 均已实现，均走 `engine.PromoteTool`（before_promote 门禁 fail-closed）；状态机语义在 `model.CanPromote` + `registry.PromoteToolVersion` 落地 |
 | REQ-API-AI | §11/§9 | AI 闭环（自然语言 → Flow）：`POST /api/ai/infer` + CLI `gear ai gen [--register]` | `implemented`（S6c） | `internal/ai`（Inferrer 接口 + Ollama 客户端 + GenerateFlow 收敛重试≤3）；`server_test.go`: TestInferFlow；`cli/ai_test.go`: TestAIGenPrintsYAML、TestAIGenRegister；LLM 接入方式定为本地 Ollama（qwen3.5:4b，可配置） |
-| REQ-API-LOGS | §11 | `GET /api/executions/{id}/logs` | `deferred`（需日志 Hook 产出） | 端点未实现；当前执行产物只有 RunResult |
-| REQ-EXEC-PERSIST | §11(§0 第 14 条) | 执行记录持久化（跨重启保留历史） | `deferred`（有意选择内存态） | `ExecStore` 为进程内 map，重启即失；已在代码注释显式声明 |
+| REQ-API-LOGS | §11 | `GET /api/executions/{id}/logs` | `implemented`（#71） | 端点已实现；processRuntime 把 step 的 stdout/stderr 行经 `Engine.WithLogSink` → `ExecStore.Logs` 落盘（仅文本、跳过空行），供查询；红线：日志只含运行期输出、绝不落 input/secret 明文。覆盖：`server_test.go`: TestExecutionLogs |
+| REQ-EXEC-PERSIST | §11(§0 第 14 条) | 执行记录持久化（跨重启保留历史） | `implemented`（#70） | `ExecStore` 改为 modernc.org/sqlite 持久化（环境变量 `GEAR_EXEC_DB`，缺省 `build/gear.db`，已在 .gitignore 忽略）；重启可恢复全部执行历史与日志；`Server.Shutdown` 关闭 SQLite 句柄释放 WAL 侧车文件。覆盖：`server_test.go`: TestConcurrentExecutions、TestExecutionLogs |
 | REQ-FLOW-IO | §4.1 | Flow 级 input/output 声明 | `contradicted→fixed` | 模型无此字段，PRD §4.1 示例已移除 |
 
 ---

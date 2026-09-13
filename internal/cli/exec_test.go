@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,9 @@ steps:
 // newTestServer 起一个带 t1 / f1 的 httptest 执行面，返回 server 与 host:port。
 func newTestServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
+	// 每个测试用独立的执行记录库（GEAR_EXEC_DB），避免 #70 持久化后跨测试/跨 gate 运行
+	// 残留历史执行导致 "空列表" 等断言误判（生产仍走默认 build/gear.db）。
+	t.Setenv("GEAR_EXEC_DB", filepath.Join(t.TempDir(), "gear.db"))
 	reg, err := registry.Open(tempDB(t))
 	if err != nil {
 		t.Fatal(err)
@@ -62,8 +66,11 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 		t.Fatal(err)
 	}
 
-	ts := httptest.NewServer(server.New(reg).Handler())
+	srv := server.New(reg)
+	ts := httptest.NewServer(srv.Handler())
+	// 先停 HTTP，再 Shutdown（后者会关闭 ExecStore 释放 SQLite 句柄，使 t.TempDir 清理成功）。
 	t.Cleanup(ts.Close)
+	t.Cleanup(srv.Shutdown)
 	return ts, strings.TrimPrefix(ts.URL, "http://")
 }
 

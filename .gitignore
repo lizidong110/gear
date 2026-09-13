@@ -10,6 +10,9 @@
 # 测试日志落盘（scripts/gate.sh 产出，不纳入版本控制）
 /build/testlogs/
 
+# 执行记录 SQLite 持久化库（execstore.go 默认 build/gear.db，测试时落在 internal/server/build/）
+**/gear.db
+
 # 编辑器 / OS 临时文件
 .idea/
 .vscode/
