@@ -49,7 +49,7 @@
 | REQ-HOOK-ONERROR | §5.4 | on_error Hook 触发但**不能恢复/重试**主流程（输出被丢弃） | `implemented`（S3） | `engine/hook_test.go`: TestHookOnErrorDoesNotRecover |
 | REQ-HOOK-NORECUR | §5.4 | Hook 执行不再触发 Hook（结构性无递归） | `implemented`（S3） | `engine/hook_test.go`: TestHookNoRecursion |
 | REQ-HOOK-SELECT | §5.3 | Target（精确 tool id 或 `*`）+ Order 升序装配；无隐式依赖 | `implemented`（S3） | `engine/hook_test.go`: TestHookTargetFilter、TestHookOrder |
-| REQ-HOOK-VALID | §5(F3) | Hook.Validate 注册期守卫：stage 合法、action/target/id 非空、criticality 合法；before_promote 显式拒绝（S5） | `implemented`（S3） | `model_test.go`: TestHookValidate；`registry_test.go`: TestHookRoundtrip |
+| REQ-HOOK-VALID | §5(F3) | Hook.Validate 注册期守卫：stage 合法、action/target/id 非空、criticality 合法；before_promote 已开放（S5 实现） | `implemented`（S5） | `model_test.go`: TestHookValidate；`registry_test.go`: TestHookRoundtrip |
 | REQ-HOOK-CLI | §11/§14.6 | Hook 落库 + CLI（`gear hook register/list/show/remove`） | `implemented`（S3） | `registry_test.go`: TestHookRoundtrip（含 Get/Delete/拒绝非法） |
 | REQ-RUN-RESULT | §9.1 | `RunFlowResult` 返回结构化 step input/output（补上「可观测性为零」缺口） | `implemented`（S3） | `engine/hook_test.go`（全部用例经 RunResult 断言） |
 | REQ-PARALLEL | §4.3 | 无依赖 step **默认并行**调度（分层执行） | `implemented`（S4） | `engine/parallel_test.go`: TestParallelExecution、TestMaxParallelOneSerializes、TestMaxParallelTwoBatches |
@@ -68,15 +68,15 @@
 | REQ-DEL-TOOL-GUARD | §8.2 | 注销 Tool 守卫：被 Flow step / Hook action 引用则拒绝（`ErrInUse`→409） | `implemented`（S6a） | `registry_test.go`: TestDeleteTool；`server_test.go`: TestDeleteToolInUse、TestDeleteToolUsedByHook |
 | REQ-DEL-TOOL-RUNNING | §8.2 | 注销守卫第三条：**运行中** Execution 持有的 Tool 不可注销（注入 `RunningChecker`；执行结束后可再次尝试） | `implemented`（本轮） | `registry_test.go`: TestDeleteToolRunningGuard；`server_test.go`: TestDeleteToolWhileRunning（运行中 409 → 结束后 200）；`engine/planned_test.go`: TestRunFlowResultObservedReportsToolIDs（运行侧上报计划用到的 Tool，含仅作 Hook action 的） |
 | REQ-FLOW-STATIC-CHECK | §9.2 | Flow 静态校验：结构 → 依赖图(环/未知) → Tool 存在 → when 可编译（CLI/REST/AI 闭环共用） | `implemented`（S6a） | `server_test.go`: TestFlowsAndValidate |
-| REQ-API-REST | §11 | REST 执行面（12/15 端点）：healthz / tools(CRUD) / flows(CRUD+validate) / hooks / executions / apps | `implemented`（S6a） | `server_test.go`（12 条契约测试，含状态码 400/404/409） |
+| REQ-API-REST | §11 | REST 执行面（14/15 端点）：healthz / tools(CRUD) / flows(CRUD+validate) / hooks / executions(+列表) / apps / ai-infer | `implemented`（S6a+S5+S6c） | `server_test.go`（端点契约测试，含状态码 400/404/409/422） |
 | REQ-API-ASYNC-EXEC | §11(F10) | 异步执行：POST 202 + id，GET 查询 running/succeeded/failed + RunResult | `implemented`（S6a） | `server_test.go`: TestExecutionLifecycle、TestExecutionFailure、TestConcurrentExecutions |
 | REQ-API-APPS | §11/§14 | REST 托管 Flow 进程：POST/GET/DELETE apps（cancel ⇒ Supervisor 停服务） | `implemented`（S6a） | `server_test.go`: TestAppsLifecycle |
 | REQ-API-SHUTDOWN | §0 第 14 条(F11) | 优雅停机：cancel + **等待子任务收敛**（避免 registry 关闭竞态） | `implemented`（S6a） | `server_test.go`: TestAppsLifecycle（含 `Shutdown` 等待） |
 
 | 需求 ID | PRD 章节 | 行为 | 状态 | 处置 |
 |---------|---------|------|------|------|
-| REQ-USEVERSION | §4.2/§7 | step 钉版本 `use_version` | `deferred`（S5） | `Flow.Validate` 注册期拒绝；测试 TestFlowValidate |
-| REQ-HOOK-PROMOTE | §5.3/§7 | `before_promote` 阶段 Hook（版本晋升前） | `deferred`（S5） | `Hook.Validate` 注册期显式拒绝；测试 TestHookValidate、TestHookRoundtrip |
+| REQ-USEVERSION | §4.2/§7 | step 钉版本 `use_version` | `implemented`（S5） | `engine/version_test.go`: TestRunFlowResolvesUseVersion、TestRunFlowDefaultVersion、TestValidateFlowStaticUnknownVersion；`model/version_test.go`: TestFlowValidateAllowsUseVersion |
+| REQ-HOOK-PROMOTE | §5.3/§7 | `before_promote` 阶段 Hook（版本晋升前） | `implemented`（S5） | `engine/version_test.go`: TestPromoteToolBeforePromoteGate；`model/version_test.go`: TestHookValidateAllowsBeforePromote |
 | REQ-HOOK-ACTION-FLOW | §5.3 | Hook 的 action 指向 **Flow**（PRD §5.3 原文「引用的 Flow/Tool」，当前仅支持 Tool） | `deferred`（后续；需递归调引擎 + 完整嵌套守卫） | 现以「action = 已注册 Tool id」实现（用户选定方案 A），Flow 载体待评估 |
 | REQ-CTX | §10/§14.1 | 宿主能力 `ctx.*`（http/call/db/kv/secret/event） | `implemented`（M5） | `internal/cap` 包 + 引擎按 `Tool.Capabilities` 精确放行；lua 经 `setupLuaCapabilities`、process 经 `withHostCapabilities` 注入；db 原语已定义但宿主未实现，调用返回 `ErrCapabilityUnavailable`；测试见 `engine/lua_cap_test.go`、`engine/cap_integration_test.go`、`cap/cap_test.go`。注：process/go-host 运行期绕过 capability（P0-4）仍 deferred |
 | REQ-RUNTIME-GOHOST | §3.2 | go-host runtime | `deferred`（S7 后续） | `Tool.Validate` 注册期拒 + `runtimeFor` 报错；测试 TestSpecRejectsUnimplementedRuntimeTool、TestRuntimeForRejectsUnimplemented |
@@ -87,8 +87,8 @@
 | REQ-APP-HEALTH | §14.3 | service 健康检查（HTTP/命令探针） | `deferred`（S2+） | 当前仅存活（进程退出即视为不健康）；探针未实现 |
 | REQ-CONCURRENCY-CROSS | §14.5 | 跨进程的执行入口队列 / 进程池（背压排队、拒绝策略） | `deferred`（后续） | step 级并发闸门已落地（REQ-PARALLEL / REQ-APP-MAXCONC）；跨进程池尚未实现 |
 | REQ-TMPL-SECRETS | §4.3 | 模板前缀 `${secrets.x}`（secret 原语随 ctx.* 落地，M5） | `deferred`（M5） | 注册期显式拒绝未知前缀（`validateTemplates`）；测试 `engine/template_test.go`: TestValidateTemplatesRejectsSecrets、TestSpecSecretsTemplateRejectedAtRegister |
-| REQ-API-PROMOTE | §11 | `POST /api/tools/{id}/versions/{v}/promote`（版本晋升） | `deferred`（S5） | 依赖版本状态机；端点未实现 |
-| REQ-API-AI | §11/§9 | `POST /api/tools/.../ai-infer`、`POST /api/flows/{id}/ai-gen`（AI 闭环） | `deferred`（S6c，需先定 LLM 接入方式） | 端点未实现；静态校验器（REQ-FLOW-STATIC-CHECK）已就绪，是闭环的校验环节 |
+| REQ-API-PROMOTE | §11 | 版本晋升（状态机 + `before_promote` 门禁） | `partial`（S5） | CLI `gear tool promote <id> <v> <target>` 已实现（走 `engine.PromoteTool`，fail-closed 门禁）；REST 端点 `POST /api/tools/{id}/versions/{v}/promote` 未实现（晋升经 CLI 触发） |
+| REQ-API-AI | §11/§9 | AI 闭环（自然语言 → Flow）：`POST /api/ai/infer` + CLI `gear ai gen [--register]` | `implemented`（S6c） | `internal/ai`（Inferrer 接口 + Ollama 客户端 + GenerateFlow 收敛重试≤3）；`server_test.go`: TestInferFlow；`cli/ai_test.go`: TestAIGenPrintsYAML、TestAIGenRegister；LLM 接入方式定为本地 Ollama（qwen3.5:4b，可配置） |
 | REQ-API-LOGS | §11 | `GET /api/executions/{id}/logs` | `deferred`（需日志 Hook 产出） | 端点未实现；当前执行产物只有 RunResult |
 | REQ-EXEC-PERSIST | §11(§0 第 14 条) | 执行记录持久化（跨重启保留历史） | `deferred`（有意选择内存态） | `ExecStore` 为进程内 map，重启即失；已在代码注释显式声明 |
 | REQ-FLOW-IO | §4.1 | Flow 级 input/output 声明 | `contradicted→fixed` | 模型无此字段，PRD §4.1 示例已移除 |

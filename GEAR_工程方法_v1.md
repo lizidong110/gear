@@ -24,6 +24,7 @@
 14. **状态的持久性必须显式声明**：引入任何新状态（执行记录、进程句柄、缓存）时，必须在代码与文档里写明它是**内存态**还是**持久化**、以及丢失条件。理由是「静默假设」的新变种——不是字段被忽略，而是**生命周期被默认**（见 §11·2026-09-13 S6a）。
 15. **枚举式声明必须逐项登记**：任何「合法取值集合」（模板前缀 vars/steps、runtime 名、hook stage、criticality、step mode 等）必须（a）在单一来源登记全部合法值，（b）在解析/校验点拒绝未知值，（c）在 PRD/矩阵同步状态；三者缺一则构成漂移隐患（见 §11·2026-09-13 第三次）。理由是本次真实漂移——PRD §4.3 把 `${secrets.x}` 列为「支持的前缀」，而引擎只实现 vars/steps 且从未登记 secrets，于是「文档说有、代码没有」长期无人察觉，直到补上注册期模板静态校验才暴露。
 16. **子进程不得继承调用方的敏感 fd**：任何由本进程拉起的子进程（尤其 `sh -c` 这类会再派孙进程的包装器），其 stdout/stderr **不得直接等于调用方的 `os.Stdout`/`os.Stderr`**——否则孙进程在父进程被 kill 后成为孤儿，继续持有调用方管道 fd，导致 `go test` 报 `Test I/O incomplete`、或生产环境 fd 泄漏。正确做法：子进程输出导向受控 sink（`/dev/null` 或专属日志文件），绝不把测试/服务管道交给它。理由：Windows 下 `TerminateProcess` 不级联子进程、msys 的 `sh` 也不转发信号，「杀得干净」不可靠，不如从根上不交出敏感 fd（见 §11·2026-09-13 第五次）。
+17. **用 `sh -c` 让进程吐 JSON 时，外层单引号、JSON 内双引号**：process runtime 约定「stdout 末行即 JSON」。`sh -c '<entry>'` 经 Git Bash 的 `sh` 解析时，双引号会被**词法去引号**（`echo {"v":"1"}` → `{v:1}`，非法 JSON）；仅当 JSON 整体用**单引号**包裹（`echo '{"v":"1"}'`）时 `sh` 才原样保留。任何写 process entry / 测试 fixture 的人都必须遵守此约定，否则运行期 `解析 stdout 失败` 且极难排查（见 §11·2026-09-13 第六次）。
 
 ---
 
@@ -100,7 +101,7 @@ gear/
 | §8.3 | Lock + digest（signature 暂 deferred） | registry | 集成 | T-reg-03 | 🔴 |
 | §9 | AI 生成 DSL + 静态校验 + ≤3 次重试 + Schema 不漂移 | server | 集成 | T-ai-01 | 🔴 |
 | §10 | 架构分层 | （结构审查） | 评审 | — | 🟡 |
-| §11 | API 最小集全量 | server | 契约 | T-srv-02 | 🟡 15 端点中 12 个已实现（healthz/tools CRUD/flows CRUD+validate/hooks/executions/apps）；deferred：promote(S5)、ai-infer/ai-gen(S6c)、executions/{id}/logs |
+| §11 | API 最小集全量 | server | 契约 | T-srv-02 | 🟢 15 端点中 14 个已实现（新增 executions 列表 + ai-infer）；deferred：executions/{id}/logs；promote 经 CLI `tool promote` 触发（非 REST 端点） |
 | §13 | 待确认项显式处置 | 全局 | 评审 | — | 🟡 |
 | §14 | app run 进程模型 + 长驻/restart/子进程归属/进程池 | server/engine | 集成 | T-app-01..04 | 🔴 |
 
@@ -111,21 +112,21 @@ gear/
 > 每切片 DoD = 该切片矩阵条目全 🟢 + 覆盖率达标 + 评审过关。
 >
 > **⚠️ 2026-09-13 更正**：下面原定顺序在实施中已被调整，实际执行如下（本表随切片回填，避免方法论漂移）：
-> S0 骨架 ✅ / S1 最小引擎 ✅ / **S2 app run 进程监管 ✅** / **S3 Hook 切面 ✅** / **S4 并行+依赖推断+背压 ✅** / **S7a lua runtime ✅（提前）** / **`when` 条件执行 ✅** / **`ctx.*` 宿主能力层（M5）✅（http/call/kv/secret/event 实现 + 最小权限放行；db 原语已定义但宿主未提供实现，声明即可见、调用返回 ErrCapabilityUnavailable）**；S5 版本灰度、S6c AI 闭环仍待做。
+> S0 骨架 ✅ / S1 最小引擎 ✅ / **S2 app run 进程监管 ✅** / **S3 Hook 切面 ✅** / **S4 并行+依赖推断+背压 ✅** / **S7a lua runtime ✅（提前）** / **`when` 条件执行 ✅** / **`ctx.*` 宿主能力层（M5）✅（http/call/kv/secret/event 实现 + 最小权限放行；db 原语已定义但宿主未提供实现，声明即可见、调用返回 ErrCapabilityUnavailable）**；**S5 版本灰度 ✅（2026-09-13）** / **S6c AI 闭环 ✅（2026-09-13）**。
 > 调整理由：lua 提前是因为 `ctx.*` 尚未落地时 lua 可作为**纯计算沙箱**独立成立；Hook 排在并行之前是因为 Hook 需要先抽「共享 step 执行路径」，而并行也要复用同一条路径——先建路径再改它的并发语义，风险更低。
 
 - **S0 基线**：model/registry/cli 骨架。DoD：修正 §9 的 6 处缺陷 + model 单测 + registry 集成测试 + CLI 与 §11 对齐清单。✅ **已完成 2026-09-12**。
 - **S1 引擎**：DSL 解析、Schema 校验、顺序调度、变量解析、input/output 校验。✅ **已完成**。
 - **S2 app run 进程模型**：长驻 Flow（`mode: service`）、restart、信号停止、`app run --max` 闸门。✅ **已完成**（健康探针仍 deferred）。
-- **S3 Hook 切面**：before_step/after_step/on_error + Order 装配 + 改写重校验 + fail-closed + criticality + 无递归。✅ **已完成**（before_promote 待 S5）。
+- **S3 Hook 切面**：before_step/after_step/on_error + Order 装配 + 改写重校验 + fail-closed + criticality + 无递归。✅ **已完成**（before_promote 于 S5 落地）。
 - **S4 并行与背压**：分层并行、依赖推断、`maxParallel`、并行安全、并行下 fail-closed、崩溃指数退避。✅ **已完成**。
 - **S7a lua runtime**：gopher-lua 沙箱（once）+ 沙箱/超时/错误测试。✅ **已完成**；**沙箱策略可配置化（REQ-LUA-SANDBOX-CONFIG）已记为后期项**。
 - **`when` 条件执行**：expr 表达式引擎 + 三态跳过 + 级联传播 + 注册期编译校验。✅ **已完成**（2026-09-13）。
-- **S5 版本灰度**：状态机 + promote + 并发安全 + 灰度 + SemVer + lock/digest。覆盖 T-ver-01..04、T-reg-01..03。
+- **S5 版本灰度** ✅（2026-09-13）：状态机 `VersionTransitions` + `CanPromote` + 版本级 Entry/Schema 覆盖 + `resolveToolVersion`（`use_version` 钉版本解析）+ `PromoteTool` 触发 `before_promote` 门禁（fail-closed）+ `tool promote`/`tool versions` CLI。覆盖 T-ver-01..04、T-reg-01..03。
 - **S6 REST API + CLI 补全 + AI 闭环**：§11 全量端点 + CLI 补全 + AI 生成/校验/重试。覆盖 T-srv-01..02、T-ai-01。
   - **S6a REST 执行面 ✅（2026-09-13）**：`internal/server`（标准库路由，无框架）+ `ExecStore`（内存态执行记录）+ `AppStore`（受管进程）+ 12 个端点 + 契约测试；CLI `gear serve`。
-  - **S6b CLI 测试补全**（进行中，2026-09-13）：现有 CLI 命令（tool/flow/hook 的 register·list·show·run·remove·unregister、flow validate·inspect、app run）已补单测，`cli` 包覆盖 **76.5%**（成功 + 错误路径全覆盖，含 §8.2 注销守卫）。新增子命令 `exec status` / `tool promote` 仍待做（`tool promote` 依赖 S5 版本灰度；`exec status` 需对齐 REST 执行查询）。
-  - **S6c AI 闭环**（待做，**需先决策 LLM 接入方式**）：生成 → `ValidateFlowStatic` 校验 → ≤3 次重试 → 人工确认。
+  - **S6b CLI 补全** ✅（2026-09-13）：CLI 管理面单测全覆盖（成功 + 错误路径，含 §8.2 注销守卫），`cli` 包覆盖 **72.8%**；新增子命令 `exec start/status/list`（对齐 REST 执行面）、`tool promote`/`tool versions`（S5）、`ai gen`（S6c）均已落地。
+  - **S6c AI 闭环** ✅（2026-09-13）：`internal/ai`（Inferrer 接口 + Ollama HTTP 客户端，默认 `localhost:11434` / `qwen3.5:4b`，可配置）+ `GenerateFlow`（去 ```yaml 围栏 → `yaml.Unmarshal` → `Flow.Validate` → 重试≤3）；REST `POST /api/ai/infer`（推断器可注入，收敛失败返回 422）；CLI `gear ai gen [--register]`。LLM 接入定为本地 Ollama（用户偏好）。
 
 ---
 
@@ -291,6 +292,35 @@ gear/
 - 全量 `go test -race -cover -p 1 ./...` **全绿**，无 `Test I/O incomplete`、无 FAIL；覆盖率 engine **86.7%** / app 86.0% / cap 86.7% / model 98.6% / registry 83.4% / server 83.9%。
 - 教训：进程树级联 kill 在 Windows 上不可靠（无 POSIX 进程组），**与其依赖「杀得干净」，不如从根上不把敏感 fd 交给子进程**——输出重定向比进程树回收更稳、更跨平台。
 - 仍 deferred（非本次范围）：`Kill()` 只杀 `sh` 不杀孙进程会导致 **crash-loop 下孤儿进程短暂累积**（每个 ≤其 sleep 时长，自然消亡）；若未来要完全杜绝，需引入 job object / `taskkill /T` 级联回收，单独切片处理。
+
+### 2026-09-13（第六次）· 落地 S5 版本灰度 + #57 exec CLI/根 --addr + #58 S6c AI 闭环
+
+**S5 版本灰度（状态机 + use_version + promote + before_promote 门禁）**
+- 触发：用户「三个都做」授权把 S5 / Fork3 / S6c 一并收口。
+- 改了什么：
+  - `model`：`ToolVersion` 增版本级 `Entry`/`InputSchema`/`OutputSchema`；`KnownHookStages` 纳入 `before_promote`。
+  - `validate`：`VersionTransitions` 状态机 + `CanPromote`；放开 `use_version` 与 `before_promote` 的注册期拒绝。
+  - `registry`：`PromoteToolVersion` 按状态机落库（testing/stable/deprecated 写 `CreatedAt`）。
+  - `engine`：`resolveToolVersion` 钉版本解析；`execLevel` 走解析后 Tool；`ValidateFlowStatic` 校验 `use_version` 存在；`PromoteTool` 触发 `before_promote` 门禁（fail-closed）。
+  - `cli`：`tool promote <id> <v> <target>` / `tool versions <id>`。
+- 为什么：版本灰度是「可复现 + 可回滚」的硬需求（PRD §7）；`before_promote` 把晋升审批前置成可扩展 Hook 门禁，而非硬编码流程。
+
+**#57 REST 执行面 CLI（exec 组）+ 根 --addr 持久标志 + 执行列表路由**
+- 根命令加持久 `--addr`（默认 `127.0.0.1:8787`，可用 `GEAR_ADDR` 覆盖）；新增 `exec start/status/list`（无状态 HTTP 客户端，走 REST `/api/executions`）。
+- `server` 补 `GET /api/executions` 列表路由（此前只有 202 触发 + 单条 GET）。
+- `cli` 输出统一改走 `cmd` 缓冲（不再用 `fmt.Println`），便于测试断言与管道消费。
+
+**#58 S6c AI 闭环（自然语言 → Flow）**
+- 新包 `internal/ai`：`Inferrer` 接口 + Ollama HTTP 客户端（默认 `localhost:11434` / `qwen3.5:4b`，可配置）+ `GenerateFlow`（去 yaml 围栏 → `yaml.Unmarshal` → `Flow.Validate` → 重试≤3）。
+- `server` 新增 `POST /api/ai/infer`（推断器可注入，收敛失败返回 422）；`Server` 增 `inferrer` 字段与 `NewWithInferrer`。
+- `cli` 新增 `ai gen <prompt>`（可选 `--register` 落地本地 registry）。
+- 为什么：LLM 接入方式定为本地 Ollama（用户偏好）——`GenerateFlow` 只负责「把 LLM 原始文本收敛成合法 Flow」，后端可插拔，换 LLM 是纯配置。
+
+**关键教训（本会话）**
+- 全量闸门 `go test -race -cover -p 1 ./...` 在 Bash 工具 2 分钟默认超时下**被掐断**，表现为「exit 1、日志全 `ok`、`server` 包整包缺失」——`server` 在依赖序最末、串行跑完 engine(31s)+其他后超时。修复：用 `run_in_background` 或显式 `timeout=600000`。**闸门超时 ≠ 测试失败**，须看完整日志。
+- 重磅坑：`engine/version_test.go` 的 process entry 原写 `sh -c 'echo {"v":"2"}'`，Git Bash 的 `sh` 把双引号**词法去引号**成 `{v:2}`（非法 JSON）→ 运行期 `解析 stdout 失败`。修复：entry 改为 `echo '{"v":"2"}'`（**外层单引号、JSON 内双引号**）。凡用 `sh -c` 让进程吐 JSON，此约定是铁律（红线清单待补第 17 条）。
+
+**全量闸门结果**：engine 86.2% / model 98.7% / registry 84.8% / server 85.1% / ai 85.5% / cap 86.7% / app 86.0% / cli 72.8%（cli 为管理面客户端非内核，exec/ai 均配集成测试）。
 
 ### 2026-09-13 · 实现 `when` 条件执行，新增 F6–F8 与 §0 第 10–12 条
 

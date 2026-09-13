@@ -161,7 +161,7 @@ steps:
 # 说明：
 # - Flow 级 input/output 声明（旧稿）当前模型未支持，已移除。
 # - when 条件执行（已实现） / parallel 并行（S4 起无依赖本就并行） 见 §4.3；
-#   **use_version 钉版本仍未实现**（计划 S5），含该字段的 Flow 注册期即显式拒绝（见 REQUIREMENTS.md）。
+#   **use_version 钉版本已实现**（S5）：钉版本解析走 `resolveToolVersion`，版本级 Entry/Schema 覆盖 Tool 级；未知版本注册期即拒绝（见 REQUIREMENTS.md REQ-USEVERSION）。
 # - 模板支持 ${vars.x} / ${steps.id.output.field}；**${secrets.x} 尚未实现**
 #   （secret 原语随 ctx.* 落地，见 REQ-TMPL-SECRETS），注册期显式拒绝而非执行期才报错。
 ```
@@ -215,7 +215,7 @@ hooks:
 ```
 
 > **实现状态（S3）与字段名对齐**：当前代码用 `stage`（= 上面的 pointcut）、`order`（= weight）、`target`、`action`、`criticality`。
-> - `stage` 现仅支持 `before_step` / `after_step` / `on_error`；`before_flow`、`on_success`、`before_promote` **尚未实现**（`before_promote` 计划 S5，注册期会被显式拒绝）。
+> - `stage` 现支持 `before_step` / `after_step` / `on_error` / `before_promote`；`before_flow`、`on_success` 尚未实现（`before_promote` 于 S5 落地，由 `engine.PromoteTool` 触发 fail-closed 门禁）。
 > - `target` 现支持**精确 tool id** 或 `*`；`flow_id` / step_id / 通配前缀（`dingtalk.*`）尚未实现。
 > - `action` 指向**已注册 Tool 的 id**（PRD 原意「Flow/Tool」，Flow 载体待评估，见 REQUIREMENTS.md REQ-HOOK-ACTION-FLOW）。
 > - 实际 YAML 形态见 `gear hook register` 的示例（`examples/` 与 CLI help）。
@@ -328,6 +328,8 @@ testing → stable 的晋升（Promote）必须由 **用户显式调用**，非�
 POST /api/tools/{tool_id}/versions/{version}/promote
 { "operator": "alice", "expected_old_version": "1.0.0" }
 ```
+
+> **实现状态（S5）**：晋升当前由 CLI `gear tool promote <id> <v> <target>` 触发（走 `engine.PromoteTool`：先跑 `before_promote` 门禁再落库）；上述 REST 端点暂未单独实现。状态机语义（§7.3）已在 `model.CanPromote` + `registry.PromoteToolVersion` 落地，`expected_old_version` 的 CAS 预期留待 REST 端点补齐。
 
 ### 7.3 幂等与并发安全
 
@@ -443,21 +445,22 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 | GET | `/api/tools` | 列出 Tool |
 | POST | `/api/tools` | 注册 Tool（注册期校验，非法 runtime → 400） |
 | DELETE | `/api/tools/{id}` | 注销（被 Flow/Hook 引用 → 409；**运行中引用 → 409**，执行结束后可再次尝试） |
-| POST | `/api/tools/.../ai-infer` | AI 从脚本推断 Schema ⏳ S6c |
+| POST | `/api/ai/infer` | AI 闭环：自然语言→Flow（可注入 Inferrer，收敛失败 422）✅ S6c（统一入口，原 `/api/tools/.../ai-infer` 调整为此） |
 | GET | `/api/flows` | 列出 Flow |
 | POST | `/api/flows` | 保存 Flow（**静态校验**：依赖图/Tool 存在/when 可编译） |
-| POST | `/api/flows/:id/ai-gen` | AI 生成 Flow ⏳ S6c |
+| POST | `/api/flows/:id/ai-gen` | （合并入 `/api/ai/infer`；CLI `gear ai gen --register` 负责落库）✅ S6c |
 | POST | `/api/flows/:id/validate` | 校验 Flow（返回 `{valid, error}`） |
 | POST | `/api/executions` | 触发执行（**异步**：202 + execution id） |
+| GET | `/api/executions` | 列出全部执行记录 ✅ |
 | GET | `/api/executions/:id` | 查询执行状态（running / succeeded / failed + RunResult） |
 | GET | `/api/executions/:id/logs` | 查看日志 ⏳ 需日志 Hook 产出 |
 | GET / POST | `/api/hooks` | 列出 / 添加 Hook |
 | POST | `/api/apps` | 启动 Flow 为受管进程（对应 `app run`） |
 | GET | `/api/apps` | 列出运行中的 Flow 进程 |
 | DELETE | `/api/apps/{id}` | 停止 Flow 进程（cancel ⇒ 杀掉 service 子进程） |
-| POST | `/api/tools/{id}/versions/{v}/promote` | 用户显式晋升 ⏳ S5（版本状态机） |
+| POST | `/api/tools/{id}/versions/{v}/promote` | 用户显式晋升 ✅ S5（经 CLI `gear tool promote <id> <v> <target>`；REST 端点未单独实现，晋升由 CLI 触发） |
 
-> **实现状态（S6a）**：除标 ⏳ 的四项外均已实现，端到端可用（`gear serve --addr`）。
+> **实现状态（S6a+S5+S6c）**：除 `GET /api/executions/{id}/logs` 外均已实现，端到端可用（`gear serve --addr`；晋升 / AI 经 CLI `tool promote` / `ai gen` 触发，非独立 REST 端点）。
 > - **执行是异步的**：`POST /api/executions` 立即返回 `202 {id, status}`，结果经 `GET /api/executions/{id}` 查询（三态：running / succeeded / failed，失败带 `error`）。
 > - **状态是内存态**（显式声明）：执行记录与 app 句柄都存活在服务进程内，**进程重启即丢失**。持久化执行历史属后续切片，勿当作已持久化。
 > - **统一错误体**：`{"error": "..."}`；状态码语义 400 参数/校验、404 不存在、409 仍被引用。
@@ -469,7 +472,7 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 
 | 阶段 | 范围 | 不做 |
 |------|------|------|
-| V1 MVP | 单节点；**process runtime（S1）+ lua 沙箱 runtime（S7a）**（go-host 计划后续）；Flow 顺序执行 + input/output schema 校验 + 拓扑依赖；**`step.mode: service` 长驻 step + `app run` 监管（restart/信号停止，S2）**；**Hook 切面（before_step/after_step/on_error，改写+重校验+fail-closed+criticality，S3）**；**无依赖 step 并行 + 依赖推断 + 并发上限/背压（S4）**；**`when` 条件执行 + 三态跳过（表达式引擎）**；**REST 执行面（S6a：healthz/tools/flows/hooks/executions/apps，`gear serve`）**；本地 Registry + 版本声明；`app run` 进程模型 + CLI 管理面 | 无 WASM、无 go-host、无钉版本（S5）、**REST 四端点待做（promote/ai-infer/ai-gen/logs）**、**Hook 仅 before_step/after_step/on_error（before_promote 属 S5；target 仅精确 id 或 `*`）**、无 ctx.* 宿主能力（M5）、**无健康探针 / 队列背压（S2+/S4）**、lua 不支持 service、无自动解析下载、无分布式调度 |
+| V1 MVP | 单节点；**process runtime（S1）+ lua 沙箱 runtime（S7a）**（go-host 计划后续）；Flow 顺序执行 + input/output schema 校验 + 拓扑依赖；**`step.mode: service` 长驻 step + `app run` 监管（restart/信号停止，S2）**；**Hook 切面（before_step/after_step/on_error/before_promote，改写+重校验+fail-closed+criticality，S3+S5）**；**无依赖 step 并行 + 依赖推断 + 并发上限/背压（S4）**；**`when` 条件执行 + 三态跳过（表达式引擎）**；**REST 执行面（S6a+S5+S6c：healthz/tools/flows/hooks/executions(+列表)/apps/ai-infer，`gear serve`）**；本地 Registry + 版本声明（含钉版本 use_version 与状态机 promote）；`app run` 进程模型 + CLI 管理面（含 `exec` / `tool promote` / `ai gen`） | 无 WASM、无 go-host、**REST 一端点待做（`GET /api/executions/{id}/logs`）**、**Hook 仅 before_step/after_step/on_error/before_promote（before_flow/on_success 待做；target 仅精确 id 或 `*`）**、无 ctx.* 宿主能力（M5）、**无健康探针 / 队列背压（S2+/S4）**、lua 不支持 service、无自动解析下载、无分布式调度 |
 | V2 | AI 编排闭环；Hook 完整（含 before_promote）；依赖自动解析；灰度发布 | 无审批默认开关、无多租户 |
 | V3 | WASM runtime；event 触发；Web UI 作为可选 Flow（任意版本可 `app run`） | 无租户级隔离 |
 | V4 | 分布式调度、高可用、水平扩展 | — |
@@ -561,7 +564,7 @@ CLI 是 V1 永久原生管理面（不同用户对 UI 需求不同，UI 以可�
 | 命令 | 说明 |
 |------|------|
 | `gear tool register / unregister / inspect` | Tool 注册 / 注销 / 查看 |
-| `gear tool promote --operator` | 显式晋升 testing→stable（写审计） |
+| `gear tool promote <id> <version> <target>` | 显式晋升（触发 `before_promote` 门禁，fail-closed；target ∈ draft/testing/stable/deprecated/rejected） |
 | `gear flow save / validate / ai-gen / inspect` | Flow 保存 / 校验 / AI 生成 / 查看 |
 | `gear hook add / list / remove` | Hook 配置 |
 | `gear app run / ls / stop <flow>` | 启动 / 列出 / 停止 Flow 进程 |
