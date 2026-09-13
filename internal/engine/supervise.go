@@ -16,11 +16,45 @@ type ServiceHandle struct {
 	StepID    string                 // step id
 	Runtime   model.Runtime          // 重启时按同一 runtime 重新分发
 	Proc      Process                // 当前（或重启后的）子进程抽象句柄
+	procMu    sync.Mutex             // 保护 Proc：探针 goroutine 与 Relaunch/stopAll 并发读写同一句柄
 	Entry     string                 // 重启时复用的命令
 	Input     map[string]interface{} // 已解析并校验的 input（重启时复用）
 	Host      *cap.Context           // 重启时复用的宿主能力视图（M5，按原 Tool.Capabilities 授权）
+	Probe     *model.HealthProbe     // service 健康检查探针（nil = 不探）；仅 service 模式生效
 	Restarts  int                    // 已重启次数（restart=always 时 > 0）
 	StartedAt time.Time              // 本次（重）启动时间；Supervisor 据此判断存活时长以重置退避
+}
+
+// ProcKill 在锁内杀掉当前 service 进程（探针与停机共用，避免与 Relaunch 并发写 Proc 竞争）。
+func (h *ServiceHandle) ProcKill() error {
+	h.procMu.Lock()
+	defer h.procMu.Unlock()
+	if h.Proc == nil {
+		return nil
+	}
+	return h.Proc.Kill()
+}
+
+// ProcWaitDone 返回在当前 Proc 退出时关闭的 channel（读 Proc 加锁，避免与 Relaunch 竞争）。
+func (h *ServiceHandle) ProcWaitDone() <-chan struct{} {
+	h.procMu.Lock()
+	p := h.Proc
+	h.procMu.Unlock()
+	ch := make(chan struct{})
+	go func() {
+		if p != nil {
+			_ = p.Wait()
+		}
+		close(ch)
+	}()
+	return ch
+}
+
+// CurrentProc 在锁内返回当前 Proc（探针据此判断进程是否已被重启，重置失败计数）。
+func (h *ServiceHandle) CurrentProc() Process {
+	h.procMu.Lock()
+	defer h.procMu.Unlock()
+	return h.Proc
 }
 
 // SuperviseResult 是 app run 监管启动后的结果：once 步骤已执行，service 步骤已拉起。
@@ -168,7 +202,9 @@ func (e *Engine) Relaunch(h *ServiceHandle) error {
 	if err != nil {
 		return fmt.Errorf("restart step %s 失败: %w", h.StepID, err)
 	}
+	h.procMu.Lock()
 	h.Proc = proc
+	h.procMu.Unlock()
 	h.Restarts++
 	h.StartedAt = time.Now()
 	return nil

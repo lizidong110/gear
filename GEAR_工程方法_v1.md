@@ -103,7 +103,7 @@ gear/
 | §10 | 架构分层 | （结构审查） | 评审 | — | 🟡 |
 | §11 | API 最小集全量 | server | 契约 | T-srv-02 | 🟢 15 端点中 15 个已实现（含 executions 列表 + ai-infer + REST promote 端点；GET /api/flows 列表端点补测见 TestListFlows）；deferred：executions/{id}/logs |
 | §13 | 待确认项显式处置 | 全局 | 评审 | — | 🟡 |
-| §14 | app run 进程模型 + 长驻/restart/子进程归属/进程池 | server/engine | 集成 | T-app-01..04 | 🟢 已落地（restart 策略 + 信号停止 + `--max` 闸门 + 子进程归属；REQ-APP-* / `app/supervisor_test.go`）；**健康探针 deferred**（REQ-APP-HEALTH）、**跨进程队列/进程池 deferred**（REQ-CONCURRENCY-CROSS） |
+| §14 | app run 进程模型 + 长驻/restart/子进程归属/进程池 | server/engine | 集成 | T-app-01..04 | 🟢 已落地（restart 策略 + 信号停止 + `--max` 闸门 + 子进程归属 + 健康探针；REQ-APP-* / `app/supervisor_test.go`）；**跨进程队列/进程池 deferred**（REQ-CONCURRENCY-CROSS） |
 
 ---
 
@@ -117,7 +117,7 @@ gear/
 
 - **S0 基线**：model/registry/cli 骨架。DoD：修正 §9 的 6 处缺陷 + model 单测 + registry 集成测试 + CLI 与 §11 对齐清单。✅ **已完成 2026-09-12**。
 - **S1 引擎**：DSL 解析、Schema 校验、顺序调度、变量解析、input/output 校验。✅ **已完成**。
-- **S2 app run 进程模型**：长驻 Flow（`mode: service`）、restart、信号停止、`app run --max` 闸门。✅ **已完成**（健康探针仍 deferred）。
+- **S2 app run 进程模型**：长驻 Flow（`mode: service`）、restart、信号停止、`app run --max` 闸门、service 健康检查探针。✅ **已完成**（健康检查探针 #75 已落地；跨进程队列/进程池仍 deferred，见 REQ-CONCURRENCY-CROSS）。
 - **S3 Hook 切面**：before_step/after_step/on_error + Order 装配 + 改写重校验 + fail-closed + criticality + 无递归。✅ **已完成**（before_promote 于 S5 落地）。
 - **S4 并行与背压**：分层并行、依赖推断、`maxParallel`、并行安全、并行下 fail-closed、崩溃指数退避。✅ **已完成**。
 - **S7a lua runtime**：gopher-lua 沙箱（once）+ 沙箱/超时/错误测试。✅ **已完成**；**沙箱策略可配置化（REQ-LUA-SANDBOX-CONFIG）已落地**：引擎级 `WithSandbox(strict|permissive)`，strict 仅 base/string/table/math，permissive 额外开 coroutine，文件加载全局任何策略都禁（防逃逸）。

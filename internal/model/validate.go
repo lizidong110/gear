@@ -97,6 +97,12 @@ func (t Tool) Validate() error {
 	if err := validateSchema(t.OutputSchema, "output_schema"); err != nil {
 		return err
 	}
+	// 健康检查探针（REQ-APP-HEALTH / #75）：注册期即解析校验，杜绝运行期才发现配置非法。
+	if t.HealthProbe != nil {
+		if _, err := t.HealthProbe.Resolve(); err != nil {
+			return fmt.Errorf("tool %s 的 health_probe: %w", t.ID, err)
+		}
+	}
 	return nil
 }
 

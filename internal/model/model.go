@@ -3,6 +3,8 @@
 package model
 
 import (
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -64,6 +66,114 @@ type Tool struct {
 	// Capabilities 声明该 Tool 被允许使用的宿主能力原语（PRD §6，最小权限）。
 	// 对应 ctx.* 的 http/call/db/kv/secret/event；运行期未声明的原语调用一律拒绝。
 	Capabilities []string `yaml:"capabilities" json:"capabilities"`
+	// HealthProbe 是 service 模式 Tool 的健康检查探针（REQ-APP-HEALTH / #75）。
+	// 仅当该 Tool 被 service step 调用时生效：进程「活着」≠「健康」，探针按阈值
+	// 连续失败后由 Supervisor 杀掉并重启（与崩溃重启共用退避）。once 工具忽略。
+	HealthProbe *HealthProbe `yaml:"health_probe,omitempty" json:"health_probe,omitempty"`
+}
+
+// HealthProbe 探针类型。
+const (
+	ProbeKindHTTP = "http" // GET http://addr/path，状态码 < 400 视为健康
+	ProbeKindTCP  = "tcp"  // 拨号 host:port 成功视为健康
+	ProbeKindCmd  = "cmd"  // 以 sh -c 执行 Cmd，退出码 0 视为健康
+)
+
+// KnownProbeKinds 是合法探针类型（单一来源）。
+var KnownProbeKinds = map[string]bool{
+	ProbeKindHTTP: true,
+	ProbeKindTCP:  true,
+	ProbeKindCmd:  true,
+}
+
+// 探针默认值（缺省字段回退）。
+const (
+	defaultProbeInterval  = 5 * time.Second
+	defaultProbeTimeout   = 2 * time.Second
+	defaultProbeThreshold = 3
+	defaultProbeAddr      = "127.0.0.1"
+	defaultProbePath      = "/"
+)
+
+// HealthProbe 是 service 模式 Tool 的健康检查配置（REQ-APP-HEALTH / #75）。
+// 字段用字符串表达时长（YAML 友好），由 Resolve 解析为运行期结构。
+type HealthProbe struct {
+	Kind     string `yaml:"kind" json:"kind"`         // http | tcp | cmd（必填）
+	Addr     string `yaml:"addr" json:"addr"`         // http/tcp: host:port（缺省 127.0.0.1）
+	Path     string `yaml:"path" json:"path"`         // http: 请求路径（缺省 /）
+	Cmd      string `yaml:"cmd" json:"cmd"`           // cmd: 健康检查命令（sh -c 执行，退出 0 = 健康）
+	Interval string `yaml:"interval" json:"interval"` // 探测间隔（缺省 5s）
+	Timeout  string `yaml:"timeout" json:"timeout"`   // 单次探测超时（缺省 2s）
+	Threshold int   `yaml:"threshold" json:"threshold"` // 连续失败几次触发重启（缺省 3）
+}
+
+// ResolvedProbe 是 HealthProbe 解析后的运行期结构（时长已为 time.Duration）。
+type ResolvedProbe struct {
+	Kind      string
+	Addr      string
+	Path      string
+	Cmd       string
+	Interval  time.Duration
+	Timeout   time.Duration
+	Threshold int
+}
+
+// Resolve 校验并解析 HealthProbe 为 ResolvedProbe（注册期即可调用，错误即拒绝，不留到运行期）。
+// p 为 nil 时返回 (nil, nil)（表示无探针）。
+func (p *HealthProbe) Resolve() (*ResolvedProbe, error) {
+	if p == nil {
+		return nil, nil
+	}
+	if !KnownProbeKinds[p.Kind] {
+		return nil, fmt.Errorf("health_probe.kind=%q 非法（应为 http/tcp/cmd）", p.Kind)
+	}
+	interval := defaultProbeInterval
+	if p.Interval != "" {
+		d, err := time.ParseDuration(p.Interval)
+		if err != nil {
+			return nil, fmt.Errorf("health_probe.interval=%q 非法: %w", p.Interval, err)
+		}
+		interval = d
+	}
+	timeout := defaultProbeTimeout
+	if p.Timeout != "" {
+		d, err := time.ParseDuration(p.Timeout)
+		if err != nil {
+			return nil, fmt.Errorf("health_probe.timeout=%q 非法: %w", p.Timeout, err)
+		}
+		timeout = d
+	}
+	threshold := defaultProbeThreshold
+	if p.Threshold > 0 {
+		threshold = p.Threshold
+	}
+	addr := p.Addr
+	if addr == "" {
+		addr = defaultProbeAddr
+	}
+	switch p.Kind {
+	case ProbeKindHTTP, ProbeKindTCP:
+		if !strings.Contains(addr, ":") {
+			return nil, fmt.Errorf("health_probe.addr=%q 缺少端口（http/tcp 需 host:port）", addr)
+		}
+	case ProbeKindCmd:
+		if p.Cmd == "" {
+			return nil, fmt.Errorf("health_probe.cmd 为空：cmd 探针需提供健康检查命令")
+		}
+	}
+	path := p.Path
+	if path == "" {
+		path = defaultProbePath
+	}
+	return &ResolvedProbe{
+		Kind:      p.Kind,
+		Addr:      addr,
+		Path:      path,
+		Cmd:       p.Cmd,
+		Interval:  interval,
+		Timeout:   timeout,
+		Threshold: threshold,
+	}, nil
 }
 
 // ToolVersion 是 Tool 的一个版本条目。

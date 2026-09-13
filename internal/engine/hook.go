@@ -226,6 +226,7 @@ func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []m
 
 	return &ServiceHandle{
 		StepID: step.ID, Runtime: tool.Runtime, Proc: proc, Entry: tool.Entry, Input: input, Host: host,
+		Probe: tool.HealthProbe, // service 健康检查探针（REQ-APP-HEALTH / #75）；nil = 不探
 		StartedAt: time.Now(), // 供 Supervisor 判定「存活时长」以决定是否重置退避
 	}, nil
 }

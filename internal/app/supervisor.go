@@ -164,6 +164,11 @@ func (s *Supervisor) superviseOne(ctx context.Context, flowID string) error {
 		return nil // 纯 once Flow：执行完即结束
 	}
 
+	// 为每个 service 句柄启动健康检查探针（REQ-APP-HEALTH / #75）；nil 探针不启动。
+	for _, h := range res.Services {
+		go s.probeLoop(ctx, h)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -195,6 +200,8 @@ func (s *Supervisor) superviseOne(ctx context.Context, flowID string) error {
 		s.restarts++
 		s.mu.Unlock()
 		fmt.Printf("↻ step %s service 重启 (第 %d 次)\n", h.StepID, h.Restarts)
+		// 重启后该 handle 的进程已换柄，启动新一轮探针（旧探针循环已在 procKill 后退出）。
+		go s.probeLoop(ctx, h)
 	}
 }
 
@@ -208,7 +215,7 @@ func (s *Supervisor) waitAny(ctx context.Context, handles []*engine.ServiceHandl
 		go func(h *engine.ServiceHandle) {
 			select {
 			case <-wctx.Done():
-			case <-procDone(h.Proc):
+			case <-h.ProcWaitDone():
 				select {
 				case ch <- h:
 				case <-wctx.Done():
@@ -224,20 +231,8 @@ func (s *Supervisor) waitAny(ctx context.Context, handles []*engine.ServiceHandl
 	}
 }
 
-// procDone 返回在 p.Wait() 返回时关闭的 channel。
-func procDone(p engine.Process) <-chan struct{} {
-	ch := make(chan struct{})
-	go func() {
-		_ = p.Wait()
-		close(ch)
-	}()
-	return ch
-}
-
 func (s *Supervisor) stopAll(handles []*engine.ServiceHandle) {
 	for _, h := range handles {
-		if h.Proc != nil {
-			_ = h.Proc.Kill()
-		}
+		_ = h.ProcKill()
 	}
 }
