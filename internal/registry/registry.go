@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动，注册名 "sqlite"，无需 cgo
 
@@ -151,6 +152,39 @@ func (r *Registry) ListTools() ([]*model.Tool, error) {
 		return nil
 	})
 	return out, err
+}
+
+// PromoteToolVersion 将某 Tool 的某个版本提升到目标状态（S5 灰度）。
+// 校验状态迁移合法（model.CanPromote）；版本不存在 / 迁移非法均返回错误，不改变任何状态。
+// 晋升成功（state 落入 testing/stable/deprecated）时记录 CreatedAt 为本次晋升时刻。
+func (r *Registry) PromoteToolVersion(toolID, version string, target model.ToolVersionState) error {
+	t, err := r.GetTool(toolID)
+	if err != nil {
+		return err
+	}
+	if t == nil {
+		return fmt.Errorf("Tool 不存在: %s: %w", toolID, ErrNotFound)
+	}
+	idx := -1
+	for i, v := range t.Versions {
+		if v.Version == version {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("Tool %s 不存在版本 %s: %w", toolID, version, ErrNotFound)
+	}
+	cur := t.Versions[idx].State
+	if !model.CanPromote(cur, target) {
+		return fmt.Errorf("Tool %s 版本 %s 状态迁移非法: %s -> %s", toolID, version, cur, target)
+	}
+	t.Versions[idx].State = target
+	if target == model.StateStable || target == model.StateTesting || target == model.StateDeprecated {
+		t.Versions[idx].CreatedAt = time.Now()
+	}
+	// 重新校验整 Tool（含 version 合法状态），再落库。
+	return r.UpsertTool(t)
 }
 
 // ---- Flows ----

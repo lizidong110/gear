@@ -29,6 +29,30 @@ var ValidStates = map[ToolVersionState]bool{
 	StateRejected:   true,
 }
 
+// VersionTransitions 定义版本状态机的合法迁移（S5 灰度）。
+// key 为当前状态，value 为允许迁移到的目标状态集合。任何不在此表中的迁移均非法。
+//
+// 设计：灰度典型路径 draft→testing→stable；stable 可降级回 testing 复测、或 deprecated 后
+// 再 stable（复活）；rejected 为终态，仅可重开为 draft。非法迁移（如 stable→draft 直接跳级、
+// testing→deprecated 跳过 stable）一律拒绝，杜绝状态混乱。
+var VersionTransitions = map[ToolVersionState][]ToolVersionState{
+	StateDraft:      {StateTesting, StateStable, StateRejected},
+	StateTesting:    {StateStable, StateRejected, StateDraft},
+	StateStable:     {StateDeprecated, StateTesting, StateRejected},
+	StateDeprecated: {StateStable, StateRejected},
+	StateRejected:   {StateDraft},
+}
+
+// CanPromote 报告从 from 迁移到 to 是否为合法状态迁移。
+func CanPromote(from, to ToolVersionState) bool {
+	for _, t := range VersionTransitions[from] {
+		if t == to {
+			return true
+		}
+	}
+	return false
+}
+
 // Validate 校验单个 ToolVersion：version 必须合法 SemVer，state 必须枚举值。
 func (v ToolVersion) Validate() error {
 	if err := ParseSemVer(v.Version); err != nil {
@@ -101,7 +125,8 @@ func (h Hook) Validate() error {
 		return fmt.Errorf("hook %s 的 action 不能为空（应指向已注册的 Tool id）", h.ID)
 	}
 	if h.Stage == StageBeforePromote {
-		return fmt.Errorf("hook %s 使用了 before_promote 阶段，版本晋升当前尚未实现（计划 S5）", h.ID)
+		// S5 起 before_promote 由 engine.PromoteTool 在晋升前触发；
+		// 这里不再拒绝，但需确认它仍在已知阶段集合内（下方统一校验）。
 	}
 	if !KnownHookStages[h.Stage] {
 		return fmt.Errorf("hook %s 的 stage=%q 非法（应为 before_step / after_step / on_error）", h.ID, h.Stage)
@@ -118,10 +143,9 @@ func (h Hook) Validate() error {
 //   - id 非空、至少一个 step、每个 step 的 call 非空
 //   - depends_on 引用的 step 必须存在
 //   - mode 必须是 once / service 之一（未知 mode 显式拒绝，不静默降级）
-//   - 不支持的字段（S1 尚未实现）显式报错，而非静默忽略：
-//     when（条件执行）/ parallel（并行）/ use_version（钉版本）
+//   - 不支持的字段显式报错，而非静默忽略（when/parallel 已分别由 S1/S4 实现；
+//     use_version 由 S5 实现，此处放行并在 ValidateFlowStatic 做版本存在性校验）。
 //
-// 状态：when 计划于后续切片实现；parallel 计划 S4；use_version 计划 S5。
 // 显式拒绝能把「文档说有、代码无」的漂移变成注册期可见错误，而非悄悄 no-op（RC-D）。
 func (f Flow) Validate() error {
 	if f.ID == "" {
@@ -153,9 +177,6 @@ func (f Flow) Validate() error {
 		// 若某 step 已声明 depends_on 却仍标 parallel，属误导性标注，显式拒绝（RC-D）。
 		if s.Parallel && len(s.DependsOn) > 0 {
 			return fmt.Errorf("step %s 标记了 parallel 但同时声明了 depends_on：无依赖 step 本就并行调度，该标注在此处无意义且易误导", s.ID)
-		}
-		if s.UseVersion != "" {
-			return fmt.Errorf("step %s 钉了 use_version=%s，版本灰度当前 S1 尚未实现（计划 S5）", s.ID, s.UseVersion)
 		}
 		for _, dep := range s.DependsOn {
 			if !ids[dep] {

@@ -7,12 +7,13 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
+	"gear/internal/engine"
 	"gear/internal/model"
 )
 
 func toolCmd() *cobra.Command {
 	c := &cobra.Command{Use: "tool", Short: "管理 Tool（原子能力）"}
-	c.AddCommand(toolRegisterCmd(), toolListCmd(), toolShowCmd(), toolUnregisterCmd())
+	c.AddCommand(toolRegisterCmd(), toolListCmd(), toolShowCmd(), toolUnregisterCmd(), toolPromoteCmd(), toolVersionsCmd())
 	return c
 }
 
@@ -115,6 +116,64 @@ func toolUnregisterCmd() *cobra.Command {
 				return err
 			}
 			fmt.Printf("✓ 已注销 Tool: %s\n", args[0])
+			return nil
+		},
+	}
+}
+
+// toolPromoteCmd 晋升某 Tool 版本到目标状态（S5 灰度）。
+// 走 engine.PromoteTool：先触发 before_promote Hook 门禁，再落库；状态迁移非法由
+// model.CanPromote 在 registry 层校验。
+func toolPromoteCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "promote <id> <version> <target>",
+		Short: "晋升某 Tool 版本到目标状态（S5 灰度）",
+		Args:  cobra.ExactArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target := model.ToolVersionState(args[2])
+			if !model.ValidStates[target] {
+				return fmt.Errorf("非法目标状态: %q（应为 draft/testing/stable/deprecated/rejected）", args[2])
+			}
+			reg, err := openRegistry()
+			if err != nil {
+				return err
+			}
+			defer reg.Close()
+			if err := engine.New(reg).PromoteTool(args[0], args[1], target); err != nil {
+				return err
+			}
+			fmt.Printf("✓ Tool %s 版本 %s 已晋升为 %s\n", args[0], args[1], target)
+			return nil
+		},
+	}
+}
+
+// toolVersionsCmd 列出某 Tool 的全部版本与状态。
+func toolVersionsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "versions <id>",
+		Short: "列出某 Tool 的全部版本与状态",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			reg, err := openRegistry()
+			if err != nil {
+				return err
+			}
+			defer reg.Close()
+			t, err := reg.GetTool(args[0])
+			if err != nil {
+				return err
+			}
+			if t == nil {
+				return fmt.Errorf("Tool 不存在: %s", args[0])
+			}
+			if len(t.Versions) == 0 {
+				fmt.Println("（无版本）")
+				return nil
+			}
+			for _, v := range t.Versions {
+				fmt.Printf("- %-10s %-12s %s\n", v.Version, v.State, v.Note)
+			}
 			return nil
 		},
 	}

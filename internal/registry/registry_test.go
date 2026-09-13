@@ -242,9 +242,10 @@ func TestHookRoundtrip(t *testing.T) {
 	if err := reg.UpsertHook(bad); err == nil {
 		t.Fatal("非法 stage 的 Hook 应被拒绝")
 	}
-	bad2 := &model.Hook{ID: "bad2", Target: "*", Stage: model.StageBeforePromote, Action: "a"}
-	if err := reg.UpsertHook(bad2); err == nil {
-		t.Fatal("before_promote Hook 应被拒绝（S5 未实现）")
+	// before_promote 自 S5 起允许注册（由 engine.PromoteTool 触发）
+	ok2 := &model.Hook{ID: "ok2", Target: "*", Stage: model.StageBeforePromote, Action: "a"}
+	if err := reg.UpsertHook(ok2); err != nil {
+		t.Fatalf("before_promote Hook 应允许注册（S5 已实现）: %v", err)
 	}
 
 	// DeleteHook

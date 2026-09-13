@@ -39,6 +39,19 @@ func (e *Engine) ValidateFlowStatic(f *model.Flow) error {
 		if t == nil {
 			return fmt.Errorf("step %s 引用的 Tool 不存在: %s", s.ID, s.Call)
 		}
+		// S5：钉版本必须存在，否则运行期解析会失败——提前到注册期暴露。
+		if s.UseVersion != "" {
+			ok := false
+			for _, v := range t.Versions {
+				if v.Version == s.UseVersion {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				return fmt.Errorf("step %s 钉了 use_version=%s，但 Tool %s 不存在该版本", s.ID, s.UseVersion, s.Call)
+			}
+		}
 	}
 	return nil
 }

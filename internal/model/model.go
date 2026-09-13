@@ -67,12 +67,17 @@ type Tool struct {
 }
 
 // ToolVersion 是 Tool 的一个版本条目。
+// Entry / InputSchema / OutputSchema 为**可选**的版本级覆盖：钉版本（step.use_version）时，
+// 若版本提供了这些字段则覆盖 Tool 级实现，否则回退 Tool 级（S5 灰度：同一 Tool 多版本并存）。
 type ToolVersion struct {
-	Version   string           `yaml:"version" json:"version"`
-	State     ToolVersionState `yaml:"state" json:"state"`
-	Digest    string           `yaml:"digest" json:"digest"`
-	Note      string           `yaml:"note" json:"note"`
-	CreatedAt time.Time        `yaml:"created_at" json:"created_at"`
+	Version       string                 `yaml:"version" json:"version"`
+	State         ToolVersionState       `yaml:"state" json:"state"`
+	Digest        string                 `yaml:"digest" json:"digest"`
+	Note          string                 `yaml:"note" json:"note"`
+	CreatedAt     time.Time              `yaml:"created_at" json:"created_at"`
+	Entry         string                 `yaml:"entry,omitempty" json:"entry,omitempty"`
+	InputSchema   map[string]interface{} `yaml:"input_schema,omitempty" json:"input_schema,omitempty"`
+	OutputSchema  map[string]interface{} `yaml:"output_schema,omitempty" json:"output_schema,omitempty"`
 }
 
 // Step 是 Flow 内的一个执行单元。
@@ -125,11 +130,12 @@ const (
 	StageBeforePromote = "before_promote" // 版本晋升前（deferred：S5）
 )
 
-// KnownHookStages 是当前**已实现**的 Hook 阶段（before_promote 计划 S5，注册期拒绝）。
+// KnownHookStages 是当前**已实现**的 Hook 阶段（S5 起 before_promote 由 PromoteTool 触发）。
 var KnownHookStages = map[string]bool{
-	StageBeforeStep: true,
-	StageAfterStep:  true,
-	StageOnError:    true,
+	StageBeforeStep:    true,
+	StageAfterStep:     true,
+	StageOnError:       true,
+	StageBeforePromote: true,
 }
 
 // Hook 是横切控制（认证/脱敏/限流/日志），由宿主策略显式装配（不通过插件间私下约定耦合）。

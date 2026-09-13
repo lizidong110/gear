@@ -145,7 +145,8 @@ func TestHookFields(t *testing.T) {
 }
 
 // T-hook-validate：Hook.Validate 守卫（F3）。
-// 关键点：criticality 留空按 critical 处理（fail-closed 默认）；before_promote 属 S5 显式拒绝。
+// 关键点：criticality 留空按 critical 处理（fail-closed 默认）；before_promote 自 S5 起允许
+// （由 engine.PromoteTool 在晋升前触发，见 promote.go）。
 func TestHookValidate(t *testing.T) {
 	valid := &Hook{ID: "h", Target: "*", Stage: StageBeforeStep, Action: "mask"}
 	if err := valid.Validate(); err != nil {
@@ -171,7 +172,6 @@ func TestHookValidate(t *testing.T) {
 		{name: "空 target", h: &Hook{ID: "h", Stage: StageBeforeStep, Action: "a"}},
 		{name: "空 action", h: &Hook{ID: "h", Target: "*", Stage: StageBeforeStep}},
 		{name: "stage 非法", h: &Hook{ID: "h", Target: "*", Stage: "whenever", Action: "a"}},
-		{name: "before_promote 未实现", h: &Hook{ID: "h", Target: "*", Stage: StageBeforePromote, Action: "a"}},
 		{name: "criticality 非法", h: &Hook{ID: "h", Target: "*", Stage: StageBeforeStep, Action: "a", Criticality: HookCriticality("maybe")}},
 	}
 	for _, c := range cases {
@@ -360,7 +360,6 @@ func TestFlowValidate(t *testing.T) {
 		{name: "mode 非法", f: &Flow{ID: "x", Steps: []Step{{ID: "s1", Call: "hello", Mode: "daemon"}}}},
 		{name: "when 误用 ${} 模板语法", f: &Flow{ID: "x", Steps: []Step{{ID: "s1", Call: "hello", When: "${steps.s1.output.n} > 1"}}}},
 		{name: "parallel 与 depends_on 同存（误导标注）", f: &Flow{ID: "x", Steps: []Step{{ID: "s0", Call: "hello"}, {ID: "s1", Call: "hello", Parallel: true, DependsOn: []string{"s0"}}}}},
-		{name: "use_version 未实现", f: &Flow{ID: "x", Steps: []Step{{ID: "s1", Call: "hello", UseVersion: "1.0.0"}}}},
 	}
 	for _, c := range cases {
 		if err := c.f.Validate(); err == nil {

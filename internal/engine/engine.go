@@ -264,7 +264,12 @@ loop:
 				record(fmt.Errorf("step %s 引用的 Tool 不存在: %s", step.ID, step.Call))
 				return
 			}
-			if err := fn(lvlCtx, step, tool); err != nil {
+			resolved, err := resolveToolVersion(tool, step)
+			if err != nil {
+				record(err)
+				return
+			}
+			if err := fn(lvlCtx, step, resolved); err != nil {
 				record(err)
 			}
 		}(step)
