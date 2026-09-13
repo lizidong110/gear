@@ -1,0 +1,360 @@
+// Package engine 实现 Gear 内核引擎（S1：顺序执行 + process runtime + schema 校验 + vars 传递）。
+package engine
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"sync"
+
+	"github.com/santhosh-tekuri/jsonschema/v5"
+
+	"gear/internal/model"
+	"gear/internal/registry"
+)
+
+// DefaultMaxParallel 是单个 Flow 内**同时执行**的 step 数上限（S4 并发闸门/背压）。
+// 防止高扇出 Flow 一次性 fork 出成百上千个进程把机器打爆（PRD §14.5）。
+const DefaultMaxParallel = 4
+
+// Engine 持有 registry，负责把 Flow 跑起来。
+type Engine struct {
+	reg         *registry.Registry
+	maxParallel int
+}
+
+// New 构造引擎。可用 WithMaxParallel 覆盖并发上限。
+func New(reg *registry.Registry, opts ...func(*Engine)) *Engine {
+	e := &Engine{reg: reg, maxParallel: DefaultMaxParallel}
+	for _, o := range opts {
+		o(e)
+	}
+	return e
+}
+
+// WithMaxParallel 设置并发上限；n < 1 时取 1（退化为串行执行）。
+func WithMaxParallel(n int) func(*Engine) {
+	return func(e *Engine) {
+		if n < 1 {
+			n = 1
+		}
+		e.maxParallel = n
+	}
+}
+
+// RunResult 是一次 Flow 执行的结构化结果。
+// Steps：step id → {input, output}（**仅已执行**的 step）。
+// Skipped：step id → 跳过原因（when 为假或上游被跳过）——「没跑」与「跑失败」必须分开表达（F6）。
+//
+// JSON tag 是**对外契约的一部分**（REST /api/executions 直接序列化它），故显式声明
+// snake_case，避免默认导出 Go 字段名（FlowID/Steps）泄漏到 API 形状里。
+type RunResult struct {
+	FlowID  string                            `json:"flow_id"`
+	Steps   map[string]map[string]interface{} `json:"steps,omitempty"`
+	Skipped map[string]string                 `json:"skipped,omitempty"`
+}
+
+// RunFlow 一次性执行（flow run）：所有 step 必须为 once 模式。
+// 遇到 service 模式 step 报错，提示改用 app run（F3：service 长驻不能一次性执行）。
+func (e *Engine) RunFlow(flowID string) error {
+	_, err := e.RunFlowResult(flowID)
+	return err
+}
+
+// RunFlowResult 是 RunFlow 的带结果版本，返回每个 step 的最终 input/output。
+func (e *Engine) RunFlowResult(flowID string) (*RunResult, error) {
+	return e.RunFlowResultObserved(flowID, nil)
+}
+
+// ToolObserver 接收一次运行「可能用到」的 Tool id 集合（已去重、升序）。
+type ToolObserver func(toolIDs []string)
+
+// RunFlowResultObserved 与 RunFlowResult 相同，但在**加载完 Flow 与 Hook 快照之后**
+// 回调一次 observe，告知本次运行可能用到的 Tool。
+//
+// 为什么需要「运行期引用」可观测（PRD §8.2 第三条守卫）：
+// Registry 的注销守卫只能看到**静态**引用（Flow 的 step.call / Hook 的 action）。
+// 一旦 Hook 被删除、或 Flow 被重新注册去掉了该 step，静态引用就消失了，
+// 但**正在跑的执行**仍持有这些 Tool（它在启动时已把 Hook 快照读进内存）——
+// 此时若允许注销，正在跑的执行会在下次触发 Hook 时拿到 nil Tool 而中途失败。
+// 唯一可靠的判据来自运行侧，所以由引擎在快照点上报，而不是让 Registry 去猜。
+func (e *Engine) RunFlowResultObserved(flowID string, observe ToolObserver) (*RunResult, error) {
+	flow, err := e.reg.GetFlow(flowID)
+	if err != nil {
+		return nil, err
+	}
+	if flow == nil {
+		return nil, fmt.Errorf("Flow 不存在: %s", flowID)
+	}
+	for _, s := range flow.Steps {
+		if s.IsService() {
+			return nil, fmt.Errorf("step %s 是 service 模式（长驻），不能用 flow run 一次性执行；请用 `app run %s` 监管", s.ID, flowID)
+		}
+	}
+	return e.run(flow, observe)
+}
+
+// plannedToolIDs 计算一次运行可能用到的 Tool id：step 的 call ∪ 生效 Hook 的 action。
+//
+// Hook 的选择规则**复用 hooksFor**（applyHooks 用的同一个函数），不在此重写匹配逻辑——
+// 否则「哪些 Hook 会触发」就出现了第二处判定，日后加 stage 或改 target 语义时必漏一处
+// （G2/M10 的教训：同一判定出现两处即漂移）。
+func plannedToolIDs(flow *model.Flow, hooks []model.Hook) []string {
+	seen := map[string]bool{}
+	for _, s := range flow.Steps {
+		seen[s.Call] = true
+		for _, stage := range []string{model.StageBeforeStep, model.StageAfterStep, model.StageOnError} {
+			for _, h := range hooksFor(hooks, stage, s.Call) {
+				seen[h.Action] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out) // 稳定输出，便于测试与日志断言
+	return out
+}
+
+func (e *Engine) run(flow *model.Flow, observe ToolObserver) (*RunResult, error) {
+	levels, err := topoLevels(flow.Steps)
+	if err != nil {
+		return nil, err
+	}
+
+	hooks, err := e.loadHooks()
+	if err != nil {
+		return nil, err
+	}
+
+	// 在快照点上报「本次运行可能用到的 Tool」——这是上层实现 §8.2「运行中不可注销」
+	// 守卫的唯一可靠依据（静态引用会在 Hook 被删 / Flow 被改写后消失）。
+	if observe != nil {
+		observe(plannedToolIDs(flow, hooks))
+	}
+
+	rc := &runContext{
+		vars:  flow.Vars,
+		steps: map[string]map[string]interface{}{},
+	}
+
+	// when 跳过需要沿**有效依赖**（含推断边）传播：上游被跳过 ⇒ 下游也跳过。
+	deps, err := depMap(flow.Steps)
+	if err != nil {
+		return nil, err
+	}
+	skipped := map[string]string{} // stepID -> 跳过原因
+	var skMu sync.Mutex
+	markSkipped := func(id, reason string) {
+		skMu.Lock()
+		skipped[id] = reason
+		skMu.Unlock()
+	}
+	skipReasonFor := func(id string) (string, bool) {
+		skMu.Lock()
+		defer skMu.Unlock()
+		for _, d := range deps[id] {
+			if r, ok := skipped[d]; ok {
+				return fmt.Sprintf("上游 step %s 被跳过（%s）", d, r), true
+			}
+		}
+		return "", false
+	}
+
+	// S4：分层执行——同一层内无依赖的 step 并行调度（PRD §4.3），受 maxParallel 限流。
+	for _, level := range levels {
+		err := e.execLevel(flow.Steps, level, func(ctx context.Context, step model.Step, tool *model.Tool) error {
+			if reason, ok := skipReasonFor(step.ID); ok {
+				markSkipped(step.ID, reason)
+				fmt.Printf("- step %s 跳过（%s）\n", step.ID, reason)
+				return nil
+			}
+
+			input, output, err := e.runOnceStep(ctx, rc, hooks, step, tool)
+			if errors.Is(err, ErrStepSkipped) {
+				markSkipped(step.ID, "when=false")
+				fmt.Printf("- step %s 跳过（when=false）\n", step.ID)
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			rc.setStep(step.ID, input, output)
+			fmt.Printf("✓ step %s (%s) -> %v\n", step.ID, step.Call, output)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	fmt.Printf("✓ Flow %s 执行完成，共 %d 步", flow.ID, len(flow.Steps))
+	if n := len(skipped); n > 0 {
+		fmt.Printf("，跳过 %d 步", n)
+	}
+	fmt.Println()
+	return &RunResult{FlowID: flow.ID, Steps: rc.steps, Skipped: skipped}, nil
+}
+
+// execLevel 并发执行一层 step（受 maxParallel 限制）。
+//
+// 失败语义（fail-closed）：首个错误即取消本层上下文（阻止未启动的 step 起跑，
+// 并让在跑的子进程随 ctx 被杀），等待本层全部 goroutine 收尾后返回该错误；
+// 后续层不再执行。
+func (e *Engine) execLevel(steps []model.Step, level []int, fn func(ctx context.Context, step model.Step, tool *model.Tool) error) error {
+	lvlCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sem := make(chan struct{}, e.maxParallel)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+
+	record := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		mu.Unlock()
+		cancel()
+	}
+
+loop:
+	for _, idx := range level {
+		select {
+		case <-lvlCtx.Done():
+			break loop
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		step := steps[idx]
+		go func(step model.Step) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			tool, err := e.reg.GetTool(step.Call)
+			if err != nil {
+				record(err)
+				return
+			}
+			if tool == nil {
+				record(fmt.Errorf("step %s 引用的 Tool 不存在: %s", step.ID, step.Call))
+				return
+			}
+			if err := fn(lvlCtx, step, tool); err != nil {
+				record(err)
+			}
+		}(step)
+	}
+	wg.Wait()
+	return firstErr
+}
+
+// 拓扑排序 / 依赖推断见 deps.go（topoLevels / topoOrder / effectiveDeps）。
+
+// runContext 保存跨 step 的数据流上下文。
+//
+// S4 并发安全：同一层的 step 会**并行**执行并写入 steps，故所有访问都经 mu 保护。
+// vars 是 Flow 级只读（并行 step 不写 vars），无并发写问题。
+type runContext struct {
+	mu    sync.Mutex
+	vars  map[string]interface{}
+	steps map[string]map[string]interface{}
+}
+
+// setStep 记录一个 step 的最终 input/output（并发安全）。
+func (c *runContext) setStep(id string, input, output map[string]interface{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.steps[id] = map[string]interface{}{"input": input, "output": output}
+}
+
+// snapshot 返回 vars 与 steps 的**浅拷贝**，供 when 求值等只读场景使用。
+// 直接把 map 交给外部读取会在并行写入时触发 data race，故这里在锁内拷贝外层 map
+// （内层 map 由 setStep 整体替换、从不原地修改，故浅拷贝足够）。
+func (c *runContext) snapshot() (map[string]interface{}, map[string]map[string]interface{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	steps := make(map[string]map[string]interface{}, len(c.steps))
+	for k, v := range c.steps {
+		steps[k] = v
+	}
+	return c.vars, steps
+}
+
+// resolveInput 对 step.input 做模板替换（vars / steps 引用）。
+// 持有读锁期间完成解析，避免并发读到「写了一半」的 steps。
+func resolveInput(in map[string]interface{}, ctx *runContext) (map[string]interface{}, error) {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		rv, err := resolveValue(v, ctx)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = rv
+	}
+	return out, nil
+}
+
+func resolveValue(v interface{}, ctx *runContext) (interface{}, error) {
+	switch x := v.(type) {
+	case string:
+		return expandString(x, ctx)
+	case map[string]interface{}:
+		m := make(map[string]interface{}, len(x))
+		for k, vv := range x {
+			rv, err := resolveValue(vv, ctx)
+			if err != nil {
+				return nil, err
+			}
+			m[k] = rv
+		}
+		return m, nil
+	case []interface{}:
+		s := make([]interface{}, len(x))
+		for i, vv := range x {
+			rv, err := resolveValue(vv, ctx)
+			if err != nil {
+				return nil, err
+			}
+			s[i] = rv
+		}
+		return s, nil
+	default:
+		return v, nil
+	}
+}
+
+// 模板语法（expandString / lookup / walk / scanTemplateRefs / validateTemplates）见 template.go——
+// 解析是一次实现、三方共用（运行期展开 / 依赖推断 / 注册期静态校验），不再放在本文件里
+// 以免又长出第二份「什么算引用」的判定。
+
+// validate 用 JSON Schema 校验 instance；schema 为空则跳过。
+func validate(schema map[string]interface{}, instance interface{}) error {
+	if len(schema) == 0 {
+		return nil
+	}
+	schemaBytes, err := json.Marshal(schema)
+	if err != nil {
+		return fmt.Errorf("序列化 schema 失败: %w", err)
+	}
+	c := jsonschema.NewCompiler()
+	if err := c.AddResource("schema.json", bytes.NewReader(schemaBytes)); err != nil {
+		return fmt.Errorf("编译 schema 失败: %w", err)
+	}
+	sch, err := c.Compile("schema.json")
+	if err != nil {
+		return fmt.Errorf("编译 schema 失败: %w", err)
+	}
+	if err := sch.Validate(instance); err != nil {
+		return fmt.Errorf("%w", err)
+	}
+	return nil
+}
