@@ -2,6 +2,9 @@ package engine
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -75,4 +78,33 @@ func containsSubstr(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// Fork3：service 子进程级联回收——杀掉 sh 时其孙进程（sleep）也必须被回收，
+// 否则会成为脱离监管的孤儿（红线 16 的延伸）。用「孙进程在 Kill 后是否触碰 marker」
+// 来区分：若被级联回收，marker 永不会出现。
+//
+// 命令结构：`sh -c "(sleep 2; echo > MARKER) & wait"` —— sh 后台起一个子 shell，
+// 子 shell 先 sleep 2s 再 echo 出 marker。若 Kill 只杀 sh、不杀子 shell，则 sleep
+// 变孤儿并在 ~2s 时 echo 出 marker；若级联回收生效，子 shell 一并被杀，marker 不出现。
+func TestProcessTreeKillNoOrphan(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "orphan_marker")
+	rt := processRuntime{}
+	p, err := rt.Start(context.Background(), fmt.Sprintf("(sleep 2; echo > %s) & wait", marker), map[string]interface{}{}, nil)
+	if err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := p.Kill(); err != nil {
+		t.Fatalf("Kill 失败: %v", err)
+	}
+	// 最多等 3s：若孙进程（sleep 2）未被级联回收，会在 ~2s 时 echo 出 marker。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatalf("孙进程未被级联回收：marker 出现 %s", marker)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

@@ -30,15 +30,20 @@ func (p *processRuntime) Start(ctx context.Context, entry string, input map[stri
 	if err != nil {
 		return nil, err
 	}
-	return &execProcess{cmd: cmd}, nil
+	return &execProcess{cmd: cmd, kill: func() error { return killProcessTree(cmd) }}, nil
 }
 
 // execProcess 把 *exec.Cmd 适配成 engine.Process 抽象（避免上层依赖 os/exec）。
-type execProcess struct{ cmd *exec.Cmd }
+// kill 是平台化的「级联回收」函数（见 process_unix.go / process_windows.go）：
+// 不仅杀 sh，还要一并杀掉其孙进程（如 `sleep`），否则孤儿会脱离监管（红线 16 的延伸）。
+type execProcess struct {
+	cmd  *exec.Cmd
+	kill func() error
+}
 
 func (e *execProcess) Pid() int { return e.cmd.Process.Pid }
 
-func (e *execProcess) Kill() error { return e.cmd.Process.Kill() }
+func (e *execProcess) Kill() error { return e.kill() }
 
 func (e *execProcess) Wait() error { return e.cmd.Wait() }
 
@@ -138,6 +143,8 @@ func startProcess(ctx context.Context, entry string, input map[string]interface{
 	cmd.Stdin = bytes.NewReader(inBytes)
 	cmd.Stdout = serviceOut
 	cmd.Stderr = serviceOut
+	configureProcessTree(cmd)                       // 平台钩子：Unix 置 Setpgid；Windows 无操作
+	cmd.Cancel = func() error { return killProcessTree(cmd) } // ctx 取消也走级联回收（非只杀 sh）
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("%v", err)
 	}
