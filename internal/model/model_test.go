@@ -95,13 +95,13 @@ func TestRuntimeKnownImplemented(t *testing.T) {
 			t.Fatalf("[%s] 应为合法枚举值", r)
 		}
 	}
-	// S7a 起：process 与 lua 已实现；go-host / wasm 未实现。
-	for _, r := range []Runtime{RuntimeProcess, RuntimeLua} {
+	// 已实现：process / lua / go-host（#76）；wasm 仍未实现（V3）。
+	for _, r := range []Runtime{RuntimeProcess, RuntimeLua, RuntimeGoHost} {
 		if !r.Implemented() {
 			t.Fatalf("[%s] 应为已实现", r)
 		}
 	}
-	for _, r := range []Runtime{RuntimeGoHost, RuntimeWASM} {
+	for _, r := range []Runtime{RuntimeWASM} {
 		if r.Implemented() {
 			t.Fatalf("[%s] 当前不应标记为已实现", r)
 		}
@@ -296,7 +296,8 @@ func TestToolValidate(t *testing.T) {
 		}
 	})
 	t.Run("已知但未实现的 runtime", func(t *testing.T) {
-		for _, rt := range []Runtime{RuntimeGoHost, RuntimeWASM} {
+		// #76 起 go-host 已实现；仅 wasm 仍 deferred（V3）。
+		for _, rt := range []Runtime{RuntimeWASM} {
 			tl := &Tool{ID: "bad", Runtime: rt, InputSchema: objectSchema(), OutputSchema: objectSchema(),
 				Versions: []ToolVersion{{Version: "1.0.0", State: StateStable}}}
 			if err := tl.Validate(); err == nil {
@@ -305,7 +306,7 @@ func TestToolValidate(t *testing.T) {
 		}
 	})
 	t.Run("已实现 runtime 通过", func(t *testing.T) {
-		for _, rt := range []Runtime{RuntimeProcess, RuntimeLua} {
+		for _, rt := range []Runtime{RuntimeProcess, RuntimeLua, RuntimeGoHost} {
 			tl := &Tool{ID: "ok_" + string(rt), Runtime: rt, InputSchema: objectSchema(), OutputSchema: objectSchema(),
 				Versions: []ToolVersion{{Version: "1.0.0", State: StateStable}}}
 			if err := tl.Validate(); err != nil {

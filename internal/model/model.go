@@ -27,19 +27,21 @@ var KnownRuntimes = map[Runtime]bool{
 }
 
 // ImplementedRuntimes 是引擎**真正实现**了适配器的 runtime 集合（单一来源，C）。
-// 新增 runtime（如 S7 的 lua）只需：在此登记 + 在 engine.runtimeFor 加一个 case。
+// 新增 runtime（如 S7 的 lua、#76 的 go-host）只需：在此登记 + 在 engine.runtimeFor 加一个 case。
 // 注册期校验、引擎分发、文档状态均以本表为唯一依据，避免多处列表漂移。
 var ImplementedRuntimes = map[Runtime]bool{
 	RuntimeProcess: true,
 	RuntimeLua:     true, // S7a：嵌入式 Lua（沙箱，once 可用；service 不支持）
+	RuntimeGoHost:  true, // #76：进程内 Go 函数（engine.RegisterHostFunc 登记；once 可用；service 不支持）
 }
 
 // Known 报告 r 是否为合法枚举值。
 func (r Runtime) Known() bool { return KnownRuntimes[r] }
 
 // Implemented 报告 r 是否已有引擎实现（once 路径可用）。
-// 已知但未实现者（go-host/wasm）注册期应被拒绝。
-// 注意：service 能力另见 luaRuntime.Start 的显式错误（lua 已实现但不支持 service）。
+// 已知但未实现者（仅 wasm 现仍 deferred，计划 V3）注册期应被拒绝。
+// 注意：service 能力另见 luaRuntime.Start / goHostRuntime.Start 的显式错误
+// （lua / go-host 已实现但不支持 service，长驻请用 process）。
 func (r Runtime) Implemented() bool { return ImplementedRuntimes[r] }
 
 // ToolVersionState 是 Tool 版本的生命周期状态。

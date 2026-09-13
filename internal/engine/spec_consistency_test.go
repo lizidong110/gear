@@ -139,12 +139,13 @@ func TestRunFlowRejectsInvalidOutput(t *testing.T) {
 // M10：未实现的 runtime 必须显式报错，不静默降级。
 // S7a 起 lua 已实现（沙箱），不再属于此列；go-host / wasm 仍未实现。
 func TestRuntimeForRejectsUnimplemented(t *testing.T) {
-	for _, rt := range []model.Runtime{model.RuntimeGoHost, model.RuntimeWASM} {
+	// #76 起 go-host 已实现；仅 wasm 仍 deferred（V3）。
+	for _, rt := range []model.Runtime{model.RuntimeWASM} {
 		if _, err := runtimeFor(rt, ""); err == nil {
 			t.Fatalf("runtime %q 应报错（未实现），实际未报错", rt)
 		}
 	}
-	for _, rt := range []model.Runtime{model.RuntimeProcess, model.RuntimeLua} {
+	for _, rt := range []model.Runtime{model.RuntimeProcess, model.RuntimeLua, model.RuntimeGoHost} {
 		if _, err := runtimeFor(rt, ""); err != nil {
 			t.Fatalf("已实现 runtime %q 应可用: %v", rt, err)
 		}
@@ -155,7 +156,7 @@ func TestRuntimeForRejectsUnimplemented(t *testing.T) {
 }
 
 // G1 修复（F3）：未实现 / 未知 runtime 的 Tool 在**注册期**即被拒，不推迟到执行期。
-// S7a 起 lua 可注册（已实现），故只断言 go-host/wasm 被拒。
+// #76 起 go-host 可注册（已实现），故只断言 wasm 被拒。
 func TestSpecRejectsUnimplementedRuntimeTool(t *testing.T) {
 	reg := newTestRegistry(t)
 	defer reg.Close()
@@ -166,7 +167,7 @@ func TestSpecRejectsUnimplementedRuntimeTool(t *testing.T) {
 			OutputSchema: map[string]interface{}{"type": "object"},
 			Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}}}
 	}
-	for _, rt := range []model.Runtime{model.RuntimeGoHost, model.RuntimeWASM} {
+	for _, rt := range []model.Runtime{model.RuntimeWASM} {
 		if err := reg.UpsertTool(mk("unimpl_"+string(rt), rt)); err == nil {
 			t.Fatalf("未实现 runtime %q 的 Tool 注册应被拒绝", rt)
 		}
@@ -174,7 +175,7 @@ func TestSpecRejectsUnimplementedRuntimeTool(t *testing.T) {
 	if err := reg.UpsertTool(mk("bogus", model.Runtime("foobar"))); err == nil {
 		t.Fatal("未知 runtime 的 Tool 注册应被拒绝")
 	}
-	for _, rt := range []model.Runtime{model.RuntimeProcess, model.RuntimeLua} {
+	for _, rt := range []model.Runtime{model.RuntimeProcess, model.RuntimeLua, model.RuntimeGoHost} {
 		if err := reg.UpsertTool(mk("ok_"+string(rt), rt)); err != nil {
 			t.Fatalf("已实现 runtime %q 的 Tool 应可注册: %v", rt, err)
 		}

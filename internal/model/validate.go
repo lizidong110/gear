@@ -77,7 +77,7 @@ func (t Tool) Validate() error {
 		return fmt.Errorf("tool %s 的 runtime=%q 非法（应为 process/lua/go-host/wasm）", t.ID, t.Runtime)
 	}
 	if !t.Runtime.Implemented() {
-		return fmt.Errorf("tool %s 的 runtime=%q 尚未实现（已实现：process / lua；go-host 计划后续，wasm 计划 V3）；请勿注册跑不起来的 Tool", t.ID, t.Runtime)
+		return fmt.Errorf("tool %s 的 runtime=%q 尚未实现（已实现：process / lua / go-host；wasm 计划 V3）；请勿注册跑不起来的 Tool", t.ID, t.Runtime)
 	}
 	if len(t.Versions) == 0 {
 		return fmt.Errorf("tool %s 至少要有一个 version", t.ID)

@@ -81,7 +81,7 @@ gear/
 | §2 | 5 原语模型正确 | model | 单测 | T-model-01 | 🟢 |
 | §3.1 | Tool 定义/字段 | model | 单测 | T-model-02 | 🟢 |
 | §3.2 | Runtime 类型枚举 | model | 单测 | T-model-03 | 🟢 |
-| §3.3 | 参数统一 JSON 协议 | runtime/* | 集成 | T-rt-01..03 | 🟢 已落地（`sh -c <entry>`、stdin JSON → stdout 末行 JSON；REQ-PROC / `process_test.go`） |
+| §3.2 | Runtime 适配器实现（process/lua/go-host 已落地，wasm deferred） | engine | 集成 | T-rt-* | 🟢 process + lua（S7a）+ **go-host（#76，2026-09-13：进程内 Go 函数注册表 `engine.RegisterHostFunc`，`runtimeFor` 分发，`host` 视图透传，service 不支持）；wasm 仍 deferred（V3，需 wazero + guest 工具链）**；未知/未实现 runtime 注册期即拒（REQ-TOOL-RUNTIME-VALID / `spec_consistency_test.go`） |
 | §4.1 | input/output 类型/必填/默认校验 | engine | 单测+集成 | T-eng-01 | 🟢 已落地（单一真理源 Tool.input_schema/output_schema；REQ-SCHEMA-IN/OUT / `engine_test.go`: TestRunFlowRejectsInvalidInput/Output） |
 | §4.2 | 版本层/参数层分离（Flow 默认 stable） | engine | 单测 | T-eng-02 | 🟢 已落地（ToolVersion 状态机 + Flow 默认 stable；REQ-USEVERSION / `model/version_test.go`） |
 | §4.3 | depends_on / when / 变量引用 `${vars.x}` 等 | engine | 单测 | T-eng-03..05 | 🟢 |
@@ -112,7 +112,7 @@ gear/
 > 每切片 DoD = 该切片矩阵条目全 🟢 + 覆盖率达标 + 评审过关。
 >
 > **⚠️ 2026-09-13 更正**：下面原定顺序在实施中已被调整，实际执行如下（本表随切片回填，避免方法论漂移）：
-> S0 骨架 ✅ / S1 最小引擎 ✅ / **S2 app run 进程监管 ✅** / **S3 Hook 切面 ✅** / **S4 并行+依赖推断+背压 ✅** / **S7a lua runtime ✅（提前）** / **`when` 条件执行 ✅** / **`ctx.*` 宿主能力层（M5）✅（http/call/kv/secret/event 实现 + 最小权限放行；db 原语已定义但宿主未提供实现，声明即可见、调用返回 ErrCapabilityUnavailable）** / **#69 ctx.* 宿主默认装配 ✅（2026-09-13：db 实现 SQLite + 引擎默认宿主 KV/HTTP/Event/DB + call 解析器 Tool/Flow + 循环守卫，声明即生产可用）**；**S5 版本灰度 ✅（2026-09-13）** / **S6c AI 闭环 ✅（2026-09-13）**。
+> S0 骨架 ✅ / S1 最小引擎 ✅ / **S2 app run 进程监管 ✅** / **S3 Hook 切面 ✅** / **S4 并行+依赖推断+背压 ✅** / **S7a lua runtime ✅（提前）** / **`when` 条件执行 ✅** / **`ctx.*` 宿主能力层（M5）✅（http/call/kv/secret/event 实现 + 最小权限放行；db 原语已定义但宿主未提供实现，声明即可见、调用返回 ErrCapabilityUnavailable）** / **#69 ctx.* 宿主默认装配 ✅（2026-09-13：db 实现 SQLite + 引擎默认宿主 KV/HTTP/Event/DB + call 解析器 Tool/Flow + 循环守卫，声明即生产可用）**；**S5 版本灰度 ✅（2026-09-13）** / **S6c AI 闭环 ✅（2026-09-13）** / **#73 执行入口全局并发闸门 ✅（2026-09-13，ConcurrencyGate 背压闸门，REQ-CONCURRENCY-CROSS `implemented`）** / **#76 go-host runtime ✅（2026-09-13，进程内 Go 函数注册表 `engine.RegisterHostFunc` + `runtimeFor` 分发 + host 视图透传；wasm 仍 deferred V3）**。
 > 调整理由：lua 提前是因为 `ctx.*` 尚未落地时 lua 可作为**纯计算沙箱**独立成立；Hook 排在并行之前是因为 Hook 需要先抽「共享 step 执行路径」，而并行也要复用同一条路径——先建路径再改它的并发语义，风险更低。
 
 - **S0 基线**：model/registry/cli 骨架。DoD：修正 §9 的 6 处缺陷 + model 单测 + registry 集成测试 + CLI 与 §11 对齐清单。✅ **已完成 2026-09-12**。

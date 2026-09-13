@@ -39,13 +39,15 @@ func runtimeFor(rt model.Runtime, policy string) (Runtime, error) {
 		return nil, fmt.Errorf("未知的 runtime: %q", rt)
 	}
 	if !rt.Implemented() {
-		return nil, fmt.Errorf("runtime %q 尚未实现（当前支持 process / lua；go-host 计划 S7 后续，wasm 计划 V3）", rt)
+		return nil, fmt.Errorf("runtime %q 尚未实现（当前支持 process / lua / go-host；wasm 计划 V3）", rt)
 	}
 	switch rt {
 	case model.RuntimeProcess:
 		return &processRuntime{}, nil
 	case model.RuntimeLua:
 		return &luaRuntime{policy: policy}, nil
+	case model.RuntimeGoHost:
+		return &goHostRuntime{}, nil
 	default:
 		// 被登记为「已实现」却没有适配器 —— 内部不一致，显式暴露而非跑错分支。
 		return nil, fmt.Errorf("runtime %q 已登记为已实现但缺少适配器（内部不一致）", rt)
