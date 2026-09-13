@@ -234,29 +234,50 @@ const (
 
 // Hook 阶段（PRD §5.3）。
 const (
+	StageBeforeFlow   = "before_flow"    // Flow 开始执行前（认证/参数审计/初始化）：可改写 Flow 初始 vars
 	StageBeforeStep   = "before_step"    // 步骤执行前：可改写 input
 	StageAfterStep    = "after_step"     // 步骤执行后：可改写 output
 	StageOnError      = "on_error"       // 步骤失败时：仅补偿/告警，不能恢复主流程
-	StageBeforePromote = "before_promote" // 版本晋升前（deferred：S5）
+	StageOnSuccess    = "on_success"     // Flow 全部成功时（汇总通知/收尾）：仅副作用，不改主结果
+	StageBeforePromote = "before_promote" // 版本晋升前（S5 由 PromoteTool 触发）
 )
 
-// KnownHookStages 是当前**已实现**的 Hook 阶段（S5 起 before_promote 由 PromoteTool 触发）。
+// FlowLevelStages 是「Flow 级」Hook 阶段：匹配维度是 flow id（而非 tool id）。
+// run() 在 Flow 级挂载它们时按 flow.ID 过滤 Target；step 级 Hook 则按 tool.ID 过滤。
+var FlowLevelStages = map[string]bool{
+	StageBeforeFlow: true,
+	StageOnSuccess:  true,
+}
+
+// IsFlowLevelStage 报告 stage 是否为 Flow 级（按 flow id 匹配 Target）。
+func IsFlowLevelStage(stage string) bool { return FlowLevelStages[stage] }
+
+// KnownHookStages 是当前**已实现**的 Hook 阶段（S5 起 before_promote 由 PromoteTool 触发；
+// #72 起 before_flow/on_success 在 once 模式 Flow 上生效）。
 var KnownHookStages = map[string]bool{
+	StageBeforeFlow:    true,
 	StageBeforeStep:    true,
 	StageAfterStep:     true,
 	StageOnError:       true,
+	StageOnSuccess:     true,
 	StageBeforePromote: true,
 }
 
-// Hook 是横切控制（认证/脱敏/限流/日志），由宿主策略显式装配（不通过插件间私下约定耦合）。
+// Hook 是横切控制（认证/脱敏/限流/日志/汇总），由宿主策略显式装配（不通过插件间私下约定耦合）。
 //
-// Action 指向**已注册的 Tool id**：Hook 逻辑本身就是一个 Tool（process / lua 均可写），
-// 由引擎直接调用其 runtime 执行 —— 因此 Hook 执行**不会**再触发 Hook（天然无递归）。
+// Action 指向**已注册的 Tool id 或 Flow id**：
+//   - Tool 载体：Hook 逻辑本身是一个 Tool（process / lua 均可写），引擎直接调用其 runtime 执行，
+//     不经 step 流程 —— 因此 Hook 执行**不会**再触发 Hook（天然无递归）。
+//   - Flow 载体（#72）：Action 指向一个 Flow id，引擎**同步内联**执行该子 Flow（同 execID 上下文，
+//     结构性无递归），before_flow 时其 RunResult 暴露给主 Flow 的 vars（key=子 Flow id）供下游引用。
+//
+// Target 匹配维度由 Stage 决定：step 级 stage（before_step/after_step/on_error）按 step 的 tool id 匹配，
+// Flow 级 stage（before_flow/on_success）按 Flow id 匹配；两者均支持 `*` 表示「全部」。
 type Hook struct {
 	ID         string           `yaml:"id" json:"id"`
-	Target     string           `yaml:"target" json:"target"`     // 作用对象：tool id 或 "*"
-	Stage      string           `yaml:"stage" json:"stage"`       // before_step / after_step / on_error
-	Action     string           `yaml:"action" json:"action"`     // 已注册 Tool 的 id
+	Target     string           `yaml:"target" json:"target"`     // 匹配对象：step 级按 tool id、flow 级按 flow id；"*" 表示全部
+	Stage      string           `yaml:"stage" json:"stage"`       // before_flow / before_step / after_step / on_error / on_success / before_promote
+	Action     string           `yaml:"action" json:"action"`     // 已注册 Tool 的 id 或 Flow 的 id
 	Criticality HookCriticality `yaml:"criticality" json:"criticality"`
 	Order      int              `yaml:"order" json:"order"`       // 装配顺序（weight，升序执行）
 }

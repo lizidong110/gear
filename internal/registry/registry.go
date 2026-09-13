@@ -296,6 +296,65 @@ func (r *Registry) DeleteTool(id string) error {
 	return nil
 }
 
+// DeleteFlow 注销 Flow，并按 PRD §8.2 的守卫拒绝危险删除：
+//  1. 被任何其它 Flow 的 step 引用（作为 call）→ 拒绝
+//  2. 被任何 Hook 的 action 引用（Flow 载体，#72 起 before_flow/on_success 可指向 Flow）→ 拒绝
+//  3. 正被**运行中的执行**作为 Hook 的 Flow 载体使用 → 拒绝（由注入的 RunningChecker 判定）
+//
+// 第 3 条不是第 1/2 条的重复：静态引用会在 Hook 被删 / Flow 被改写后消失，而**正在跑的执行**
+// 仍持有启动时的 Hook 快照 —— 此时放行注销会让它在 before_flow 触发时拿到 nil Flow 而中途失败。
+func (r *Registry) DeleteFlow(id string) error {
+	f, err := r.GetFlow(id)
+	if err != nil {
+		return err
+	}
+	if f == nil {
+		return fmt.Errorf("Flow 不存在: %s: %w", id, ErrNotFound)
+	}
+
+	flows, err := r.ListFlows()
+	if err != nil {
+		return err
+	}
+	for _, other := range flows {
+		if other.ID == id {
+			continue
+		}
+		for _, s := range other.Steps {
+			if s.Call == id {
+				return fmt.Errorf("Flow %s 被 Flow %s 的 step %s 引用，无法注销: %w", id, other.ID, s.ID, ErrInUse)
+			}
+		}
+	}
+
+	hooks, err := r.ListHooks()
+	if err != nil {
+		return err
+	}
+	for _, h := range hooks {
+		// 仅 Flow 级 stage 的 action 可能指向 Flow（step 级 action 指向 Tool，不会误伤同名 Flow）。
+		if model.IsFlowLevelStage(h.Stage) && h.Action == id {
+			return fmt.Errorf("Flow %s 被 Hook %s（stage=%s）的 action 引用，无法注销: %w", id, h.ID, h.Stage, ErrInUse)
+		}
+	}
+
+	// 第 3 条守卫：运行中的执行仍可能用到它。
+	if reason := r.runningReason(id); reason != "" {
+		return fmt.Errorf("Flow %s %s，无法注销: %w", id, reason, ErrInUse)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	res, err := r.db.Exec("DELETE FROM flows WHERE id=?", id)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("Flow 不存在: %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
 // ---- Hooks ----
 
 // UpsertHook 校验后落库（F3：stage 非法 / before_promote / action 为空等在注册期即拒绝）。

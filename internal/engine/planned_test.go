@@ -23,12 +23,14 @@ func TestPlannedToolIDsIncludesOnlyEffectiveHookActions(t *testing.T) {
 		{ID: "h3", Stage: model.StageOnError, Target: "b", Action: "alert", Criticality: model.CritBestEffort},
 		// target 不命中任何 step → 其 action 不应进入集合
 		{ID: "h4", Stage: model.StageBeforeStep, Target: "zzz", Action: "never", Criticality: model.CritCritical},
-		// stage 不合法（未实现）→ 不应进入集合
-		{ID: "h5", Stage: "before_flow", Target: "*", Action: "never2", Criticality: model.CritCritical},
+		// before_flow（Flow 级）：Target="*" 命中 flow f → 其 action 应进入集合（#72 已实现）
+		{ID: "h5", Stage: model.StageBeforeFlow, Target: "*", Action: "never2", Criticality: model.CritCritical},
+		// on_success（Flow 级）：Target 指向别的 flow，不命中 f → 其 action 不应进入集合
+		{ID: "h6", Stage: model.StageOnSuccess, Target: "other-flow", Action: "never3", Criticality: model.CritCritical},
 	}
 	got := plannedToolIDs(flow, hooks)
 	sort.Strings(got)
-	want := []string{"a", "alert", "b", "mask", "redact"}
+	want := []string{"a", "alert", "b", "mask", "never2", "redact"}
 	if len(got) != len(want) {
 		t.Fatalf("计划用到的 Tool 集合不符：got=%v want=%v", got, want)
 	}

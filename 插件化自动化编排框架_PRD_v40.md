@@ -214,10 +214,10 @@ hooks:
     weight: 10                   # 排序，越小越靠前
 ```
 
-> **实现状态（S3）与字段名对齐**：当前代码用 `stage`（= 上面的 pointcut）、`order`（= weight）、`target`、`action`、`criticality`。
-> - `stage` 现支持 `before_step` / `after_step` / `on_error` / `before_promote`；`before_flow`、`on_success` 尚未实现（`before_promote` 于 S5 落地，由 `engine.PromoteTool` 触发 fail-closed 门禁）。
-> - `target` 现支持**精确 tool id** 或 `*`；`flow_id` / step_id / 通配前缀（`dingtalk.*`）尚未实现。
-> - `action` 指向**已注册 Tool 的 id**（PRD 原意「Flow/Tool」，Flow 载体待评估，见 REQUIREMENTS.md REQ-HOOK-ACTION-FLOW）。
+> **实现状态（S3 + #72）与字段名对齐**：当前代码用 `stage`（= 上面的 pointcut）、`order`（= weight）、`target`、`action`、`criticality`。
+> - `stage` 现支持 `before_flow` / `before_step` / `after_step` / `on_error` / `on_success` / `before_promote`，全部已实现（`before_promote` 于 S5 落地，`before_flow`/`on_success` 于 #72 在 once 模式 Flow 上生效；service 长驻模式的 Flow 级 Hook 仍 deferred，见下）。
+> - `target` 匹配维度由 stage 决定：step 级 stage 按**精确 tool id** 或 `*` 匹配；Flow 级 stage（before_flow/on_success）按 **flow id** 或 `*` 匹配（`flow_id` 已落地；step_id / 通配前缀 `dingtalk.*` 仍 deferred）。
+> - `action` 指向**已注册 Tool 的 id 或 Flow 的 id**（#72 起支持 Flow 载体：同步内联执行子 Flow，同 execID 上下文、结构性无递归；before_flow 时子 Flow 结果暴露进主 Flow vars）。递归守卫拦截循环调用。
 > - 实际 YAML 形态见 `gear hook register` 的示例（`examples/` 与 CLI help）。
 
 ### 5.2 生命周期与 weight 排序

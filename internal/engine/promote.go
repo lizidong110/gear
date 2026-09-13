@@ -26,7 +26,7 @@ func (e *Engine) PromoteTool(toolID, version string, target model.ToolVersionSta
 		"target":  string(target),
 	}
 	// before_promote Hook 不改变晋升本身，只做门禁/副作用；只看 err（critical 失败即中止）。
-	if _, _, err := e.applyHooks(context.Background(), hooks, model.StageBeforePromote, toolID, payload); err != nil {
+	if _, _, err := e.applyHooks(context.Background(), hooks, model.StageBeforePromote, "", toolID, payload); err != nil {
 		return fmt.Errorf("before_promote Hook 中止晋升 %s@%s -> %s: %w", toolID, version, target, err)
 	}
 	return e.reg.PromoteToolVersion(toolID, version, target)

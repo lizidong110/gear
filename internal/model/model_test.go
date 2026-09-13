@@ -163,6 +163,18 @@ func TestHookValidate(t *testing.T) {
 	if be.EffectiveCriticality() != CritBestEffort {
 		t.Fatal("显式 best-effort 应生效")
 	}
+	// #72：before_flow / on_success（Flow 级）应被接受。
+	for _, st := range []string{StageBeforeFlow, StageOnSuccess} {
+		bf := &Hook{ID: "h3", Target: "*", Stage: st, Action: "setup"}
+		if err := bf.Validate(); err != nil {
+			t.Fatalf("Flow 级 stage=%q 应通过: %v", st, err)
+		}
+		// Flow 级 stage 的 action 可指向 Flow id（#72），这里只校验形态，存在性运行期解析。
+		bfFlow := &Hook{ID: "h4", Target: "myflow", Stage: st, Action: "subflow"}
+		if err := bfFlow.Validate(); err != nil {
+			t.Fatalf("Flow 级 stage=%q 的 action 指向 Flow id 应通过: %v", st, err)
+		}
+	}
 
 	cases := []struct {
 		name string

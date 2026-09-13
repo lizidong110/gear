@@ -88,7 +88,7 @@ gear/
 | §4.4 | 触发方式收敛为执行入口 | server | 契约 | T-srv-01 | 🟢 已落地（REST 执行面 14/15 端点 + CLI；REQ-API-REST / `server_test.go` 端点契约） |
 | §5.1 | Hook 四要素模型 | model | 单测 | T-model-04 | 🟢 |
 | §5.2 | 生命周期 + weight 升序（同重注册序） | engine | 单测 | T-eng-06 | 🟢 已落地（Target 过滤 + Order 升序装配；REQ-HOOK-SELECT/ORDER / `hook_test.go`: TestHookTargetFilter/Order） |
-| §5.3 | 插件无感知 / action 是 Tool / fail-closed / 禁止隐式依赖 | engine | 集成 | T-eng-07 | 🟢 已落地（action=已注册 Tool id；fail-closed；结构性无递归；REQ-HOOK-FAILCLOSED/NORECUR）；**Flow 载体 deferred**（REQ-HOOK-ACTION-FLOW） |
+| §5.3 | 插件无感知 / action 是 Tool 或 Flow / fail-closed / 禁止隐式依赖 | engine | 集成 | T-eng-07 | 🟢 已落地（action=已注册 Tool id 或 Flow id；#72 起 Flow 载体=同步内联子 Flow，同 execID、结构性无递归、递归守卫拦截循环；fail-closed；REQ-HOOK-FAILCLOSED/NORECUR/ACTION-FLOW）；Flow 级 stage（before_flow/on_success）#72 落地 |
 | §5.4 | 改写 input/output + 重校验；best-effort；on_error 不恢复；Hook 嵌套防重入 | engine | 集成 | T-eng-08..11 | 🟢 已落地（改写后按 schema 重校验、best-effort 仅告警、on_error 不恢复、无递归；REQ-HOOK-REWRITE/REVALIDATE/ONERROR/NORECUR） |
 | §6 | 宿主 6 原语 http/call/db/kv/secret/event | host | 集成 | T-host-01..06 | 🟢 M5 已落地（`internal/cap` + `engine.luaRuntime`/`processRuntime` 注入 `ctx.*`；db 原语已实现接口但宿主未提供实现，调用返回 ErrCapabilityUnavailable） |
 | §6.2 | call 与 event 边界 | host | 集成 | T-host-07 | 🟢 M5：call 经 Resolver 唯一通道、event notify/wait 同步往返，均已测 |

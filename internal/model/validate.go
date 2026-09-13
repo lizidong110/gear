@@ -117,25 +117,26 @@ func validateSchema(s map[string]interface{}, field string) error {
 }
 
 // Hook.Validate 校验 Hook 级不变量（F3 严格守卫）：
-//   - id / target / action 非空（action 指向已注册的 Tool id）
-//   - stage 必须是已实现阶段；before_promote 属 S5，注册期显式拒绝
+//   - id / target / action 非空（action 指向已注册的 Tool id 或 Flow id）
+//   - stage 必须是已实现阶段（before_step/after_step/on_error/before_promote 自 S5；
+//     before_flow/on_success 自 #72）
 //   - criticality 为空（按 critical 处理）或必须是 critical / best-effort
+//
+// 注：Action 指向的 Tool / Flow 是否存在**不在注册期校验**——Hook 与 Tool/Flow 独立注册，
+// 存在性在运行期 aplicar 时解析（Tool 缺失按 criticality 处置，Flow 缺失报错）；此处只校验
+// 形态不变量，避免引入「跨实体存在性」的注册期耦合。
 func (h Hook) Validate() error {
 	if h.ID == "" {
 		return fmt.Errorf("hook.id 不能为空")
 	}
 	if h.Target == "" {
-		return fmt.Errorf("hook %s 的 target 不能为空（应为 tool id 或 \"*\"）", h.ID)
+		return fmt.Errorf("hook %s 的 target 不能为空（应为 tool id / flow id 或 \"*\"）", h.ID)
 	}
 	if h.Action == "" {
-		return fmt.Errorf("hook %s 的 action 不能为空（应指向已注册的 Tool id）", h.ID)
-	}
-	if h.Stage == StageBeforePromote {
-		// S5 起 before_promote 由 engine.PromoteTool 在晋升前触发；
-		// 这里不再拒绝，但需确认它仍在已知阶段集合内（下方统一校验）。
+		return fmt.Errorf("hook %s 的 action 不能为空（应指向已注册的 Tool id 或 Flow id）", h.ID)
 	}
 	if !KnownHookStages[h.Stage] {
-		return fmt.Errorf("hook %s 的 stage=%q 非法（应为 before_step / after_step / on_error）", h.ID, h.Stage)
+		return fmt.Errorf("hook %s 的 stage=%q 非法（应为 before_flow / before_step / after_step / on_error / on_success / before_promote）", h.ID, h.Stage)
 	}
 	switch h.Criticality {
 	case "", CritCritical, CritBestEffort:

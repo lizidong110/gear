@@ -149,7 +149,7 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 			}
 
 			if step.IsService() {
-				h, err := e.startServiceStep(ctx, rc, hooks, step, tool)
+				h, err := e.startServiceStep(ctx, rc, hooks, flowID, step, tool)
 				if errors.Is(err, ErrStepSkipped) {
 					markSkipped(step.ID, "when=false")
 					fmt.Printf("- step %s 跳过（when=false）\n", step.ID)
@@ -165,7 +165,7 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 				return nil
 			}
 
-			input, output, err := e.runOnceStep(ctx, rc, hooks, step, tool)
+			input, output, err := e.runOnceStep(ctx, rc, hooks, flowID, step, tool)
 			if errors.Is(err, ErrStepSkipped) {
 				markSkipped(step.ID, "when=false")
 				fmt.Printf("- step %s 跳过（when=false）\n", step.ID)

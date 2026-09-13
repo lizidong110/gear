@@ -42,7 +42,7 @@
 | REQ-LUA-SANDBOX | §3.2 | lua 沙箱无宿主逃逸：不加载 os/io/package/debug，移除 dofile/loadfile/require/module | `implemented`（S7a） | `engine/lua_test.go`: TestLuaSandboxGlobals、TestLuaSandboxEscapeBlocked |
 | REQ-LUA-TIMEOUT | §3.2/§3.3 | lua 死循环被 ctx 中断（`L.SetContext`），与 process 超时对称 | `implemented`（S7a） | `engine/lua_test.go`: TestLuaTimeout |
 | REQ-LUA-ERR | §3.2 | lua 编译/运行期错误与「无输出」显式报错 | `implemented`（S7a） | `engine/lua_test.go`: TestLuaSyntaxError、TestLuaRuntimeError、TestLuaNoOutput |
-| REQ-HOOK | §5/§14 | Hook 生命周期（before_step / after_step / on_error）；once 与 service 共用同一执行路径 | `implemented`（S3） | `engine/hook_test.go`: TestHookBeforeStepRewritesInput、TestHookAppliesToServiceStep |
+| REQ-HOOK | §5/§14 | Hook 生命周期（before_flow / before_step / after_step / on_error / on_success；service 与 once 共用同一执行路径）；Flow 级 stage 按 flow id 匹配、step 级按 tool id 匹配 | `implemented`（S3 + #72） | `engine/hook_test.go`: TestHookBeforeStepRewritesInput、TestHookAppliesToServiceStep；`engine/flowhook_test.go`: TestBeforeFlowHookToolRewritesVars、TestOnSuccessHookRunsAfterSuccess、TestFlowHookTargetFilter |
 | REQ-HOOK-REWRITE | §5.4 | Hook 可改写 input/output；**下游看到改后值**（after_step 改写对下游可见） | `implemented`（S3） | `engine/hook_test.go`: TestHookBeforeStepRewritesInput、TestHookAfterStepRewritesOutput |
 | REQ-HOOK-REVALIDATE | §5.4/§9.1 | Hook 改写后**按 step 的 Tool schema 重新校验**（保住不可绕过） | `implemented`（S3） | `engine/hook_test.go`: TestHookBeforeStepRewriteRevalidated |
 | REQ-HOOK-FAILCLOSED | §5.4 | critical 失败即终止（fail-closed）；best-effort 仅告警继续；**留空默认 critical** | `implemented`（S3） | `engine/hook_test.go`: TestHookCriticalFailureAborts、TestHookBestEffortFailureContinues；`model_test.go`: TestHookValidate |
@@ -77,7 +77,7 @@
 |---------|---------|------|------|------|
 | REQ-USEVERSION | §4.2/§7 | step 钉版本 `use_version` | `implemented`（S5） | `engine/version_test.go`: TestRunFlowResolvesUseVersion、TestRunFlowDefaultVersion、TestValidateFlowStaticUnknownVersion；`model/version_test.go`: TestFlowValidateAllowsUseVersion |
 | REQ-HOOK-PROMOTE | §5.3/§7 | `before_promote` 阶段 Hook（版本晋升前） | `implemented`（S5） | `engine/version_test.go`: TestPromoteToolBeforePromoteGate；`model/version_test.go`: TestHookValidateAllowsBeforePromote |
-| REQ-HOOK-ACTION-FLOW | §5.3 | Hook 的 action 指向 **Flow**（PRD §5.3 原文「引用的 Flow/Tool」，当前仅支持 Tool） | `deferred`（后续；需递归调引擎 + 完整嵌套守卫） | 现以「action = 已注册 Tool id」实现（用户选定方案 A），Flow 载体待评估 |
+| REQ-HOOK-ACTION-FLOW | §5.3 | Hook 的 action 指向 **Flow**（PRD §5.3 原文「引用的 Flow/Tool」） | `implemented`（#72） | `engine/flowhook_test.go`: TestBeforeFlowHookFlowInline、TestBeforeFlowHookFlowNoInfiniteRecursion、TestBeforeFlowHookFlowCycleGuarded；同步内联子 Flow（同 execID 上下文，结构性无递归），before_flow 时子 Flow 结果暴露进主 Flow vars（key=子 Flow id）；递归守卫拦截循环调用；仅 once 模式（RunFlowExec）生效，service 长驻模式 Flow 级 Hook 仍 deferred |
 | REQ-CTX | §10/§14.1 | 宿主能力 `ctx.*`（http/call/db/kv/secret/event） | `implemented`（M5） | `internal/cap` 包 + 引擎按 `Tool.Capabilities` 精确放行；lua 经 `setupLuaCapabilities`、process 经 `withHostCapabilities` 注入；db 原语已定义但宿主未实现，调用返回 `ErrCapabilityUnavailable`；测试见 `engine/lua_cap_test.go`、`engine/cap_integration_test.go`、`cap/cap_test.go`。注：process/go-host 运行期绕过 capability（P0-4）仍 deferred |
 | REQ-RUNTIME-GOHOST | §3.2 | go-host runtime | `deferred`（S7 后续） | `Tool.Validate` 注册期拒 + `runtimeFor` 报错；测试 TestSpecRejectsUnimplementedRuntimeTool、TestRuntimeForRejectsUnimplemented |
 | REQ-RUNTIME-WASM | §3.2 | wasm runtime | `deferred`（V3） | 同上 |

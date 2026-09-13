@@ -368,3 +368,106 @@ func TestDeleteToolRunningGuard(t *testing.T) {
 		t.Fatalf("不在运行时应可注销: %v", err)
 	}
 }
+
+// T-reg-08：DeleteFlow 的注销守卫（PRD §8.2，#72 扩展）——
+// 不存在 → ErrNotFound；被其它 Flow 的 step 引用 → ErrInUse；
+// 被 Flow 级 Hook 的 action 引用（Flow 载体）→ ErrInUse；无引用 → 删除成功。
+func TestDeleteFlow(t *testing.T) {
+	reg := mustOpen(t)
+	defer reg.Close()
+
+	// 1) 不存在
+	if err := reg.DeleteFlow("ghost"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("删不存在的 Flow 应返回 ErrNotFound，实际 %v", err)
+	}
+
+	// 2) 无引用 → 成功
+	if err := reg.UpsertFlow(&model.Flow{ID: "solo", Steps: []model.Step{
+		{ID: "s1", Call: "x", Input: map[string]interface{}{}},
+	}}); err != nil {
+		t.Fatalf("注册 Flow 失败: %v", err)
+	}
+	if err := reg.DeleteFlow("solo"); err != nil {
+		t.Fatalf("无引用的 Flow 应可删除: %v", err)
+	}
+	if got, _ := reg.GetFlow("solo"); got != nil {
+		t.Fatal("删除后不应再读到")
+	}
+
+	// 3) 被其它 Flow 的 step 引用（作为 call）→ ErrInUse
+	if err := reg.UpsertFlow(&model.Flow{ID: "sub", Steps: []model.Step{
+		{ID: "s1", Call: "x", Input: map[string]interface{}{}},
+	}}); err != nil {
+		t.Fatalf("注册子 Flow 失败: %v", err)
+	}
+	if err := reg.UpsertFlow(&model.Flow{ID: "caller", Steps: []model.Step{
+		{ID: "s1", Call: "sub", Input: map[string]interface{}{}},
+	}}); err != nil {
+		t.Fatalf("注册调用方 Flow 失败: %v", err)
+	}
+	if err := reg.DeleteFlow("sub"); !errors.Is(err, ErrInUse) {
+		t.Fatalf("被其它 Flow 的 step 引用的 Flow 应返回 ErrInUse，实际 %v", err)
+	}
+
+	// 4) 被 Flow 级 Hook 的 action 引用（#72 Flow 载体）→ ErrInUse。
+	//    注意：step 级 Hook 的 action 指向 Tool，不应误伤同名 Flow。
+	if err := reg.UpsertFlow(&model.Flow{ID: "sub2", Steps: []model.Step{
+		{ID: "s1", Call: "x", Input: map[string]interface{}{}},
+	}}); err != nil {
+		t.Fatalf("注册 Flow 失败: %v", err)
+	}
+	if err := reg.UpsertHook(&model.Hook{ID: "hbf", Target: "*", Stage: model.StageBeforeFlow, Action: "sub2"}); err != nil {
+		t.Fatalf("注册 Flow 级 Hook 失败: %v", err)
+	}
+	if err := reg.DeleteFlow("sub2"); !errors.Is(err, ErrInUse) {
+		t.Fatalf("被 Flow 级 Hook action 引用的 Flow 应返回 ErrInUse，实际 %v", err)
+	}
+	// step 级 Hook 指向同名 Tool 不应阻止删除同名 Flow。
+	if err := reg.UpsertTool(validTool("sub2")); err != nil {
+		t.Fatalf("注册 Tool 失败: %v", err)
+	}
+	if err := reg.UpsertHook(&model.Hook{ID: "hstep", Target: "*", Stage: model.StageBeforeStep, Action: "sub2"}); err != nil {
+		t.Fatalf("注册 step 级 Hook 失败: %v", err)
+	}
+	// 同名 Flow "sub2" 此时仍被 hbf（Flow 级）引用，先删 hbf 再删 Flow 应成功。
+	if err := reg.DeleteHook("hbf"); err != nil {
+		t.Fatalf("删 hbf 失败: %v", err)
+	}
+	if err := reg.DeleteFlow("sub2"); err != nil {
+		t.Fatalf("Flow 级引用清除后应可删除 Flow，实际 %v", err)
+	}
+}
+
+// T-reg-09：DeleteFlow 的「运行中」守卫（§8.2 第三条）—— Flow 作为 Hook 载体被运行中的执行使用时拒绝注销。
+func TestDeleteFlowRunningGuard(t *testing.T) {
+	reg := mustOpen(t)
+	defer reg.Close()
+	if err := reg.UpsertFlow(&model.Flow{ID: "live", Steps: []model.Step{
+		{ID: "s1", Call: "x", Input: map[string]interface{}{}},
+	}}); err != nil {
+		t.Fatalf("注册失败: %v", err)
+	}
+
+	// 未注入检查器 → 可注销
+	if err := reg.DeleteFlow("live"); err != nil {
+		t.Fatalf("未启用运行中守卫时应可注销: %v", err)
+	}
+	if err := reg.UpsertFlow(&model.Flow{ID: "live", Steps: []model.Step{
+		{ID: "s1", Call: "x", Input: map[string]interface{}{}},
+	}}); err != nil {
+		t.Fatalf("注册失败: %v", err)
+	}
+	reg.SetRunningChecker(func(id string) string {
+		if id == "live" {
+			return "正被运行中的执行 exec_2 作为 Hook 载体使用"
+		}
+		return ""
+	})
+	err := reg.DeleteFlow("live")
+	if !errors.Is(err, ErrInUse) {
+		t.Fatalf("运行中的 Flow 应返回 ErrInUse，实际 %v", err)
+	}
+	if !strings.Contains(err.Error(), "exec_2") {
+		t.Fatalf("拒绝原因应指出是哪个执行在用，实际: %v", err)
+	}
+}

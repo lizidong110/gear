@@ -182,7 +182,7 @@ func (e *Engine) RunFlowExec(flowID, execID string, observe ToolObserver) (*RunR
 			return nil, fmt.Errorf("step %s 是 service 模式（长驻），不能用 flow run 一次性执行；请用 `app run %s` 监管", s.ID, flowID)
 		}
 	}
-	return e.run(flow, observe, execID)
+	return e.run(flow, observe, execID, nil)
 }
 
 // plannedToolIDs 计算一次运行可能用到的 Tool id：step 的 call ∪ 生效 Hook 的 action。
@@ -192,10 +192,16 @@ func (e *Engine) RunFlowExec(flowID, execID string, observe ToolObserver) (*RunR
 // （G2/M10 的教训：同一判定出现两处即漂移）。
 func plannedToolIDs(flow *model.Flow, hooks []model.Hook) []string {
 	seen := map[string]bool{}
+	// 全部已实现 stage 都参与「计划用到的 Tool」计算：Flow 级 stage 按 flow.ID 匹配，
+	// step 级 stage 按 step.Call 匹配（匹配维度由 hooksFor 内部按 stage 选，避免第二处判定）。
+	allStages := []string{
+		model.StageBeforeFlow, model.StageBeforeStep, model.StageAfterStep,
+		model.StageOnError, model.StageOnSuccess,
+	}
 	for _, s := range flow.Steps {
 		seen[s.Call] = true
-		for _, stage := range []string{model.StageBeforeStep, model.StageAfterStep, model.StageOnError} {
-			for _, h := range hooksFor(hooks, stage, s.Call) {
+		for _, stage := range allStages {
+			for _, h := range hooksFor(hooks, stage, flow.ID, s.Call) {
 				seen[h.Action] = true
 			}
 		}
@@ -208,7 +214,8 @@ func plannedToolIDs(flow *model.Flow, hooks []model.Hook) []string {
 	return out
 }
 
-func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string) (*RunResult, error) {
+func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string, ancestors []string) (*RunResult, error) {
+	ctx := context.Background() // 同 execLevel：运行期取消由层级 ctx 负责，run() 顶层用 Background
 	levels, err := topoLevels(flow.Steps)
 	if err != nil {
 		return nil, err
@@ -231,6 +238,14 @@ func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string) (*Ru
 		secretGet: e.secretResolver(),
 		execID:    execID,
 		logSink:   e.logSinkFor(execID),
+		ancestors: ancestors,
+		flowID:    flow.ID,
+	}
+
+	// before_flow Hook（#72）：Flow 开始执行前，按 flow.ID 匹配。可改写初始 vars
+	// （Tool 载体整体替换 vars；Flow 载体内联执行并把结果暴露进 vars）。失败即终止编排。
+	if err := e.applyFlowScopedHooks(ctx, rc, hooks, model.StageBeforeFlow, flow.ID); err != nil {
+		return nil, err
 	}
 
 	// when 跳过需要沿**有效依赖**（含推断边）传播：上游被跳过 ⇒ 下游也跳过。
@@ -265,7 +280,7 @@ func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string) (*Ru
 				return nil
 			}
 
-			input, output, err := e.runOnceStep(ctx, rc, hooks, step, tool)
+			input, output, err := e.runOnceStep(ctx, rc, hooks, flow.ID, step, tool)
 			if errors.Is(err, ErrStepSkipped) {
 				markSkipped(step.ID, "when=false")
 				fmt.Printf("- step %s 跳过（when=false）\n", step.ID)
@@ -288,7 +303,16 @@ func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string) (*Ru
 		fmt.Printf("，跳过 %d 步", n)
 	}
 	fmt.Println()
-	return &RunResult{FlowID: flow.ID, Steps: rc.steps, Skipped: skipped}, nil
+
+	result := &RunResult{FlowID: flow.ID, Steps: rc.steps, Skipped: skipped}
+	rc.setResult(result)
+
+	// on_success Hook（#72）：仅当 Flow「全部成功」时触发（step 失败已在上面返回错误，不会到达此处）。
+	// 其 payload 是最终 RunResult（仅副作用，输出丢弃）；critical 失败会让「已成功的主 Flow」返回错误。
+	if err := e.applyFlowScopedHooks(ctx, rc, hooks, model.StageOnSuccess, flow.ID); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // execLevel 并发执行一层 step（受 maxParallel 限制）。
@@ -367,6 +391,13 @@ type runContext struct {
 	execID string
 	// logSink 是 step 级日志回调（REQ-API-LOGS / #71）；nil 表示不记日志。
 	logSink func(stepID, stream, line string)
+	// result 是本次 Flow 的最终结果（供 on_success Hook 取用，仅 once 模式）。
+	result *RunResult
+	// ancestors 是拉起本 Flow 的「祖先 Flow id」链（不含自身），用于 before_flow 内联子 Flow
+	// 的递归守卫（#72）：防止 A→B→A 循环或被 Target="*" 的 before_flow 钩中自身而无限递归。
+	ancestors []string
+	// flowID 是本 Flow 的 id（供递归守卫快速拼出完整调用链）。
+	flowID string
 }
 
 // setStep 记录一个 step 的最终 input/output（并发安全）。
@@ -374,6 +405,65 @@ func (c *runContext) setStep(id string, input, output map[string]interface{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.steps[id] = map[string]interface{}{"input": input, "output": output}
+}
+
+// varsSnapshot 返回 vars 的浅拷贝（before_flow Hook 改写前的快照，避免 Hook 读到改写中途状态）。
+func (c *runContext) varsSnapshot() map[string]interface{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]interface{}, len(c.vars))
+	for k, v := range c.vars {
+		out[k] = v
+	}
+	return out
+}
+
+// replaceVars 整体替换 vars（before_flow 的 Tool 载体返回非空 object 时调用）。
+func (c *runContext) replaceVars(m map[string]interface{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.vars = m
+}
+
+// exposeFlowResult 把内联子 Flow 的 steps 输出暴露进主 Flow 的 vars（key=子 Flow id），
+// 供下游 step 经 `vars.<flowID>.<stepID>.output` 引用。类型上把
+// map[string]map[string]interface{} 转成 map[string]interface{}（值本就是 map[string]interface{}），
+// 以保证模板解析的嵌套 map 递归能正确下钻（否则 map[string]map[...] 不匹配 map[string]interface{} 分支）。
+func (c *runContext) exposeFlowResult(flowID string, res *RunResult) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.vars == nil {
+		c.vars = map[string]interface{}{}
+	}
+	exposed := make(map[string]interface{}, len(res.Steps))
+	for k, v := range res.Steps {
+		exposed[k] = v
+	}
+	c.vars[flowID] = exposed
+}
+
+// setResult 记录最终结果（供 on_success Hook 取用）。
+func (c *runContext) setResult(r *RunResult) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.result = r
+}
+
+// lastResultMap 把最终结果序列化成 map（on_success Hook 的 payload；仅副作用，输出丢弃）。
+func (c *runContext) lastResultMap() map[string]interface{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.result == nil {
+		return map[string]interface{}{}
+	}
+	m := map[string]interface{}{"flow_id": c.result.FlowID}
+	if c.result.Steps != nil {
+		m["steps"] = c.result.Steps
+	}
+	if c.result.Skipped != nil {
+		m["skipped"] = c.result.Skipped
+	}
+	return m
 }
 
 // snapshot 返回 vars 与 steps 的**浅拷贝**，供 when 求值等只读场景使用。
