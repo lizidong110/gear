@@ -118,13 +118,17 @@ type Call interface {
 }
 
 // DB 结构化数据读写（原语已定义，M5 当前未提供实现，留待后续切片）。
+// Query 返回 []interface{}（元素为 map[string]interface{}）：既能直接 JSON 序列化，
+// 也能被 engine 的 toLuaValue 正确转成 Lua 数组（命中 []interface{} 分支），避免被当成字符串。
 type DB interface {
-	Query(query string, args ...interface{}) ([]map[string]interface{}, error)
+	Query(query string, args ...interface{}) ([]interface{}, error)
 	Exec(query string, args ...interface{}) error
 }
 
 // Resolver 是 Call 原语背后的委托：由引擎注入，按 target 执行一个 Tool / Flow。
-type Resolver func(target string, input map[string]interface{}) (map[string]interface{}, error)
+// via 是调用方的执行链（祖先 Flow id 列表，含当前 Flow），供引擎做循环调用守卫
+// （A→B→A 无限递归），与 Hook 内联子 Flow 的祖先链守卫复用同一套语义（见 engine #72）。
+type Resolver func(target string, input map[string]interface{}, via []string) (map[string]interface{}, error)
 
 // Providers 汇集各原语的具体实现，由宿主（Engine）一次性注入。
 type Providers struct {
@@ -142,7 +146,13 @@ type Context struct {
 	grants  Grants
 	prov    *Providers
 	sandbox bool
+	// via 是本次执行的调用链（祖先 Flow id，含当前 Flow）。经 ctx.call 透传给 Resolver，
+	// 供引擎检测循环调用（A→B→A）。空表示非 Flow 内执行（如顶级 flow run / call 入口）。
+	via []string
 }
+
+// SetCallChain 写入本次执行的调用链（引擎在构建宿主视图时调用）。
+func (c *Context) SetCallChain(via []string) { c.via = via }
 
 // New 构造一次执行的宿主能力视图。grants 来自 Tool.Capabilities；prov 来自宿主。
 func New(grants Grants, prov *Providers) *Context {
@@ -214,6 +224,7 @@ func (c *Context) Event() (Event, error) {
 }
 
 // Call 返回调用原语；未授权则 ErrCapabilityDenied；未注入 Resolver 则 ErrCapabilityUnavailable。
+// 调用链 via 一并透传给 Resolver，供引擎循环调用守卫。
 func (c *Context) Call() (Call, error) {
 	if !c.grants.Has(PrimCall) {
 		return nil, ErrCapabilityDenied
@@ -221,7 +232,7 @@ func (c *Context) Call() (Call, error) {
 	if c.prov == nil || c.prov.Resolver == nil {
 		return nil, ErrCapabilityUnavailable
 	}
-	return resolverCall{fn: c.prov.Resolver}, nil
+	return resolverCall{fn: c.prov.Resolver, via: c.via}, nil
 }
 
 // DB 返回结构化数据原语；未授权则 ErrCapabilityDenied；未提供实现则 ErrCapabilityUnavailable。
@@ -268,11 +279,14 @@ func (h httpCap) Request(method, url string, body []byte, headers map[string]str
 	return &Response{StatusCode: resp.StatusCode, Body: respBody, Headers: hmap}, nil
 }
 
-// resolverCall 把 Resolver 适配成 Call 接口。
-type resolverCall struct{ fn Resolver }
+// resolverCall 把 Resolver 适配成 Call 接口，并携带调用链 via。
+type resolverCall struct {
+	fn  Resolver
+	via []string
+}
 
 func (r resolverCall) Call(target string, input map[string]interface{}) (map[string]interface{}, error) {
-	return r.fn(target, input)
+	return r.fn(target, input, r.via)
 }
 
 // MemKV 是进程内的 KV 实现（配置 / 状态 / 缓存）。

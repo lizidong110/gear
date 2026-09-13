@@ -90,7 +90,7 @@ gear/
 | §5.2 | 生命周期 + weight 升序（同重注册序） | engine | 单测 | T-eng-06 | 🟢 已落地（Target 过滤 + Order 升序装配；REQ-HOOK-SELECT/ORDER / `hook_test.go`: TestHookTargetFilter/Order） |
 | §5.3 | 插件无感知 / action 是 Tool 或 Flow / fail-closed / 禁止隐式依赖 | engine | 集成 | T-eng-07 | 🟢 已落地（action=已注册 Tool id 或 Flow id；#72 起 Flow 载体=同步内联子 Flow，同 execID、结构性无递归、递归守卫拦截循环；fail-closed；REQ-HOOK-FAILCLOSED/NORECUR/ACTION-FLOW）；Flow 级 stage（before_flow/on_success）#72 落地 |
 | §5.4 | 改写 input/output + 重校验；best-effort；on_error 不恢复；Hook 嵌套防重入 | engine | 集成 | T-eng-08..11 | 🟢 已落地（改写后按 schema 重校验、best-effort 仅告警、on_error 不恢复、无递归；REQ-HOOK-REWRITE/REVALIDATE/ONERROR/NORECUR） |
-| §6 | 宿主 6 原语 http/call/db/kv/secret/event | host | 集成 | T-host-01..06 | 🟢 M5 已落地（`internal/cap` + `engine.luaRuntime`/`processRuntime` 注入 `ctx.*`；db 原语已实现接口但宿主未提供实现，调用返回 ErrCapabilityUnavailable） |
+| §6 | 宿主 6 原语 http/call/db/kv/secret/event | host | 集成 | T-host-01..06 | 🟢 M5 已落地（`internal/cap` + `engine.luaRuntime`/`processRuntime` 注入 `ctx.*`；#69 收口：db 原语实现 SQLite、引擎默认宿主装配 KV/HTTP/Event/DB + `call` 解析器 Tool/Flow + 循环守卫，声明即生产可用） |
 | §6.2 | call 与 event 边界 | host | 集成 | T-host-07 | 🟢 M5：call 经 Resolver 唯一通道、event notify/wait 同步往返，均已测 |
 | §7.1 | 状态机 draft→testing→stable→deprecated/rejected | engine/registry | 单测 | T-ver-01 | 🟢 已落地（VersionTransitions 白名单 + CanPromote；`model/version_test.go` / `engine/version_test.go`） |
 | §7.2 | 晋升显式 + operator 审计 | server/registry | 集成 | T-ver-02 | 🟢 已落地（晋升经 CLI `gear tool promote` 与 REST `POST /api/tools/{id}/versions/{v}/promote` 均可触发，均走 `engine.PromoteTool` + `before_promote` 门禁 fail-closed；见 REQ-API-PROMOTE） |
@@ -112,7 +112,7 @@ gear/
 > 每切片 DoD = 该切片矩阵条目全 🟢 + 覆盖率达标 + 评审过关。
 >
 > **⚠️ 2026-09-13 更正**：下面原定顺序在实施中已被调整，实际执行如下（本表随切片回填，避免方法论漂移）：
-> S0 骨架 ✅ / S1 最小引擎 ✅ / **S2 app run 进程监管 ✅** / **S3 Hook 切面 ✅** / **S4 并行+依赖推断+背压 ✅** / **S7a lua runtime ✅（提前）** / **`when` 条件执行 ✅** / **`ctx.*` 宿主能力层（M5）✅（http/call/kv/secret/event 实现 + 最小权限放行；db 原语已定义但宿主未提供实现，声明即可见、调用返回 ErrCapabilityUnavailable）**；**S5 版本灰度 ✅（2026-09-13）** / **S6c AI 闭环 ✅（2026-09-13）**。
+> S0 骨架 ✅ / S1 最小引擎 ✅ / **S2 app run 进程监管 ✅** / **S3 Hook 切面 ✅** / **S4 并行+依赖推断+背压 ✅** / **S7a lua runtime ✅（提前）** / **`when` 条件执行 ✅** / **`ctx.*` 宿主能力层（M5）✅（http/call/kv/secret/event 实现 + 最小权限放行；db 原语已定义但宿主未提供实现，声明即可见、调用返回 ErrCapabilityUnavailable）** / **#69 ctx.* 宿主默认装配 ✅（2026-09-13：db 实现 SQLite + 引擎默认宿主 KV/HTTP/Event/DB + call 解析器 Tool/Flow + 循环守卫，声明即生产可用）**；**S5 版本灰度 ✅（2026-09-13）** / **S6c AI 闭环 ✅（2026-09-13）**。
 > 调整理由：lua 提前是因为 `ctx.*` 尚未落地时 lua 可作为**纯计算沙箱**独立成立；Hook 排在并行之前是因为 Hook 需要先抽「共享 step 执行路径」，而并行也要复用同一条路径——先建路径再改它的并发语义，风险更低。
 
 - **S0 基线**：model/registry/cli 骨架。DoD：修正 §9 的 6 处缺陷 + model 单测 + registry 集成测试 + CLI 与 §11 对齐清单。✅ **已完成 2026-09-12**。
@@ -277,7 +277,7 @@ gear/
   - `Runtime` 接口加 `host *cap.Context` 参数；引擎 `Engine.hostFor(tool)` 按 `tool.Capabilities` 逐次执行构建视图并沿 `runOnceStep`/`startServiceStep`/`applyHooks`/`Relaunch` 透传。
   - **lua**：`setupLuaCapabilities` 仅注入**已声明**的原语（未声明的连字段都不出现在 `ctx` 上——比「存在但报错」更严格的防御纵深），闭包捕获授权后的实现，脚本无法绕过沙箱。
   - **process**：`withHostCapabilities` 把 `ctx.capabilities` / `ctx.sandbox` 注入 step input 的 JSON，进程侧可做最小权限自检（进程内实时强制留待后续切片）。
-  - **db**：原语已实现接口定义，但宿主当前未提供 `Providers.DB`，故声明 `db` 的 Tool 其 `ctx.db` 可见、调用返回 `ErrCapabilityUnavailable`（明确 deferred，而非静默成功）。
+  - **db**：原语已实现（`internal/cap/sqldb.go`，modernc.org/sqlite，文件或内存 DSN）；引擎 `New` 未显式 `WithHost` 时注入默认宿主（KV/HTTP/Event/DB），声明 `db` 的 Tool 在 `gear serve` 下即可读写 SQLite，不再返回 `ErrCapabilityUnavailable`（#69 收口）。
 
 **M5 顺手修的真实坑（值得记一笔）**
 - `cap.Context.HTTP()` 原先在 `Providers` 为 nil 时直接 `c.prov.HTTP` → **nil 解引用 panic**。其他访问器都有 `c.prov == nil` 守卫，唯独 HTTP 漏了。修复为：无宿主即 `ErrCapabilityUnavailable`（绝不静默回退到 `http.DefaultClient` 去访问公网——最小权限的「安全默认」）。新增 `TestHTTPUnavailableWhenNoProvider` 锁死。

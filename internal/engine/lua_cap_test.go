@@ -101,7 +101,7 @@ func TestLuaCapHTTP(t *testing.T) {
 
 // M5-lua-5：call 原语调用 Resolver（插件间唯一通信通道）。
 func TestLuaCapCall(t *testing.T) {
-	prov := &cap.Providers{Resolver: func(target string, input map[string]interface{}) (map[string]interface{}, error) {
+	prov := &cap.Providers{Resolver: func(target string, input map[string]interface{}, via []string) (map[string]interface{}, error) {
 		return map[string]interface{}{"echo": target}, nil
 	}}
 	host := luaHost(t, []string{"call"}, prov)

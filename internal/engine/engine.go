@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/santhosh-tekuri/jsonschema/v5"
 
@@ -50,7 +53,40 @@ func New(reg *registry.Registry, opts ...func(*Engine)) *Engine {
 	for _, o := range opts {
 		o(e)
 	}
+	// 默认宿主装配（M5 收口 / #69）：未显式 WithHost 时注入 KV/HTTP/Event/DB 原语，
+	// 使声明了对应 capability 的 Tool 在生产环境真正可用（不再恒返回 ErrCapabilityUnavailable）。
+	// 显式 WithHost 时尊重调用方配置，但仍补注入 call 解析器（除非调用方已自带）。
+	if e.host == nil {
+		e.host = defaultProviders()
+	}
+	if e.host.Resolver == nil {
+		e.host.Resolver = e.newResolver()
+	}
 	return e
+}
+
+// capDBSeq 为每次默认宿主的内存 SQLite 生成唯一 DSN，避免进程内多个引擎共享同一内存库
+// （cache=shared 的命名内存库是按 DSN 共享的，独立 DSN 即独立库）。
+var capDBSeq int64
+
+// defaultProviders 构造引擎默认宿主能力集（#69）：KV 内存表、HTTP 客户端、Event 总线、
+// DB 内存 SQLite（每引擎唯一 DSN，进程级共享、重启即丢，M5 scratch 语义）。
+// Secret 默认 nil（无密钥源时声明 secret 的 Tool 收到 ErrCapabilityUnavailable，fail-closed）。
+func defaultProviders() *cap.Providers {
+	seq := atomic.AddInt64(&capDBSeq, 1)
+	dsn := fmt.Sprintf("file:gear_cap_%d?mode=memory&cache=shared", seq)
+	var dbCap cap.DB
+	if db, err := cap.NewSQLiteDB(dsn); err == nil {
+		dbCap = db
+	}
+	// 注意：dbCap 用接口类型承载，出错时保持 nil 接口（而非 *SQLiteDB 的 typed-nil），
+	// 否则 cap.Context.DB() 的 `c.prov.DB == nil` 判定会失效、对已授权 db 调用 panic。
+	return &cap.Providers{
+		KV:    cap.NewMemKV(),
+		HTTP:  &http.Client{Timeout: 30 * time.Second},
+		Event: cap.NewMemEvent(),
+		DB:    dbCap,
+	}
 }
 
 // WithMaxParallel 设置并发上限；n < 1 时取 1（退化为串行执行）。
@@ -95,10 +131,75 @@ func WithSandbox(policy string) func(*Engine) {
 }
 
 // hostFor 为一次执行构建宿主能力视图：按 Tool.Capabilities 精确授权，从引擎持有
-// 的宿主实现集中取原语。注册期已校验 Capabilities 合法（model.Tool.Validate），故此处忽略错误。
-func (e *Engine) hostFor(tool *model.Tool) *cap.Context {
+// 的宿主实现集中取原语。rc 非空时把当前执行链写入 ctx（供 ctx.call 递归守卫）；
+// 注册期已校验 Capabilities 合法（model.Tool.Validate），故此处忽略错误。
+func (e *Engine) hostFor(tool *model.Tool, rc *runContext) *cap.Context {
+	var via []string
+	if rc != nil {
+		for _, id := range rc.ancestors {
+			if id != "" {
+				via = append(via, id)
+			}
+		}
+		if rc.flowID != "" {
+			via = append(via, rc.flowID)
+		}
+	}
+	return e.hostForChain(tool, via)
+}
+
+// hostForChain 用给定的调用链构造宿主视图（调用链用于 ctx.call 循环守卫，复用 #72 祖先链语义）。
+func (e *Engine) hostForChain(tool *model.Tool, via []string) *cap.Context {
 	grants, _ := cap.GrantsFromStrings(tool.Capabilities)
-	return cap.New(grants, e.host)
+	c := cap.New(grants, e.host)
+	if len(via) > 0 {
+		c.SetCallChain(via)
+	}
+	return c
+}
+
+// newResolver 构造引擎的 call 解析器（插件间唯一通信通道，PRD §6）：
+//   - target 是已注册 Tool：直接执行其 runtime（按自身 Capabilities 授权）。
+//   - target 是已注册 Flow：同步内联执行（复用 e.run，调用链追加 target 做循环守卫）。
+//   - 否则报错（既非 Tool 也非 Flow）。
+func (e *Engine) newResolver() cap.Resolver {
+	return func(target string, input map[string]interface{}, via []string) (map[string]interface{}, error) {
+		// 1) Tool 优先（call 的主通道是调用一个已注册 Tool）。
+		if tool, err := e.reg.GetTool(target); err == nil && tool != nil {
+			rt, err := runtimeFor(tool.Runtime, e.sandboxPolicy)
+			if err != nil {
+				return nil, err
+			}
+			host := e.hostForChain(tool, via)
+			out, err := rt.Run(context.Background(), tool.Entry, input, host)
+			if err != nil {
+				return nil, fmt.Errorf("call Tool %q 失败: %w", target, err)
+			}
+			return out, nil
+		}
+		// 2) Flow：内联执行，循环守卫（target 已在调用链上则拦截，避免 A→B→A 无限递归）。
+		if flow, err := e.reg.GetFlow(target); err == nil && flow != nil {
+			for _, id := range via {
+				if id == target {
+					return nil, fmt.Errorf("call %q 会形成循环调用（调用链 %v），已拦截", target, via)
+				}
+			}
+			res, err := e.run(flow, nil, "", append(append([]string{}, via...), target))
+			if err != nil {
+				return nil, fmt.Errorf("call Flow %q 失败: %w", target, err)
+			}
+			if res == nil {
+				return nil, fmt.Errorf("call Flow %q 返回空结果", target)
+			}
+			// 返回子 Flow 的 step 输出集合（stepID → {input, output}），供调用方经 r.<stepID>.output 取用。
+			out := make(map[string]interface{}, len(res.Steps))
+			for k, v := range res.Steps {
+				out[k] = v
+			}
+			return out, nil
+		}
+		return nil, fmt.Errorf("call 目标 %q 既不是已注册 Tool 也不是 Flow", target)
+	}
 }
 
 // secretResolver 返回执行期 ${secrets.x} 的解析器（REQ-TMPL-SECRETS）。

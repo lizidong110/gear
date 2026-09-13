@@ -102,7 +102,7 @@ func (e *Engine) applyHooks(ctx context.Context, all []model.Hook, stage, flowID
 		}
 
 		hctx, cancel := context.WithTimeout(ctx, defaultExecTimeout)
-		host := e.hostFor(tool)
+		host := e.hostFor(tool, nil)
 		out, err := rt.Run(hctx, tool.Entry, cur, host)
 		cancel()
 		if err != nil {
@@ -201,7 +201,7 @@ func (e *Engine) applyFlowScopedToolHook(ctx context.Context, rc *runContext, h 
 		payload = rc.lastResultMap()
 	}
 	hctx, cancel := context.WithTimeout(ctx, defaultExecTimeout)
-	host := e.hostFor(tool)
+	host := e.hostFor(tool, rc)
 	out, err := rt.Run(hctx, tool.Entry, payload, host)
 	cancel()
 	if err != nil {
@@ -298,7 +298,7 @@ func (e *Engine) runOnceStep(ctx context.Context, rc *runContext, hooks []model.
 	}
 
 	stepCtx, cancel := context.WithTimeout(ctx, defaultExecTimeout)
-	host := e.hostFor(tool)
+	host := e.hostFor(tool, rc)
 	output, err = rt.Run(stepCtx, tool.Entry, input, host)
 	cancel()
 	if err != nil {
@@ -339,7 +339,7 @@ func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []m
 	if err != nil {
 		return nil, fmt.Errorf("step %s: %w", step.ID, err)
 	}
-	host := e.hostFor(tool)
+	host := e.hostFor(tool, rc)
 
 	// 关键：service 进程是**长驻**的，不能绑在层级的 ctx 上——
 	// execLevel 在层结束时会 cancel()，若沿用该 ctx，刚拉起的 service 会被立刻杀掉。

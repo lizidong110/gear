@@ -2,8 +2,10 @@ package cap
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 )
 
@@ -13,7 +15,7 @@ func testProviders() *Providers {
 		Secret: MapSecret{"api_token": "s3cr3t"},
 		HTTP:   http.DefaultClient,
 		Event:  NewMemEvent(),
-		Resolver: func(target string, input map[string]interface{}) (map[string]interface{}, error) {
+		Resolver: func(target string, input map[string]interface{}, via []string) (map[string]interface{}, error) {
 			return map[string]interface{}{"echo": target}, nil
 		},
 	}
@@ -129,6 +131,45 @@ func TestDBNilUnavailable(t *testing.T) {
 	c := New(g, testProviders())
 	if _, err := c.DB(); err != ErrCapabilityUnavailable {
 		t.Fatalf("db 未实现应返回 ErrCapabilityUnavailable，实为 %v", err)
+	}
+}
+
+// TestSQLiteDBImpl 直接锁死 db 原语实现（#69）：建表/插入/查询/类型归一。
+// 用临时文件 DSN，顺带验证文件持久化路径可用（引擎默认宿主用内存 DSN，此处覆盖文件形态）。
+func TestSQLiteDBImpl(t *testing.T) {
+	db, err := NewSQLiteDB(filepath.Join(t.TempDir(), "cap.db"))
+	if err != nil {
+		t.Fatalf("打开 SQLite 失败: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Exec("CREATE TABLE t(id INTEGER, name TEXT, blob BLOB)"); err != nil {
+		t.Fatalf("建表失败: %v", err)
+	}
+	if err := db.Exec("INSERT INTO t VALUES(1, 'alice', X'beef')"); err != nil {
+		t.Fatalf("插入失败: %v", err)
+	}
+	rows, err := db.Query("SELECT id, name, blob FROM t")
+	if err != nil {
+		t.Fatalf("查询失败: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("应返回 1 行，实为 %d", len(rows))
+	}
+	row, ok := rows[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("行类型异常: %T", rows[0])
+	}
+	if fmt.Sprint(row["name"]) != "alice" {
+		t.Fatalf("name 应为 alice，实为 %v", row["name"])
+	}
+	if fmt.Sprint(row["id"]) != "1" {
+		t.Fatalf("id 应为 1，实为 %v", row["id"])
+	}
+	// BLOB 应被归一为字符串（X'beef' 即字节 0xbe,0xef，原样转字符串而非 hex 文本）。
+	blob, ok := row["blob"].(string)
+	if !ok || blob != string([]byte{0xbe, 0xef}) {
+		t.Fatalf("blob 应归一为 2 字节字符串，实为 %v (%T)", row["blob"], row["blob"])
 	}
 }
 

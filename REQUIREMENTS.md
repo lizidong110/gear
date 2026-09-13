@@ -78,7 +78,7 @@
 | REQ-USEVERSION | §4.2/§7 | step 钉版本 `use_version` | `implemented`（S5） | `engine/version_test.go`: TestRunFlowResolvesUseVersion、TestRunFlowDefaultVersion、TestValidateFlowStaticUnknownVersion；`model/version_test.go`: TestFlowValidateAllowsUseVersion |
 | REQ-HOOK-PROMOTE | §5.3/§7 | `before_promote` 阶段 Hook（版本晋升前） | `implemented`（S5） | `engine/version_test.go`: TestPromoteToolBeforePromoteGate；`model/version_test.go`: TestHookValidateAllowsBeforePromote |
 | REQ-HOOK-ACTION-FLOW | §5.3 | Hook 的 action 指向 **Flow**（PRD §5.3 原文「引用的 Flow/Tool」） | `implemented`（#72） | `engine/flowhook_test.go`: TestBeforeFlowHookFlowInline、TestBeforeFlowHookFlowNoInfiniteRecursion、TestBeforeFlowHookFlowCycleGuarded；同步内联子 Flow（同 execID 上下文，结构性无递归），before_flow 时子 Flow 结果暴露进主 Flow vars（key=子 Flow id）；递归守卫拦截循环调用；仅 once 模式（RunFlowExec）生效，service 长驻模式 Flow 级 Hook 仍 deferred |
-| REQ-CTX | §10/§14.1 | 宿主能力 `ctx.*`（http/call/db/kv/secret/event） | `implemented`（M5） | `internal/cap` 包 + 引擎按 `Tool.Capabilities` 精确放行；lua 经 `setupLuaCapabilities`、process 经 `withHostCapabilities` 注入；db 原语已定义但宿主未实现，调用返回 `ErrCapabilityUnavailable`；测试见 `engine/lua_cap_test.go`、`engine/cap_integration_test.go`、`cap/cap_test.go`。注：process/go-host 运行期绕过 capability（P0-4）仍 deferred |
+| REQ-CTX | §10/§14.1 | 宿主能力 `ctx.*`（http/call/db/kv/secret/event） | `implemented`（M5，#69 收口） | `internal/cap` 包 + 引擎按 `Tool.Capabilities` 精确放行；lua 经 `setupLuaCapabilities`、process 经 `withHostCapabilities` 注入；**db 原语已实现**（`internal/cap/sqldb.go`，modernc.org/sqlite，文件或内存 DSN）；**引擎默认宿主装配（#69）**：`New` 在未显式 `WithHost` 时注入 KV/HTTP/Event/DB 原语，并始终注入 `call` 解析器（Tool/Flow 目标，复用祖先链循环守卫），声明了对应 capability 的 Tool 在生产环境真正可用，不再恒返回 `ErrCapabilityUnavailable`；测试见 `engine/lua_cap_test.go`、`engine/cap_integration_test.go`、`cap/cap_test.go`、`engine/host_default_test.go`（#69 新增 7 例）。注：secret 默认无密钥源（nil → Unavailable，fail-closed）；process/go-host 运行期绕过 capability（P0-4）仍 deferred |
 | REQ-RUNTIME-GOHOST | §3.2 | go-host runtime | `deferred`（S7 后续） | `Tool.Validate` 注册期拒 + `runtimeFor` 报错；测试 TestSpecRejectsUnimplementedRuntimeTool、TestRuntimeForRejectsUnimplemented |
 | REQ-RUNTIME-WASM | §3.2 | wasm runtime | `deferred`（V3） | 同上 |
 | REQ-LUA-SERVICE | §14.2 | lua 的 service（长驻）模式 | `deferred`（依赖 M5 ctx.*） | `luaRuntime.Start` 显式报错「不支持 service」；测试 TestLuaServiceUnsupported |
@@ -110,7 +110,7 @@
 | G2 | M10 只完成一半：`Runtime` 接口只有 `Run`，service 路径硬编码 `tool.Runtime != process` 白名单 + 直调 `startProcess`，绕过接口 | 架构债（两处判定、接口缺 Start） | 接口加 `Start`+`Process` 抽象；service/once 共用 `runtimeFor` 唯一点；删硬编码白名单 |
 | G3 | 「已实现 runtime」列表散落多处（model 枚举、runtimeFor、supervise 白名单） | 列表漂移风险 | 收敛到 `model.KnownRuntimes` / `ImplementedRuntimes` 单一来源（C） |
 | M4 | Hook 机制零实现、引擎无接缝 | 架构债 | 标 `architecture-debt`，S3 建调用点 |
-| M5 | `ctx.*` 宿主能力层不存在 | 架构债 → 已解决 | M5 已实现：`internal/cap` 包（6 原语 + 最小权限放行）+ 引擎 `Runtime` 接口透传 `host *cap.Context` + lua `ctx.*` 暴露 + process `ctx.capabilities` 注入；db 原语 deferred 实现（声明可见、调用返回 `ErrCapabilityUnavailable`） |
+| M5 | `ctx.*` 宿主能力层不存在 | 架构债 → 已解决 | M5 已实现：`internal/cap` 包（6 原语 + 最小权限放行）+ 引擎 `Runtime` 接口透传 `host *cap.Context` + lua `ctx.*` 暴露 + process `ctx.capabilities` 注入；**#69 收口**：db 原语实现（SQLite，见 `internal/cap/sqldb.go`）、引擎默认宿主装配（KV/HTTP/Event/DB）+ `call` 解析器（Tool/Flow + 循环守卫），生产环境声明即可用 |
 | M11 | PRD §4.3 把 `${secrets.x}` 列为「支持的变量引用前缀」，引擎仅实现 vars/steps，secrets 未实现 | 文档超前于代码（漂移） | 引擎 `validateTemplates` 注册期显式拒绝未知前缀（secrets）；PRD §4.3 改为标注「未实现（REQ-TMPL-SECRETS）」；测试 `TestValidateTemplatesRejectsSecrets` / `TestSpecSecretsTemplateRejectedAtRegister` 锁死 |
 
 ---
