@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"gear/internal/ai"
 	"gear/internal/app"
 	"gear/internal/engine"
 	"gear/internal/model"
@@ -40,19 +41,28 @@ type Server struct {
 	execs *ExecStore
 	mux   *http.ServeMux
 
+	// inferrer 是 AI 闭环（S6c）的推断器：默认本地 Ollama，测试 / 远端网关可注入。
+	inferrer ai.Inferrer
+
 	appMu  sync.Mutex
 	apps   map[string]*AppInstance
 	appSeq []string
 	appWG  sync.WaitGroup // 受管 app 的 goroutine 计数（Shutdown 需等其收敛）
 }
 
-// New 构造 Server（不启动监听）。
+// New 构造 Server（不启动监听）。AI 推断默认走本地 Ollama（S6c）。
 func New(reg *registry.Registry) *Server {
+	return NewWithInferrer(reg, ai.NewOllama("", ""))
+}
+
+// NewWithInferrer 与 New 相同，但可注入自定义 Inferrer（测试 / 远端 LLM 网关用）。
+func NewWithInferrer(reg *registry.Registry, inf ai.Inferrer) *Server {
 	s := &Server{
-		reg:   reg,
-		execs: NewExecStore(),
-		mux:   http.NewServeMux(),
-		apps:  map[string]*AppInstance{},
+		reg:      reg,
+		execs:    NewExecStore(),
+		mux:      http.NewServeMux(),
+		apps:     map[string]*AppInstance{},
+		inferrer: inf,
 	}
 	// §8.2 第三条守卫需要「运行期引用」，而运行期状态在 Server 手里 —— 由这里注入，
 	// registry 不反向依赖执行状态。
@@ -116,7 +126,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/hooks", s.handleCreateHook)
 
 	s.mux.HandleFunc("POST /api/executions", s.handleCreateExecution)
+	s.mux.HandleFunc("GET /api/executions", s.handleListExecutions)
 	s.mux.HandleFunc("GET /api/executions/{id}", s.handleGetExecution)
+
+	s.mux.HandleFunc("POST /api/ai/infer", s.handleInfer)
 
 	s.mux.HandleFunc("POST /api/apps", s.handleCreateApp)
 	s.mux.HandleFunc("GET /api/apps", s.handleListApps)
@@ -285,6 +298,11 @@ type createExecutionReq struct {
 	FlowID string `json:"flow_id"`
 }
 
+// inferReq 是 POST /api/ai/infer 的请求体（S6c）。
+type inferReq struct {
+	Prompt string `json:"prompt"`
+}
+
 func (s *Server) handleCreateExecution(w http.ResponseWriter, r *http.Request) {
 	var req createExecutionReq
 	if err := decodeJSON(r, &req); err != nil {
@@ -326,6 +344,32 @@ func (s *Server) handleGetExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rec)
+}
+
+// handleListExecutions 返回全部执行记录（内存态，重启即失；见 ExecStore 注释）。
+func (s *Server) handleListExecutions(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.execs.List())
+}
+
+// handleInfer 是 AI 闭环（S6c）的推断入口：自然语言 prompt → Flow 定义。
+// 推断器可注入（默认本地 Ollama）；生成失败（解析 / 校验不过，重试 3 次仍失败）
+// 返回 422，由调用方决定降级策略。
+func (s *Server) handleInfer(w http.ResponseWriter, r *http.Request) {
+	var req inferReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Prompt == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("prompt 不能为空"))
+		return
+	}
+	flow, err := ai.GenerateFlow(r.Context(), s.inferrer, req.Prompt)
+	if err != nil {
+		writeErr(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, flow)
 }
 
 type createAppReq struct {

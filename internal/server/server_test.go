@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -491,4 +492,74 @@ func TestCreateFlowWithoutWhen(t *testing.T) {
 		t.Fatalf("不含 when 的 Flow 保存期望 201，实际 %d %s", rec.Code, rec.Body.String())
 	}
 	_ = out
+}
+
+// A-15：执行列表端点——POST 触发后，GET /api/executions 应返回含该 Flow 的记录。
+func TestListExecutions(t *testing.T) {
+	s, reg := newTestServer(t)
+	seed(t, reg)
+
+	do(t, s.Handler(), "POST", "/api/executions", map[string]interface{}{"flow_id": "f1"})
+
+	list := doArray(t, s.Handler(), "GET", "/api/executions")
+	if len(list) == 0 {
+		t.Fatal("执行列表不应为空")
+	}
+	found := false
+	for _, e := range list {
+		if e["flow_id"] == "f1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("执行列表应含 f1 的执行记录")
+	}
+}
+
+// mockInferrer 是 ai.Inferrer 的 Mock（server 测试用）。
+type mockInferrer struct {
+	text string
+	err  error
+}
+
+func (m *mockInferrer) Infer(ctx context.Context, prompt string) (string, error) {
+	return m.text, m.err
+}
+
+// A-16：AI 闭环端点——合法收敛返回 200 + Flow；空 prompt 400；收敛失败（非法 YAML）422。
+func TestInferFlow(t *testing.T) {
+	reg, err := registry.Open(filepath.Join(t.TempDir(), "registry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	inf := &mockInferrer{text: `id: ai-flow
+steps:
+  - id: s1
+    call: t1
+`}
+	s := NewWithInferrer(reg, inf)
+
+	rec, out := do(t, s.Handler(), "POST", "/api/ai/infer", map[string]interface{}{"prompt": "make a flow"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("合法收敛应 200，实为 %d: %s", rec.Code, rec.Body.String())
+	}
+	if out["id"] != "ai-flow" {
+		t.Fatalf("生成的 flow id 错误: %v", out["id"])
+	}
+
+	// 空 prompt → 400
+	rec2, _ := do(t, s.Handler(), "POST", "/api/ai/infer", map[string]interface{}{"prompt": ""})
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("空 prompt 应 400，实为 %d", rec2.Code)
+	}
+
+	// 收敛失败（非法 YAML）→ 422
+	infBad := &mockInferrer{text: "这根本不是 YAML"}
+	sBad := NewWithInferrer(reg, infBad)
+	rec3, _ := do(t, sBad.Handler(), "POST", "/api/ai/infer", map[string]interface{}{"prompt": "x"})
+	if rec3.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("收敛失败应 422，实为 %d: %s", rec3.Code, rec3.Body.String())
+	}
 }

@@ -12,6 +12,10 @@ import (
 
 var registryPath string
 
+// serverAddr 是 REST 执行面地址（exec / ai 等客户端子命令与 serve 共用，作为持久标志）。
+// 默认 127.0.0.1:8787；可用环境变量 GEAR_ADDR 覆盖（便于联调远端执行面）。
+var serverAddr string
+
 // newRootCmd 构造根命令（供 CLI 入口与测试复用）。
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
@@ -21,9 +25,19 @@ func newRootCmd() *cobra.Command {
 	}
 	root.PersistentFlags().StringVar(&registryPath, "registry", defaultRegistry(),
 		"registry 数据库路径（默认 ~/.gear/registry.db）")
+	root.PersistentFlags().StringVar(&serverAddr, "addr", defaultAddr(),
+		"REST 执行面地址（默认 127.0.0.1:8787，可用 GEAR_ADDR 覆盖）")
 
-	root.AddCommand(toolCmd(), flowCmd(), appCmd(), hookCmd(), serveCmd())
+	root.AddCommand(toolCmd(), flowCmd(), appCmd(), hookCmd(), serveCmd(), execCmd(), aiCmd())
 	return root
+}
+
+// defaultAddr 返回 --addr 的默认值：优先环境变量 GEAR_ADDR，否则内置默认。
+func defaultAddr() string {
+	if v := os.Getenv("GEAR_ADDR"); v != "" {
+		return v
+	}
+	return "127.0.0.1:8787"
 }
 
 // Execute 是 CLI 入口。

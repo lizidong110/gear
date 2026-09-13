@@ -67,10 +67,10 @@ func tempDB(t *testing.T) string {
 	return filepath.Join(t.TempDir(), "registry.db")
 }
 
-// TestNewRootCmd 校验根命令装配了 5 个子命令（管理面完整性）。
+// TestNewRootCmd 校验根命令装配了全部子命令（管理面完整性）。
 func TestNewRootCmd(t *testing.T) {
 	root := newRootCmd()
-	want := []string{"tool", "flow", "app", "hook", "serve"}
+	want := []string{"tool", "flow", "app", "hook", "serve", "exec", "ai"}
 	got := make(map[string]bool)
 	for _, c := range root.Commands() {
 		got[c.Name()] = true
@@ -233,7 +233,7 @@ func TestHookRegisterInvalid(t *testing.T) {
 	}{
 		{"bad-stage", `id: h2
 target: "*"
-stage: before_promote
+stage: not_a_real_stage
 action: t1
 `},
 		{"empty-action", `id: h3
@@ -260,12 +260,13 @@ func TestAppRunIllegalRestart(t *testing.T) {
 	}
 }
 
-// TestServeCmdConstruction 校验 serve 子命令装配了 --addr 标志（执行路径会阻塞，不在此跑）。
+// TestServeCmdConstruction 校验 --addr 作为根命令持久标志存在（serve / exec / ai 共用，
+// 执行路径会阻塞，不在此跑）。
 func TestServeCmdConstruction(t *testing.T) {
-	c := serveCmd()
-	fl := c.Flags().Lookup("addr")
+	root := newRootCmd()
+	fl := root.PersistentFlags().Lookup("addr")
 	if fl == nil {
-		t.Fatal("serve 缺少 --addr 标志")
+		t.Fatal("根命令缺少 --addr 持久标志")
 	}
 	if fl.DefValue != "127.0.0.1:8787" {
 		t.Errorf("--addr 默认值应为 127.0.0.1:8787，实为 %q", fl.DefValue)
