@@ -20,6 +20,9 @@ const (
 	StatusRunning   = "running"
 	StatusSucceeded = "succeeded"
 	StatusFailed    = "failed"
+	// StatusRejected 表示执行因入口繁忙被拒绝（REQ-CONCURRENCY-CROSS / #73）：
+	// 超出并发上限且队列已满，未真正运行。
+	StatusRejected = "rejected"
 )
 
 // Execution 是一次 Flow 触发的记录（对外 JSON 表示）。
@@ -184,6 +187,16 @@ func (s *ExecStore) Finish(id string, res *engine.RunResult, err error) {
 	_, _ = s.db.Exec(
 		`UPDATE executions SET status=?, error=?, result=?, finished_at=? WHERE id=?`,
 		status, errMsg, resultJSON, now.Format(time.RFC3339Nano), id,
+	)
+}
+
+// Reject 标记一次执行因入口繁忙被拒绝（REQ-CONCURRENCY-CROSS / #73）：
+// 并发上限且队列已满，任务未真正运行即被拒，status 置为 rejected 供查询可见。
+func (s *ExecStore) Reject(id, reason string) {
+	now := time.Now()
+	_, _ = s.db.Exec(
+		`UPDATE executions SET status=?, error=?, finished_at=? WHERE id=?`,
+		StatusRejected, reason, now.Format(time.RFC3339Nano), id,
 	)
 }
 

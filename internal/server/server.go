@@ -49,22 +49,53 @@ type Server struct {
 	apps   map[string]*AppInstance
 	appSeq []string
 	appWG  sync.WaitGroup // 受管 app 的 goroutine 计数（Shutdown 需等其收敛）
+
+	// gate 是执行入口的全局并发闸门（REQ-CONCURRENCY-CROSS / #73）：
+	// 固定 worker 池 = 最大并发执行数，超额排队、再超额在入口拒绝（回 429，背压）。
+	// 区别于 S4 step 级 maxParallel（限单个 Flow 内 step 并发）与 S2 app run --max（限 Flow 数）。
+	gate          *ConcurrencyGate
+	maxConcurrent int // worker 数（并发执行上限）；0 表示取默认
+	execQueueSize int // 待执行队列长度；0 表示取默认
 }
+
+// ServerOption 调整 Server 的构造期配置（目前仅并发闸门相关）。
+type ServerOption func(*Server)
+
+// WithMaxConcurrent 设执行入口「同时跑的 Flow 执行数」上限（即 gate worker 数）。
+// 影响的是跨 Flow 的全局并发，不是单 Flow 内 step 并发（那是 S4 maxParallel）。
+func WithMaxConcurrent(n int) ServerOption { return func(s *Server) { s.maxConcurrent = n } }
+
+// WithExecQueueSize 设执行入口的有界排队队列长度：worker 全忙时进入排队，
+// 队列满再提交即被拒绝（回 429）。0 表示不排队、满即拒。
+func WithExecQueueSize(n int) ServerOption { return func(s *Server) { s.execQueueSize = n } }
 
 // New 构造 Server（不启动监听）。AI 推断默认走线上 SiliconFlow（S6c）；无 Key 回退 Ollama。
 func New(reg *registry.Registry) *Server {
 	return NewWithInferrer(reg, ai.DefaultInferrer())
 }
 
-// NewWithInferrer 与 New 相同，但可注入自定义 Inferrer（测试 / 远端 LLM 网关用）。
-func NewWithInferrer(reg *registry.Registry, inf ai.Inferrer) *Server {
+// NewWithInferrer 与 New 相同，但可注入自定义 Inferrer（测试 / 远端 LLM 网关用），
+// 并支持构造期选项（如 WithMaxConcurrent / WithExecQueueSize 调并发闸门，REQ-CONCURRENCY-CROSS / #73）。
+func NewWithInferrer(reg *registry.Registry, inf ai.Inferrer, opts ...ServerOption) *Server {
+	const (
+		defaultMaxConcurrent = 64  // 全局部署默认：单机能同时跑 64 个 Flow 执行
+		defaultQueueSize     = 256 // 排队缓冲，避免瞬时抖动直接 429
+	)
 	s := &Server{
-		reg:      reg,
-		execs:    NewExecStore(),
-		mux:      http.NewServeMux(),
-		apps:     map[string]*AppInstance{},
-		inferrer: inf,
+		reg:           reg,
+		execs:         NewExecStore(),
+		mux:           http.NewServeMux(),
+		apps:          map[string]*AppInstance{},
+		inferrer:      inf,
+		maxConcurrent: defaultMaxConcurrent,
+		execQueueSize: defaultQueueSize,
 	}
+	for _, o := range opts {
+		o(s)
+	}
+	// 并发闸门（#73）：执行入口的「进程池」。worker 数 = 最大并发执行数，
+	// 待执行任务入有界队列，队列满且 worker 全忙时 Submit 返回 false（入口拒绝、回 429）。
+	s.gate = NewConcurrencyGate(s.maxConcurrent, s.execQueueSize)
 	// 日志采集（REQ-API-LOGS / #71）：引擎执行 step 时把 stdout/stderr 行经 ExecStore 落盘，
 	// 供 GET /api/executions/{id}/logs 查询。
 	s.engine = engine.New(reg, engine.WithLogSink(s.execs.logSink()))
@@ -113,6 +144,11 @@ func (s *Server) Shutdown() {
 	s.appSeq = nil
 	s.appMu.Unlock()
 	s.appWG.Wait()
+	// 先收敛执行入口闸门：关闭队列并等全部 worker 退出，确保「在途执行」已落终态
+	// （RunFlowExec → execs.Finish）后再释放 ExecStore 句柄，避免 Finish 写到已关的库。
+	if s.gate != nil {
+		s.gate.Stop()
+	}
 	// 释放执行记录库句柄（#70 SQLite 持久化）：停机后不再查询，关闭以解锁 WAL 侧车文件。
 	_ = s.execs.Close()
 }
@@ -368,7 +404,9 @@ func (s *Server) handleCreateExecution(w http.ResponseWriter, r *http.Request) {
 	}
 
 		rec := s.execs.Create(req.FlowID)
-	go func() {
+	// 经并发闸门派发（REQ-CONCURRENCY-CROSS / #73）：worker 全忙且队列已满 → 拒绝（背压），
+	// 执行记录置 rejected 并回 429，由调用方决定退避重试，而非放任高扇出打爆机器。
+	job := func() {
 		// 引擎在加载完 Flow + Hook 快照后回报「本次可能用到的 Tool」，
 		// 作为 §8.2「运行中不可注销」守卫的判据（静态引用可能已被删/改）。
 		// RunFlowExec 带上 exec id，使 step 运行日志经 logSink 落盘（REQ-API-LOGS / #71）。
@@ -376,7 +414,17 @@ func (s *Server) handleCreateExecution(w http.ResponseWriter, r *http.Request) {
 			s.execs.SetTools(rec.ID, toolIDs)
 		})
 		s.execs.Finish(rec.ID, res, runErr)
-	}()
+	}
+	if !s.gate.Submit(job) {
+		const reason = "执行入口繁忙：并发已达上限且队列已满"
+		s.execs.Reject(rec.ID, reason)
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{
+			"id":     rec.ID,
+			"status": StatusRejected,
+			"error":  reason + "，请稍后重试",
+		})
+		return
+	}
 
 	writeJSON(w, http.StatusAccepted, map[string]string{"id": rec.ID, "status": rec.Status})
 }
