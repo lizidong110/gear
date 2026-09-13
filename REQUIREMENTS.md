@@ -87,7 +87,7 @@
 | REQ-APP-HEALTH | §14.3 | service 健康检查（HTTP/命令探针） | `deferred`（S2+） | 当前仅存活（进程退出即视为不健康）；探针未实现 |
 | REQ-CONCURRENCY-CROSS | §14.5 | 跨进程的执行入口队列 / 进程池（背压排队、拒绝策略） | `deferred`（后续） | step 级并发闸门已落地（REQ-PARALLEL / REQ-APP-MAXCONC）；跨进程池尚未实现 |
 | REQ-TMPL-SECRETS | §4.3 | 模板前缀 `${secrets.x}`（secret 原语随 ctx.* 落地，M5） | `deferred`（M5） | 注册期显式拒绝未知前缀（`validateTemplates`）；测试 `engine/template_test.go`: TestValidateTemplatesRejectsSecrets、TestSpecSecretsTemplateRejectedAtRegister |
-| REQ-API-PROMOTE | §11 | 版本晋升（状态机 + `before_promote` 门禁） | `partial`（S5） | CLI `gear tool promote <id> <v> <target>` 已实现（走 `engine.PromoteTool`，fail-closed 门禁）；REST 端点 `POST /api/tools/{id}/versions/{v}/promote` 未实现（晋升经 CLI 触发） |
+| REQ-API-PROMOTE | §11 | 版本晋升（状态机 + `before_promote` 门禁） | `implemented`（S5→REST） | CLI `gear tool promote <id> <v> <target>` 与 REST `POST /api/tools/{id}/versions/{v}/promote` 均已实现，均走 `engine.PromoteTool`（before_promote 门禁 fail-closed）；状态机语义在 `model.CanPromote` + `registry.PromoteToolVersion` 落地 |
 | REQ-API-AI | §11/§9 | AI 闭环（自然语言 → Flow）：`POST /api/ai/infer` + CLI `gear ai gen [--register]` | `implemented`（S6c） | `internal/ai`（Inferrer 接口 + Ollama 客户端 + GenerateFlow 收敛重试≤3）；`server_test.go`: TestInferFlow；`cli/ai_test.go`: TestAIGenPrintsYAML、TestAIGenRegister；LLM 接入方式定为本地 Ollama（qwen3.5:4b，可配置） |
 | REQ-API-LOGS | §11 | `GET /api/executions/{id}/logs` | `deferred`（需日志 Hook 产出） | 端点未实现；当前执行产物只有 RunResult |
 | REQ-EXEC-PERSIST | §11(§0 第 14 条) | 执行记录持久化（跨重启保留历史） | `deferred`（有意选择内存态） | `ExecStore` 为进程内 map，重启即失；已在代码注释显式声明 |

@@ -120,6 +120,59 @@ func TestToolsCRUD(t *testing.T) {
 	}
 }
 
+// A-2b：REST promote 端点（对应 CLI `tool promote`）：合法晋升 / 非法 target / 不存在版本 / 不存在 Tool。
+func TestPromoteVersion(t *testing.T) {
+	s, reg := newTestServer(t)
+	h := s.Handler()
+	tool := &model.Tool{
+		ID: "prom", Name: "Prom", Runtime: model.RuntimeProcess, Entry: "cat",
+		InputSchema:  map[string]interface{}{"type": "object"},
+		OutputSchema: map[string]interface{}{"type": "object"},
+		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateDraft}},
+	}
+	if err := reg.UpsertTool(tool); err != nil {
+		t.Fatalf("注册 Tool 失败: %v", err)
+	}
+
+	// 合法晋升 draft -> testing
+	rec, _ := do(t, h, "POST", "/api/tools/prom/versions/1.0.0/promote", promoteReq{Target: "testing"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("晋升期望 200，实际 %d %s", rec.Code, rec.Body.String())
+	}
+	// 验证状态已落库
+	got, err := reg.GetTool("prom")
+	if err != nil || got == nil {
+		t.Fatalf("取回 Tool 失败: %v", err)
+	}
+	if got.Versions[0].State != model.StateTesting {
+		t.Fatalf("晋升后状态应为 testing，实际 %s", got.Versions[0].State)
+	}
+
+	// 非法 target -> 400
+	rec, _ = do(t, h, "POST", "/api/tools/prom/versions/1.0.0/promote", promoteReq{Target: "bogus"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("非法 target 期望 400，实际 %d %s", rec.Code, rec.Body.String())
+	}
+
+	// target 为空 -> 400
+	rec, _ = do(t, h, "POST", "/api/tools/prom/versions/1.0.0/promote", promoteReq{Target: ""})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("空 target 期望 400，实际 %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 不存在版本 -> 404
+	rec, _ = do(t, h, "POST", "/api/tools/prom/versions/9.9.9/promote", promoteReq{Target: "stable"})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("不存在版本期望 404，实际 %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 不存在 Tool -> 404
+	rec, _ = do(t, h, "POST", "/api/tools/nope/versions/1.0.0/promote", promoteReq{Target: "stable"})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("不存在 Tool 期望 404，实际 %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 // A-3：非法 runtime 的 Tool → 400（注册期校验经由 REST 生效）。
 func TestCreateToolInvalid(t *testing.T) {
 	s, _ := newTestServer(t)

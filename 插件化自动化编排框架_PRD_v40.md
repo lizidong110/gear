@@ -329,7 +329,7 @@ POST /api/tools/{tool_id}/versions/{version}/promote
 { "operator": "alice", "expected_old_version": "1.0.0" }
 ```
 
-> **实现状态（S5）**：晋升当前由 CLI `gear tool promote <id> <v> <target>` 触发（走 `engine.PromoteTool`：先跑 `before_promote` 门禁再落库）；上述 REST 端点暂未单独实现。状态机语义（§7.3）已在 `model.CanPromote` + `registry.PromoteToolVersion` 落地，`expected_old_version` 的 CAS 预期留待 REST 端点补齐。
+> **实现状态（S5，已收口）**：晋升可由 CLI `gear tool promote <id> <v> <target>` 与 REST `POST /api/tools/{id}/versions/{v}/promote`（body `{"target":"testing"}`）两种方式触发，均走 `engine.PromoteTool`：先跑 `before_promote` 门禁再落库。状态机语义（§7.3）已在 `model.CanPromote` + `registry.PromoteToolVersion` 落地。注：当前实现以 `{target}` 表达目标状态，**未**采纳 PRD 草拟的 `operator`/`expected_old_version` 字段（`expected_old_version` 的 CAS 预期为后续可选增强，当前版本不可变 + 写锁已提供并发安全，见 §7.3）。
 
 ### 7.3 幂等与并发安全
 
@@ -458,9 +458,9 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 | POST | `/api/apps` | 启动 Flow 为受管进程（对应 `app run`） |
 | GET | `/api/apps` | 列出运行中的 Flow 进程 |
 | DELETE | `/api/apps/{id}` | 停止 Flow 进程（cancel ⇒ 杀掉 service 子进程） |
-| POST | `/api/tools/{id}/versions/{v}/promote` | 用户显式晋升 ✅ S5（经 CLI `gear tool promote <id> <v> <target>`；REST 端点未单独实现，晋升由 CLI 触发） |
+| POST | `/api/tools/{id}/versions/{v}/promote` | 用户显式晋升 ✅ S5（CLI `gear tool promote <id> <v> <target>` 与 REST `POST /api/tools/{id}/versions/{v}/promote` 均已实现，均走 `engine.PromoteTool` + before_promote 门禁） |
 
-> **实现状态（S6a+S5+S6c）**：除 `GET /api/executions/{id}/logs` 外均已实现，端到端可用（`gear serve --addr`；晋升 / AI 经 CLI `tool promote` / `ai gen` 触发，非独立 REST 端点）。
+> **实现状态（S6a+S5+S6c）**：除 `GET /api/executions/{id}/logs` 外均已实现，端到端可用（`gear serve --addr`；晋升经 CLI `tool promote` 与 REST promote 端点均可触发、AI 经 `ai gen` / `POST /api/ai/infer`）。
 > - **执行是异步的**：`POST /api/executions` 立即返回 `202 {id, status}`，结果经 `GET /api/executions/{id}` 查询（三态：running / succeeded / failed，失败带 `error`）。
 > - **状态是内存态**（显式声明）：执行记录与 app 句柄都存活在服务进程内，**进程重启即丢失**。持久化执行历史属后续切片，勿当作已持久化。
 > - **统一错误体**：`{"error": "..."}`；状态码语义 400 参数/校验、404 不存在、409 仍被引用。

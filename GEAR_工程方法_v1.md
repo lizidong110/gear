@@ -93,7 +93,7 @@ gear/
 | §6 | 宿主 6 原语 http/call/db/kv/secret/event | host | 集成 | T-host-01..06 | 🟢 M5 已落地（`internal/cap` + `engine.luaRuntime`/`processRuntime` 注入 `ctx.*`；db 原语已实现接口但宿主未提供实现，调用返回 ErrCapabilityUnavailable） |
 | §6.2 | call 与 event 边界 | host | 集成 | T-host-07 | 🟢 M5：call 经 Resolver 唯一通道、event notify/wait 同步往返，均已测 |
 | §7.1 | 状态机 draft→testing→stable→deprecated/rejected | engine/registry | 单测 | T-ver-01 | 🟢 已落地（VersionTransitions 白名单 + CanPromote；`model/version_test.go` / `engine/version_test.go`） |
-| §7.2 | 晋升显式 + operator 审计 | server/registry | 集成 | T-ver-02 | 🟢 已落地（晋升经 CLI `gear tool promote` 显式触发 + `before_promote` 门禁 fail-closed；REST promote 端点 deferred，见 REQ-API-PROMOTE） |
+| §7.2 | 晋升显式 + operator 审计 | server/registry | 集成 | T-ver-02 | 🟢 已落地（晋升经 CLI `gear tool promote` 与 REST `POST /api/tools/{id}/versions/{v}/promote` 均可触发，均走 `engine.PromoteTool` + `before_promote` 门禁 fail-closed；见 REQ-API-PROMOTE） |
 | §7.3 | 幂等 + 并发安全（写锁/CAS/版本不可变） | registry | 并发测试 | T-ver-03 | 🟢 已落地（Registry 写锁 + upsert 事务 + `TestConcurrentUpsert`；版本行不可变） |
 | §7.4 | 灰度选择（use_version:testing / allow_testing） | engine | 单测 | T-ver-04 | 🟢 已落地（resolveToolVersion 钉版本解析；REQ-USEVERSION / `engine/version_test.go`: TestRunFlowResolvesUseVersion） |
 | §8.1 | 依赖图三类（Flow→Tool 不传递） | registry | 单测 | T-reg-01 | 🟢 已落地（`registry_test.go` 依赖图三类校验） |
@@ -101,7 +101,7 @@ gear/
 | §8.3 | Lock + digest（signature 暂 deferred） | registry | 集成 | T-reg-03 | 🟡 Lock 已做（`sync.Mutex` + 事务）；digest/signature 仍 deferred |
 | §9 | AI 生成 DSL + 静态校验 + ≤3 次重试 + Schema 不漂移 | server | 集成 | T-ai-01 | 🟢 已落地（S6c：`internal/ai` GenerateFlow 收敛重试≤3 + 静态校验；REQ-API-AI / `server_test.go`: TestInferFlow + `cli/ai_test.go`） |
 | §10 | 架构分层 | （结构审查） | 评审 | — | 🟡 |
-| §11 | API 最小集全量 | server | 契约 | T-srv-02 | 🟢 15 端点中 14 个已实现（新增 executions 列表 + ai-infer；GET /api/flows 列表端点补测见 TestListFlows）；deferred：executions/{id}/logs；promote 经 CLI `tool promote` 触发（非 REST 端点） |
+| §11 | API 最小集全量 | server | 契约 | T-srv-02 | 🟢 15 端点中 15 个已实现（含 executions 列表 + ai-infer + REST promote 端点；GET /api/flows 列表端点补测见 TestListFlows）；deferred：executions/{id}/logs |
 | §13 | 待确认项显式处置 | 全局 | 评审 | — | 🟡 |
 | §14 | app run 进程模型 + 长驻/restart/子进程归属/进程池 | server/engine | 集成 | T-app-01..04 | 🟢 已落地（restart 策略 + 信号停止 + `--max` 闸门 + 子进程归属；REQ-APP-* / `app/supervisor_test.go`）；**健康探针 deferred**（REQ-APP-HEALTH）、**跨进程队列/进程池 deferred**（REQ-CONCURRENCY-CROSS） |
 
@@ -382,6 +382,19 @@ gear/
 **验证（真实联网）**：`SILICONFLOW_API_KEY=… go test ./internal/ai/ -run TestSiliconFlowInferLive` 实测返回 3 步 Flow（`fetch-unshipped-orders → generate-csv → send-email`，含 `depends_on` 与具体 `input`），`parseAndValidateFlow` 一次收敛成功——"太简单"问题已解决。
 
 **注意（key 不入库）**：API Key 仅经环境变量传入，绝不写入源码/配置；本机运行前需 `export SILICONFLOW_API_KEY=sk-…`（或 Windows `set`），再 `gear serve`。
+
+### 2026-09-13（第十次）· 补 REST promote 端点（REQ-API-PROMOTE 收口）
+
+**触发**：待完成清单 #78（deferred 项）挑最轻量的先做。此前晋升仅 CLI `gear tool promote` 可触发，PRD §11 与 REQ-API-PROMOTE 都把它标成「非 REST 端点」。
+
+**改了什么**
+- `internal/server/server.go` 新增路由 `POST /api/tools/{id}/versions/{v}/promote` + handler `handlePromoteVersion`：解析 `{target}`，校验 `model.ValidStates`，走 `engine.PromoteTool`（before_promote 门禁 fail-closed + `registry.PromoteToolVersion` 状态校验）。错误经 `statusForErr` 映射：Tool/版本不存在→404，非法 target/迁移→400。
+- `internal/server/server_test.go` 新增 `TestPromoteVersion`：合法晋升 draft→testing（断言落库）、非法 target→400、不存在版本→404、不存在 Tool→404。
+- REQ-API-PROMOTE：`partial` → `implemented (S5→REST)`；PRD §11 端点表 promote 行、§7.3 实现状态块同步标 ✅；方法论 §7.2（T-ver-02）/ §11 矩阵收口（REST promote 端点已实现，仅 `executions/{id}/logs` 仍 deferred）。
+
+**为什么**：晋升是一个「受 Hook 守卫的边界动作」，REST 暴露后运维可直接经 HTTP 灰度，不必依赖 CLI；逻辑复用既有的 `engine.PromoteTool`，无新分支风险。
+
+**验证**：`TestPromoteVersion` 通过；全量 `gate.sh` 仍绿（server 包覆盖率见闸门输出）。
 
 ### 2026-09-13 · 实现 `when` 条件执行，新增 F6–F8 与 §0 第 10–12 条
 

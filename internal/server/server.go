@@ -117,6 +117,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/tools", s.handleListTools)
 	s.mux.HandleFunc("POST /api/tools", s.handleCreateTool)
 	s.mux.HandleFunc("DELETE /api/tools/{id}", s.handleDeleteTool)
+	s.mux.HandleFunc("POST /api/tools/{id}/versions/{v}/promote", s.handlePromoteVersion)
 
 	s.mux.HandleFunc("GET /api/flows", s.handleListFlows)
 	s.mux.HandleFunc("POST /api/flows", s.handleCreateFlow)
@@ -219,6 +220,42 @@ func (s *Server) handleDeleteTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
+}
+
+// promoteReq 是 POST /api/tools/{id}/versions/{v}/promote 的请求体（S5 灰度 REST 端点）。
+type promoteReq struct {
+	Target string `json:"target"`
+}
+
+// handlePromoteVersion 晋升某 Tool 版本到目标状态（S5 灰度 REST 端点，对应 CLI `tool promote`）。
+// 走 engine.PromoteTool：先触发 before_promote Hook 门禁（fail-closed），再落库；
+// 状态迁移合法性由 model.CanPromote 在 registry 层校验。
+func (s *Server) handlePromoteVersion(w http.ResponseWriter, r *http.Request) {
+	toolID := r.PathValue("id")
+	version := r.PathValue("v")
+	var req promoteReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Target == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("target 不能为空"))
+		return
+	}
+	target := model.ToolVersionState(req.Target)
+	if !model.ValidStates[target] {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("非法目标状态: %q（应为 draft/testing/stable/deprecated/rejected）", req.Target))
+		return
+	}
+	if err := engine.New(s.reg).PromoteTool(toolID, version, target); err != nil {
+		writeErr(w, statusForErr(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"tool_id": toolID,
+		"version": version,
+		"state":   string(target),
+	})
 }
 
 func (s *Server) handleListFlows(w http.ResponseWriter, r *http.Request) {
