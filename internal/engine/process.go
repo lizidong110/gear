@@ -67,17 +67,17 @@ func runProcess(ctx context.Context, entry string, input map[string]interface{},
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("%v (stderr=%s)", err, stderr.String())
+		return nil, procFail(fmt.Sprintf("%v (stderr=%s)", err, stderr.String()), entry, stdout.Bytes(), stderr.Bytes())
 	}
 
 	last := lastNonEmptyLine(stdout.String())
 	if last == "" {
-		return nil, fmt.Errorf("stdout 为空")
+		return nil, procFail("stdout 为空", entry, stdout.Bytes(), stderr.Bytes())
 	}
 
 	var out map[string]interface{}
 	if err := json.Unmarshal([]byte(last), &out); err != nil {
-		return nil, fmt.Errorf("解析 stdout 失败(%q): %w", last, err)
+		return nil, procFail(fmt.Sprintf("解析 stdout 失败(%q): %v", last, err), entry, stdout.Bytes(), stderr.Bytes())
 	}
 	return out, nil
 }
