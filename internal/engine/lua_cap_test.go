@@ -135,7 +135,7 @@ func TestLuaCapEvent(t *testing.T) {
 func TestLuaCapDBUnavailable(t *testing.T) {
 	prov := &cap.Providers{} // DB 为 nil
 	host := luaHost(t, []string{"db"}, prov)
-	_, err := luaRunHost(t, `return ctx.db.query("SELECT 1")`, nil, host)
+	_, err := luaRunHost(t, `return ctx.db.query({ driver = "sqlite", sql = "SELECT 1" })`, nil, host)
 	if err == nil {
 		t.Fatal("未提供 DB 实现时调用 ctx.db 应报错")
 	}

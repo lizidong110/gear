@@ -1,0 +1,53 @@
+# 演示 Tool：调用三个 P2 消息/短信原子（RabbitMQ + Kafka + SMS）。
+# 每个原子用 pcall 包裹——无 broker 时 rabbitmq/kafka 会 error，但不影响 sms 与其它步骤。
+#
+# 注册：gear tool register --registry <db> -   （stdin 喂本文件）
+# 运行：gear tool run messaging.fanout --registry <db> --input '{"topic":"hr","phone":"13800000000","sms_gateway":"http://...","kafka_brokers":"127.0.0.1:9092"}'
+id: messaging.fanout
+name: 消息扇出（RabbitMQ + Kafka + SMS）
+runtime: lua
+capabilities: [ext.rabbitmq, ext.kafka, ext.sms]
+input_schema:
+  type: object
+  properties:
+    topic: {type: string, description: "MQ 主题/路由键前缀"}
+    event: {type: object, description: "事件载荷"}
+    phone: {type: string, description: "短信手机号"}
+    sms_gateway: {type: string, description: "短信网关 URL（必填参数，传给 ext.sms）"}
+    kafka_brokers: {type: string, description: "Kafka broker 列表（逗号分隔，必填参数，传给 ext.kafka）"}
+  required: [topic, phone]
+output_schema:
+  type: object
+  properties:
+    rabbitmq: {type: object, description: "RabbitMQ 原子结果或错误"}
+    kafka: {type: object, description: "Kafka 原子结果或错误"}
+    sms: {type: object, description: "SMS 原子结果或错误"}
+versions:
+  - version: 1.0.0
+    state: stable
+entry: |
+  local out = {}
+  local ev = ctx.input.event or { id = "E2001" }
+
+  local ok, r = pcall(function()
+    return ctx.ext.rabbitmq.publish({
+      exchange = "hr", routing_key = ctx.input.topic, body = ev,
+    })
+  end)
+  out.rabbitmq = ok and r or { error = tostring(r) }
+
+  ok, r = pcall(function()
+    return ctx.ext.kafka.produce({ topic = ctx.input.topic, value = ev,
+      brokers = ctx.input.kafka_brokers })
+  end)
+  out.kafka = ok and r or { error = tostring(r) }
+
+  ok, r = pcall(function()
+    return ctx.ext.sms.send({
+      phone = ctx.input.phone, gateway = ctx.input.sms_gateway,
+      content = "事件: " .. ctx.input.topic,
+    })
+  end)
+  out.sms = ok and r or { error = tostring(r) }
+
+  return out

@@ -173,9 +173,12 @@ func walkStrings(v interface{}, fn func(string) error) error {
 // validateTemplates 注册期静态校验 Flow 里全部模板引用（F3：能静态校验的不留到运行期）。
 //
 // 校验范围（只覆盖能被静态判定的部分）：
-//   - 前缀必须是**已实现**的 vars / steps；secrets 等未实现前缀在此显式拒绝
+//   - 前缀必须是内核**已实现**的三类：vars / steps / secrets（其余前缀在此显式拒绝——
+//     新增前缀必须同时改本文件的 lookup 与这里的 switch，单一真相源）
 //   - `${vars.<k>}`：k 必须是 Flow.vars 的顶层键（拼错在注册期暴露，而不是等到某次执行）
 //   - `${steps.<id>}`：必须带 step id（拒绝 `${steps}` 这种残缺引用）
+//   - `${secrets.<name>}`：必须带密钥名；密钥本身**是否存在**不在此校验（密钥源是运行期
+//     宿主能力，注册期无从知晓），缺失留待运行期解析时报错
 //
 // 刻意**不**在此重复校验的内容（同一规则只留一处实现，避免漂移）：
 //   - `${steps.X}` 的 X 是否存在、是否自引用 —— 由依赖图（effectiveDeps）唯一负责；

@@ -39,8 +39,8 @@ func TestBackoffFor(t *testing.T) {
 func TestNextBackoffResetsWhenStable(t *testing.T) {
 	h := &engine.ServiceHandle{
 		StepID:    "s",
-		Restarts:  5,                                 // 已累计 5 次
-		StartedAt: time.Now().Add(-2 * time.Second),  // 但本次存活 2s（> stableWindow）
+		Restarts:  5,                                // 已累计 5 次
+		StartedAt: time.Now().Add(-2 * time.Second), // 但本次存活 2s（> stableWindow）
 	}
 	if got := nextBackoff(h); got != restartBase {
 		t.Fatalf("稳定后应重置为 %v，实际 %v", restartBase, got)

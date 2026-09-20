@@ -48,23 +48,23 @@ func (r Runtime) Implemented() bool { return ImplementedRuntimes[r] }
 type ToolVersionState string
 
 const (
-	StateDraft     ToolVersionState = "draft"     // 草稿，未晋升
-	StateTesting   ToolVersionState = "testing"   // 测试中（灰度）
-	StateStable    ToolVersionState = "stable"    // 稳定，默认调用
+	StateDraft      ToolVersionState = "draft"      // 草稿，未晋升
+	StateTesting    ToolVersionState = "testing"    // 测试中（灰度）
+	StateStable     ToolVersionState = "stable"     // 稳定，默认调用
 	StateDeprecated ToolVersionState = "deprecated" // 已弃用，仍可调用
-	StateRejected  ToolVersionState = "rejected"  // 已否决，不可调用
+	StateRejected   ToolVersionState = "rejected"   // 已否决，不可调用
 )
 
 // Tool 是原子能力，带 input/output schema，可被 Flow 内 step 调用。
 type Tool struct {
-	ID          string                 `yaml:"id" json:"id"`
-	Name        string                 `yaml:"name" json:"name"`
-	Description string                 `yaml:"description" json:"description"`
-	Runtime     Runtime                `yaml:"runtime" json:"runtime"`
-	Entry       string                 `yaml:"entry" json:"entry"` // process: 命令；lua/go-host: 函数引用
-	InputSchema map[string]interface{} `yaml:"input_schema" json:"input_schema"`
+	ID           string                 `yaml:"id" json:"id"`
+	Name         string                 `yaml:"name" json:"name"`
+	Description  string                 `yaml:"description" json:"description"`
+	Runtime      Runtime                `yaml:"runtime" json:"runtime"`
+	Entry        string                 `yaml:"entry" json:"entry"` // process: 命令；lua/go-host: 函数引用
+	InputSchema  map[string]interface{} `yaml:"input_schema" json:"input_schema"`
 	OutputSchema map[string]interface{} `yaml:"output_schema" json:"output_schema"`
-	Versions    []ToolVersion          `yaml:"versions" json:"versions"`
+	Versions     []ToolVersion          `yaml:"versions" json:"versions"`
 	// Capabilities 声明该 Tool 被允许使用的宿主能力原语（PRD §6，最小权限）。
 	// 对应 ctx.* 的 http/call/db/kv/secret/event；运行期未声明的原语调用一律拒绝。
 	Capabilities []string `yaml:"capabilities" json:"capabilities"`
@@ -100,13 +100,13 @@ const (
 // HealthProbe 是 service 模式 Tool 的健康检查配置（REQ-APP-HEALTH / #75）。
 // 字段用字符串表达时长（YAML 友好），由 Resolve 解析为运行期结构。
 type HealthProbe struct {
-	Kind     string `yaml:"kind" json:"kind"`         // http | tcp | cmd（必填）
-	Addr     string `yaml:"addr" json:"addr"`         // http/tcp: host:port（缺省 127.0.0.1）
-	Path     string `yaml:"path" json:"path"`         // http: 请求路径（缺省 /）
-	Cmd      string `yaml:"cmd" json:"cmd"`           // cmd: 健康检查命令（sh -c 执行，退出 0 = 健康）
-	Interval string `yaml:"interval" json:"interval"` // 探测间隔（缺省 5s）
-	Timeout  string `yaml:"timeout" json:"timeout"`   // 单次探测超时（缺省 2s）
-	Threshold int   `yaml:"threshold" json:"threshold"` // 连续失败几次触发重启（缺省 3）
+	Kind      string `yaml:"kind" json:"kind"`           // http | tcp | cmd（必填）
+	Addr      string `yaml:"addr" json:"addr"`           // http/tcp: host:port（缺省 127.0.0.1）
+	Path      string `yaml:"path" json:"path"`           // http: 请求路径（缺省 /）
+	Cmd       string `yaml:"cmd" json:"cmd"`             // cmd: 健康检查命令（sh -c 执行，退出 0 = 健康）
+	Interval  string `yaml:"interval" json:"interval"`   // 探测间隔（缺省 5s）
+	Timeout   string `yaml:"timeout" json:"timeout"`     // 单次探测超时（缺省 2s）
+	Threshold int    `yaml:"threshold" json:"threshold"` // 连续失败几次触发重启（缺省 3）
 }
 
 // ResolvedProbe 是 HealthProbe 解析后的运行期结构（时长已为 time.Duration）。
@@ -182,26 +182,32 @@ func (p *HealthProbe) Resolve() (*ResolvedProbe, error) {
 // Entry / InputSchema / OutputSchema 为**可选**的版本级覆盖：钉版本（step.use_version）时，
 // 若版本提供了这些字段则覆盖 Tool 级实现，否则回退 Tool 级（S5 灰度：同一 Tool 多版本并存）。
 type ToolVersion struct {
-	Version       string                 `yaml:"version" json:"version"`
-	State         ToolVersionState       `yaml:"state" json:"state"`
-	Digest        string                 `yaml:"digest" json:"digest"`
-	Note          string                 `yaml:"note" json:"note"`
-	CreatedAt     time.Time              `yaml:"created_at" json:"created_at"`
-	Entry         string                 `yaml:"entry,omitempty" json:"entry,omitempty"`
-	InputSchema   map[string]interface{} `yaml:"input_schema,omitempty" json:"input_schema,omitempty"`
-	OutputSchema  map[string]interface{} `yaml:"output_schema,omitempty" json:"output_schema,omitempty"`
+	Version      string                 `yaml:"version" json:"version"`
+	State        ToolVersionState       `yaml:"state" json:"state"`
+	Digest       string                 `yaml:"digest" json:"digest"`
+	Note         string                 `yaml:"note" json:"note"`
+	CreatedAt    time.Time              `yaml:"created_at" json:"created_at"`
+	Entry        string                 `yaml:"entry,omitempty" json:"entry,omitempty"`
+	InputSchema  map[string]interface{} `yaml:"input_schema,omitempty" json:"input_schema,omitempty"`
+	OutputSchema map[string]interface{} `yaml:"output_schema,omitempty" json:"output_schema,omitempty"`
 }
 
 // Step 是 Flow 内的一个执行单元。
+//
+// Call 支持两种写法（解析规则见 engine.resolveStepCall，已注册 Tool 优先）：
+//   - 已注册 Tool 的 id（如 "translate_zh_en"）；
+//   - 原子能力直调「能力.方法」（如 "kv.put" / "http.Request" / "ext.ai.complete"）——
+//     免去为用一次原语先注册一层 Tool 包装；此时 Input 即该方法的参数表，
+//     输出统一为 {result: <返回值>}。
 type Step struct {
 	ID         string                 `yaml:"id" json:"id"`
-	Call       string                 `yaml:"call" json:"call"`               // 被调用的 Tool id
-	UseVersion string                 `yaml:"use_version" json:"use_version"` // 可选：钉版本
+	Call       string                 `yaml:"call" json:"call"`               // Tool id，或「能力.方法」直调
+	UseVersion string                 `yaml:"use_version" json:"use_version"` // 可选：钉版本（仅 Tool 载体）
 	Input      map[string]interface{} `yaml:"input" json:"input"`
 	DependsOn  []string               `yaml:"depends_on" json:"depends_on"` // 上游 step id
 	When       string                 `yaml:"when" json:"when"`             // 条件执行（S1 后）
 	Parallel   bool                   `yaml:"parallel" json:"parallel"`     // 是否并行（S4）
-	Mode       string                 `yaml:"mode" json:"mode"`             // once（默认，执行完返回）/ service（长驻，拉起不等待）
+	Mode       string                 `yaml:"mode" json:"mode"`             // once（默认，执行完返回）/ service（长驻，拉起不等待；仅 Tool 载体）
 }
 
 // StepMode 是 Step 的执行模式。
@@ -230,17 +236,17 @@ type Flow struct {
 type HookCriticality string
 
 const (
-	CritCritical    HookCriticality = "critical"    // 失败即终止主流程（认证/脱敏/限流）
+	CritCritical   HookCriticality = "critical"    // 失败即终止主流程（认证/脱敏/限流）
 	CritBestEffort HookCriticality = "best-effort" // 失败仅记 stderr，主流程继续（日志/指标）
 )
 
 // Hook 阶段（PRD §5.3）。
 const (
-	StageBeforeFlow   = "before_flow"    // Flow 开始执行前（认证/参数审计/初始化）：可改写 Flow 初始 vars
-	StageBeforeStep   = "before_step"    // 步骤执行前：可改写 input
-	StageAfterStep    = "after_step"     // 步骤执行后：可改写 output
-	StageOnError      = "on_error"       // 步骤失败时：仅补偿/告警，不能恢复主流程
-	StageOnSuccess    = "on_success"     // Flow 全部成功时（汇总通知/收尾）：仅副作用，不改主结果
+	StageBeforeFlow    = "before_flow"    // Flow 开始执行前（认证/参数审计/初始化）：可改写 Flow 初始 vars
+	StageBeforeStep    = "before_step"    // 步骤执行前：可改写 input
+	StageAfterStep     = "after_step"     // 步骤执行后：可改写 output
+	StageOnError       = "on_error"       // 步骤失败时：仅补偿/告警，不能恢复主流程
+	StageOnSuccess     = "on_success"     // Flow 全部成功时（汇总通知/收尾）：仅副作用，不改主结果
 	StageBeforePromote = "before_promote" // 版本晋升前（S5 由 PromoteTool 触发）
 )
 
@@ -276,12 +282,12 @@ var KnownHookStages = map[string]bool{
 // Target 匹配维度由 Stage 决定：step 级 stage（before_step/after_step/on_error）按 step 的 tool id 匹配，
 // Flow 级 stage（before_flow/on_success）按 Flow id 匹配；两者均支持 `*` 表示「全部」。
 type Hook struct {
-	ID         string           `yaml:"id" json:"id"`
-	Target     string           `yaml:"target" json:"target"`     // 匹配对象：step 级按 tool id、flow 级按 flow id；"*" 表示全部
-	Stage      string           `yaml:"stage" json:"stage"`       // before_flow / before_step / after_step / on_error / on_success / before_promote
-	Action     string           `yaml:"action" json:"action"`     // 已注册 Tool 的 id 或 Flow 的 id
+	ID          string          `yaml:"id" json:"id"`
+	Target      string          `yaml:"target" json:"target"` // 匹配对象：step 级按 tool id、flow 级按 flow id；"*" 表示全部
+	Stage       string          `yaml:"stage" json:"stage"`   // before_flow / before_step / after_step / on_error / on_success / before_promote
+	Action      string          `yaml:"action" json:"action"` // 已注册 Tool 的 id 或 Flow 的 id
 	Criticality HookCriticality `yaml:"criticality" json:"criticality"`
-	Order      int              `yaml:"order" json:"order"`       // 装配顺序（weight，升序执行）
+	Order       int             `yaml:"order" json:"order"` // 装配顺序（weight，升序执行）
 }
 
 // EffectiveCriticality 返回生效的 criticality：空值按 critical 处理。

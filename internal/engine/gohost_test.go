@@ -108,7 +108,7 @@ func TestGoHostToolRunsThroughFlow(t *testing.T) {
 		ID: "ght", Name: "ght", Runtime: model.RuntimeGoHost, Entry: "gh_echo",
 		InputSchema:  map[string]interface{}{"type": "object"},
 		OutputSchema: map[string]interface{}{"type": "object"},
-		Versions: []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
+		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
 	}
 	if err := reg.UpsertTool(tool); err != nil {
 		t.Fatalf("注册 go-host Tool 失败: %v", err)

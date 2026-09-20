@@ -21,3 +21,20 @@
 .vscode/
 *.swp
 .DS_Store
+
+# 用户本地扩展配置（由 extensions.example.yaml 复制而来，不纳入版本控制）
+extensions.yaml
+
+# 「发布后用户自助」演示的临时产物（sidecar 脚本 / 本地 registry / 示例 YAML）
+/.postpublish-demo/
+
+# Web UI 插件（plugin/web-ui）：依赖与构建产物不入库；
+# 注意 src/logic/generated/enums.ts 是生成物但**必须入库**（契约守卫要逐字节比对），故不在此忽略。
+**/node_modules/
+**/dist/
+plugin/web-ui/coverage/
+build/
+# 演示目录：提交顶层的演示 YAML 与 README，忽略子目录/临时产物
+examples/*
+!examples/*.yaml
+!examples/*.md

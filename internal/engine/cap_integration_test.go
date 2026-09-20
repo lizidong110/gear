@@ -11,10 +11,10 @@ import (
 // capTool 是一个声明了 kv + http 能力的 process Tool，entry 用 cat 把 stdin（含注入的 ctx）原样回显。
 func capTool() *model.Tool {
 	return &model.Tool{
-		ID:          "cap-tool",
-		Name:        "cap-tool",
-		Runtime:     model.RuntimeProcess,
-		Entry:       "cat",
+		ID:           "cap-tool",
+		Name:         "cap-tool",
+		Runtime:      model.RuntimeProcess,
+		Entry:        "cat",
 		InputSchema:  map[string]interface{}{"type": "object"},
 		OutputSchema: map[string]interface{}{"type": "object"},
 		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
@@ -85,7 +85,7 @@ func TestRunFlowNoHostDeclaredCap(t *testing.T) {
 		t.Fatalf("注册 Tool 失败: %v", err)
 	}
 	flow := &model.Flow{
-		ID:   "capflow2",
+		ID:    "capflow2",
 		Steps: []model.Step{{ID: "s1", Call: "cap-tool", Input: map[string]interface{}{"name": "x"}}},
 	}
 	if err := reg.UpsertFlow(flow); err != nil {

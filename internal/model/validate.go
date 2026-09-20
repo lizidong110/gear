@@ -170,7 +170,7 @@ func (f Flow) Validate() error {
 			return fmt.Errorf("flow %s 第 %d 个 step 缺少 id", f.ID, i)
 		}
 		if s.Call == "" {
-			return fmt.Errorf("step %s 的 call 不能为空（需指向已注册的 Tool）", s.ID)
+			return fmt.Errorf("step %s 的 call 不能为空（需指向已注册的 Tool，或写成「能力.方法」直调原子能力，如 kv.put）", s.ID)
 		}
 		if s.Mode != "" && StepMode(s.Mode) != ModeOnce && StepMode(s.Mode) != ModeService {
 			return fmt.Errorf("step %s 的 mode=%q 非法（应为 once 或 service）", s.ID, s.Mode)

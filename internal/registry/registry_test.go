@@ -136,10 +136,10 @@ func TestConcurrentUpsert(t *testing.T) {
 	}
 }
 
-// T-s0-example：加载 examples/hello_flow.yaml，
+// T-s0-example：加载 testdata/hello_flow.yaml，
 // 断言变量引用是 ${vars.topic} 而非 {{...}}（锁死 D1 回归）。
 func TestExampleFlowUsesDollarBrace(t *testing.T) {
-	path := filepath.Join("..", "..", "examples", "hello_flow.yaml")
+	path := filepath.Join("..", "..", "testdata", "hello_flow.yaml")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("读取示例失败: %v", err)
@@ -183,7 +183,7 @@ func TestFlowRoundtrip(t *testing.T) {
 	defer reg.Close()
 
 	in := &model.Flow{ID: "demo", Name: "Demo", Description: "两步",
-		Vars: map[string]interface{}{"topic": "world"},
+		Vars:  map[string]interface{}{"topic": "world"},
 		Steps: []model.Step{{ID: "s1", Call: "hello", Input: map[string]interface{}{"name": "${vars.topic}"}}}}
 	if err := reg.UpsertFlow(in); err != nil {
 		t.Fatalf("UpsertFlow 失败: %v", err)

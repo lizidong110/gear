@@ -89,9 +89,9 @@ func TestSpecShorthandSchemaRejected(t *testing.T) {
 	}
 }
 
-// F2：examples/hello_flow.yaml（PRD §4.1 修正后示例）应当能端到端跑通。
+// F2：testdata/hello_flow.yaml（PRD §4.1 修正后示例）应当能端到端跑通。
 func TestRunExampleHelloFlow(t *testing.T) {
-	path := filepath.Join("..", "..", "examples", "hello_flow.yaml")
+	path := filepath.Join("..", "..", "testdata", "hello_flow.yaml")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("读取示例失败: %v", err)

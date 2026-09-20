@@ -15,11 +15,12 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
-	"gear/internal/ai"
 	"gear/internal/app"
+	"gear/internal/cap"
 	"gear/internal/engine"
 	"gear/internal/model"
 	"gear/internal/registry"
@@ -42,8 +43,9 @@ type Server struct {
 	engine *engine.Engine
 	mux    *http.ServeMux
 
-	// inferrer 是 AI 闭环（S6c）的推断器：默认线上 SiliconFlow（无 Key 回退 Ollama），测试 / 远端网关可注入。
-	inferrer ai.Inferrer
+	// secrets 是进程内密钥源（REQ-API-SECRETS）：管理面经 REST /api/secrets 写入、
+	// 启动期经 GEAR_SECRET_* 环境变量播种；注入引擎后运行期只读（ctx.secret.get）。
+	secrets *cap.SecretStore
 
 	appMu  sync.Mutex
 	apps   map[string]*AppInstance
@@ -69,14 +71,11 @@ func WithMaxConcurrent(n int) ServerOption { return func(s *Server) { s.maxConcu
 // 队列满再提交即被拒绝（回 429）。0 表示不排队、满即拒。
 func WithExecQueueSize(n int) ServerOption { return func(s *Server) { s.execQueueSize = n } }
 
-// New 构造 Server（不启动监听）。AI 推断默认走线上 SiliconFlow（S6c）；无 Key 回退 Ollama。
-func New(reg *registry.Registry) *Server {
-	return NewWithInferrer(reg, ai.DefaultInferrer())
-}
-
-// NewWithInferrer 与 New 相同，但可注入自定义 Inferrer（测试 / 远端 LLM 网关用），
-// 并支持构造期选项（如 WithMaxConcurrent / WithExecQueueSize 调并发闸门，REQ-CONCURRENCY-CROSS / #73）。
-func NewWithInferrer(reg *registry.Registry, inf ai.Inferrer, opts ...ServerOption) *Server {
+// New 构造 Server（不启动监听）。支持构造期选项（如 WithMaxConcurrent /
+// WithExecQueueSize 调并发闸门，REQ-CONCURRENCY-CROSS / #73）。
+// 扩展原语经 extensions.yaml 配置化加载（含内建 ext.registry；无配置回退默认 ext.ai）；
+// 配置非法时返回 error（fail-closed，不让引擎带残缺扩展目录起来）。
+func New(reg *registry.Registry, opts ...ServerOption) (*Server, error) {
 	const (
 		defaultMaxConcurrent = 64  // 全局部署默认：单机能同时跑 64 个 Flow 执行
 		defaultQueueSize     = 256 // 排队缓冲，避免瞬时抖动直接 429
@@ -86,24 +85,45 @@ func NewWithInferrer(reg *registry.Registry, inf ai.Inferrer, opts ...ServerOpti
 		execs:         NewExecStore(),
 		mux:           http.NewServeMux(),
 		apps:          map[string]*AppInstance{},
-		inferrer:      inf,
 		maxConcurrent: defaultMaxConcurrent,
 		execQueueSize: defaultQueueSize,
 	}
 	for _, o := range opts {
 		o(s)
 	}
+	// 密钥源（REQ-API-SECRETS）：启动期先从 GEAR_SECRET_* 环境变量播种部署凭据，
+	// 再注入引擎——声明了 secret capability 的 Tool 运行期 ctx.secret.get 可用，
+	// ${secrets.x} 模板可解析；管理面写入经 /api/secrets，运行期只读。
+	// 播种失败即 fail-closed 返回 error：GEAR_SECRET_ 前缀下的非法名字（空名/含空白/${}）
+	// 会让该密钥**静默缺失**——运维「配了却读不到」且无任何提示，是最难排查的一类故障。
+	// cap.SecretStore.SeedFromEnv 刻意返回 error 就是为了这个，此处不得丢弃。
+	//
+	// 顺序要求：必须排在并发闸门**之前**——闸门的 worker goroutine 在构造期就已启动，
+	// 之后再返回 error 会留下永不退出的 goroutine（NewConcurrencyGate 无人 Shutdown）。
+	s.secrets = cap.NewSecretStore()
+	if err := s.secrets.SeedFromEnv(); err != nil {
+		return nil, fmt.Errorf("播种环境变量密钥失败: %w", err)
+	}
 	// 并发闸门（#73）：执行入口的「进程池」。worker 数 = 最大并发执行数，
 	// 待执行任务入有界队列，队列满且 worker 全忙时 Submit 返回 false（入口拒绝、回 429）。
 	s.gate = NewConcurrencyGate(s.maxConcurrent, s.execQueueSize)
 	// 日志采集（REQ-API-LOGS / #71）：引擎执行 step 时把 stdout/stderr 行经 ExecStore 落盘，
 	// 供 GET /api/executions/{id}/logs 查询。
-	s.engine = engine.New(reg, engine.WithLogSink(s.execs.logSink()))
+	// 扩展原语目录（PRD §9 去内置化）：配置化加载（extensions.yaml，GEAR_EXT_CONFIG 可覆盖），
+	// 始终含内建 ext.registry（读引擎 registry，供 agent 自我锚定）；无配置回退默认 ext.ai。
+	// 使声明了 capabilities:[ext.ai] 的 Tool 在 REST 执行面也能调用 AI 能力；sidecar 二进制
+	// 缺失时调用返回 ErrCapabilityUnavailable（fail-closed），不影响其它能力。
+	capReg := engine.NewCapabilityRegistry()
+	agent, err := engine.SetupExtensions(capReg, reg, "")
+	if err != nil {
+		return nil, fmt.Errorf("初始化扩展失败: %w", err)
+	}
+	s.engine = engine.New(reg, engine.WithLogSink(s.execs.LogSink()), engine.WithCapabilities(capReg), engine.WithAIAgent(agent), engine.WithSecret(s.secrets))
 	// §8.2 第三条守卫需要「运行期引用」，而运行期状态在 Server 手里 —— 由这里注入，
 	// registry 不反向依赖执行状态。
 	reg.SetRunningChecker(s.runningToolReason)
 	s.routes()
-	return s
+	return s, nil
 }
 
 // runningToolReason 报告 toolID 是否正被运行中的执行使用（PRD §8.2 第三条守卫）。
@@ -121,8 +141,26 @@ func (s *Server) runningToolReason(toolID string) string {
 // Handler 返回可供 httptest / 反向代理使用的 handler。
 func (s *Server) Handler() http.Handler { return s.mux }
 
+// serverBaseURL 计算 gear 自身回推基址（供 subscribe 机制拼回推端点 /api/events/{handle}）。
+// addr 是 ListenAndServe 的监听地址：":port" 补 127.0.0.1，空回退默认 8787，已带 scheme 前缀则原样。
+func serverBaseURL(addr string) string {
+	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+		return strings.TrimRight(addr, "/")
+	}
+	if addr == "" {
+		addr = ":8787"
+	}
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+	return "http://" + addr
+}
+
 // ListenAndServe 启动 HTTP 服务（阻塞）。
 func (s *Server) ListenAndServe(addr string) error {
+	// subscribe 机制的回推回调 URL 由 gear 自身监听地址派生（每个 gear 实例独立），
+	// 而非经 env 传给 sidecar（多 gear 并行时单一 env 会串扰）。
+	s.engine.SetSubscribeCallbackBase(serverBaseURL(addr))
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           s.mux,
@@ -155,25 +193,35 @@ func (s *Server) Shutdown() {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealthz)
+	s.mux.HandleFunc("GET /api/news", s.handleNews)
+	s.mux.HandleFunc("GET /api/capabilities", s.handleCapabilities)
+	s.mux.HandleFunc("POST /api/capabilities/invoke", s.handleInvokeCapability)
+
+	s.mux.HandleFunc("GET /api/secrets", s.handleListSecrets)
+	s.mux.HandleFunc("PUT /api/secrets/{name}", s.handleSetSecret)
+	s.mux.HandleFunc("DELETE /api/secrets/{name}", s.handleDeleteSecret)
 
 	s.mux.HandleFunc("GET /api/tools", s.handleListTools)
+	s.mux.HandleFunc("GET /api/tools/{id}", s.handleGetTool)
 	s.mux.HandleFunc("POST /api/tools", s.handleCreateTool)
 	s.mux.HandleFunc("DELETE /api/tools/{id}", s.handleDeleteTool)
 	s.mux.HandleFunc("POST /api/tools/{id}/versions/{v}/promote", s.handlePromoteVersion)
 
 	s.mux.HandleFunc("GET /api/flows", s.handleListFlows)
 	s.mux.HandleFunc("POST /api/flows", s.handleCreateFlow)
+	s.mux.HandleFunc("DELETE /api/flows/{id}", s.handleDeleteFlow)
 	s.mux.HandleFunc("POST /api/flows/{id}/validate", s.handleValidateFlow)
 
 	s.mux.HandleFunc("GET /api/hooks", s.handleListHooks)
 	s.mux.HandleFunc("POST /api/hooks", s.handleCreateHook)
+	s.mux.HandleFunc("DELETE /api/hooks/{id}", s.handleDeleteHook)
 
 	s.mux.HandleFunc("POST /api/executions", s.handleCreateExecution)
 	s.mux.HandleFunc("GET /api/executions", s.handleListExecutions)
 	s.mux.HandleFunc("GET /api/executions/{id}", s.handleGetExecution)
 	s.mux.HandleFunc("GET /api/executions/{id}/logs", s.handleGetExecutionLogs)
 
-	s.mux.HandleFunc("POST /api/ai/infer", s.handleInfer)
+	s.mux.HandleFunc("POST /api/events/{handle}", s.handleSubscriptionEvent)
 
 	s.mux.HandleFunc("POST /api/apps", s.handleCreateApp)
 	s.mux.HandleFunc("GET /api/apps", s.handleListApps)
@@ -231,6 +279,105 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleCapabilities 返回当前实时「原子能力目录」：内核原语（builtin + pure）+ 已注册 ext.*，
+// 每个能力含方法级参数 schema（type/description/required）。人与 web-ui 用同一份
+// engine.AIAgent().CapabilitiesMethod() 数据源——即 CLI `gear ai capabilities` 的 REST 入口，
+// 直接回答「有哪些原子能力 / 扩展了哪些 / 各能力要什么参数」（用户决策：能力必须可查询、可扩展）。
+// 能力目录只读、无副作用，失败仅回 500。
+func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	agent := s.engine.AIAgent()
+	if agent == nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("扩展目录未初始化"))
+		return
+	}
+	caps, err := agent.CapabilitiesMethod()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if caps == nil {
+		caps = []map[string]interface{}{}
+	}
+	writeJSON(w, http.StatusOK, caps)
+}
+
+// invokeCapabilityReq 是 POST /api/capabilities/invoke 的请求体：直接执行一个原子能力的方法。
+// args 以「参数名为键」的 map（与 capabilities() 的 schema 对齐）——内置原语经
+// builtinParamOrder 重排为位置参数、ext.* 原样作为单 table 传入。
+type invokeCapabilityReq struct {
+	Name   string                 `json:"name"`
+	Method string                 `json:"method"`
+	Args   map[string]interface{} `json:"args"`
+}
+
+// handleInvokeCapability 直接执行一个原子能力的方法（「能力目录」页调用测试用）。
+// 与 react 同权限（全量宿主授权 + Lua 沙箱）：db/kv 为内存态、secret 需内核已注入密钥源、
+// http 可访问任意 URL。未知能力名 / 方法在引擎侧 fail-closed 报错，不静默执行。
+func (s *Server) handleInvokeCapability(w http.ResponseWriter, r *http.Request) {
+	var req invokeCapabilityReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Name == "" || req.Method == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("name 与 method 均不能为空"))
+		return
+	}
+	res, err := s.engine.InvokeCapability(req.Name, req.Method, req.Args)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"result": res})
+}
+
+// handleNews 经引擎同步运行 news.top10 Flow（抓取并整理百度热搜榜 Top10），
+// 直接把结果作为 HTTP 响应返回——这是「Flow + Lua 工具直接调用 ctx.http 干活」的对外服务化示例。
+// Flow 未注册（如未用 `gear serve --seed examples/news-top10.yaml`）→ 404。
+func (s *Server) handleNews(w http.ResponseWriter, r *http.Request) {
+	res, err := s.engine.RunFlowResult("news.top10")
+	if err != nil {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("运行 news.top10 失败（是否用 `gear serve --seed examples/news-top10.yaml` 注册了示例?）: %w", err))
+		return
+	}
+	gen, ok := res.Steps["gen"]
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("news.top10 缺少 step gen 输出"))
+		return
+	}
+	out, _ := gen["output"].(map[string]interface{})
+	if out == nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("step gen 无 output: %v", gen))
+		return
+	}
+	if errMsg, _ := out["error"].(string); errMsg != "" {
+		writeErr(w, http.StatusBadGateway, fmt.Errorf("news.fetch 失败: %s", errMsg))
+		return
+	}
+	out["served_at"] = time.Now().UTC().Format(time.RFC3339)
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleSubscriptionEvent 是 subscribe 机制的回推端点（mqtt-sidecar 收到消息后 POST 到
+// /api/events/{handle}）。按 handle 定位订阅，取出 payload 交引擎投递（run/notify）。
+// 这是「回调 URL 不走 sidecar env」的关键：每个 gear 用自己的 --addr 派生回推地址，
+// sidecar 只维护 handle -> callbackURL 映射，多 gear 并行互不串扰。
+func (s *Server) handleSubscriptionEvent(w http.ResponseWriter, r *http.Request) {
+	handle := r.PathValue("handle")
+	var body struct {
+		Payload interface{} `json:"payload"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.engine.Deliver(handle, body.Payload); err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
 	tools, err := s.reg.ListTools()
 	if err != nil {
@@ -241,6 +388,24 @@ func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
 		tools = []*model.Tool{}
 	}
 	writeJSON(w, http.StatusOK, tools)
+}
+
+// handleGetTool 返回单个 Tool 的完整定义（含 versions）。不存在 → 404。
+//
+// 此前 UI 只能「拉全量列表再本地索引」——那时内核确实没有单查端点。现在补上，
+// 供按 id 直取（如执行详情里点某个 tool 想看完整定义）而不必先取全表。
+func (s *Server) handleGetTool(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	t, err := s.reg.GetTool(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if t == nil {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("Tool 不存在: %s: %w", id, registry.ErrNotFound))
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
 }
 
 func (s *Server) handleCreateTool(w http.ResponseWriter, r *http.Request) {
@@ -290,7 +455,7 @@ func (s *Server) handlePromoteVersion(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("非法目标状态: %q（应为 draft/testing/stable/deprecated/rejected）", req.Target))
 		return
 	}
-	if err := engine.New(s.reg).PromoteTool(toolID, version, target); err != nil {
+	if err := s.engine.PromoteTool(toolID, version, target); err != nil {
 		writeErr(w, statusForErr(err), err)
 		return
 	}
@@ -319,8 +484,10 @@ func (s *Server) handleCreateFlow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	// 静态校验（含 Tool 存在性 / when 可编译）——与 CLI、AI 闭环共用同一份规则。
-	if err := engine.New(s.reg).ValidateFlowStatic(&f); err != nil {
+	// 静态校验（含 Tool/原子能力存在性、when 可编译）——与 CLI、AI 闭环共用同一份规则。
+	// 必须用**已装配的** s.engine：扩展目录（capReg）与 ext.ai 都挂在它上面，
+	// 若在此新建一次性 engine，注册期就看不到任何 ext.*，判定会比运行期更宽/更严（两处漂移）。
+	if err := s.engine.ValidateFlowStatic(&f); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
@@ -342,7 +509,7 @@ func (s *Server) handleValidateFlow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, fmt.Errorf("Flow 不存在: %s: %w", id, registry.ErrNotFound))
 		return
 	}
-	if err := engine.New(s.reg).ValidateFlowStatic(f); err != nil {
+	if err := s.engine.ValidateFlowStatic(f); err != nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"valid": false, "error": err.Error()})
 		return
 	}
@@ -374,13 +541,33 @@ func (s *Server) handleCreateHook(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, h)
 }
 
-type createExecutionReq struct {
-	FlowID string `json:"flow_id"`
+// handleDeleteFlow 注销 Flow。守卫全部在 registry.DeleteFlow 里（PRD §8.2 三条）：
+// 被其它 Flow 的 step 引用、被 Flow 级 Hook 的 action 引用、或正被运行中的执行作为
+// Hook 载体使用 → 拒绝（409）；不存在 → 404。REST 层只做「错误 → 状态码」映射，
+// 不重复实现判定（守卫必须只有一份，否则 CLI 与 REST 会漂移）。
+func (s *Server) handleDeleteFlow(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.reg.DeleteFlow(id); err != nil {
+		writeErr(w, statusForErr(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
 }
 
-// inferReq 是 POST /api/ai/infer 的请求体（S6c）。
-type inferReq struct {
-	Prompt string `json:"prompt"`
+// handleDeleteHook 删除一个 Hook。与 Tool/Flow 不同，Hook 不被其它定义引用
+// （它只是 stage+target 的匹配关系），所以没有引用守卫；但「不存在」仍报 404，
+// 不静默 no-op。
+func (s *Server) handleDeleteHook(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.reg.DeleteHook(id); err != nil {
+		writeErr(w, statusForErr(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
+}
+
+type createExecutionReq struct {
+	FlowID string `json:"flow_id"`
 }
 
 func (s *Server) handleCreateExecution(w http.ResponseWriter, r *http.Request) {
@@ -403,7 +590,7 @@ func (s *Server) handleCreateExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-		rec := s.execs.Create(req.FlowID)
+	rec := s.execs.Create(req.FlowID)
 	// 经并发闸门派发（REQ-CONCURRENCY-CROSS / #73）：worker 全忙且队列已满 → 拒绝（背压），
 	// 执行记录置 rejected 并回 429，由调用方决定退避重试，而非放任高扇出打爆机器。
 	job := func() {
@@ -455,27 +642,6 @@ func (s *Server) handleListExecutions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.execs.List())
 }
 
-// handleInfer 是 AI 闭环（S6c）的推断入口：自然语言 prompt → Flow 定义。
-// 推断器可注入（默认本地 Ollama）；生成失败（解析 / 校验不过，重试 3 次仍失败）
-// 返回 422，由调用方决定降级策略。
-func (s *Server) handleInfer(w http.ResponseWriter, r *http.Request) {
-	var req inferReq
-	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	if req.Prompt == "" {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("prompt 不能为空"))
-		return
-	}
-	flow, err := ai.GenerateFlow(r.Context(), s.inferrer, req.Prompt)
-	if err != nil {
-		writeErr(w, http.StatusUnprocessableEntity, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, flow)
-}
-
 type createAppReq struct {
 	FlowID  string `json:"flow_id"`
 	Restart string `json:"restart"` // always（默认）/ never
@@ -524,7 +690,9 @@ func (s *Server) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 	s.appWG.Add(1)
 	go func() {
 		defer s.appWG.Done()
-		sup := app.New(engine.New(s.reg), policy, 0)
+		// 复用已装配的 s.engine：service step 同样需要扩展目录 / 密钥源 / 宿主原语，
+		// 新建一次性 engine 会让「经 Apps 拉起的 Flow」比「经 /api/executions 跑的同一个 Flow」能力更弱。
+		sup := app.New(s.engine, policy, 0)
 		if err := sup.Supervise(ctx, []string{req.FlowID}); err != nil {
 			fmt.Fprintf(os.Stderr, "app %s(%s) 结束: %v\n", inst.ID, req.FlowID, err)
 		}

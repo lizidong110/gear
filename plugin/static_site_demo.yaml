@@ -1,0 +1,33 @@
+# 演示 Tool：用 ext.serve 起一个静态网站（类似 nginx），浏览器即可访问。
+#
+# 注册：gear tool register --registry <db> -   （stdin 喂本文件）
+# 运行：gear tool run static_site.serve --registry <db> --input '{"port":8080,"dir":"./site"}'
+#   → 返回 {"url":"http://0.0.0.0:8080/"}，打开浏览器访问该地址即可看到 dir 下的静态页。
+# 停止：gear tool run static_site.stop --registry <db> '{}'
+#   （不手动 stop 也没关系：gear 进程退出后占用列表清空，侧车会自动退出释放端口）
+id: static_site.serve
+name: 静态网站服务（ext.serve 起服）
+runtime: lua
+capabilities: [ext.serve]
+input_schema:
+  type: object
+  properties:
+    port: {type: number, description: "对外服务端口（必填，传给 ext.serve）"}
+    dir: {type: string, description: "静态网站根目录（本地路径，必填，传给 ext.serve）"}
+    host: {type: string, description: "绑定地址（默认 0.0.0.0 即所有网卡；改 127.0.0.1 仅本机）"}
+  required: [port, dir]
+output_schema:
+  type: object
+  properties:
+    url: {type: string, description: "网站访问地址"}
+    serving: {type: boolean, description: "是否正在服务"}
+versions:
+  - version: 1.0.0
+    state: stable
+entry: |
+  local r = ctx.ext.serve.start({
+    port = ctx.input.port,
+    dir  = ctx.input.dir,
+    host = ctx.input.host,
+  })
+  return r

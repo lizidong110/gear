@@ -2,8 +2,11 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
+	"strings"
 	"time"
 
 	"gear/internal/cap"
@@ -32,6 +35,8 @@ import (
 type luaRuntime struct {
 	// policy 是 Lua 沙箱档位（strict/permissive），由引擎 WithSandbox 透传（REQ-LUA-SANDBOX-CONFIG）。
 	policy string
+	// caps 是扩展原语目录（用户/插件注册的 ctx.<name>）；nil 时仅内核原语可用。
+	caps *CapabilityRegistry
 }
 
 // luaForbiddenGlobals 是沙箱必须从全局表移除的名字（防宿主逃逸）。
@@ -86,6 +91,81 @@ func newSandboxState(policy string) (*lua.LState, error) {
 	return L, nil
 }
 
+// luaScopeArg 从 Lua 第 idx 个参数读取 KV Scope；非字符串或非法值（含缺省 nil）一律退回
+// ScopeGlobal，保证旧调用（不传 scope）仍走全局命名空间（向后兼容）。
+func luaScopeArg(L *lua.LState, idx int) cap.Scope {
+	if v := L.Get(idx); v != lua.LNil {
+		if s, ok := v.(lua.LString); ok {
+			switch cap.Scope(s) {
+			case cap.ScopeSession, cap.ScopeGlobal:
+				return cap.Scope(s)
+			}
+		}
+	}
+	return cap.ScopeGlobal
+}
+
+// luaDBArgs 从 Lua 第 1 个参数读取 db 调用的 {driver?, dsn?, sql, params?} 表。
+// 调用方已先行 host.DB() 探过实现可用性，故此处只负责参数塑形；缺 sql 即报错（不做静默 no-op）。
+func luaDBArgs(L *lua.LState) (driver, dsn, sql string, params []interface{}, err error) {
+	m, ok := fromLuaValue(L.Get(1)).(map[string]interface{})
+	if !ok {
+		return "", "", "", nil, fmt.Errorf("db 调用需传入 table：{driver?, dsn?, sql, params?}")
+	}
+	sql, _ = m["sql"].(string)
+	if sql == "" {
+		return "", "", "", nil, fmt.Errorf("db 调用缺少必填参数 sql")
+	}
+	driver, _ = m["driver"].(string)
+	dsn, _ = m["dsn"].(string)
+	if p, ok := m["params"].([]interface{}); ok {
+		params = p
+	}
+	return driver, dsn, sql, params, nil
+}
+
+// subscriptionRequestFromMap 把 Lua table（JSON 兼容 map）塑形成 Subscribe.Start 的请求体。
+// 手动解析而非 JSON round-trip：保持与 stdio/HTTP 侧同一套字段语义，避开往返引入的键漂移。
+func subscriptionRequestFromMap(m map[string]interface{}) (cap.SubscriptionRequest, error) {
+	var req cap.SubscriptionRequest
+	source, _ := m["source"].(string)
+	if source == "" {
+		return req, fmt.Errorf("subscribe.start 缺少必填参数 source")
+	}
+	req.Source = source
+	switch c := m["config"].(type) {
+	case nil:
+	case map[string]interface{}:
+		req.Config = c
+	default:
+		return req, fmt.Errorf("subscribe.start 的 config 必须是 object")
+	}
+	cm, ok := m["callback"].(map[string]interface{})
+	if !ok {
+		return req, fmt.Errorf("subscribe.start 缺少必填参数 callback（{type, target, input}）")
+	}
+	cb, err := subscriptionCallbackFromMap(cm)
+	if err != nil {
+		return req, err
+	}
+	req.Callback = cb
+	return req, nil
+}
+
+// subscriptionCallbackFromMap 塑形投递动作（run/notify）。target 必填；input 为模板（run 时与事件负载合并）。
+func subscriptionCallbackFromMap(m map[string]interface{}) (cap.SubscriptionCallback, error) {
+	var cb cap.SubscriptionCallback
+	cb.Type, _ = m["type"].(string)
+	cb.Target, _ = m["target"].(string)
+	if cb.Target == "" {
+		return cb, fmt.Errorf("subscribe.start 的 callback 缺少必填参数 target")
+	}
+	if in, ok := m["input"].(map[string]interface{}); ok {
+		cb.Input = in
+	}
+	return cb, nil
+}
+
 // setupLuaCapabilities 把 Tool.Capabilities 声明的宿主能力原语注入 Lua 的 ctx 表（M5，PRD §6）。
 //
 // 安全模型（最小权限 + 防御纵深）：
@@ -94,7 +174,9 @@ func newSandboxState(policy string) (*lua.LState, error) {
 //   - 已声明但未提供实现者（如 db，宿主未注入 Providers.DB），调用时由 cap.Context 返回
 //     ErrCapabilityUnavailable ——「文档说有、代码无」变成可见的明确错误，而非静默成功。
 //   - 所有原语函数都在宿主侧执行，闭包捕获的是经过授权的实现；脚本**无法绕过沙箱**直接接触宿主。
-func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context) {
+//   - 末尾额外注入用户/插件注册的扩展原语（reg 非空时）：遍历已声明且非内置的名字，查目录
+//     注入 ctx.<name>；未声明的扩展名同样不出现在 ctx 上（脚本无法探测）。
+func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context, reg *CapabilityRegistry) {
 	if host == nil {
 		return
 	}
@@ -103,13 +185,14 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 		declared[c] = true
 	}
 
-	// ctx.kv: get(k) -> string|nil；put(k,v)；delete(k)
+	// ctx.kv: get(k[, scope]) -> string|nil；put(k,v[, scope])；delete(k[, scope])。
+	// scope 缺省 "global"（向后兼容旧调用）；传 "session" 则落到本次 flow 执行的会话命名空间，
+	// 跨 step 共享、run 结束回收（M-KV-LIFECYCLE）。
 	if declared["kv"] {
 		if kv, err := host.KV(); err == nil {
-			k := kv
 			t := L.NewTable()
 			t.RawSetString("get", L.NewFunction(func(L *lua.LState) int {
-				v, ok := k.Get(L.CheckString(1))
+				v, ok := kv.Get(L.CheckString(1), luaScopeArg(L, 2))
 				if !ok {
 					L.Push(lua.LNil)
 					return 1
@@ -118,11 +201,11 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 				return 1
 			}))
 			t.RawSetString("put", L.NewFunction(func(L *lua.LState) int {
-				k.Put(L.CheckString(1), L.CheckString(2))
+				kv.Put(L.CheckString(1), L.CheckString(2), luaScopeArg(L, 3))
 				return 0
 			}))
 			t.RawSetString("delete", L.NewFunction(func(L *lua.LState) int {
-				k.Delete(L.CheckString(1))
+				kv.Delete(L.CheckString(1), luaScopeArg(L, 2))
 				return 0
 			}))
 			ctxTable.RawSetString("kv", t)
@@ -185,6 +268,73 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 			}))
 			ctxTable.RawSetString("http", t)
 		}
+	}
+
+	// ctx.json: decode(str) -> table|nil,err ；encode(table) -> string。
+	// 纯函数、无外部依赖，故无条件提供（不属 capabilities 门禁）。所有需要解析 HTTP
+	// 响应体 / 结构化文本的 Lua 工具都复用它——否则 ctx.http.Request 只能拿到字符串 body。
+	{
+		t := L.NewTable()
+		t.RawSetString("decode", L.NewFunction(func(L *lua.LState) int {
+			s := L.CheckString(1)
+			var v interface{}
+			if err := json.Unmarshal([]byte(s), &v); err != nil {
+				L.Push(lua.LNil)
+				L.Push(lua.LString(err.Error()))
+				return 2
+			}
+			L.Push(toLuaValue(L, v))
+			return 1
+		}))
+		t.RawSetString("encode", L.NewFunction(func(L *lua.LState) int {
+			v := fromLuaValue(L.Get(1))
+			b, err := json.Marshal(v)
+			if err != nil {
+				L.Push(lua.LString(""))
+				L.Push(lua.LString(err.Error()))
+				return 2
+			}
+			L.Push(lua.LString(string(b)))
+			return 1
+		}))
+		ctxTable.RawSetString("json", t)
+	}
+
+	// 纯函数核心原子（time/template/crypto）：内核内建、始终可用，故与 ctx.json 一样**无条件**
+	// 注入（不查 grants——它们没有「宿主能力边界」可言，要求声明 capabilities 反而违背直觉，
+	// 见 ATOM_ROADMAP.md §0 与 purefunc.go）。
+	// 方法名**由 schema 的键生成**（单一来源）：新增/改名方法只改 purefunc.go 的 schema，
+	// Lua 绑定自动跟随，不会出现「能力目录里有、ctx 上却没有」的漂移。
+	// 统一「单具名 table」入参（与 ctx.ext.* 同款），调用落到唯一调度点 callPureFunc。
+	for _, prim := range purePrimitiveOrder {
+		funcs := builtinCapabilitySchemas[prim]
+		if len(funcs) == 0 {
+			continue
+		}
+		t := L.NewTable()
+		for _, method := range sortedKeys(funcs) {
+			p, m := prim, method
+			sig := fieldsList(funcs[m].Parameters)
+			t.RawSetString(m, L.NewFunction(func(L *lua.LState) int {
+				args := map[string]interface{}{}
+				if L.GetTop() >= 1 && L.Get(1) != lua.LNil {
+					mt, ok := fromLuaValue(L.Get(1)).(map[string]interface{})
+					if !ok {
+						L.RaiseError("%s.%s 的参数必须是 table：{ %s }", p, m, sig)
+						return 0
+					}
+					args = mt
+				}
+				res, err := callPureFunc(p, m, args)
+				if err != nil {
+					L.RaiseError("%s.%s 失败: %v", p, m, err)
+					return 0
+				}
+				L.Push(toLuaValue(L, res))
+				return 1
+			}))
+		}
+		ctxTable.RawSetString(prim, t)
 	}
 
 	// ctx.call: Call(target, input_table?) -> result_table（插件间唯一通信通道）
@@ -250,7 +400,46 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 		}
 	}
 
-	// ctx.db: query/exec（原语已定义；若宿主未提供实现，调用返回 ErrCapabilityUnavailable）
+	// ctx.subscribe: start(table) -> handle；stop(handle)。通用订阅原语（与 event 平级）：
+	// Source（事件源，首批 mqtt）+ Deliver（投递动作 run/notify）经 cap.Subscribe 装配；
+	// 消费回调仅 serve/监管模式可用（需引擎监听 HTTP 回推端点），一次性执行 Start 报明确错误。
+	if declared["subscribe"] {
+		if sub, err := host.Subscribe(); err == nil {
+			ss := sub
+			t := L.NewTable()
+			t.RawSetString("start", L.NewFunction(func(L *lua.LState) int {
+				m, ok := fromLuaValue(L.Get(1)).(map[string]interface{})
+				if !ok {
+					L.RaiseError("subscribe.start 需传入 table：{source, config, callback}")
+					return 0
+				}
+				req, err := subscriptionRequestFromMap(m)
+				if err != nil {
+					L.RaiseError("%v", err)
+					return 0
+				}
+				handle, err := ss.Start(req)
+				if err != nil {
+					L.RaiseError("subscribe.start 失败: %v", err)
+					return 0
+				}
+				L.Push(lua.LString(handle))
+				return 1
+			}))
+			t.RawSetString("stop", L.NewFunction(func(L *lua.LState) int {
+				if err := ss.Stop(L.CheckString(1)); err != nil {
+					L.RaiseError("subscribe.stop 失败: %v", err)
+					return 0
+				}
+				return 0
+			}))
+			ctxTable.RawSetString("subscribe", t)
+		}
+	}
+
+	// ctx.db: query/exec/ping（多后端：sqlite/mysql/postgres；dsn 缺省回退引擎 scratch 库）。
+	// 调用形态：ctx.db.query({ driver="sqlite", dsn="", sql="...", params={...} })；
+	// 参数形态与 builtinCapabilitySchemas["db"] 一一对应（见 extensions.go）。
 	if declared["db"] {
 		t := L.NewTable()
 		t.RawSetString("query", L.NewFunction(func(L *lua.LState) int {
@@ -259,7 +448,12 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 				L.RaiseError("db.query 失败: %v", err)
 				return 0
 			}
-			rows, err := d.Query(L.CheckString(1))
+			driver, dsn, sql, params, err := luaDBArgs(L)
+			if err != nil {
+				L.RaiseError("db.query 失败: %v", err)
+				return 0
+			}
+			rows, err := d.Query(driver, dsn, sql, params...)
 			if err != nil {
 				L.RaiseError("db.query 失败: %v", err)
 				return 0
@@ -273,13 +467,69 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 				L.RaiseError("db.exec 失败: %v", err)
 				return 0
 			}
-			if err := d.Exec(L.CheckString(1)); err != nil {
+			driver, dsn, sql, params, err := luaDBArgs(L)
+			if err != nil {
+				L.RaiseError("db.exec 失败: %v", err)
+				return 0
+			}
+			if err := d.Exec(driver, dsn, sql, params...); err != nil {
 				L.RaiseError("db.exec 失败: %v", err)
 				return 0
 			}
 			return 0
 		}))
+		t.RawSetString("ping", L.NewFunction(func(L *lua.LState) int {
+			d, err := host.DB()
+			if err != nil {
+				L.RaiseError("db.ping 失败: %v", err)
+				return 0
+			}
+			driver, dsn, _, _, err := luaDBArgs(L)
+			if err != nil {
+				L.RaiseError("db.ping 失败: %v", err)
+				return 0
+			}
+			if err := d.Ping(driver, dsn); err != nil {
+				L.RaiseError("db.ping 失败: %v", err)
+				return 0
+			}
+			return 0
+		}))
 		ctxTable.RawSetString("db", t)
+	}
+
+	// 扩展原语（用户/插件注册）：遍历已声明且非内置的名字，查目录注入 ctx.<name>。
+	// 扩展名形如 "ext.xxx"，按命名空间嵌套注入为 ctx.ext.xxx（两级），与脚本的
+	// `ctx.ext.slack.send(...)` 自然对应；未声明（不在此循环）的扩展名根本不出现在 ctx 上
+	// （比「存在但报错」更严格，脚本无法探测边界）。
+	if reg != nil {
+		for _, name := range host.Capabilities() {
+			if cap.IsBuiltin(cap.Primitive(name)) {
+				continue
+			}
+			if !strings.HasPrefix(name, "ext.") {
+				continue
+			}
+			ext, ok := reg.Lookup(name)
+			if !ok {
+				continue
+			}
+			lv, err := ext.BuildLua(L, host)
+			if err != nil || lv == lua.LNil {
+				continue
+			}
+			// 嵌套：确保 ctx.ext 表存在，再把 ext.<suffix> 设为其字段。
+			suffix := strings.TrimPrefix(name, "ext.")
+			extTbl := ctxTable.RawGetString("ext")
+			var et *lua.LTable
+			if extTbl == lua.LNil {
+				et = L.NewTable()
+				ctxTable.RawSetString("ext", et)
+			} else {
+				et = extTbl.(*lua.LTable)
+			}
+			et.RawSetString(suffix, lv)
+		}
 	}
 }
 
@@ -295,7 +545,7 @@ func (l *luaRuntime) Run(ctx context.Context, entry string, input map[string]int
 	// ctx.input（宿主能力原语 ctx.http/call/... 在 M5 注入，见 setupLuaCapabilities）
 	ctxTable := L.NewTable()
 	ctxTable.RawSetString("input", toLuaValue(L, input))
-	setupLuaCapabilities(L, ctxTable, host)
+	setupLuaCapabilities(L, ctxTable, host, l.caps)
 	L.SetGlobal("ctx", ctxTable)
 
 	// 超时 / 取消：gopher-lua 会在解释循环中检查 context。
@@ -372,7 +622,27 @@ func toLuaValue(L *lua.LState, v interface{}) lua.LValue {
 		}
 		return t
 	default:
-		return lua.LString(fmt.Sprint(x))
+		// 兜底：任意 slice/map（含 []map[string]interface{} 这类具名元素类型）也递归展开，
+		// 否则会掉进 fmt.Sprint 被转成字符串（与 resolveValue 字符串化是同一类 bug）。
+		rv := reflect.ValueOf(v)
+		switch rv.Kind() {
+		case reflect.Slice, reflect.Array:
+			t := L.NewTable()
+			for i := 0; i < rv.Len(); i++ {
+				t.RawSetInt(i+1, toLuaValue(L, rv.Index(i).Interface()))
+			}
+			return t
+		case reflect.Map:
+			t := L.NewTable()
+			for _, k := range rv.MapKeys() {
+				if ks, ok := k.Interface().(string); ok {
+					t.RawSetString(ks, toLuaValue(L, rv.MapIndex(k).Interface()))
+				}
+			}
+			return t
+		default:
+			return lua.LString(fmt.Sprint(x))
+		}
 	}
 }
 

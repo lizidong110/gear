@@ -7,7 +7,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"gear/internal/app"
-	"gear/internal/engine"
 )
 
 func appCmd() *cobra.Command {
@@ -48,7 +47,11 @@ func appRunCmd() *cobra.Command {
 
 			fmt.Printf("[app run] 监管 %d 个 Flow，restart=%s，maxConcurrent=%d（Ctrl+C 停止）\n",
 				len(args), policy, maxConc)
-			sup := app.New(engine.New(reg), policy, maxConc)
+			eng, err := cliEngine(reg)
+			if err != nil {
+				return err
+			}
+			sup := app.New(eng, policy, maxConc)
 			if err := sup.Supervise(ctx, args); err != nil {
 				return err
 			}

@@ -1,0 +1,21 @@
+# 演示 Tool：停止 ext.serve 起的静态网站服务（释放端口）。
+#
+# 注册：gear tool register --registry <db> -   （stdin 喂本文件）
+# 运行：gear tool run static_site.stop --registry <db> '{}'
+id: static_site.stop
+name: 静态网站服务停止（ext.serve 停服）
+runtime: lua
+capabilities: [ext.serve]
+input_schema:
+  type: object
+  properties: {}
+output_schema:
+  type: object
+  properties:
+    ok: {type: boolean, description: "是否成功"}
+    running: {type: boolean, description: "停服前是否正在服务"}
+versions:
+  - version: 1.0.0
+    state: stable
+entry: |
+  return ctx.ext.serve.stop({})

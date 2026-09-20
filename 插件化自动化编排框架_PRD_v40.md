@@ -271,7 +271,7 @@ hooks:
 
 ## 6. 宿主能力原语
 
-宿主（Runtime）只向 Tool 暴露 6 个跨边界通信原语。它们处于同一抽象层级——都是「插件与外界交换数据的通道」，不混杂业务。
+宿主（Runtime）只向 Tool 暴露 7 个跨边界通信原语。它们处于同一抽象层级——都是「插件与外界交换数据的通道」，不混杂业务。
 
 | 能力原语 | 调用方式 | 职责 |
 |---------|---------|------|
@@ -281,6 +281,9 @@ hooks:
 | kv | `ctx.kv.get / put / delete` | 简单键值存储（配置 / 状态 / 缓存） |
 | secret | `ctx.secret.get(name)` | 密钥读取（只读，框架负责解密与审计） |
 | event | `ctx.event.notify / wait` | 异步事件通知 / 等待 |
+| subscribe | `ctx.subscribe.start(req) / stop(handle)` | 通用订阅（事件源回调 → 重调度 Tool/Flow），长驻订阅可按归属回收 |
+
+> 另有 **time / template / crypto 三个纯函数原子**（内核内建、始终可用、纯计算无外部依赖）：它们刻意**不进** capability 门禁（要求声明才可用的纯函数违背直觉），故不列在上表；分类口径与实现见 `ATOM_ROADMAP.md` §0 与 `internal/engine/purefunc.go`（REQ-PURE-FUNC）。
 
 ### 6.1 设计原则
 
@@ -288,7 +291,7 @@ hooks:
 - **capability 精确放行**：未声明的调用一律拒绝，权限遵循最小权限原则。
 - **secret 只读**：插件看不到明文存储位置，只能通过 `ctx.secret.get` 获取。
 - **未声明的原语不出现在 `ctx` 上**（lua）/ 不被注入 `ctx.capabilities`（process）：防御纵深——脚本连该字段都读不到，无法探测宿主能力边界；已声明但未提供实现的（如 `db`）调用时返回明确错误，而非静默成功。
-- **调用形态（M5 落地）**：lua 侧 `ctx.{http,call,db,kv,secret,event}`（http/db 为对象方法 `ctx.http.Request` / `ctx.db.query`；kv/secret/event 为子表方法 `ctx.kv.get` / `ctx.secret.get` / `ctx.event.notify`）；process 侧运行期以 `input.ctx.capabilities`（字符串数组）与 `input.ctx.sandbox`（bool）透传声明，供进程自检。
+- **调用形态（M5 落地）**：lua 侧 `ctx.{http,call,db,kv,secret,event,subscribe}`（http/db 为对象方法 `ctx.http.Request` / `ctx.db.query`；kv/secret/event/subscribe 为子表方法 `ctx.kv.get` / `ctx.secret.get` / `ctx.event.notify` / `ctx.subscribe.start`；call 是**裸函数** `ctx.call(target, input)`）；process 侧运行期以 `input.ctx.capabilities`（字符串数组）与 `input.ctx.sandbox`（bool）透传声明，供进程自检。
 
 ### 6.2 call 与 event 的边界
 
@@ -384,6 +387,23 @@ POST /api/tools/{tool_id}/versions/{version}/promote
 
 ## 9. AI 编排
 
+> **实现形态（2026-09-14 更新，去内置化 + 三层分层）**：AI 不再是引擎内建原语，而是可插拔的 `ext.ai` 扩展原语（sidecar 载体，参考 `examples/gear-ai-sidecar`）。它严格遵循本框架的分层哲学——**能力的分层、职责的分层**，拆成三层：
+>
+> - **LLM 层（稳定、参数化）**：`ctx.ext.ai.complete({system, prompt, provider, model, base_url, api_key, temperature, format})`——唯一与模型对话的出口，是一个带参数的 LLM 原语；任意模型经参数注入（默认 SiliconFlow，回退 Ollama；key 走 env `GEAR_AI_SILICONFLOW_KEY` / `GEAR_AI_OLLAMA_URL`），`provider="mock"` 或 `GEAR_AI_PROVIDER=mock` 走确定性离线路径（测试用）。
+> - **静态原语层（Go 编译进 sidecar，稳定不可变）**：`catalog`（BM25 式域内工具检索）、`domains`（按 namespace 归类的能力域概览）、`validate`（复用引擎 `ValidateFlowStatic` 单一真相源做静态校验）。sidecar 协议（`stdin {method,args}` → `stdout` 末行 `{result}`/`{error}`）、检索、校验均为不变部分，编译期锁定。
+> - **Registry 内省原语（进程内、稳定）**：`ext.registry.tools()` / `ext.registry.flows()`——Agent **自己读引擎 registry 的真实工具/流程目录**，不再由调用方喂 `tools`（旧实现要 CLI 手工注入工具清单，否则 LLM 只能基于调用方塞进来的东西规划、必幻觉）。这是易变 agent 自我锚定的根；它与 sidecar 同属 `ext.*` 命名空间、走同一套 capabilities 白名单，只是实现载体是 Go 闭包而非子进程，由引擎内建、始终装配。
+> - **Agent 层（易变、Lua 实现，不编译进 Go）**：多阶段编排——**从 `ext.registry` 读真实工具目录** → 能力域概览 → LLM 拆解步骤 → 域内检索 → 组装 Flow/Tool → 校验 → 失败回灌重来（≤N 次，默认 3）→ 人工确认/注册——**全部活在 `examples/ai-create-flow.yaml` 的 `ai-gen` Tool 的 Lua entry 里**。改 agent 行为（换提示词、调阶段、改重试）只改这份 YAML，无需重编任何 Go。
+>
+> 入口有二：① `gear ai gen flow|tool --intent "..." [--register]` 薄壳命令（跑参考 Flow `examples/ai-create-flow.yaml`；Agent 自行经 `ext.registry` 读真实工具目录，无需调用方喂 tools）；② 任意 Flow 内声明 `capabilities:[ext.ai, ext.registry]` 后直接 `ctx.ext.*` 调用，agent 编排本身由 Lua 实现（见参考 Flow）。**扩展装配已配置化**：`extensions.yaml`（`GEAR_EXT_CONFIG` 可覆盖路径）声明各 `ext.<name>` 的 sidecar 命令与方法，无配置则回退默认 `ext.ai`（缺省 `go run ./examples/gear-ai-sidecar`，或 `GEAR_AI_SIDECAR` 指定二进制）；这**取代原先写死在启动代码的 `Register("ext.ai", ...)`**——发布后加 `ext.tls` 等原生能力只需在 `extensions.yaml` 加一段，不必改 gear 源码。`ext.registry` 由引擎内建、始终装配。
+> 能力边界不变（见 9.1）：AI 只生成 DSL（Flow/Tool 定义），绝不运行任意代码、绝不触碰 secret、绝不由自身提升/访问密钥——这些仍由引擎与宿主原语把关。
+>
+> **两类 Agent（避免误解「Agent 能不能直接调工具」）**：本框架的 Agent 活在 Lua 里、改行为不重编 Go，但分两种角色——
+> 1. *生成器* `ai-gen`（即上面的 `ext.ai` 闭环）：按 §9 边界**只产出 DSL（Flow/Tool 定义）**，不直接执行——这是「设计态」agent。
+> 2. *执行器（worker）*：一个声明了 `capabilities:[http]`（或 `call`/`db`/`ext.ai`）的 Lua Tool，运行时**直接调用宿主原语完成真实任务**——抓网页（`ctx.http`）、查库（`ctx.db`）、调 LLM（`ctx.ext.ai`）、调其它 Tool（`ctx.call`）。这是「运行态」agent，与典型 ReAct agent「直接调工具干活」是同一件事。
+> 二者都证明 Gear 的 Flow/Tool 本身**就是能直接调工具做真实工作的 agent**。`examples/news-top10.yaml`（`news.fetch` 直接 `ctx.http` 抓百度热搜榜 + `ctx.json` 解析）配合 `gear serve --seed examples/news-top10.yaml` 后的 `GET /api/news`，即「执行器 agent 对外服务化」的端到端示例（详见 §11、方法论 §11 第十五次）。
+>
+> **`ctx.json` 引擎内建稳定原语（无条件提供）**：`decode(str)` / `encode(table)` 供所有 Lua 工具解析 / 序列化结构化文本——否则 `ctx.http.Request` 只能拿到字符串 body。它属「静态能力层」，随引擎编译、不随 agent 易变。
+
 ### 9.1 AI 的职责边界
 
 | AI 可以做 | AI 不做 |
@@ -398,17 +418,70 @@ POST /api/tools/{tool_id}/versions/{version}/promote
 
 ```
 用户输入自然语言
-  → 意图解析
-  → 从 Registry 匹配 Tool（仅见 tool_id + description + Schema）
-  → 生成 Flow DSL（含 input/output）
-  → 引擎静态校验（tool_id 存在 / Schema 匹配 / depends_on 无环 / 变量路径合法）
-  → 校验失败：返回原因给 AI 修正，最多 3 次
-  → 校验通过：人工确认 → 保存 → 等待触发
+  → 能力域概览（按 namespace 自动归类，无需 LLM）
+  → LLM 拆解步骤（每步：子任务描述 + 所属域）
+  → 按子任务在域内检索工具（BM25，仅见 tool_id + description + Schema）
+  → 组装 Flow/Tool DSL（含 input/output 映射）
+  → 引擎静态校验 ValidateFlowStatic（结构 / 依赖图 / 模板引用 / Tool 存在 / when 可编译）
+  → 校验失败：返回原因给 AI 修正，最多 N 次（默认 3）
+  → 校验通过：人工确认 → 保存（--register）→ 等待触发
 ```
+
+> **实现归属（分层）**：以上闭环现由 `examples/ai-create-flow.yaml` 的 `ai-gen` Lua entry（**Agent 层**）实现——其中「LLM 拆解 / 组装」经 `ctx.ext.ai.complete` 调 **LLM 层**、「域内检索」经 `catalog`、「校验」经 `validate`（**静态原语层**）。Go 侧只提供这四个稳定原语，不含任何 agent 编排逻辑。
 
 ### 9.3 给 AI 的上下文
 
 只提供 Tool 的 `tool_id + description + input_schema + output_schema`，不提供实现细节。同一份 Schema 同时供 AI、引擎校验、前端表单使用，不允许漂移。
+
+### 9.4 发布后用户自助（不改 gear 源码）
+
+`gear` 编译发布（预编译二进制）后，用户完成下列三件事**无需任何源码改动**：
+
+**① 配 LLM 凭证——用同一个 `gear.exe` 真调模型**
+```bash
+GEAR_AI_API_KEY=<key> GEAR_AI_MODEL=<model> gear ai gen tool --intent "把中文翻译为英文"
+# 默认 provider=siliconflow（base https://api.siliconflow.cn/v1，GEAR_AI_BASE_URL 只需给到 /v1，代码自拼 /chat/completions）；
+# GEAR_AI_PROVIDER=ollama 走本地；GEAR_AI_API_KEY/GEAR_AI_MODEL 亦可由 extensions.yaml 侧 env 注入。
+# 健壮性（全部流式，不靠「拍一个够大的固定总超时」）：
+#   - GEAR_AI_IDLE_TIMEOUT（秒，默认 60）：超过该时长无任何新增输出（推理增量也算活动）→ 判连接假死并报错；慢推理模型只要持续吐 token 就不会被误杀。
+#   - 重复输出检测：生成文本/推理尾部同一小段（≤40 rune 的块连续 ≥8 次，或同一整行连续 ≥6 次）反复出现 → 判「重复死循环」并报错。
+#   - GEAR_AI_TOTAL_TIMEOUT（秒，默认 900）：兜底总时长，防止慢速滴流永远跑不完。
+# GEAR_AI_MAX_TOKENS（默认 4096）、GEAR_AI_THINKING=true|false（不设则不下发，沿用模型默认——DeepSeek 推理模型即开思考）。
+```
+
+**② 加一个全新原生能力（示例：`ext.tls`）——写配置 + 任意语言 sidecar**
+```yaml
+# extensions.yaml（gear 读 cwd，或用 GEAR_EXT_CONFIG 指定路径）
+ext.ai:  { cmd: ["./gear-ai-sidecar.exe"], methods: [complete, catalog, domains, validate] }
+ext.tls: { cmd: ["python", "tls-sidecar.py"], methods: [issue, verify] }
+```
+sidecar 只是「读 stdin 一行 JSON `{method,args}`、写 stdout 末行 JSON `{result|error}`」的小程序（Python/Node/任意语言皆可）；Tool 声明 `capabilities: [ext.tls]` 后，Lua 里即可 `ctx.ext.tls.issue({ domain = "x.com" })`。
+⚠ **配置存在时「以配置为准」**：未列出的扩展不会注册，须把用到的都列全（含 `ext.ai`，否则 AI 能力静默消失）。`ext.registry` 由引擎内建、始终装配，无需声明。
+
+**③ 管理 Tool / Flow——REST 契约即 UI 后端**
+框架不内置 UI，但把管理做成 REST（`gear serve --addr`）：`GET/POST /api/tools`、`GET/POST /api/flows`、`DELETE /api/tools/{id}`（被引用则 409）、`POST /api/flows/{id}/validate`。UI（SPA 或长驻 Flow）即这份 API 的图形前端；Tool 的 `input_schema` 可直接驱动表单渲染（单一 Schema 真相源，无需另写）。
+> 持久性：Registry 由 `--registry` 指向的库（默认 `~/.gear/registry.db`）**持久化**，故 UI 管理长期生效（执行记录另存）。
+
+**④ 连各种数据库——内置 `db` 原语（多后端）；`ext.db` 仅作自定义 sidecar 的形态参考**
+> 2026-09-19 更新：内置 `db` 原语已原生支持 `sqlite`/`mysql`/`postgres`（`internal/cap/sqldb.go`），**不再需要 `ext.db` 侧车**；原示例源码 `examples/gear-db-sidecar/` 已移除，`extensions.example.yaml` 的 `ext.db` 段改为默认注释的参考形态。
+与 LLM 层完全同构：`driver`（`sqlite`/`mysql`/`postgres`）+ `dsn` 是**参数**（调用传参，或 env `GEAR_DB_DRIVER` / `GEAR_DB_DSN` 回退），而 SQL / 事务编排是**易变层**（写在 Lua Tool 里）。
+```yaml
+# 仅当你需要自研 driver 时：把 cmd 指向你自己的 sidecar
+# ext.db: { cmd: ["./your-db-sidecar"], methods: [query, exec, ping] }
+```
+```lua
+local r = ctx.ext.db.query({ driver = "postgres", dsn = ctx.input.dsn,
+                             sql = "SELECT * FROM t WHERE city = ?", params = { ctx.input.city } })
+-- r.columns / r.rows / r.row_count；写用 ctx.ext.db.exec(...) → r.rows_affected；ctx.ext.db.ping(...) 探活
+```
+参数走预编译占位符（`params`）天然防注入；DSN 含口令时用 `${secrets.*}` 注入，切勿硬编码。加新库（Mongo/Redis…）只需在 sidecar 里 `import` 驱动 + 加一行别名，或另写一个任意语言的 sidecar。
+> 已知约束：`CommandTransport` 每次调用起一个进程 → **每次会重连数据库**（SQLite 廉价；网络库高频场景建议配连接池/代理，或后续引入长驻 sidecar 传输）。
+
+**⑤ 两个易踩点（CLI 已加护栏）**
+- **`--registry` 是 gear 的「目录库」，不是你应用的数据库**。默认 `~/.gear/registry.db`；gear 会在此文件建 `tools`/`flows`/`hooks` 三张表。若你把它指向业务库（如 `--registry ./myapp.db`），gear 会把注册表建进你的库里——CLI 检测到该文件含非 gear 表时会打印警告（不阻断）。`ext.db` 要连的业务库用 `driver`/`dsn` 传给 sidecar，**与 `--registry` 是两回事**。
+- **Tool 用 `gear tool register`，Flow 用 `gear flow register`**。用错子命令时（如把 Tool YAML 交给 `flow register`），CLI 会在**打开 registry 之前**就报出可操作提示，并**不创建/污染**任何库文件。
+
+**已知调优边界**：单 step 执行超时硬编码 30s（`internal/engine/process.go` 的 `defaultExecTimeout`），多轮调用远端 LLM 的 agent 贴近该边界；后续宜开 per-step `timeout` 字段 / CLI flag。agent 侧的 LLM 输出容错（如 `depends_on` 归一化）属**易变层（Lua）职责**，稳定层（Go 反序列化 / 静态校验）保持严格。
 
 ---
 
@@ -425,8 +498,9 @@ POST /api/tools/{tool_id}/versions/{version}/promote
 │  Tool Registry                    │
 │  Schema / 版本 / 依赖图 / Lock    │
 ├─────────────────────────────────┤
-│  宿主能力层（6 个原语）            │
-│  http / call / db / kv / secret / event
+│  宿主能力层（7 个原语）            │
+│  http / call / db / kv / secret / event / subscribe
+│  （另有纯函数原子 time / template / crypto，始终可用）
 ├─────────────────────────────────┤
 │  Runtime 层                       │
 │  go-host / lua / process / wasm   │
@@ -445,10 +519,10 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 | GET | `/api/tools` | 列出 Tool |
 | POST | `/api/tools` | 注册 Tool（注册期校验，非法 runtime → 400） |
 | DELETE | `/api/tools/{id}` | 注销（被 Flow/Hook 引用 → 409；**运行中引用 → 409**，执行结束后可再次尝试） |
-| POST | `/api/ai/infer` | AI 闭环：自然语言→Flow（可注入 Inferrer，收敛失败 422）✅ S6c（统一入口，原 `/api/tools/.../ai-infer` 调整为此） |
+| POST | `/api/ai/infer` | AI 闭环（旧，REST 端点）**❌ 已移除**：AI 改为 `ext.ai` 扩展原语，不经独立 REST 端点。经 `gear ai gen` 薄壳命令或 Flow 内 `ctx.ext.ai.*` 调用（见 §9） |
 | GET | `/api/flows` | 列出 Flow |
 | POST | `/api/flows` | 保存 Flow（**静态校验**：依赖图/Tool 存在/when 可编译） |
-| POST | `/api/flows/:id/ai-gen` | （合并入 `/api/ai/infer`；CLI `gear ai gen --register` 负责落库）✅ S6c |
+| POST | `/api/flows/:id/ai-gen` | （旧，合并入 `/api/ai/infer`）**❌ 已移除**：AI 生成改由 `gear ai gen` 薄壳命令（`--register` 落库）或参考 Flow 内 `ctx.ext.ai.*` 完成 |
 | POST | `/api/flows/:id/validate` | 校验 Flow（返回 `{valid, error}`） |
 | POST | `/api/executions` | 触发执行（**异步**：202 + execution id） |
 | GET | `/api/executions` | 列出全部执行记录 ✅ |
@@ -460,7 +534,7 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 | DELETE | `/api/apps/{id}` | 停止 Flow 进程（cancel ⇒ 杀掉 service 子进程） |
 | POST | `/api/tools/{id}/versions/{v}/promote` | 用户显式晋升 ✅ S5（CLI `gear tool promote <id> <v> <target>` 与 REST `POST /api/tools/{id}/versions/{v}/promote` 均已实现，均走 `engine.PromoteTool` + before_promote 门禁） |
 
-> **实现状态（S6a+S5+S6c）**：除 `GET /api/executions/{id}/logs` 外均已实现，端到端可用（`gear serve --addr`；晋升经 CLI `tool promote` 与 REST promote 端点均可触发、AI 经 `ai gen` / `POST /api/ai/infer`）。
+> **实现状态（S6a+S5；AI 改 `ext.ai` 扩展，2026-09-14）**：除 `GET /api/executions/{id}/logs` 外均已实现，端到端可用（`gear serve --addr`；晋升经 CLI `tool promote` 与 REST promote 端点均可触发）。**注意**：AI 已去内置化——不再是引擎内建原语，而是 `ext.ai` 扩展（sidecar 载体，`examples/gear-ai-sidecar`，结构化多阶段 agent）；REST 端点 `/api/ai/infer` 仍不存在（AI 不经独立端点），改由 `gear ai gen` 薄壳命令或 Flow 内 `ctx.ext.ai.*` 调用（见 §9）。`internal/ai` 旧包已删除。
 > - **执行是异步的**：`POST /api/executions` 立即返回 `202 {id, status}`，结果经 `GET /api/executions/{id}` 查询（三态：running / succeeded / failed，失败带 `error`）。
 > - **状态是内存态**（显式声明）：执行记录与 app 句柄都存活在服务进程内，**进程重启即丢失**。持久化执行历史属后续切片，勿当作已持久化。
 > - **统一错误体**：`{"error": "..."}`；状态码语义 400 参数/校验、404 不存在、409 仍被引用。
@@ -563,10 +637,24 @@ CLI 是 V1 永久原生管理面（不同用户对 UI 需求不同，UI 以可�
 
 | 命令 | 说明 |
 |------|------|
-| `gear tool register / unregister / inspect` | Tool 注册 / 注销 / 查看 |
+| `gear tool register / unregister / list / show / versions` | Tool 注册 / 注销 / 列举 / 查看 / 版本（`register` 路径写 `-` 表示从 stdin 读 YAML；**支持 `---` 分隔的多文档，一次注册全部文档**，要么全成功要么全不写） |
+| `gear tool run <id>` | **一次性执行单个 Tool**（语义同「Flow 里跑一个 step」：input_schema 校验 → capability 门禁 → runtime 执行 → step 级 Hook → output_schema 校验）。输入四选一：`--input '<json>'` / `--input-file <path>` / `--arg k=v`（可重复，值按 JSON 解析）/ **stdin 管道** |
 | `gear tool promote <id> <version> <target>` | 显式晋升（触发 `before_promote` 门禁，fail-closed；target ∈ draft/testing/stable/deprecated/rejected） |
-| `gear flow save / validate / ai-gen / inspect` | Flow 保存 / 校验 / AI 生成 / 查看 |
-| `gear hook add / list / remove` | Hook 配置 |
-| `gear app run / ls / stop <flow>` | 启动 / 列出 / 停止 Flow 进程 |
-| `gear exec trigger / status / logs` | 触发 / 查状态 / 查日志 |
-| `gear secret set / get` | 密钥管理 |
+| `gear flow register / list / inspect / validate` | Flow 注册 / 列举 / 查看 / 静态校验（仅校验不注册；`register`/`validate` 路径写 `-` 表示从 stdin 读 YAML；**`register` 支持多文档**，同样全成功或全不写） |
+| `gear flow run <id> [--var k=v ...] [--input '<json>'] [--max-parallel=N]` | 执行 Flow。**`--var`/`--input` 运行时覆盖 Flow 变量**（覆盖 Flow 声明的默认值；只作用于本次运行、**不写回 registry**，仍会被 `before_flow` Hook 进一步改写）；也可从 **stdin 管道**读 vars |
+| `gear hook register - / list / show / remove` | Hook 配置（`register` 路径写 `-` 表示从 stdin 读 YAML）。注：Hook **无独立执行命令**——它只在 Flow/step 执行时被触发 |
+| `gear app run <flow>` | 把 Flow 作为受管进程启动（`mode: service` 长驻 step 用；`flow run` 遇 service step 会拒绝并提示改用它） |
+| `gear exec <flow>` | 触发 REST 执行面执行（`--addr` 指定执行面） |
+| `gear serve [--seed <yaml>] [--addr]` | 启动 REST 执行面（管理契约供 UI/程序调用，见 §11）。`--seed` 可灌入**含 Tool 与 Flow 混合**的多文档文件（按 Tool → Flow 顺序落库，因 Flow 静态校验需其 call 目标已存在）；任一对象失败则**回滚**本次全部写入 |
+| `gear ai gen flow\|tool --intent "..." [--register]` | AI 生成 Flow/Tool 草稿（`ext.ai`，见 §9） |
+
+**统一输入约定（Unix 管道直觉，`internal/cli/input.go`）**——JSON 入参与 YAML 文件都吃管道：
+
+```bash
+cat vars.json      | gear flow run demo-db-people          # 自动读 stdin 当 vars
+echo '{"domain":"x.com"}' | gear tool run tls.issue          # 经典管道
+gear tool run db.people --input - < in.json                  # 显式声明从 stdin 读
+cat demo-db.yaml   | gear flow register -                    # YAML 也从 stdin 读
+```
+规则：① 给了显式标志（`--input`/`--input-file`/`--arg`/`--var`）→ **用标志、不读 stdin**（若检测到管道仍存在会打 warning，不静默）；② `-` 显式表示 stdin；③ 未给标志且 stdin 是管道 → 自动读；④ 都没有 → 空输入（合法性由 `input_schema` 说了算）；⑤ 显式标志之间互斥，混用即报错。终端下**绝不阻塞等待输入**。
+> Hook 无独立执行命令（只在 Flow/step 执行时触发），故 JSON 入参管道对 hook 不适用；hook 需要的是「注册时从 stdin 读 YAML」，已支持。

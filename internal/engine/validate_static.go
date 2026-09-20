@@ -11,7 +11,9 @@ import (
 // 校验层次（PRD §9.2「引擎静态校验」）：
 //  1. 结构不变量（`model.Flow.Validate`：id/step/call/mode/未实现字段）
 //  2. 依赖图：有效依赖（显式 + 推断）无环、无未知/自引用
-//  3. 引用的 Tool 必须已注册
+//  3. step 的调用目标必须可解析：已注册 Tool，或「能力.方法」直调的原子能力
+//     （解析规则与运行期共用 resolveStepCall，只有一处真相）；直调还额外校验
+//     input 的参数名与必填项（把拼错参数名这类错误挡在注册那一刻）
 //  4. `when` 表达式必须可编译
 //  5. 模板引用：前缀必须是已实现的 vars/steps、vars 键存在、`${steps…}` 必须带 step id
 //     （模板语法与其边界见 template.go）
@@ -32,25 +34,17 @@ func (e *Engine) ValidateFlowStatic(f *model.Flow) error {
 		if _, err := compileWhen(s.When); err != nil {
 			return fmt.Errorf("step %s: %w", s.ID, err)
 		}
-		t, err := e.reg.GetTool(s.Call)
+		call, err := e.resolveStepCall(s)
 		if err != nil {
 			return err
 		}
-		if t == nil {
-			return fmt.Errorf("step %s 引用的 Tool 不存在: %s", s.ID, s.Call)
+		if !call.isPrimitive() {
+			continue
 		}
-		// S5：钉版本必须存在，否则运行期解析会失败——提前到注册期暴露。
-		if s.UseVersion != "" {
-			ok := false
-			for _, v := range t.Versions {
-				if v.Version == s.UseVersion {
-					ok = true
-					break
-				}
-			}
-			if !ok {
-				return fmt.Errorf("step %s 钉了 use_version=%s，但 Tool %s 不存在该版本", s.ID, s.UseVersion, s.Call)
-			}
+		// 直调原子能力：参数校验。input 里的值可能是模板串（如 ${vars.k}），
+		// 但**键名**此刻已确定，足以查出「拼错参数名 / 漏必填」——这正是最常见的两类误写。
+		if err := e.validatePrimitiveArgs(call.prim, call.method, s.Input); err != nil {
+			return fmt.Errorf("step %s: %w", s.ID, err)
 		}
 	}
 	return nil

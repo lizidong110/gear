@@ -1,109 +1,58 @@
 package cli
 
 import (
-	"bytes"
-	"context"
-	"net/http/httptest"
-	"strings"
 	"testing"
 
+	"gear/internal/model"
 	"gear/internal/registry"
-	"gear/internal/server"
 )
 
-// mockInferrer 是 ai.Inferrer 的 Mock（cli 测试用；结构满足接口即可，无需显式声明实现）。
-type mockInferrer struct {
-	text string
-	err  error
-}
-
-func (m *mockInferrer) Infer(ctx context.Context, prompt string) (string, error) {
-	return m.text, m.err
-}
-
-// TestAIGenPrintsYAML 覆盖「ai gen 默认打印生成的 Flow YAML」分支（不入库）。
-func TestAIGenPrintsYAML(t *testing.T) {
+// TestSeedRefRegistry 验证 runAIGen 的 grounding 机制：把持久 registry 的真实
+// 工具/流程灌入内存 refReg，使 agent 经 ctx.ext.registry 读到真实目录（不再由调用方喂 tools）。
+func TestSeedRefRegistry(t *testing.T) {
 	reg, err := registry.Open(tempDB(t))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open registry 失败: %v", err)
 	}
-	t.Cleanup(func() { reg.Close() })
-
-	inf := &mockInferrer{text: "```yaml\nid: ai-flow\nsteps:\n  - id: s1\n    call: t1\n```"}
-	ts := httptest.NewServer(server.NewWithInferrer(reg, inf).Handler())
-	t.Cleanup(ts.Close)
-	addr := strings.TrimPrefix(ts.URL, "http://")
-
-	var buf bytes.Buffer
-	root := newRootCmd()
-	root.SetOut(&buf)
-	root.SetErr(&buf)
-	root.SetArgs([]string{"ai", "gen", "make a flow", "--addr", addr})
-	if err := root.Execute(); err != nil {
-		t.Fatalf("ai gen: %v", err)
+	defer reg.Close()
+	tl := &model.Tool{
+		ID:           "db.query",
+		Name:         "db.query",
+		Description:  "查询数据库",
+		Runtime:      model.RuntimeLua,
+		Entry:        "return {}",
+		InputSchema:  map[string]interface{}{"type": "object"},
+		OutputSchema: map[string]interface{}{"type": "object"},
+		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
 	}
-	if !strings.Contains(buf.String(), "ai-flow") {
-		t.Fatalf("输出应含生成的 flow id：%s", buf.String())
+	if err := reg.UpsertTool(tl); err != nil {
+		t.Fatalf("注册 Tool 失败: %v", err)
 	}
-}
+	fl := &model.Flow{ID: "etl", Steps: []model.Step{{ID: "s1", Call: "db.query"}}}
+	if err := reg.UpsertFlow(fl); err != nil {
+		t.Fatalf("注册 Flow 失败: %v", err)
+	}
 
-// TestAIGenRegister 覆盖「ai gen --register 把生成的 Flow 落到本地 registry」分支。
-func TestAIGenRegister(t *testing.T) {
-	reg, err := registry.Open(tempDB(t))
+	refReg, err := registry.Open(tempDB(t))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open refReg 失败: %v", err)
 	}
-	t.Cleanup(func() { reg.Close() })
-
-	inf := &mockInferrer{text: "```yaml\nid: reg-flow\nsteps:\n  - id: s1\n    call: t1\n```"}
-	ts := httptest.NewServer(server.NewWithInferrer(reg, inf).Handler())
-	t.Cleanup(ts.Close)
-	addr := strings.TrimPrefix(ts.URL, "http://")
-
-	cliDB := tempDB(t)
-	var buf bytes.Buffer
-	root := newRootCmd()
-	root.SetOut(&buf)
-	root.SetErr(&buf)
-	root.SetArgs([]string{"ai", "gen", "make a flow", "--addr", addr, "--register", "--registry", cliDB})
-	if err := root.Execute(); err != nil {
-		t.Fatalf("ai gen --register: %v", err)
+	defer refReg.Close()
+	if err := seedRefRegistry(refReg, reg); err != nil {
+		t.Fatalf("seedRefRegistry 失败: %v", err)
 	}
-
-	// 断言 flow 已注册进 CLI 自己的 registry
-	out, err := registry.Open(cliDB)
+	tools, err := refReg.ListTools()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ListTools 失败: %v", err)
 	}
-	defer out.Close()
-	got, err := out.GetFlow("reg-flow")
+	if len(tools) != 1 || tools[0].ID != "db.query" {
+		t.Fatalf("refReg 应含 db.query，实际 %v", tools)
+	}
+	flows, err := refReg.ListFlows()
 	if err != nil {
-		t.Fatalf("读取注册结果失败: %v", err)
+		t.Fatalf("ListFlows 失败: %v", err)
 	}
-	if got == nil || got.ID != "reg-flow" {
-		t.Fatalf("生成的 Flow 未注册成功: %+v", got)
-	}
-}
-
-// TestAIGenInferError 覆盖「推断失败 → ai gen 报错（不入库、不打印）」。
-func TestAIGenInferError(t *testing.T) {
-	reg, err := registry.Open(tempDB(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { reg.Close() })
-
-	inf := &mockInferrer{err: context.DeadlineExceeded}
-	ts := httptest.NewServer(server.NewWithInferrer(reg, inf).Handler())
-	t.Cleanup(ts.Close)
-	addr := strings.TrimPrefix(ts.URL, "http://")
-
-	var buf bytes.Buffer
-	root := newRootCmd()
-	root.SetOut(&buf)
-	root.SetErr(&buf)
-	root.SetArgs([]string{"ai", "gen", "make a flow", "--addr", addr})
-	if err := root.Execute(); err == nil {
-		t.Fatal("推断失败应报错")
+	if len(flows) != 1 || flows[0].ID != "etl" {
+		t.Fatalf("refReg 应含 etl，实际 %v", flows)
 	}
 }

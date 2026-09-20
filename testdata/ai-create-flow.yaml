@@ -1,0 +1,170 @@
+# examples/ai-create-flow.yaml
+# Gear AI 创建 Flow / Tool 的「参考流程」（PRD §9，ext.ai 承载，去内置化 + 能力分层）。
+#
+# 由两篇文档组成：① ai-gen Tool（Lua 编排，声明 capabilities:[ext.ai]）② ai-create-flow Flow。
+# 这两篇也是 internal/cli/ai.go 中 aiRefYAML 嵌入常量的内容（单一真相源，二者须一致）。
+#
+# 分层职责（关键）：
+#   - ai-gen 的 Lua entry = 「易变的 agent 编排层」：拆阶段、写提示词、定重试、组输出。
+#     改 agent 行为（阶段/提示词/重试/输出形态）只改这段 Lua，不重编任何 Go。
+#   - ctx.ext.ai.{complete,catalog,domains,validate} = 「稳定的能力原语层」（Go sidecar 实现）：
+#     LLM(参数化 model/url/key) / 工具检索 / 能力域概览 / 静态校验。换模型或算法只改 sidecar。
+#
+# 推荐用法（薄壳命令，自动注入工具目录 + 意图 + 模式后在内存 registry 跑一遍）：
+#   gear ai gen flow --intent "把数据库结果发到 Slack" [--register]
+#   gear ai gen tool --intent "一个缩放图片的原子能力" [--register]
+#
+# 运行前需在本仓库根目录（sidecar 默认 `go run ./examples/gear-ai-sidecar`）或设环境变量
+# GEAR_AI_SIDECAR 指向编译好的二进制；LLM 默认 SiliconFlow（GEAR_AI_SILICONFLOW_KEY），
+# 否则回退本地 Ollama（http://localhost:11434）。
+
+---
+id: ai-gen
+name: AI 生成器
+description: 结构化多阶段 agent（易变层，Lua）。按 mode 组合 ext.ai 原语生成 Flow/Tool 草稿。
+runtime: lua
+entry: |
+  -- ai-gen：结构化多阶段 agent（易变层，Lua）—— 只负责「编排」，组合 ext.ai 稳定原语。
+  -- 分层：本脚本决定阶段/提示词/重试/输出；LLM/catalog/domains/validate 都是 Go 静态原语。
+  -- 改 agent 行为只改这里，不重编任何 Go。
+  local intent = ctx.input.intent
+  local mode   = ctx.input.mode or "flow"
+  local max_retries = tonumber(ctx.input.max_retries) or 3
+
+  -- 工具目录由 agent 自己从引擎 registry 读取（ext.registry 是进程内稳定原语），
+  -- 不再依赖调用方喂 tools——LLM 规划才有真实依据，不会幻觉出不存在的工具。
+  local tools = ctx.ext.registry.tools() or {}
+
+  -- ① 能力域概览（纯规则，无需 LLM）
+  local dres = ctx.ext.ai.domains({ tools = tools })
+  local domain_brief = ""
+  if dres and dres.domains then
+    for _, d in ipairs(dres.domains) do
+      domain_brief = domain_brief .. "- " .. tostring(d.name) .. " 域：" .. table.concat(d.tool_ids, ", ") .. "\n"
+    end
+  end
+
+  -- LLM 调用并解析 JSON（format=json 让 sidecar 直接返回结构化 data）
+  local function llm_json(system, prompt)
+    local r = ctx.ext.ai.complete({ system = system, prompt = prompt, format = "json" })
+    if r == nil then error("LLM 调用失败") end
+    return r.data
+  end
+
+  -- 抽取候选工具 id 列表
+  local function cand_ids(list)
+    local ids = {}
+    if list then for _, t in ipairs(list) do ids[#ids + 1] = t.id end end
+    return ids
+  end
+
+  -- 拼装「子任务 + 候选工具」提示
+  local function build_assemble(intent, plans, last_err)
+    local s = "用户意图：" .. intent .. "\n\n子任务与候选工具：\n"
+    for i, p in ipairs(plans) do
+      s = s .. i .. ". 子任务：" .. tostring(p.subtask) .. "（域：" .. tostring(p.domain) .. "）\n   候选工具："
+      local ids = cand_ids(p.tools)
+      if #ids == 0 then s = s .. "（无）\n" else s = s .. table.concat(ids, " ") .. "\n" end
+    end
+    if last_err then s = s .. "\n上次静态校验错误：" .. tostring(last_err) .. "\n请修正后重新生成（call 必须是候选工具、依赖与模板引用合法）。" end
+    return s
+  end
+
+  -- mode == "tool"：生成单个原子能力
+  if mode == "tool" then
+    local sys = "你是一个 Gear Tool（原子能力）定义生成器。结构：{\"id\":\"<蛇形小写>\",\"name\":\"<名称>\",\"description\":\"<用途>\",\"runtime\":\"lua\",\"entry\":\"<实现入口>\",\"input_schema\":{\"type\":\"object\",\"properties\":{}},\"output_schema\":{\"type\":\"object\"},\"versions\":[{\"version\":\"1.0.0\",\"state\":\"draft\"}]}。只输出 JSON，不要解释。"
+    local last_err
+    for attempt = 1, max_retries do
+      local t = llm_json(sys, "用户意图（想要什么原子能力）：" .. intent .. (last_err and ("\n上次校验错误：" .. last_err) or ""))
+      if t then
+        if t.runtime == nil then t.runtime = "lua" end
+        if t.entry == nil then t.entry = "-- TODO: 实现入口" end
+        if t.versions == nil then t.versions = { { version = "1.0.0", state = "draft" } } end
+        if t.input_schema == nil then t.input_schema = { type = "object" } end
+        if t.output_schema == nil then t.output_schema = { type = "object" } end
+        local v = ctx.ext.ai.validate({ kind = "tool", def = t, tools = tools })
+        if v.ok then return { kind = "tool", tool = t } end
+        last_err = v.error
+      else
+        last_err = "LLM 未返回合法 JSON"
+      end
+    end
+    error("生成 Tool 失败：" .. tostring(last_err))
+  end
+
+  -- flow 模式：② LLM 拆解成有序子任务
+  local decomposed = llm_json(
+    "你是一个编排规划器。把用户意图拆解为若干有序子任务，每个标注所属能力域（从给定域列表选一个；未知填 general）。只输出 JSON 数组：[{subtask,domain}]，不要解释。",
+    "用户意图：" .. intent .. "\n\n可选能力域：\n" .. domain_brief)
+  if decomposed == nil or #decomposed == 0 then error("LLM 拆解返回空步骤") end
+
+  -- ③ 域内检索：每步 Top-K 候选工具
+  local plans = {}
+  for _, step in ipairs(decomposed) do
+    local cands = ctx.ext.ai.catalog({ query = step.subtask, domain = step.domain, tools = tools, k = 5 }).tools
+    plans[#plans + 1] = { subtask = step.subtask, domain = step.domain, tools = cands }
+  end
+
+  -- 归一化：LLM 偶尔把 steps[].depends_on 写成对象（如 {"s1":true}）或标量，统一成
+  -- 「step id 字符串数组」，避免严格 JSON→model.Flow 反序列化失败。容错放在易变层（Lua），
+  -- 稳定层（Go 反序列化 / 静态校验）保持严格。
+  local function norm_flow(f)
+    if type(f) ~= "table" or type(f.steps) ~= "table" then return f end
+    for _, st in ipairs(f.steps) do
+      local d = st.depends_on
+      if type(d) == "table" then
+        if d[1] == nil then -- 对象形式：取键作依赖
+          local arr = {}
+          for k in pairs(d) do arr[#arr + 1] = tostring(k) end
+          st.depends_on = arr
+        end
+      elseif type(d) == "string" and d ~= "" then
+        st.depends_on = { d }
+      elseif d == "" then
+        st.depends_on = nil
+      end
+    end
+    return f
+  end
+
+  -- ④⑤⑥ 组装 + 静态校验 + 重试
+  local sys_assemble = "你是一个 Gear Flow DSL 生成器。基于子任务与候选工具生成 Flow JSON：{\"id\":\"<flow_id>\",\"name\":\"<名称>\",\"description\":\"<描述>\",\"vars\":{},\"steps\":[{\"id\":\"s1\",\"call\":\"<tool_id>\",\"input\":{\"<k>\":\"<占位>\"},\"depends_on\":[\"s1\"]}]}。约束：1) call 只能是候选工具；2) depends_on 必须是「step id 字符串数组」(如 [\"s1\"]) 或省略，绝不能是对象；3) 真实依赖才写 depends_on；4) input 用合理占位，可用 ${steps.<id>.output.<字段>} 引用上游；5) 不引入候选外工具。只输出 JSON，不要解释。"
+  local last_err
+  for attempt = 1, max_retries do
+    local flow = llm_json(sys_assemble, build_assemble(intent, plans, last_err))
+    if flow then
+      flow = norm_flow(flow)
+      local v = ctx.ext.ai.validate({ kind = "flow", def = flow, tools = tools })
+      if v.ok then return { kind = "flow", flow = flow, steps_plan = plans } end
+      last_err = v.error
+    else
+      last_err = "LLM 未返回合法 JSON"
+    end
+  end
+  error("生成 Flow 失败：" .. tostring(last_err))
+capabilities:
+  - ext.ai
+  - ext.registry
+input_schema:
+  type: object
+output_schema:
+  type: object
+versions:
+  - version: 1.0.0
+    state: stable
+
+---
+id: ai-create-flow
+name: AI 创建 Flow 参考流程
+description: 注入 intent/tools/mode/max_retries，调用 ai-gen 生成 Flow/Tool 草稿。
+vars:
+  intent: ""
+  mode: flow
+  max_retries: 3
+steps:
+  - id: gen
+    call: ai-gen
+    input:
+      intent: "${vars.intent}"
+      mode: "${vars.mode}"
+      max_retries: "${vars.max_retries}"

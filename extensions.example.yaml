@@ -1,0 +1,325 @@
+# Gear 扩展原语配置（PRD §9，去内置化 + 配置化加载）。
+#
+# 用法：把本文件复制为 extensions.yaml 放在工作目录即可启用自定义扩展；
+# 不建 extensions.yaml 时 gear 回退默认 ext.ai（进程内 Eino agent，无需 sidecar）。
+# 也可设 GEAR_EXT_CONFIG 指向任意路径的配置文件，覆盖默认查找位置。
+#
+# 每个扩展（sidecar 载体）：
+#   cmd:     sidecar 启动命令（任意语言写的小程序，读 stdin JSON、写 stdout 末行 JSON）
+#   methods: 暴露给 ctx.ext.<name> 的方法
+#   kind:    "sidecar"（默认，任意语言子进程）或 "agent"（进程内 Go 承载；目前仅 ext.ai）
+#
+# ext.ai 是 gear 内建的进程内 agent（取代原 sidecar 子进程），**始终由 gear 注册**，
+# 无需在配置里声明；配置里只列其它 sidecar 扩展（如 ext.tls / ext.db）。发布后想加一个
+# 原生能力（如 TLS），只需在这里加一段，不必改 gear 源码：
+#   ext.tls:
+#     cmd: ["./tls-sidecar"]
+#     methods: [issue, verify, renew]
+#     schemas:
+#       issue: { description: 签发, parameters: { domain: {type: string, required: true} } }
+# 然后 Tool 声明 capabilities: [ext.tls]，Lua 里即可 local c = ctx.ext.tls.issue({ domain = "x.com" })。
+# 注意：ext.registry 是 gear 内建进程内扩展（读引擎 registry，供 agent 自我锚定），无需在此声明。
+#
+# 同理无需在此声明的是**内核原语**：受门禁的 7 个（http/call/db/kv/secret/event/subscribe，
+# 由 Tool 的 capabilities 声明后使用）与始终可用的 3 个纯函数原子（time/template/crypto，
+# 无需任何声明即可用，如 Flow 直调 call: crypto.hash、Lua 里 ctx.time.now({})）。
+# 它们不是 ext.*，不进本文件；能力目录见 `gear ai capabilities`。
+#
+# ⚠ 配置存在时「以配置为准」：未列出的 sidecar 扩展不会被注册。ext.ai 不受此限（始终注册）。
+# ⚠ 严格必填：每个 ext.* 必须声明 schemas（每个方法的参数 schema，供 agent 经
+#   ext.registry.capabilities() 自我锚定，堵住「tool entry 幻觉 ctx.* 参数」缺口；
+#   缺 schemas 或 methods 与 schemas 不一致时 gear 启动即报错）。
+#
+# 生成配方（ai.gen-flow/tool/hook 的可编辑制品）在 examples/ai/recipes/*.yaml；
+# 改那里的提示词/约束即可调生成细节，无需重编 gear（GEAR_AI_RECIPES 可指向自定义目录）。
+
+# ext.ai（进程内 Eino agent）由 gear **始终注册**，方法清单与参数 schema 全部内置
+# （defaultAISchemas：complete / catalog / domains / validate / generate / capabilities / react），
+# 配置里的 ext.ai 段会被**整段忽略**（不校验、不采用）——故这里不再放示例段，避免
+# 「抄了一份过期的方法清单，以为 react 不存在」这类误读。要看当前真实清单：
+#   gear ai capabilities
+#
+# 同理，ext.registry（读引擎 registry，供 agent 自我锚定）也是内建的，无需在此声明。
+
+# ── ext.db：**示例 sidecar 源码已移除**（2026-09-19）─────────────────────────
+# 连数据库请优先用**内置 db 原语**：Tool 声明 capabilities:[db] 即可
+#   ctx.db.query({driver,dsn,sql,params})（sqlite/mysql/postgres，见 internal/cap/sqldb.go）；
+# 下面整段已注释，仅在「想用完全自定义 sidecar 承载 DB」时作形态参考——
+# 取消注释并把 cmd 换成你自己的 sidecar 可执行文件即可启用。
+# 历史形态（原示例 examples/gear-db-sidecar 已移除）：
+#
+# ⚠ 已被内置 db 原语取代：内核的 cap.DB 现已原生支持多后端（sqlite/mysql/postgres），
+#   Tool 声明 capabilities:[db] 即可 ctx.db.query({driver,dsn,sql,params})，无需本 sidecar。
+#   本段仅作为「想用完全自定义 sidecar 承载 DB」时的参考，新场景请优先用内置 db。
+#
+# driver/dsn 走调用参数或 env（GEAR_DB_DRIVER / GEAR_DB_DSN）；SQL 写在 Lua Tool 里。
+#   local r = ctx.ext.db.query({ driver="postgres", dsn=ctx.input.dsn,
+#                                sql="SELECT * FROM t WHERE id=?", params={ ctx.input.id } })
+# 释放方法：query（返回 columns/rows/row_count）、exec（返回 rows_affected）、ping（探活）。
+# DSN 常含口令：优先用 GEAR_DB_DSN 或 Flow 里的 ${secrets.*}，不要硬编码进 YAML。
+# ext.db:
+#   cmd: ["go", "run", "./plugin/gear-db-sidecar"]
+#   methods: [query, exec, ping]
+#   schemas:
+#     query:
+#       description: 参数化查询，返回 {columns, rows, row_count}
+#       parameters:
+#         driver: {type: string, enum: [sqlite, sqlite3, mysql, mariadb, postgres, postgresql, pg], description: "数据库驱动（缺省走 env GEAR_DB_DRIVER）"}
+#         dsn: {type: string, description: "数据源名/连接串（缺省走 env GEAR_DB_DSN）"}
+#         sql: {type: string, description: "SQL（用 ? 占位符，配套 params）", required: true}
+#         params: {type: array, description: "预编译占位符参数（按顺序，可选）"}
+#     exec:
+#       description: 执行写操作，返回 {rows_affected}
+#       parameters:
+#         driver: {type: string, enum: [sqlite, sqlite3, mysql, mariadb, postgres, postgresql, pg], description: "数据库驱动（缺省走 env GEAR_DB_DRIVER）"}
+#         dsn: {type: string, description: "数据源名/连接串（缺省走 env GEAR_DB_DSN）"}
+#         sql: {type: string, description: "SQL（用 ? 占位符，配套 params）", required: true}
+#         params: {type: array, description: "预编译占位符参数（按顺序，可选）"}
+#     ping:
+#       description: 探活，返回 {ok:true}
+#       parameters:
+#         driver: {type: string, enum: [sqlite, sqlite3, mysql, mariadb, postgres, postgresql, pg], description: "数据库驱动（缺省走 env GEAR_DB_DRIVER）"}
+#         dsn: {type: string, description: "数据源名/连接串（缺省走 env GEAR_DB_DSN）"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 通知类可扩展原子（P1 样板，统一注册表见 plugin/extensions.yaml；Go 单二进制载体 `gear ext`）：
+#   ext.email  —— SMTP 发邮件（send）
+#   ext.webhook —— outbound webhook（send，POST JSON）
+#   ext.wecom   —— 企业微信群机器人（send，text/markdown）
+# 三者均为「桥接具体外部系统的原生单操作」，业务规则留给 Flow / 领域 Lua 工具。
+# AI 原子已是内核内置的 ext.ai（进程内 Eino agent，始终注册），无需在此声明。
+ext.email:
+  cmd: ["build/gear.exe", "ext", "email"]
+  methods: [send]
+  schemas:
+    send:
+      description: SMTP 发送邮件（单操作原子，无业务规则）
+      parameters:
+        to: {type: string, description: "收件人（字符串或数组）", required: true}
+        subject: {type: string, description: "主题"}
+        body: {type: string, description: "正文"}
+        cc: {type: string, description: "抄送（字符串或数组，可选）"}
+        html: {type: boolean, description: "正文是否 HTML（默认 false）"}
+        from: {type: string, description: "发件人（缺省等于 user）"}
+        host: {type: string, description: "SMTP 主机", required: true}
+        port: {type: number, description: "SMTP 端口（默认 465）"}
+        user: {type: string, description: "SMTP 账号", required: true}
+        pass: {type: string, description: "SMTP 密码", required: true}
+        ssl: {type: boolean, description: "是否 SSL（默认 true）"}
+        mode: {type: string, description: "send 真实发送 / log 落盘（默认 send）"}
+        log_path: {type: string, description: "log 模式落盘路径（默认 email.out.log）"}
+
+ext.webhook:
+  cmd: ["build/webhook-sidecar.exe"]   # 真实 webhook-sidecar 侧车（plugin/webhook-sidecar；需先 go build -o build/webhook-sidecar.exe ./plugin/webhook-sidecar）
+  methods: [send, listen, unsubscribe]
+  service: true                        # 常驻能力：侧车长驻（coord:8089 + 入站回调:8088 两端口）
+  source: webhook                      # 声明承载「webhook」事件源（供通用订阅原语 ctx.subscribe 使用）
+  listen: "127.0.0.1:8089"
+  health_probe:
+    kind: tcp
+    addr: "127.0.0.1:8089"
+    interval: 5s
+    threshold: 3
+  schemas:
+    send:
+      description: 向预配置/指定 URL POST JSON（outbound webhook 原子，复用侧车长连接）
+      parameters:
+        url: {type: string, description: "目标 URL", required: true}
+        payload: {type: object, description: "请求体（必填）", required: true}
+        headers: {type: object, description: "附加请求头（可选）"}
+        method: {type: string, description: "HTTP 方法（默认 POST）"}
+    listen:
+      description: 监听一个入站 URL（外部系统 POST 到 /in/{path} 时回推事件）；通常经 ctx.subscribe.start 使用
+      parameters:
+        path: {type: string, description: "入站路由路径（外部 POST /in/{path}）", required: true}
+        callback_url: {type: string, description: "事件回推地址（缺省由 ctx.subscribe 注入）"}
+    unsubscribe:
+      description: 按 handle 取消一条长驻监听（ctx.ext.webhook.listen 登记的路由）
+      parameters:
+        handle: {type: string, description: "listen 返回的订阅句柄", required: true}
+
+ext.wecom:
+  cmd: ["build/gear.exe", "ext", "wecom"]
+  methods: [send]
+  schemas:
+    send:
+      description: 企业微信群机器人 webhook 发送（text/markdown）
+      parameters:
+        key: {type: string, description: "群机器人 key", required: true}
+        content: {type: string, description: "文本内容（必填）", required: true}
+        msgtype: {type: string, enum: [text, markdown], description: "消息类型（默认 text）"}
+        mentioned_list: {type: array, description: "提及成员 userid 列表（可选）"}
+        mentioned_mobile_list: {type: array, description: "提及成员手机号列表（可选）"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 常驻能力（service ext）示例：MQTT 订阅/发布（EXT_SERVICE_DESIGN.md §3/§4/§12）
+#
+# 与上面"一次性 sidecar"不同，service ext 声明 service:true 后会被 gear 当成一个
+# 长驻进程监管（process Tool + Supervisor：重启策略 / 健康探针 / 进程树级联回收），
+# 而非"调一次退一次"。
+#
+#   - listen：侧车常驻监听的本地 RPC 地址（127.0.0.1 only）。Gear 经本地 HTTP 调其方法
+#     （publish），侧车内部维护一条 MQTT 长连接，彻底消除"每次重连"的浪费；
+#   - health_probe：复用 Tool 健康探针，连续失败按阈值杀掉并重启；
+#   - 多 gear 共享：同主机多个 gear 都需要 ext.mqtt 时，由 coord 机制保证仅一个 sidecar
+#     实例绑定 :1884（首个 gear 拉起、其余 Register PID 复用），占用列表空则侧车自动退出。
+#
+# flow 里这样引用（step 走 process 虚拟 Tool + Start 路径）：
+#   flows:
+#     - id: mqtt-daemon
+#       steps:
+#         - id: s1
+#           call: ext.mqtt          # 命中虚拟 process Tool（由 service ext 自动生成）
+#           mode: service           # 长驻
+ext.mqtt:
+  cmd: ["build/mqtt-sidecar.exe"]   # 真实 mqtt-sidecar 侧车（plugin/mqtt-sidecar；需先 go build -o build/mqtt-sidecar.exe ./plugin/mqtt-sidecar）
+  methods: [publish, subscribe]
+  service: true
+  source: mqtt                      # 声明承载「mqtt」事件源（供通用订阅原语 ctx.subscribe 使用）
+  listen: "127.0.0.1:1884"
+  health_probe:
+    kind: tcp
+    addr: "127.0.0.1:1884"
+    interval: 5s
+    threshold: 3
+  schemas:
+    publish:
+      description: 发布 MQTT 消息（经侧车长连接复用，非每次重连）
+      parameters:
+        topic: {type: string, description: "主题", required: true}
+        payload: {type: string, description: "消息体", required: true}
+        qos: {type: number, description: "QoS（0/1/2，默认 0）"}
+    subscribe:
+      description: 订阅主题（长驻消费：sidecar 维护 handle→callbackURL 映射，收到消息按 handle 回推对应 Gear）
+      parameters:
+        topic: {type: string, description: "主题（支持 +/# 通配）", required: true}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2 消息 / 短信原子（service ext）：RabbitMQ / Kafka / SMS
+#
+# 关键：consume 是「直接可调」的一等方法（不再只能经 ctx.subscribe 一条特例）：
+#   - mode=pull（默认）拉取最多 max_messages 条，同步返回；
+#   - mode=push 长驻订阅，收到消息即回推事件；
+#   - 长驻可用 unsubscribe 按 handle 停掉（start/stop 闭环）。
+# 权威注册表见 plugin/extensions.yaml。
+ext.rabbitmq:
+  cmd: ["build/rabbitmq-sidecar.exe"]
+  methods: [publish, declare, consume, unsubscribe]
+  service: true
+  source: rabbitmq
+  listen: "127.0.0.1:5674"
+  health_probe: {kind: tcp, addr: "127.0.0.1:5674", interval: 5s, threshold: 3}
+  schemas:
+    publish:
+      description: 向指定 exchange/routing_key 发布一条消息
+      parameters:
+        url: {type: string, description: "连接串（amqp://user:pass@host:port/，优先于分项）"}
+        host: {type: string, description: "主机（默认 localhost）"}
+        port: {type: number, description: "端口（默认 5672）"}
+        user: {type: string, description: "账号（默认 guest）"}
+        pass: {type: string, description: "密码（默认 guest）"}
+        exchange: {type: string, description: "交换机（默认空直连默认交换机）"}
+        routing_key: {type: string, description: "路由键"}
+        body: {type: string, description: "消息体（str 或 JSON 对象）"}
+        persistent: {type: boolean, description: "是否持久化（默认 true）"}
+    declare:
+      description: 声明 queue / exchange
+      parameters:
+        url: {type: string, description: "连接串（优先于分项）"}
+        host: {type: string, description: "主机（默认 localhost）"}
+        port: {type: number, description: "端口（默认 5672）"}
+        user: {type: string, description: "账号（默认 guest）"}
+        pass: {type: string, description: "密码（默认 guest）"}
+        kind: {type: string, enum: [queue, exchange], description: "声明类型", required: true}
+        name: {type: string, description: "名称", required: true}
+    consume:
+      description: 消费队列（直接调用）。mode=pull 拉一批返回（取出后 ack）/ mode=push 长驻订阅，仅回推成功才 ack（失败 nack 重入队）
+      parameters:
+        url: {type: string, description: "连接串（amqp://user:pass@host:port/）"}
+        host: {type: string, description: "主机（默认 localhost）"}
+        port: {type: number, description: "端口（默认 5672）"}
+        user: {type: string, description: "账号（默认 guest）"}
+        pass: {type: string, description: "密码（默认 guest）"}
+        queue: {type: string, description: "消费目标队列", required: true}
+        mode: {type: string, enum: [pull, push], description: "pull 拉一批返回（默认）/ push 长驻订阅回推"}
+        max_messages: {type: number, description: "pull 模式单次最多拉取条数（默认 1）"}
+        handle: {type: string, description: "push 模式订阅句柄（缺省自动生成并返回）"}
+        callback_url: {type: string, description: "push 模式事件回推地址（mode=push 时必填）"}
+    unsubscribe:
+      description: 按 handle 取消一条长驻消费
+      parameters:
+        handle: {type: string, description: "consume(mode=push) 返回的订阅句柄", required: true}
+
+ext.kafka:
+  cmd: ["build/kafka-sidecar.exe"]
+  methods: [produce, consume, unsubscribe]
+  service: true
+  source: kafka
+  listen: "127.0.0.1:9094"
+  health_probe: {kind: tcp, addr: "127.0.0.1:9094", interval: 5s, threshold: 3}
+  schemas:
+    produce:
+      description: 向指定 topic 生产一条消息
+      parameters:
+        topic: {type: string, description: "主题", required: true}
+        brokers: {type: string, description: "broker 列表（逗号分隔，或数组）", required: true}
+        key: {type: string, description: "分区键（可选）"}
+        value: {type: string, description: "消息体（str 或 JSON 对象）"}
+    consume:
+      description: 消费 topic（直接调用）。mode=pull 拉一批返回（broker 先预检、成功返回后才提交 offset）/ mode=push 长驻订阅回推
+      parameters:
+        topic: {type: string, description: "主题", required: true}
+        brokers: {type: string, description: "broker 列表（逗号分隔，或数组）", required: true}
+        mode: {type: string, enum: [pull, push], description: "pull 拉一批返回（默认）/ push 长驻订阅回推"}
+        group: {type: string, description: "消费组（pull 默认 gear-consume；push 默认 gear-{handle}）"}
+        max_messages: {type: number, description: "pull 模式单次最多拉取条数（默认 1）"}
+        timeout: {type: string, description: "pull 模式本批等待时长（如 5s，默认 5s）"}
+        start: {type: string, enum: [earliest, latest], description: "无已提交 offset 时的起始位点（默认 latest）"}
+        handle: {type: string, description: "push 模式订阅句柄（缺省自动生成并返回）"}
+        callback_url: {type: string, description: "push 模式事件回推地址（mode=push 时必填）"}
+    unsubscribe:
+      description: 按 handle 取消一条长驻消费
+      parameters:
+        handle: {type: string, description: "consume(mode=push) 返回的订阅句柄", required: true}
+
+ext.sms:
+  cmd: ["build/gear.exe", "ext", "sms"]
+  methods: [send]
+  schemas:
+    send:
+      description: 经 HTTP 短信网关发送一条短信（通用短信原子，运营商解耦）
+      parameters:
+        phone: {type: string, description: "手机号（字符串或数组，多号批量）", required: true}
+        content: {type: string, description: "直接正文（与 template_id 二选一）"}
+        gateway: {type: string, description: "网关 URL（可选参数，传给 ext.sms；缺省则报错）"}
+        apikey: {type: string, description: "网关令牌（可选参数，传给 ext.sms）"}
+        sign: {type: string, description: "短信签名（可选参数，传给 ext.sms）"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P3 文件 / 网站服务原子（service ext）：静态网站服务（类似 nginx）
+#
+# 给定一个端口 + 一个本地静态网站目录，起一个 HTTP 服务即可在浏览器访问。
+# 两个端口：listen(127.0.0.1:8095) 是 Gear 调 /start /stop /caps 的 RPC 端口；
+# args.port 是网站对外服务端口（由 /start 入参决定）。
+# 权威注册表见 plugin/extensions.yaml。
+ext.serve:
+  cmd: ["build/serve-sidecar.exe"]     # 真实 serve-sidecar 侧车（plugin/serve-sidecar；需先 go build -o build/serve-sidecar.exe ./plugin/serve-sidecar）
+  methods: [start, stop]
+  service: true                        # 常驻能力：侧车长驻，对外起静态网站 HTTP 服务
+  listen: "127.0.0.1:8095"            # coord + RPC 端口（本地 HTTP 调其方法，复用长连接）
+  health_probe:
+    kind: tcp
+    addr: "127.0.0.1:8095"
+    interval: 5s
+    threshold: 3
+  schemas:
+    start:
+      description: 在指定端口起一个静态网站服务（类似 nginx：给定端口 + 静态目录，浏览器即可访问）
+      parameters:
+        port: {type: number, description: "对外服务的监听端口", required: true}
+        dir: {type: string, description: "静态网站根目录（本地路径，必填参数，传给 ext.serve）", required: true}
+        host: {type: string, description: "绑定地址（默认 0.0.0.0，即所有网卡；可改 127.0.0.1 仅本机）"}
+    stop:
+      description: 停止当前静态网站服务（释放端口）
+      parameters: {}
+

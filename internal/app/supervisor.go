@@ -72,10 +72,10 @@ type Supervisor struct {
 	policy        RestartPolicy
 	maxConcurrent int
 
-	mu         sync.Mutex
-	active     int
+	mu          sync.Mutex
+	active      int
 	maxObserved int
-	restarts   int // 累计重启次数（restart=always 时 > 0，测试可观测）
+	restarts    int // 累计重启次数（restart=always 时 > 0，测试可观测）
 }
 
 // New 构造 Supervisor。maxConcurrent < 1 表示不限（由 Supervise 按 flow 数兜底）。
@@ -234,5 +234,10 @@ func (s *Supervisor) waitAny(ctx context.Context, handles []*engine.ServiceHandl
 func (s *Supervisor) stopAll(handles []*engine.ServiceHandle) {
 	for _, h := range handles {
 		_ = h.ProcKill()
+		// service ext：杀进程后 Deregister 自身 PID；占用列表空则侧车自动退出
+		//（EXT_SERVICE_DESIGN.md §12）。Coord 为 nil 时（非 service ext）no-op。
+		if h.Coord != nil {
+			_ = h.Coord.Close()
+		}
 	}
 }

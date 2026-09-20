@@ -132,7 +132,7 @@ func TestEffectiveDepsMissingExplicit(t *testing.T) {
 // 曾经的 bug：只扫 input，导致 when 引用上游输出的 step 与上游同层并发，
 // 求值时读到还没产出的 output（`cannot fetch n from <nil>`）。
 func TestInferDepsFromWhen(t *testing.T) {
-	s := stepsOf("judge", "src") // judge 写在前面
+	s := stepsOf("judge", "src")         // judge 写在前面
 	s[0].When = "steps.src.output.n > 1" // 仅 when 里引用 src，input 为空
 	levels, err := topoLevels(s)
 	if err != nil {

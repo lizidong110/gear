@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -59,14 +60,106 @@ func TestContextGateDeniesUngranted(t *testing.T) {
 
 func TestMemKV(t *testing.T) {
 	k := NewMemKV()
-	k.Put("a", "1")
-	v, ok := k.Get("a")
+	k.Put("a", "1", ScopeGlobal)
+	v, ok := k.Get("a", ScopeGlobal)
 	if !ok || v != "1" {
 		t.Fatalf("Get 失败: %v %v", v, ok)
 	}
-	k.Delete("a")
-	if _, ok := k.Get("a"); ok {
+	k.Delete("a", ScopeGlobal)
+	if _, ok := k.Get("a", ScopeGlobal); ok {
 		t.Fatal("Delete 后应不存在")
+	}
+}
+
+// T-kv-01：session 作用域按 id 隔离——两个 flow id 的会话命名空间互不可见。
+func TestSessionKVIsolation(t *testing.T) {
+	r := NewMemSessionRegistry()
+	r.Session("flowA").Put("k", "va", ScopeSession)
+	r.Session("flowB").Put("k", "vb", ScopeSession)
+	if v, _ := r.Session("flowA").Get("k", ScopeSession); v != "va" {
+		t.Fatalf("flowA 应为 va，实为 %q", v)
+	}
+	if v, _ := r.Session("flowB").Get("k", ScopeSession); v != "vb" {
+		t.Fatalf("flowB 应为 vb，实为 %q", v)
+	}
+}
+
+// T-kv-02：session 命名空间在引用计数归零时回收（内存态，重启即失）。
+func TestSessionKVRelease(t *testing.T) {
+	r := NewMemSessionRegistry()
+	r.Acquire("flowA")
+	r.Session("flowA").Put("k", "v", ScopeSession)
+	r.Release("flowA") // 计数归零 → 回收
+	r.Acquire("flowA") // 重新 Acquire 应得到空命名空间（旧数据已清）
+	if _, ok := r.Session("flowA").Get("k", ScopeSession); ok {
+		t.Fatal("Release 后 session 命名空间应已回收，k 不应存在")
+	}
+}
+
+// T-kv-03：并发同 flow 运行各自 Acquire/Release，最后一个结束才回收（引用计数正确性）。
+func TestSessionKVRefCount(t *testing.T) {
+	r := NewMemSessionRegistry()
+	r.Acquire("f")
+	r.Acquire("f") // 并发两个运行
+	r.Session("f").Put("k", "v", ScopeSession)
+	r.Release("f") // 还有一个引用
+	if v, ok := r.Session("f").Get("k", ScopeSession); !ok || v != "v" {
+		t.Fatal("首个 Release 后命名空间应仍在（仍有引用）")
+	}
+	r.Release("f") // 归零
+	if _, ok := r.Session("f").Get("k", ScopeSession); ok {
+		t.Fatal("全部 Release 后命名空间应回收")
+	}
+}
+
+// T-kv-04：Context.KV() 按 sessionID 路由——同一 sessionID 的两个 ctx 共享会话命名空间，
+// ScopeGlobal 始终落在全局 KV（跨会话持久），不同 sessionID 互不可见。
+func TestContextKVRouting(t *testing.T) {
+	prov := &Providers{KV: NewMemKV(), Sessions: NewMemSessionRegistry()}
+	mkCtx := func(id string) *Context {
+		g, _ := GrantsFromStrings([]string{"kv"})
+		c := New(g, prov)
+		c.SetSession(id)
+		return c
+	}
+	kv1, err := mkCtx("flowX").KV()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kv2, err := mkCtx("flowX").KV()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 同一 sessionID：两 ctx 共享会话态（模拟同一次 flow run 的多个 step）。
+	kv1.Put("cached", "v1", ScopeSession)
+	if v, ok := kv2.Get("cached", ScopeSession); !ok || v != "v1" {
+		t.Fatalf("同一 sessionID 应共享会话态，实为 %v %v", v, ok)
+	}
+	// ScopeGlobal 落到全局，跨 ctx 也可见。
+	kv1.Put("gk", "gv", ScopeGlobal)
+	if v, ok := kv2.Get("gk", ScopeGlobal); !ok || v != "gv" {
+		t.Fatalf("global 应跨 ctx 可见，实为 %v %v", v, ok)
+	}
+	// 不同 sessionID 看不到 flowX 的会话数据。
+	kv3, _ := mkCtx("flowY").KV()
+	if _, ok := kv3.Get("cached", ScopeSession); ok {
+		t.Fatal("不同 sessionID 不应看到 flowX 的 session 数据")
+	}
+}
+
+// T-kv-05：无 Sessions 时 session 键降级为 global（不报错、不 panic，向后兼容）。
+func TestContextKVSessionDegrade(t *testing.T) {
+	prov := &Providers{KV: NewMemKV()} // 无 Sessions
+	g, _ := GrantsFromStrings([]string{"kv"})
+	c := New(g, prov)
+	c.SetSession("flowX")
+	kv, err := c.KV()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kv.Put("k", "v", ScopeSession) // 降级到 global
+	if v, ok := kv.Get("k", ScopeSession); !ok || v != "v" {
+		t.Fatalf("降级后应写入全局，实为 %v %v", v, ok)
 	}
 }
 
@@ -134,22 +227,19 @@ func TestDBNilUnavailable(t *testing.T) {
 	}
 }
 
-// TestSQLiteDBImpl 直接锁死 db 原语实现（#69）：建表/插入/查询/类型归一。
-// 用临时文件 DSN，顺带验证文件持久化路径可用（引擎默认宿主用内存 DSN，此处覆盖文件形态）。
-func TestSQLiteDBImpl(t *testing.T) {
-	db, err := NewSQLiteDB(filepath.Join(t.TempDir(), "cap.db"))
-	if err != nil {
-		t.Fatalf("打开 SQLite 失败: %v", err)
-	}
+// TestMultiDBImpl 直接锁死 db 原语多后端实现（#69 升级）：建表/插入/查询/类型归一。
+// 用临时文件 DSN 走 sqlite 后端，顺带验证「dsn 缺省回退 defaultSQLiteDSN」之外的文件形态。
+func TestMultiDBImpl(t *testing.T) {
+	db := NewMultiDB(filepath.Join(t.TempDir(), "cap.db"))
 	defer db.Close()
 
-	if err := db.Exec("CREATE TABLE t(id INTEGER, name TEXT, blob BLOB)"); err != nil {
+	if err := db.Exec("sqlite", "", "CREATE TABLE t(id INTEGER, name TEXT, blob BLOB)"); err != nil {
 		t.Fatalf("建表失败: %v", err)
 	}
-	if err := db.Exec("INSERT INTO t VALUES(1, 'alice', X'beef')"); err != nil {
+	if err := db.Exec("sqlite", "", "INSERT INTO t VALUES(1, 'alice', X'beef')"); err != nil {
 		t.Fatalf("插入失败: %v", err)
 	}
-	rows, err := db.Query("SELECT id, name, blob FROM t")
+	rows, err := db.Query("sqlite", "", "SELECT id, name, blob FROM t")
 	if err != nil {
 		t.Fatalf("查询失败: %v", err)
 	}
@@ -186,6 +276,63 @@ func TestCallResolver(t *testing.T) {
 	}
 	if out["echo"] != "toolX" {
 		t.Fatalf("Resolver 输出错误: %v", out)
+	}
+}
+
+// TestMultiDBBackendsRouting 锁死「内置 db 多后端」核心行为（平台化关键能力）：
+//  1. sqlite 走真实文件 DSN，跨 MultiDB 实例仍可读回（证明落盘而非内存 scratch）；
+//  2. mysql / postgres 驱动已编译链接（Ping 因无服务而报错，但报错不是「驱动未注册」）；
+//  3. 未知 driver 被拒。
+func TestMultiDBBackendsRouting(t *testing.T) {
+	fileDSN := filepath.Join(t.TempDir(), "real.db")
+
+	// 实例 A：建表 + 写一行到真实文件。
+	a := NewMultiDB("")
+	defer a.Close()
+	if err := a.Exec("sqlite", fileDSN, "CREATE TABLE t(id INTEGER, v TEXT)"); err != nil {
+		t.Fatalf("sqlite 建表失败: %v", err)
+	}
+	if err := a.Exec("sqlite", fileDSN, "INSERT INTO t VALUES(42, 'hello')"); err != nil {
+		t.Fatalf("sqlite 插入失败: %v", err)
+	}
+
+	// 实例 B：另起一个 MultiDB，读同一文件，证明真实持久化（非内存）。
+	b := NewMultiDB("")
+	defer b.Close()
+	rows, err := b.Query("sqlite", fileDSN, "SELECT id, v FROM t")
+	if err != nil {
+		t.Fatalf("sqlite 查询失败: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("应读回 1 行，实为 %d", len(rows))
+	}
+	r := rows[0].(map[string]interface{})
+	if fmt.Sprint(r["id"]) != "42" || fmt.Sprint(r["v"]) != "hello" {
+		t.Fatalf("读回内容错误: %v", r)
+	}
+
+	// mysql / postgres 驱动已链接：Ping 到不存在的端口应报「连不上」而非「驱动未注册」。
+	if err := a.Ping("mysql", "root@tcp(127.0.0.1:1)/nope"); err == nil {
+		t.Fatal("mysql Ping 应失败（无服务），却成功")
+	} else if strings.Contains(err.Error(), "unknown driver") || strings.Contains(err.Error(), "sql: unknown") {
+		t.Fatalf("mysql 驱动未链接: %v", err)
+	}
+	if err := a.Ping("postgres", "postgres://nope@127.0.0.1:1/nope"); err == nil {
+		t.Fatal("postgres Ping 应失败（无服务），却成功")
+	} else if strings.Contains(err.Error(), "unknown driver") || strings.Contains(err.Error(), "sql: unknown") {
+		t.Fatalf("postgres 驱动未链接: %v", err)
+	}
+
+	// driver 别名（mariadb / pg）也应归一识别。
+	if err := a.Ping("mariadb", "root@tcp(127.0.0.1:1)/nope"); err == nil {
+		t.Fatal("mariadb Ping 应失败")
+	} else if strings.Contains(err.Error(), "unknown driver") {
+		t.Fatalf("mariadb 别名未归一: %v", err)
+	}
+
+	// 未知 driver 必须被拒。
+	if err := a.Ping("oracle", ""); err == nil {
+		t.Fatal("未知 driver 应被拒，却成功")
 	}
 }
 

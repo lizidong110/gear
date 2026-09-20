@@ -62,7 +62,10 @@ func newGateServer(t *testing.T, opts ...ServerOption) (*Server, *httptest.Serve
 		t.Fatal(err)
 	}
 
-	srv := NewWithInferrer(reg, nil, opts...)
+	srv, err := New(reg, opts...)
+	if err != nil {
+		t.Fatalf("构造 Server 失败: %v", err)
+	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	t.Cleanup(srv.Shutdown)

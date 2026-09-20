@@ -2,12 +2,13 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -24,7 +25,11 @@ func newTestServer(t *testing.T) (*Server, *registry.Registry) {
 		t.Fatalf("打开 registry 失败: %v", err)
 	}
 	t.Cleanup(func() { _ = reg.Close() })
-	return New(reg), reg
+	srv, err := New(reg)
+	if err != nil {
+		t.Fatalf("构造 Server 失败: %v", err)
+	}
+	return srv, reg
 }
 
 func do(t *testing.T, h http.Handler, method, path string, body interface{}) (*httptest.ResponseRecorder, map[string]interface{}) {
@@ -88,6 +93,121 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+// A-1b：GET /api/capabilities 返回实时原子能力目录（含内核原语（builtin + pure）+ 默认 ext.ai）。
+func TestCapabilitiesEndpoint(t *testing.T) {
+	s, _ := newTestServer(t)
+	caps := doArray(t, s.Handler(), "GET", "/api/capabilities")
+
+	byName := map[string]map[string]interface{}{}
+	for _, c := range caps {
+		if n, ok := c["name"].(string); ok {
+			byName[n] = c
+		}
+	}
+	for _, want := range []string{"http", "call", "db", "kv", "secret", "event"} {
+		c, ok := byName[want]
+		if !ok || c["kind"] != "builtin" {
+			t.Fatalf("缺内置能力 %s: %v", want, caps)
+		}
+	}
+	ai, ok := byName["ext.ai"]
+	if !ok || ai["kind"] != "ext" {
+		t.Fatalf("缺默认 ext.ai: %v", caps)
+	}
+	methods, ok := ai["methods"].(map[string]interface{})
+	if !ok || methods["complete"] == nil {
+		t.Fatalf("ext.ai 应暴露 complete 方法 schema: %v", ai)
+	}
+}
+
+// A-1c：自定义扩展经 GEAR_EXT_CONFIG 注入后，GET /api/capabilities 自动带上它
+// （数据驱动，不复活写死的 ext.ai 清单；与 CLI `gear ai capabilities` 同源）。
+func TestCapabilitiesEndpointIncludesCustomExt(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "extensions.yaml")
+	if err := os.WriteFile(cfg, []byte(`ext.slack:
+  kind: sidecar
+  cmd: ["echo"]
+  methods: ["send"]
+  schemas:
+    send:
+      description: 发消息到 Slack 频道
+      parameters:
+        channel: { type: string, description: 频道名, required: true }
+        text: { type: string, description: 消息内容, required: true }
+`), 0o644); err != nil {
+		t.Fatalf("写扩展配置失败: %v", err)
+	}
+	t.Setenv("GEAR_EXT_CONFIG", cfg)
+
+	reg, err := registry.Open(filepath.Join(dir, "registry.db"))
+	if err != nil {
+		t.Fatalf("打开 registry 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+	srv, err := New(reg)
+	if err != nil {
+		t.Fatalf("构造 Server 失败: %v", err)
+	}
+
+	caps := doArray(t, srv.Handler(), "GET", "/api/capabilities")
+	byName := map[string]bool{}
+	for _, c := range caps {
+		if n, ok := c["name"].(string); ok {
+			byName[n] = true
+		}
+	}
+	if !byName["ext.slack"] {
+		t.Fatalf("自定义扩展 ext.slack 未出现在能力目录: %v", caps)
+	}
+}
+
+// A-1d：POST /api/capabilities/invoke 直接执行原子能力（内置走位置参数、ext.* 走单 table）。
+// 覆盖：内置 kv.put→kv.get 状态共享、ext.* 单 table 通道、未知方法 fail-closed、缺参 fail-closed。
+func TestInvokeCapabilityEndpoint(t *testing.T) {
+	s, _ := newTestServer(t)
+	h := s.Handler()
+
+	// 1) 内置原语 kv.put → kv.get 取回同一值（内存 KV 跨调用共享）。
+	rec, _ := do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{
+		"name": "kv", "method": "put", "args": map[string]interface{}{"key": "k", "value": "v", "scope": "global"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kv.put 应 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	rec, out := do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{
+		"name": "kv", "method": "get", "args": map[string]interface{}{"key": "k", "scope": "global"},
+	})
+	if rec.Code != http.StatusOK || out["result"] != "v" {
+		t.Fatalf("kv.get 应返回 v，实际 code=%d body=%v", rec.Code, out)
+	}
+
+	// 2) ext.* 单 table 通道：ext.ai.capabilities 返回能力数组。
+	rec, out = do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{
+		"name": "ext.ai", "method": "capabilities", "args": map[string]interface{}{},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ext.ai.capabilities 应 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, ok := out["result"].([]interface{}); !ok {
+		t.Fatalf("ext.ai.capabilities result 应为数组: %v", out)
+	}
+
+	// 3) 未知内置方法 fail-closed → 400（不静默执行一个不存在的东西）。
+	rec, _ = do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{
+		"name": "http", "method": "Boom", "args": map[string]interface{}{},
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("未知方法应 400，实际 %d", rec.Code)
+	}
+
+	// 4) 缺 name/method → 400。
+	rec, _ = do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{"name": "kv"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("缺 method 应 400，实际 %d", rec.Code)
+	}
+}
+
 // A-2：tools CRUD + 注销。
 func TestToolsCRUD(t *testing.T) {
 	s, _ := newTestServer(t)
@@ -117,6 +237,31 @@ func TestToolsCRUD(t *testing.T) {
 	rec, _ = do(t, h, "DELETE", "/api/tools/t1", nil)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("删不存在的期望 404，实际 %d", rec.Code)
+	}
+}
+
+// A-3b：GET /api/tools/{id} —— 单查 Tool。
+// 此前 UI 只能「拉全量列表再本地索引」；补上单查后可按 id 直取，不存在 → 404。
+func TestGetToolEndpoint(t *testing.T) {
+	s, reg := newTestServer(t)
+	seed(t, reg)
+	h := s.Handler()
+
+	rec, out := do(t, h, "GET", "/api/tools/echo", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("单查已注册 Tool 期望 200，实际 %d %s", rec.Code, rec.Body.String())
+	}
+	if out["id"] != "echo" {
+		t.Fatalf("返回体应是被查的那个 Tool，实际 %v", out)
+	}
+	// 详情端点的意义就在于把 versions 一并带回来（列表里也能看到，但这里是契约的一部分）。
+	if _, ok := out["versions"]; !ok {
+		t.Fatalf("单查应含 versions，实际 %v", out)
+	}
+
+	rec, _ = do(t, h, "GET", "/api/tools/nope", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("单查不存在的 Tool 期望 404，实际 %d", rec.Code)
 	}
 }
 
@@ -255,6 +400,69 @@ func TestFlowsAndValidate(t *testing.T) {
 	}
 }
 
+// TestFlowsAcceptPrimitiveCalls：REST 注册面必须与运行期「同样的『call 判定』」——
+// step.call 可以是「能力.方法」（kv.put / call.Call / ext.ai.capabilities），无需先包一层 Tool。
+//
+// 回归点（真实 bug）：handleCreateFlow/handleValidateFlow 曾用 engine.New(s.reg)（一次性、
+// 丢弃 capReg/agent）做静态校验，导致 ext.* 这类需要 capReg 才能识别的方法在 POST 阶段被
+// 误判为「既不是已注册的 Tool」而 400——注册期判定比运行期更严，两处判定漂移。
+// 这里断言：内建原语 + ext.* 原语都能过注册；且缺参数/未知方法仍在注册期 fail-closed 拒绝。
+func TestFlowsAcceptPrimitiveCalls(t *testing.T) {
+	s, reg := newTestServer(t)
+	seed(t, reg) // echo Tool（用于 call.Call 的 target 与 Tool-优先对照）
+	h := s.Handler()
+
+	cases := []struct {
+		name string
+		call string
+		in   map[string]interface{}
+	}{
+		{"内建原语 kv.put", "kv.put", map[string]interface{}{"key": "k1", "value": "v1"}},
+		{"内建原语 kv.get", "kv.get", map[string]interface{}{"key": "k1"}},
+		{"内建原语 call.Call（调 Tool）", "call.Call", map[string]interface{}{"target": "echo"}},
+		// 关键回归：ext.* 需要 capReg 才能识别；修复前此处 400。
+		{"扩展原语 ext.ai.capabilities", "ext.ai.capabilities", map[string]interface{}{}},
+	}
+	for i, tc := range cases {
+		id := fmt.Sprintf("pf%d", i)
+		flow := map[string]interface{}{
+			"id": id, "steps": []map[string]interface{}{
+				{"id": "s1", "call": tc.call, "input": tc.in},
+			},
+		}
+		rec, _ := do(t, h, "POST", "/api/flows", flow)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("[%s] 注册应 201，实际 %d %s", tc.name, rec.Code, rec.Body.String())
+		}
+		rec, out := do(t, h, "POST", "/api/flows/"+id+"/validate", nil)
+		if rec.Code != http.StatusOK || out["valid"] != true {
+			t.Fatalf("[%s] 校验应 valid=true，实际 %d %v", tc.name, rec.Code, out)
+		}
+	}
+
+	// 注册期 fail-closed：以下都应在 POST 阶段被拒（与运行期同源判定）。
+	bad := []struct {
+		name string
+		call string
+		in   map[string]interface{}
+	}{
+		{"未知能力", "nope.put", map[string]interface{}{"key": "k"}},
+		{"已知能力但未知方法", "kv.nope", map[string]interface{}{"key": "k"}},
+		{"缺必填参数", "kv.put", map[string]interface{}{"key": "k"}}, // 缺 value
+		{"多余未知参数", "kv.get", map[string]interface{}{"key": "k", "oops": "x"}},
+	}
+	for i, tc := range bad {
+		flow := map[string]interface{}{
+			"id": fmt.Sprintf("pbad%d", i), "steps": []map[string]interface{}{
+				{"id": "s1", "call": tc.call, "input": tc.in},
+			},
+		}
+		if rec, _ := do(t, h, "POST", "/api/flows", flow); rec.Code != http.StatusBadRequest {
+			t.Fatalf("[%s] 期望注册期 400，实际 %d %s", tc.name, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 // A-6b：GET /api/flows 列出已注册 Flow（消除 handleListFlows 0% 覆盖）。
 func TestListFlows(t *testing.T) {
 	s, reg := newTestServer(t)
@@ -297,6 +505,53 @@ func TestListFlows(t *testing.T) {
 	}
 }
 
+// A-6b：DELETE /api/flows/{id} —— 注销 Flow。
+// 覆盖三种结果：不存在 404 / 成功 200 / 被引用 409（§8.2 守卫在 registry 层判定，REST 只映射状态码）。
+func TestDeleteFlowEndpoint(t *testing.T) {
+	s, reg := newTestServer(t)
+	seed(t, reg) // echo Tool + Flow f1
+	h := s.Handler()
+
+	// 不存在 → 404
+	if rec, _ := do(t, h, "DELETE", "/api/flows/ghost", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("删不存在的 Flow 期望 404，实际 %d", rec.Code)
+	}
+
+	// 无引用 → 200，且库里真的没了
+	if rec, _ := do(t, h, "DELETE", "/api/flows/f1", nil); rec.Code != http.StatusOK {
+		t.Fatalf("注销 Flow 期望 200，实际 %d", rec.Code)
+	}
+	if got, _ := reg.GetFlow("f1"); got != nil {
+		t.Fatal("注销后不应再读到 f1")
+	}
+
+	// 被 Flow 级 Hook 的 action 引用 → 409（ErrInUse）
+	if err := reg.UpsertFlow(&model.Flow{ID: "sub", Steps: []model.Step{
+		{ID: "s1", Call: "echo", Input: map[string]interface{}{"name": "x"}},
+	}}); err != nil {
+		t.Fatalf("注册 Flow 失败: %v", err)
+	}
+	if err := reg.UpsertHook(&model.Hook{ID: "hbf", Target: "*", Stage: model.StageBeforeFlow, Action: "sub"}); err != nil {
+		t.Fatalf("注册 Flow 级 Hook 失败: %v", err)
+	}
+	rec, out := do(t, h, "DELETE", "/api/flows/sub", nil)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("被引用的 Flow 应回 409，实际 %d %s", rec.Code, rec.Body.String())
+	}
+	// 拒绝原因必须透传（排障第一手线索：告诉用户是谁挡住了）。
+	if msg, _ := out["error"].(string); !strings.Contains(msg, "hbf") {
+		t.Fatalf("409 应指明引用者 hbf，实际 %v", out)
+	}
+
+	// 清掉引用后可删
+	if err := reg.DeleteHook("hbf"); err != nil {
+		t.Fatalf("删 hbf 失败: %v", err)
+	}
+	if rec, _ := do(t, h, "DELETE", "/api/flows/sub", nil); rec.Code != http.StatusOK {
+		t.Fatalf("引用清除后应可注销，实际 %d", rec.Code)
+	}
+}
+
 // A-7：hooks 列出/添加。
 func TestHooks(t *testing.T) {
 	s, reg := newTestServer(t)
@@ -322,6 +577,31 @@ func TestHooks(t *testing.T) {
 	bad := map[string]interface{}{"id": "h2", "target": "*", "stage": "whenever", "action": "mask"}
 	if rec, _ := do(t, h, "POST", "/api/hooks", bad); rec.Code != http.StatusBadRequest {
 		t.Fatalf("非法 Hook 期望 400，实际 %d", rec.Code)
+	}
+}
+
+// A-7c：DELETE /api/hooks/{id} —— 删除 Hook。
+// Hook 不被别的定义引用，所以没有引用守卫；但「不存在」必须回 404 而非静默成功。
+func TestDeleteHookEndpoint(t *testing.T) {
+	s, reg := newTestServer(t)
+	seed(t, reg)
+	h := s.Handler()
+
+	body := map[string]interface{}{
+		"id": "h1", "target": "*", "stage": "before_step", "action": "echo", "criticality": "best-effort",
+	}
+	if rec, _ := do(t, h, "POST", "/api/hooks", body); rec.Code != http.StatusCreated {
+		t.Fatalf("注册 Hook 期望 201，实际 %d %s", rec.Code, rec.Body.String())
+	}
+	if rec, _ := do(t, h, "DELETE", "/api/hooks/h1", nil); rec.Code != http.StatusOK {
+		t.Fatalf("删 Hook 期望 200，实际 %d", rec.Code)
+	}
+	if got, _ := reg.GetHook("h1"); got != nil {
+		t.Fatal("删除后不应再读到 h1")
+	}
+	// 再删 → 404（不静默 no-op）
+	if rec, _ := do(t, h, "DELETE", "/api/hooks/h1", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("删不存在的 Hook 期望 404，实际 %d", rec.Code)
 	}
 }
 
@@ -396,8 +676,8 @@ func TestExecutionLogs(t *testing.T) {
 	objSchema := map[string]interface{}{"type": "object"}
 	if err := reg.UpsertTool(&model.Tool{
 		ID: "logt", Name: "logt", Runtime: model.RuntimeProcess,
-		Entry:        "echo 'boot-line'; echo '{\"ok\":true}'; echo 'warn-stderr' >&2",
-		InputSchema:  objSchema, OutputSchema: objSchema,
+		Entry:       "echo 'boot-line'; echo '{\"ok\":true}'; echo 'warn-stderr' >&2",
+		InputSchema: objSchema, OutputSchema: objSchema,
 		Versions: []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
 	}); err != nil {
 		t.Fatalf("注册 logt 失败: %v", err)
@@ -677,50 +957,71 @@ func TestListExecutions(t *testing.T) {
 	}
 }
 
-// mockInferrer 是 ai.Inferrer 的 Mock（server 测试用）。
-type mockInferrer struct {
-	text string
-	err  error
-}
+// mockInferrer 已随 AI 去内置化（M-EXT-AI，2026-09-14）移除：server 不再持有 inferrer 字段、
+// /api/ai/infer 端点已删除；AI 改为以 ext.ai Sidecar 扩展承载（examples/gear-ai-sidecar）。
 
-func (m *mockInferrer) Infer(ctx context.Context, prompt string) (string, error) {
-	return m.text, m.err
-}
+// TestNewsEndpoint 验证 GET /api/news：用本地 mock 百度接口（Baidu 形状 JSON）跑真实示例
+// testdata/news-top10.yaml（news.fetch 直接调 ctx.http + ctx.json），确定性、不依赖外网。
+func TestNewsEndpoint(t *testing.T) {
+	// 本地 mock 百度热搜榜接口，返回与真实接口同构的 JSON。
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"success":true,"data":{"cards":[{"component":"tabTextList","content":[{"content":[`+
+			`{"index":1,"word":"测试热点一","url":"https://example.com/1","hotTag":"3"},`+
+			`{"index":2,"word":"测试热点二","url":"https://example.com/2","hotTag":"0"},`+
+			`{"index":3,"word":"测试热点三","url":"https://example.com/3","hotTag":"1"}`+
+			`]}]}]}}`)
+	}))
+	defer mock.Close()
 
-// A-16：AI 闭环端点——合法收敛返回 200 + Flow；空 prompt 400；收敛失败（非法 YAML）422。
-func TestInferFlow(t *testing.T) {
-	reg, err := registry.Open(filepath.Join(t.TempDir(), "registry.db"))
+	_, reg := newTestServer(t)
+	tools, flows, err := registry.LoadExamples(filepath.Join(repoRoot(t), "testdata", "news-top10.yaml"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("加载示例失败: %v", err)
 	}
-	t.Cleanup(func() { _ = reg.Close() })
+	// 把 news.top10 的 step input 指向 mock 服务（覆盖默认百度 URL），使测试不依赖外网。
+	for _, f := range flows {
+		if f.ID == "news.top10" {
+			f.Steps[0].Input = map[string]interface{}{"url": mock.URL}
+		}
+		if err := reg.UpsertFlow(f); err != nil {
+			t.Fatalf("灌入 Flow %s 失败: %v", f.ID, err)
+		}
+	}
+	for _, tl := range tools {
+		if err := reg.UpsertTool(tl); err != nil {
+			t.Fatalf("灌入 Tool %s 失败: %v", tl.ID, err)
+		}
+	}
 
-	inf := &mockInferrer{text: `id: ai-flow
-steps:
-  - id: s1
-    call: t1
-`}
-	s := NewWithInferrer(reg, inf)
-
-	rec, out := do(t, s.Handler(), "POST", "/api/ai/infer", map[string]interface{}{"prompt": "make a flow"})
+	srv, err := New(reg)
+	if err != nil {
+		t.Fatalf("构造 Server 失败: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/news", nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("合法收敛应 200，实为 %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("GET /api/news = %d，body=%s", rec.Code, rec.Body.String())
 	}
-	if out["id"] != "ai-flow" {
-		t.Fatalf("生成的 flow id 错误: %v", out["id"])
+	var out map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("响应非 JSON: %v", err)
 	}
+	items, ok := out["items"].([]interface{})
+	if !ok || len(items) != 3 {
+		t.Fatalf("期望 3 条 items，实际 %v", out["items"])
+	}
+	if _, ok := out["served_at"]; !ok {
+		t.Fatalf("响应应含 served_at 时间戳，实际 %v", out)
+	}
+}
 
-	// 空 prompt → 400
-	rec2, _ := do(t, s.Handler(), "POST", "/api/ai/infer", map[string]interface{}{"prompt": ""})
-	if rec2.Code != http.StatusBadRequest {
-		t.Fatalf("空 prompt 应 400，实为 %d", rec2.Code)
+// repoRoot 由测试源文件位置向上回溯到仓库根（internal/server → internal → 仓库根）。
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("runtime.Caller 失败")
 	}
-
-	// 收敛失败（非法 YAML）→ 422
-	infBad := &mockInferrer{text: "这根本不是 YAML"}
-	sBad := NewWithInferrer(reg, infBad)
-	rec3, _ := do(t, sBad.Handler(), "POST", "/api/ai/infer", map[string]interface{}{"prompt": "x"})
-	if rec3.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("收敛失败应 422，实为 %d: %s", rec3.Code, rec3.Body.String())
-	}
+	return filepath.Dir(filepath.Dir(filepath.Dir(file)))
 }

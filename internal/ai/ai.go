@@ -162,7 +162,7 @@ type sfMessage struct {
 type sfChatResp struct {
 	Choices []struct {
 		Message struct {
-			Content         string `json:"content"`
+			Content          string `json:"content"`
 			ReasoningContent string `json:"reasoning_content"`
 		} `json:"message"`
 	} `json:"choices"`

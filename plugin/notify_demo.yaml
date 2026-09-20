@@ -1,0 +1,72 @@
+# 演示 Tool：同时调用三个 P1 通知原子（邮件 + Webhook + 企微）。
+# 每个原子用 pcall 包裹，彼此失败互不影响，便于观测各通道结果。
+#
+# 注册：gear tool register --registry <db> -   （stdin 喂本文件）
+# 运行：gear tool run notify.all --registry <db> --input '{"to":"a@x.com","subject":"s","body":"b","webhook_url":"http://...","wecom_key":"...","smtp_host":"smtp.x.com","smtp_user":"u","smtp_pass":"p"}'
+id: notify.all
+name: 统一通知（邮件 + Webhook + 企微）
+runtime: lua
+capabilities: [ext.email, ext.webhook, ext.wecom]
+input_schema:
+  type: object
+  properties:
+    to: {type: string, description: "收件人"}
+    subject: {type: string, description: "主题/标题"}
+    body: {type: string, description: "正文"}
+    webhook_url: {type: string, description: "Webhook 目标 URL（必填参数，传给 ext.webhook）"}
+    wecom_key: {type: string, description: "企微群机器人 key（必填参数，传给 ext.wecom）"}
+    smtp_host: {type: string, description: "SMTP 主机（必填参数，传给 ext.email）"}
+    smtp_port: {type: number, description: "SMTP 端口（默认 465）"}
+    smtp_user: {type: string, description: "SMTP 账号（必填参数，传给 ext.email）"}
+    smtp_pass: {type: string, description: "SMTP 密码（必填参数，传给 ext.email）"}
+    smtp_ssl: {type: boolean, description: "是否 SSL（默认 true）"}
+    smtp_from: {type: string, description: "发件人（缺省等于 smtp_user）"}
+    email_mode: {type: string, description: "send 真实发送 / log 落盘（默认 send）"}
+    email_log_path: {type: string, description: "log 模式落盘路径（默认 email.out.log）"}
+  required: [to, subject, body]
+output_schema:
+  type: object
+  properties:
+    email: {type: object, description: "邮件原子结果或错误"}
+    webhook: {type: object, description: "webhook 原子结果或错误"}
+    wecom: {type: object, description: "企微原子结果或错误"}
+versions:
+  - version: 1.0.0
+    state: stable
+entry: |
+  local out = {}
+
+  local ok, r = pcall(function()
+    return ctx.ext.email.send({
+      to = ctx.input.to,
+      subject = ctx.input.subject,
+      body = ctx.input.body,
+      from = ctx.input.smtp_from,
+      host = ctx.input.smtp_host,
+      port = ctx.input.smtp_port,
+      user = ctx.input.smtp_user,
+      pass = ctx.input.smtp_pass,
+      ssl = ctx.input.smtp_ssl,
+      mode = ctx.input.email_mode,
+      log_path = ctx.input.email_log_path,
+    })
+  end)
+  out.email = ok and r or { error = tostring(r) }
+
+  ok, r = pcall(function()
+    return ctx.ext.webhook.send({
+      url = ctx.input.webhook_url,
+      payload = { subject = ctx.input.subject, body = ctx.input.body },
+    })
+  end)
+  out.webhook = ok and r or { error = tostring(r) }
+
+  ok, r = pcall(function()
+    return ctx.ext.wecom.send({
+      key = ctx.input.wecom_key,
+      content = ctx.input.subject .. "\n" .. ctx.input.body,
+    })
+  end)
+  out.wecom = ok and r or { error = tostring(r) }
+
+  return out

@@ -1,0 +1,30 @@
+# 生成「Flow」的可编辑配方（ai.gen-flow 制品）。
+# 改这里的系统提示 / 输出约束 / 能力提示，即可调整 flow 生成细节，无需重编 gear。
+# 覆盖方式：在 examples/ai/recipes/flow.yaml 放同名文件即可（启动时被优先加载）。
+kind: flow
+max_retries: 3
+system_decompose: |
+  你是一个编排规划器。把用户意图拆解为若干有序子任务，每个标注所属能力域
+  （从给定域列表选一个；未知填 general）。只输出 JSON 数组：
+  [{"subtask":"<子任务描述>","domain":"<能力域名>"}]，不要解释。
+system_assemble: |
+  你是一个 Gear Flow DSL 生成器。基于子任务与候选工具生成一份 Flow 定义 JSON。
+output_hints: |
+  结构：{"id":"<flow_id 蛇形小写>","name":"<名称>","description":"<描述>","vars":{},
+  "steps":[{"id":"s1","call":"<tool_id 或 能力.方法>","input":{"<k>":"<占位>"},"depends_on":["s1"]}]}
+  约束：
+  1) call 只能是「候选工具 id」或「capabilities 里列出的原子能力（写成 能力.方法，
+     如 kv.put / http.Request / ext.ai.complete）」，二者都不在列表里的名字一律不准用；
+     直调原子能力时 input 就是该方法参数（键名照 capabilities 抄，不要多也不要少）；
+  2) depends_on 必须是「step id 字符串数组」(如 ["s1"]) 或省略，绝不能是对象；
+  3) 真实依赖才写 depends_on；
+  4) input 用合理占位，可用 ${steps.<id>.output.<字段>} 引用上游
+     （直调原子能力的输出固定是 {"result": ...}，故引用写法为 ${steps.<id>.output.result}）；
+  5) 不引入候选外工具，也不臆造能力方法名。
+  只输出 JSON，不要解释。
+capabilities_hint: |
+  在 step 内调用宿主能力有两种写法：
+  （a）call 指向一个候选工具；
+  （b）call 直接写成「能力.方法」（见下方 capabilities），省掉一层工具包装——能用（b）就用（b）。
+  无论哪种，都必须使用已列出的方法与参数，不得臆造方法名或参数；
+  直调原子能力不支持 use_version 与 mode=service。

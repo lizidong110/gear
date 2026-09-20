@@ -46,8 +46,8 @@ func TestYAMLRoundtrip(t *testing.T) {
 		},
 		{
 			name: "Step",
-			in: Step{ID: "s1", Call: "hello", UseVersion: "1.0.0", Input: map[string]interface{}{"x": 1}, DependsOn: []string{"s0"}, When: "x>0", Parallel: true},
-			out: &Step{},
+			in:   Step{ID: "s1", Call: "hello", UseVersion: "1.0.0", Input: map[string]interface{}{"x": 1}, DependsOn: []string{"s0"}, When: "x>0", Parallel: true},
+			out:  &Step{},
 		},
 	}
 	for _, c := range cases {

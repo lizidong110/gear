@@ -1,0 +1,733 @@
+package engine
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"gear/internal/model"
+	"gear/internal/registry"
+)
+
+// 本文件覆盖 ext.ai 的 agent 层（ai_agent.go 的 Generate/React + ai_validate.go）。
+// 重点是 ReAct 循环：它把 LLM 的自由文本变成「调用宿主能力」的动作，每一步都可能被
+// 模型带偏，因此每条护栏各测一次（不静默降级、不无限循环、不越权）：
+//   - 执行器未装配 / 任务为空 → 显式报错（不假装跑过）；
+//   - allow 名单外的工具 → 拒绝并回灌提示（不越权）；
+//   - 相同工具+参数的重复调用 → 拦住（防死循环烧钱）；
+//   - 输出既非 Action 也非 Final Answer → 回灌格式要求继续（不硬失败）；
+//   - 达到最大步数仍未收尾 → 明说「未给出 Final Answer」，绝不编造答案。
+
+// scriptedLLM 按脚本逐轮返回文本，并记录收到的请求（用于断言 opts 是否真的透传）。
+type scriptedLLM struct {
+	texts []string
+	i     int
+	got   []LLMRequest
+	err   error
+}
+
+func (s *scriptedLLM) Complete(_ context.Context, req LLMRequest) (string, error) {
+	s.got = append(s.got, req)
+	if s.err != nil {
+		return "", s.err
+	}
+	if s.i >= len(s.texts) {
+		return "", fmt.Errorf("脚本已耗尽（第 %d 次调用）", s.i+1)
+	}
+	t := s.texts[s.i]
+	s.i++
+	return t, nil
+}
+
+func seedTool(t *testing.T, reg *registry.Registry) {
+	t.Helper()
+	if err := reg.UpsertTool(&model.Tool{
+		ID: "demo.echo", Name: "回声", Description: "回显输入", Runtime: model.RuntimeLua,
+		Entry:        "return ctx.input",
+		InputSchema:  map[string]interface{}{"type": "object"},
+		OutputSchema: map[string]interface{}{"type": "object"},
+		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
+	}); err != nil {
+		t.Fatalf("注册工具失败: %v", err)
+	}
+}
+
+// newReactAgent 构造一个可跑 React 的 agent：exec 记录每次调用，返回固定 observation。
+func newReactAgent(t *testing.T, llm LLM) (*AIAgent, *[]string) {
+	t.Helper()
+	reg := newTestRegistry(t)
+	t.Cleanup(func() { _ = reg.Close() })
+	seedTool(t, reg)
+	a := newAIAgent(reg, llm, stubRecipes{}, nil)
+	entries := &[]string{}
+	a.exec = func(_ context.Context, entry string, _ map[string]interface{}) (map[string]interface{}, error) {
+		*entries = append(*entries, entry)
+		return map[string]interface{}{"result": "ok"}, nil
+	}
+	return a, entries
+}
+
+func actionJSON(tool, args string) string {
+	return "Thought: 我需要先做一步\nAction:\n```json\n{\"tool\": \"" + tool + "\", \"args\": " + args + "}\n```"
+}
+
+// ---- React ----
+
+func TestReactFailsClosedWithoutExecutorOrTask(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, nil)
+
+	if _, err := a.React(context.Background(), "任务", ReactOpts{}); err == nil ||
+		!strings.Contains(err.Error(), "未装配执行器") {
+		t.Fatalf("未注入 exec 时必须显式报错（不能静默跑空循环），实际 %v", err)
+	}
+
+	a.exec = func(context.Context, string, map[string]interface{}) (map[string]interface{}, error) {
+		return nil, nil
+	}
+	if _, err := a.React(context.Background(), "", ReactOpts{}); err == nil ||
+		!strings.Contains(err.Error(), "task") {
+		t.Fatalf("空 task 必须报错，实际 %v", err)
+	}
+	if _, err := a.ReactMethod(map[string]interface{}{}); err == nil {
+		t.Fatal("ReactMethod 缺 task 应报错")
+	}
+}
+
+func TestReactHappyPathExecutesToolThenAnswers(t *testing.T) {
+	llm := &scriptedLLM{texts: []string{
+		actionJSON("kv.put", `{"key":"k","value":"v"}`),
+		"Thought: 已经拿到结果\nFinal Answer: 答案是 42",
+	}}
+	a, entries := newReactAgent(t, llm)
+
+	res, err := a.React(context.Background(), "查一下", ReactOpts{})
+	if err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	m, _ := res.(map[string]interface{})
+	if m["answer"] != "答案是 42" {
+		t.Fatalf("answer 应为 Final Answer 的内容，实际 %q", m["answer"])
+	}
+	used, _ := m["used_tools"].([]string)
+	if len(used) != 1 || used[0] != "kv.put" {
+		t.Fatalf("used_tools 应记录实际调用过的工具，实际 %v", used)
+	}
+	steps, _ := m["steps"].([]map[string]interface{})
+	if len(steps) != 2 {
+		t.Fatalf("应记录 2 步（工具步 + 收尾步），实际 %d", len(steps))
+	}
+	if len(*entries) != 1 || !strings.Contains((*entries)[0], "ctx.kv.put") {
+		t.Fatalf("工具调用必须经宿主能力通道执行，实际 entry=%v", *entries)
+	}
+	// 缺省值：未给温度/步数时按约定值，不能退化成 0（否则一次都不跑）
+	if llm.got[0].Temperature != 0.3 {
+		t.Fatalf("默认 temperature 应为 0.3，实际 %v", llm.got[0].Temperature)
+	}
+}
+
+func TestReactAllowListBlocksUnlistedTool(t *testing.T) {
+	llm := &scriptedLLM{texts: []string{
+		actionJSON("kv.put", `{"key":"k","value":"v"}`),
+		"Final Answer: 放弃",
+	}}
+	a, entries := newReactAgent(t, llm)
+
+	res, _ := a.React(context.Background(), "任务", ReactOpts{Allow: []string{"http"}, MaxSteps: 2})
+	steps, _ := res.(map[string]interface{})["steps"].([]map[string]interface{})
+	if len(*entries) != 0 {
+		t.Fatal("allow 名单外的工具不得被执行（不越权）")
+	}
+	if !strings.Contains(fmt.Sprint(steps[0]["observation"]), "不在允许列表") {
+		t.Fatalf("应回灌「不在允许列表」的提示，实际 %v", steps[0]["observation"])
+	}
+	if used, _ := res.(map[string]interface{})["used_tools"].([]string); len(used) != 0 {
+		t.Fatalf("被拦下的工具不得计入 used_tools，实际 %v", used)
+	}
+}
+
+func TestReactDuplicateCallIsStopped(t *testing.T) {
+	// 同一工具 + 同一参数连续两次：第二次必须被拦（防模型陷入同一动作的死循环）。
+	llm := &scriptedLLM{texts: []string{
+		actionJSON("kv.put", `{"key":"k","value":"v"}`),
+		actionJSON("kv.put", `{"key":"k","value":"v"}`),
+	}}
+	a, entries := newReactAgent(t, llm)
+
+	res, _ := a.React(context.Background(), "任务", ReactOpts{MaxSteps: 2})
+	steps, _ := res.(map[string]interface{})["steps"].([]map[string]interface{})
+	if len(*entries) != 1 {
+		t.Fatalf("重复调用不得重复执行，实际执行 %d 次", len(*entries))
+	}
+	if !strings.Contains(fmt.Sprint(steps[1]["observation"]), "重复调用") {
+		t.Fatalf("第二次应回灌重复调用提示，实际 %v", steps[1]["observation"])
+	}
+}
+
+func TestReactMalformedOutputAndMaxSteps(t *testing.T) {
+	// 两轮都给不出合法格式 → 跑满 MaxSteps 后明确收尾（脚本要够长，否则第 2 步会因
+	// 「脚本耗尽」直接中止，测不到「步数用尽」这条路径）。
+	llm := &scriptedLLM{texts: []string{"嗯，我不知道该干什么", "还是不知道"}}
+	a, _ := newReactAgent(t, llm)
+
+	res, _ := a.React(context.Background(), "任务", ReactOpts{MaxSteps: 2})
+	steps, _ := res.(map[string]interface{})["steps"].([]map[string]interface{})
+	if !strings.Contains(fmt.Sprint(steps[0]["observation"]), "严格按格式") {
+		t.Fatalf("格式不对时应回灌格式要求（不硬失败），实际 %v", steps[0]["observation"])
+	}
+	ans, _ := res.(map[string]interface{})["answer"].(string)
+	if !strings.Contains(ans, "未给出 Final Answer") {
+		t.Fatalf("跑满步数仍未收尾时必须明说，不得编造答案，实际 %q", ans)
+	}
+}
+
+func TestReactPropagatesExecutorErrorAsObservation(t *testing.T) {
+	llm := &scriptedLLM{texts: []string{actionJSON("kv.put", `{"key":"k","value":"v"}`)}}
+	a, _ := newReactAgent(t, llm)
+	a.exec = func(context.Context, string, map[string]interface{}) (map[string]interface{}, error) {
+		return nil, errors.New("插件崩了")
+	}
+	res, _ := a.React(context.Background(), "任务", ReactOpts{MaxSteps: 1})
+	steps, _ := res.(map[string]interface{})["steps"].([]map[string]interface{})
+	if !strings.Contains(fmt.Sprint(steps[0]["observation"]), "工具执行错误") {
+		t.Fatalf("执行器错误应作为 observation 回灌（循环继续，不当场崩），实际 %v", steps[0]["observation"])
+	}
+}
+
+func TestReactBuildActionEntryFailureIsSurfaced(t *testing.T) {
+	// 编不出 Lua 入口（例如内置原语没有该方法）→ 作为 observation 回灌，不能 panic。
+	llm := &scriptedLLM{texts: []string{actionJSON("kv.nope", `{}`)}}
+	a, entries := newReactAgent(t, llm)
+	res, _ := a.React(context.Background(), "任务", ReactOpts{MaxSteps: 1})
+	if len(*entries) != 0 {
+		t.Fatal("构建失败的调用不得执行")
+	}
+	steps, _ := res.(map[string]interface{})["steps"].([]map[string]interface{})
+	if !strings.Contains(fmt.Sprint(steps[0]["observation"]), "构建工具调用失败") {
+		t.Fatalf("构建失败必须回灌给模型，实际 %v", steps[0]["observation"])
+	}
+}
+
+func TestReactLLMFailureAborts(t *testing.T) {
+	llm := &scriptedLLM{err: errors.New("连接不上模型")}
+	a, _ := newReactAgent(t, llm)
+	if _, err := a.React(context.Background(), "任务", ReactOpts{}); err == nil ||
+		!strings.Contains(err.Error(), "LLM 调用失败") {
+		t.Fatalf("LLM 失败必须中止并说明是第几步，实际 %v", err)
+	}
+}
+
+func TestReactMethodPassesOptsThrough(t *testing.T) {
+	llm := &scriptedLLM{texts: []string{"Final Answer: done"}}
+	a, _ := newReactAgent(t, llm)
+	if _, err := a.ReactMethod(map[string]interface{}{
+		"task":        "任务",
+		"max_steps":   float64(3),
+		"allow":       []interface{}{"kv"},
+		"provider":    "p",
+		"model":       "m",
+		"base_url":    "http://x",
+		"api_key":     "k",
+		"temperature": float64(0.9),
+	}); err != nil {
+		t.Fatalf("ReactMethod 失败: %v", err)
+	}
+	got := llm.got[0]
+	if got.Provider != "p" || got.Model != "m" || got.BaseURL != "http://x" || got.APIKey != "k" || got.Temperature != 0.9 {
+		t.Fatalf("ReactMethod 的 opts 必须透传给 LLM，实际 %+v", got)
+	}
+}
+
+func TestReactPromptAndToolsText(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, map[string]map[string]MethodSchema{
+		"ext.demo": {"run": {Description: "演示扩展方法", Parameters: map[string]ParamSchema{"x": {Type: "string"}}}},
+	})
+
+	all := a.reactSystemPrompt(nil, 4)
+	if !strings.Contains(all, "最多 4 步") || !strings.Contains(all, "Final Answer") {
+		t.Fatal("系统提示须含步数上限与输出格式约定")
+	}
+	if !strings.Contains(all, "ctx.ext.demo.run") {
+		t.Fatal("已注册的 ext.* 应出现在可用工具清单里")
+	}
+	only := a.reactToolsText([]string{"kv"})
+	if strings.Contains(only, "ctx.http") {
+		t.Fatal("allow 过滤后不得列出未授权的原语")
+	}
+	if !strings.Contains(only, "ctx.kv.put") {
+		t.Fatal("allow 内的原语应列出")
+	}
+}
+
+// ---- Generate ----
+
+func TestGenerateRejectsUnknownKind(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, nil)
+	if _, err := a.Generate(context.Background(), "bogus", "意图", GenerateOpts{}); err == nil ||
+		!strings.Contains(err.Error(), "flow|tool|hook") {
+		t.Fatalf("非法 kind 必须被拒（未知枚举即拒），实际 %v", err)
+	}
+	if _, err := a.GenerateMethod(map[string]interface{}{"kind": "bogus", "intent": "x"}); err == nil {
+		t.Fatal("GenerateMethod 同样应拒绝非法 kind")
+	}
+}
+
+func TestGenerateExhaustsRetriesOnGarbageOutput(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	seedTool(t, reg)
+	// 每趟生成链会多次调用 LLM（decompose/catalog/assemble），脚本要给够，
+	// 否则会先撞上「脚本耗尽」而测不到「重试到上限」这条路径。
+	garbage := make([]string, 12)
+	for i := range garbage {
+		garbage[i] = "这不是 JSON"
+	}
+	llm := &scriptedLLM{texts: garbage}
+	a := newAIAgent(reg, llm, stubRecipes{}, nil)
+
+	_, err := a.Generate(context.Background(), "flow", "做个流程", GenerateOpts{MaxRetries: 2})
+	if err == nil || !strings.Contains(err.Error(), "重试") {
+		t.Fatalf("LLM 一直给不出合法 JSON 时应重试到上限后报错（不静默返回空草稿），实际 %v", err)
+	}
+	if llm.i < 2 {
+		t.Fatalf("应真的重试了多次，实际调用 %d 次", llm.i)
+	}
+}
+
+func TestGenerateReturnsDraftWhenValidationPasses(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	seedTool(t, reg)
+	// 每轮都给同一份合法 flow 草稿；校验注入为「通过」（本例测的是接线，不是校验规则）。
+	llm := &scriptedLLM{texts: []string{
+		`{"id":"gen.flow","name":"n","description":"d","steps":[{"id":"s1","call":"demo.echo","input":{}}]}`,
+		`{"id":"gen.flow","name":"n","description":"d","steps":[{"id":"s1","call":"demo.echo","input":{}}]}`,
+		`{"id":"gen.flow","name":"n","description":"d","steps":[{"id":"s1","call":"demo.echo","input":{}}]}`,
+	}}
+	a := newAIAgent(reg, llm, stubRecipes{}, nil)
+	a.validateFlow = func(*model.Flow) error { return nil }
+
+	res, err := a.Generate(context.Background(), "flow", "做个流程", GenerateOpts{RegisterInto: reg})
+	if err != nil {
+		t.Fatalf("Generate 应成功: %v", err)
+	}
+	if res.Kind != "flow" || res.Def["id"] != "gen.flow" {
+		t.Fatalf("应返回草稿，实际 %+v", res)
+	}
+	if f, _ := reg.GetFlow("gen.flow"); f == nil {
+		t.Fatal("RegisterInto 给定时草稿必须落库")
+	}
+}
+
+func TestGeneratePropagatesRecipeLoadError(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	a := newAIAgent(reg, &scriptedLLM{}, failingRecipes{}, nil)
+	if _, err := a.Generate(context.Background(), "flow", "x", GenerateOpts{}); err == nil ||
+		!strings.Contains(err.Error(), "配方") {
+		t.Fatalf("配方加载失败必须上抛（不静默用空提示词继续），实际 %v", err)
+	}
+}
+
+type failingRecipes struct{}
+
+func (failingRecipes) Load(string) (*Recipe, error) { return nil, errors.New("配方目录不可读") }
+
+func TestGenerateMethodReturnsKindAndDef(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	seedTool(t, reg)
+	def := `{"id":"gen.flow","name":"n","description":"d","steps":[{"id":"s1","call":"demo.echo","input":{}}]}`
+	a := newAIAgent(reg, &scriptedLLM{texts: []string{def, def, def, def}}, stubRecipes{}, nil)
+	a.validateFlow = func(*model.Flow) error { return nil }
+
+	out, err := a.GenerateMethod(map[string]interface{}{"kind": "flow", "intent": "做个流程", "max_retries": float64(1)})
+	if err != nil {
+		t.Fatalf("GenerateMethod 失败: %v", err)
+	}
+	m, _ := out.(map[string]interface{})
+	if m["kind"] != "flow" || m["def"] == nil {
+		t.Fatalf("GenerateMethod 应返回 {kind, def}，实际 %v", m)
+	}
+}
+
+func TestRegisterDefRoutesByKind(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	seedTool(t, reg)
+	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, nil)
+
+	flowDef := map[string]interface{}{
+		"id": "gen.flow", "name": "n", "description": "d",
+		"steps": []interface{}{map[string]interface{}{"id": "s1", "call": "demo.echo", "input": map[string]interface{}{}}},
+	}
+	if err := a.registerDef(reg, "flow", flowDef); err != nil {
+		t.Fatalf("注册 flow 草稿失败: %v", err)
+	}
+	if f, _ := reg.GetFlow("gen.flow"); f == nil {
+		t.Fatal("flow 草稿应落库")
+	}
+	hookDef := map[string]interface{}{"id": "gen.hook", "target": "*", "stage": "before_step", "action": "demo.echo"}
+	if err := a.registerDef(reg, "hook", hookDef); err != nil {
+		t.Fatalf("注册 hook 草稿失败: %v", err)
+	}
+	toolDef := map[string]interface{}{
+		"id": "gen.tool", "name": "n", "description": "d", "runtime": "lua", "entry": "return {}",
+		"input_schema": map[string]interface{}{"type": "object"}, "output_schema": map[string]interface{}{"type": "object"},
+		"versions": []interface{}{map[string]interface{}{"version": "1.0.0", "state": "draft"}},
+	}
+	if err := a.registerDef(reg, "tool", toolDef); err != nil {
+		t.Fatalf("注册 tool 草稿失败: %v", err)
+	}
+	if err := a.registerDef(reg, "tool", map[string]interface{}{"id": "bad"}); err == nil {
+		t.Fatal("非法 Tool 草稿不得落库")
+	}
+}
+
+// ---- Complete / Catalog / Domains / Capabilities / Validate ----
+
+func TestCompleteTextJSONAndErrors(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	llm := &scriptedLLM{texts: []string{"纯文本", `{"a":1}`, "不是 JSON"}}
+	a := newAIAgent(reg, llm, stubRecipes{}, nil)
+
+	out, _ := a.Complete(map[string]interface{}{"prompt": "p"})
+	if got := out.(map[string]interface{})["text"]; got != "纯文本" {
+		t.Fatalf("非 json 模式应返回 {text}，实际 %v", out)
+	}
+	out, _ = a.Complete(map[string]interface{}{"prompt": "p", "format": "json"})
+	if _, ok := out.(map[string]interface{})["data"].(map[string]interface{}); !ok {
+		t.Fatalf("json 模式应返回 {data} 且解析为对象，实际 %v", out)
+	}
+	if _, err := a.Complete(map[string]interface{}{"format": "json"}); err == nil {
+		t.Fatal("format=json 但模型没给合法 JSON 时必须报错（不静默回退成文本）")
+	}
+	llm.err = errors.New("模型不可用")
+	if _, err := a.Complete(map[string]interface{}{}); err == nil {
+		t.Fatal("LLM 错误必须上抛")
+	}
+}
+
+func TestCatalogDomainsCapabilities(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	seedTool(t, reg)
+	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, nil)
+
+	out, err := a.Catalog(map[string]interface{}{"query": "echo", "k": float64(3)})
+	if err != nil {
+		t.Fatalf("Catalog 失败: %v", err)
+	}
+	if tools, _ := out.(map[string]interface{})["tools"].([]ToolSummary); len(tools) == 0 {
+		t.Fatal("Catalog 应能检索到已注册工具")
+	}
+	out, err = a.Domains(map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("Domains 失败: %v", err)
+	}
+	if ds, _ := out.(map[string]interface{})["domains"].([]DomainSummary); len(ds) == 0 {
+		t.Fatal("Domains 应归类出能力域")
+	}
+	caps, err := a.CapabilitiesMethod()
+	if err != nil {
+		t.Fatalf("CapabilitiesMethod 失败: %v", err)
+	}
+	list, _ := caps.([]map[string]interface{})
+	kinds := map[string]int{}
+	for _, c := range list {
+		kinds[fmt.Sprint(c["kind"])]++
+	}
+	if kinds["builtin"] == 0 || kinds["pure"] == 0 {
+		t.Fatalf("能力目录应同时含受门禁内核原语与纯函数原子，实际 %v", kinds)
+	}
+}
+
+func TestValidateRoutesByKind(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	seedTool(t, reg)
+	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, nil)
+
+	if err := a.Validate("bogus", nil, nil); err == nil {
+		t.Fatal("非法 kind 必须被拒")
+	}
+	okDef := map[string]interface{}{
+		"id": "f", "name": "n", "description": "d",
+		"steps": []interface{}{map[string]interface{}{"id": "s1", "call": "demo.echo", "input": map[string]interface{}{}}},
+	}
+	if err := a.Validate("flow", okDef, nil); err != nil {
+		t.Fatalf("合法 flow 草稿应通过退化校验: %v", err)
+	}
+	badDef := map[string]interface{}{
+		"id": "f", "name": "n", "description": "d",
+		"steps": []interface{}{map[string]interface{}{"id": "s1", "call": "不存在.的.东西", "input": map[string]interface{}{}}},
+	}
+	err := a.Validate("flow", badDef, nil)
+	if err == nil || !strings.Contains(err.Error(), "退化校验") {
+		t.Fatalf("call 目标不存在必须报错，且口径变窄时要在错误里明说（不静默降级），实际 %v", err)
+	}
+	// 引擎注入的静态校验优先（单一真相源，不产生第二套判定）
+	called := false
+	a.validateFlow = func(*model.Flow) error { called = true; return nil }
+	if err := a.Validate("flow", badDef, nil); err != nil || !called {
+		t.Fatalf("注入 validateFlow 后应走引擎静态校验，实际 err=%v called=%v", err, called)
+	}
+
+	toolDef := map[string]interface{}{
+		"id": "t", "name": "n", "description": "d", "runtime": "lua", "entry": "return {}",
+		"input_schema": map[string]interface{}{"type": "object"}, "output_schema": map[string]interface{}{"type": "object"},
+		"versions": []interface{}{map[string]interface{}{"version": "1.0.0", "state": "draft"}},
+	}
+	if err := a.Validate("tool", toolDef, nil); err != nil {
+		t.Fatalf("合法 tool 草稿应通过: %v", err)
+	}
+	if err := a.Validate("tool", map[string]interface{}{"id": "t"}, nil); err == nil {
+		t.Fatal("缺字段的 tool 草稿必须被拒")
+	}
+	hookDef := map[string]interface{}{"id": "h", "target": "*", "stage": "before_step", "action": "demo.echo"}
+	if err := a.Validate("hook", hookDef, nil); err != nil {
+		t.Fatalf("合法 hook 草稿应通过: %v", err)
+	}
+	if err := a.Validate("hook", map[string]interface{}{"id": "h"}, nil); err == nil {
+		t.Fatal("缺字段的 hook 草稿必须被拒")
+	}
+}
+
+func TestValidateMethodReturnsOkFlag(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	seedTool(t, reg)
+	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, nil)
+
+	ok, err := a.ValidateMethod(map[string]interface{}{"kind": "hook", "def": map[string]interface{}{
+		"id": "h", "target": "*", "stage": "before_step", "action": "demo.echo"}})
+	if err != nil {
+		t.Fatalf("ValidateMethod 不该抛错: %v", err)
+	}
+	if ok.(map[string]interface{})["ok"] != true {
+		t.Fatalf("合法定义应返回 ok:true，实际 %v", ok)
+	}
+	bad, err := a.ValidateMethod(map[string]interface{}{"kind": "bogus"})
+	if err != nil {
+		t.Fatalf("非法定义应返回 ok:false 而非抛错（供 Lua 侧分支处理），实际 %v", err)
+	}
+	if bad.(map[string]interface{})["ok"] != false {
+		t.Fatalf("非法定义应返回 ok:false（不抛错，供 Lua 侧分支处理），实际 %v", bad)
+	}
+	if _, ok := bad.(map[string]interface{})["error"].(string); !ok {
+		t.Fatal("ok:false 时必须带上 error 文案")
+	}
+}
+
+func TestCheckCallTargetsAcceptsCapabilityDirectCall(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	seedTool(t, reg)
+	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, nil)
+
+	f := model.Flow{ID: "f", Name: "n", Description: "d", Steps: []model.Step{{ID: "s1", Call: "kv.put"}}}
+	if err := a.checkCallTargets(f, nil); err != nil {
+		t.Fatalf("「能力.方法」直调应合法: %v", err)
+	}
+	f.Steps[0].Call = "kv.nope"
+	if err := a.checkCallTargets(f, nil); err == nil {
+		t.Fatal("内置原语不存在的方法必须被拒")
+	}
+	f.Steps[0].Call = "裸名字"
+	if err := a.checkCallTargets(f, nil); err == nil {
+		t.Fatal("没有点的裸名字必须被拒")
+	}
+	a.extCaps = map[string]map[string]MethodSchema{"ext.d": {"run": {}}}
+	f.Steps[0].Call = "ext.d.fly"
+	if err := a.checkCallTargets(f, nil); err == nil {
+		t.Fatal("扩展未声明的方法必须被拒（退化路径不能比主路径更松）")
+	}
+	f.Steps[0].Call = "ext.d.run"
+	if err := a.checkCallTargets(f, nil); err != nil {
+		t.Fatalf("扩展已声明的方法应放行: %v", err)
+	}
+}
+
+// ---- 配方加载 ----
+
+func TestParseRecipeDefaultsMaxRetries(t *testing.T) {
+	r, err := parseRecipe([]byte("kind: flow\nsystem_decompose: x\n"))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if r.MaxRetries != 3 {
+		t.Fatalf("max_retries 缺失应回落到 3，实际 %d", r.MaxRetries)
+	}
+	r2, _ := parseRecipe([]byte("max_retries: 7\n"))
+	if r2.MaxRetries != 7 {
+		t.Fatalf("显式值应保留，实际 %d", r2.MaxRetries)
+	}
+	if _, err := parseRecipe([]byte("\t bad: [")); err == nil {
+		t.Fatal("非法 YAML 必须报错")
+	}
+}
+
+func TestRecipeLoaderDirOverrideAndEmbeddedFallback(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "flow.yaml"), []byte("kind: flow\nmax_retries: 9\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l := DefaultRecipeLoader(dir)
+	r, err := l.Load("flow")
+	if err != nil || r.MaxRetries != 9 {
+		t.Fatalf("目录覆盖应优先: (%v, %v)", r, err)
+	}
+	if _, err := l.Load("tool"); err != nil {
+		t.Fatalf("内嵌回退失败: %v", err)
+	}
+	if _, err := l.Load("不存在的kind"); err == nil {
+		t.Fatal("不存在的 kind 必须报错（缺哪一份就等于该 kind 生成不了）")
+	}
+}
+
+// ---- 小工具 ----
+
+func TestParseReactAction(t *testing.T) {
+	tool, method, args, ok := parseReactAction(actionJSON("kv.put", `{"key":"k"}`))
+	if !ok || tool != "kv" || method != "put" || args["key"] != "k" {
+		t.Fatalf("解析不符: %q/%q/%v/%v", tool, method, args, ok)
+	}
+	tool, method, _, ok = parseReactAction(actionJSON("ext.ai.complete", `{}`))
+	if !ok || tool != "ext.ai" || method != "complete" {
+		t.Fatalf("ext 命名空间应切成两级能力名 + 方法，实际 %q/%q", tool, method)
+	}
+	tool, method, _, ok = parseReactAction("Action:\n```json\n{\"tool\":\"http\",\"method\":\"Request\"}\n```")
+	if !ok || tool != "http" || method != "Request" {
+		t.Fatalf("tool 无点时应与 method 合并，实际 %q/%q", tool, method)
+	}
+	if _, _, _, ok := parseReactAction("没有围栏"); ok {
+		t.Fatal("无 json 围栏应解析失败")
+	}
+	if _, _, _, ok := parseReactAction("```json\n{不是json}\n```"); ok {
+		t.Fatal("非法 JSON 应解析失败")
+	}
+	if _, _, _, ok := parseReactAction("```json\n{\"method\":\"x\"}\n```"); ok {
+		t.Fatal("缺 tool 字段应解析失败")
+	}
+	if _, _, args, ok := parseReactAction("```json\n{\"tool\":\"kv.get\"}\n```"); !ok || args == nil {
+		t.Fatal("缺 args 时应补成空 map（而不是 nil 让后续 panic）")
+	}
+}
+
+func TestSplitToolMethod(t *testing.T) {
+	if p, m := splitToolMethod("ext.ai.complete", ""); p != "ext.ai" || m != "complete" {
+		t.Fatalf("ext 三级切分不符: %q/%q", p, m)
+	}
+	if p, m := splitToolMethod("ext.ai", "complete"); p != "ext.ai" || m != "complete" {
+		t.Fatalf("ext 两级 + method 应原样: %q/%q", p, m)
+	}
+	if p, m := splitToolMethod("http.Request", ""); p != "http" || m != "Request" {
+		t.Fatalf("内置切分不符: %q/%q", p, m)
+	}
+	if p, m := splitToolMethod("http", "Request"); p != "http" || m != "Request" {
+		t.Fatalf("无点应保留 method: %q/%q", p, m)
+	}
+}
+
+func TestReactTextHelpers(t *testing.T) {
+	if fa, ok := extractFinalAnswer("Thought: x\nFinal Answer: 结果在这里"); !ok || strings.TrimSpace(fa) != "结果在这里" {
+		t.Fatalf("Final Answer 提取不符: %q/%v", fa, ok)
+	}
+	if _, ok := extractFinalAnswer("没有结论"); ok {
+		t.Fatal("无 Final Answer 时 ok 应为 false")
+	}
+	if got := trimThought("想了一下\nAction:\n```json\n{}```"); got != "想了一下" {
+		t.Fatalf("trimThought 应取 Action 之前的部分，实际 %q", got)
+	}
+	if got := trimThought("  纯思考  "); got != "纯思考" {
+		t.Fatalf("无 Action 时应取全文并去空白，实际 %q", got)
+	}
+	if !allowContains([]string{"http", "kv"}, "kv") {
+		t.Fatal("allowContains 应命中显式名单")
+	}
+	if !allowContains([]string{"ext.*"}, "ext.anything") {
+		t.Fatal("ext.* 通配必须放行所有扩展")
+	}
+	if allowContains([]string{"ext.*"}, "http") {
+		t.Fatal("ext.* 不得放行内核原语")
+	}
+	if allowContains([]string{"http"}, "kv") {
+		t.Fatal("名单外的工具必须拒绝")
+	}
+	if got := stableJSON(map[string]interface{}{"b": 1, "a": 2}); got != `{"a":2,"b":1}` {
+		t.Fatalf("stableJSON 应输出键有序的稳定 JSON，实际 %s", got)
+	}
+	if got := stableJSON(make(chan int)); got == "" {
+		t.Fatal("无法序列化的值也要给出可读文本（不得返回空串）")
+	}
+	if got := truncateRunes(strings.Repeat("x", 10), 5); !strings.HasSuffix(got, "...(truncated)") {
+		t.Fatalf("超长应截断并标注，实际 %q", got)
+	}
+	if got := truncateRunes("短", 5); got != "短" {
+		t.Fatal("未超长不应改动")
+	}
+	if got := appendUnique([]string{"a"}, "a"); len(got) != 1 {
+		t.Fatal("重复元素不应追加")
+	}
+	if got := appendUnique([]string{"a"}, "b"); len(got) != 2 {
+		t.Fatal("新元素应追加")
+	}
+}
+
+func TestParseToolSummariesAndMisc(t *testing.T) {
+	got := parseToolSummaries([]interface{}{
+		map[string]interface{}{"id": "a", "description": "d",
+			"input_schema":  map[string]interface{}{"type": "object"},
+			"output_schema": map[string]interface{}{"type": "object"}},
+		"not-a-map",
+	})
+	if len(got) != 1 || got[0].ID != "a" || got[0].InputSchema == nil || got[0].OutputSchema == nil {
+		t.Fatalf("解析不符: %+v", got)
+	}
+	if len(parseToolSummaries("不是数组")) != 0 {
+		t.Fatal("非数组输入应返回空切片")
+	}
+	if got := toStringSlice([]interface{}{"a", 1, "b"}); len(got) != 2 || got[0] != "a" {
+		t.Fatalf("非字符串元素应跳过，实际 %v", got)
+	}
+	if got := toStringSlice([]string{"x"}); len(got) != 1 {
+		t.Fatalf("[]string 应原样返回，实际 %v", got)
+	}
+	if got := toStringSlice(42); got != nil {
+		t.Fatal("其它类型应返回 nil")
+	}
+	if strOr(map[string]interface{}{"a": "v"}, "a") != "v" || strOr(map[string]interface{}{"a": 1}, "a") != "" {
+		t.Fatal("strOr 只取字符串值")
+	}
+}
+
+func TestBuildActionEntryShapes(t *testing.T) {
+	entry, err := buildActionEntry("kv", "put", map[string]interface{}{"key": "k", "value": "v"})
+	if err != nil || !strings.Contains(entry, "ctx.kv.put(") || !strings.Contains(entry, `"k"`) {
+		t.Fatalf("内置原语应编成位置参数调用: (%s, %v)", entry, err)
+	}
+	entry, err = buildActionEntry("crypto", "hash", map[string]interface{}{"alg": "sha256"})
+	if err != nil || !strings.Contains(entry, "ctx.crypto.hash({") {
+		t.Fatalf("纯函数原子应编成单 table 调用: (%s, %v)", entry, err)
+	}
+	if _, err := buildActionEntry("crypto", "nope", nil); err == nil {
+		t.Fatal("纯函数原子不存在的方法必须被拒（解析点拒绝未知值）")
+	}
+	if _, err := buildActionEntry("kv", "nope", nil); err == nil {
+		t.Fatal("内置原语不存在的方法必须被拒")
+	}
+	entry, err = buildActionEntry("ext.ai", "complete", map[string]interface{}{"prompt": "hi"})
+	if err != nil || !strings.Contains(entry, "ctx.ext.ai.complete({") {
+		t.Fatalf("ext 应编成单 table 调用: (%s, %v)", entry, err)
+	}
+}

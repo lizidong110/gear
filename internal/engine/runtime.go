@@ -34,7 +34,17 @@ type Process interface {
 //
 // 「已实现」判定以 model.ImplementedRuntimes 为**唯一来源**（C），本函数不再维护第二份白名单：
 // 未知 runtime、已知但未实现的 runtime 都在此显式报错，绝不静默降级为 process。
+// runtimeFor 是测试与历史调用的兼容入口：不含扩展原语注册表（reg=nil）。
 func runtimeFor(rt model.Runtime, policy string) (Runtime, error) {
+	return runtimeForCaps(rt, policy, nil)
+}
+
+// runtimeForCaps 是引擎内部统一分发点：携带扩展原语目录 reg，仅 lua runtime 需要它
+// （用于把用户/插件注册的 ctx.<name> 注入 Lua）。reg 为 nil 时退化为不含扩展注入。
+//
+// 「已实现」判定以 model.ImplementedRuntimes 为**唯一来源**（C），本函数不再维护第二份白名单：
+// 未知 runtime、已知但未实现的 runtime 都在此显式报错，绝不静默降级为 process。
+func runtimeForCaps(rt model.Runtime, policy string, reg *CapabilityRegistry) (Runtime, error) {
 	if !rt.Known() {
 		return nil, fmt.Errorf("未知的 runtime: %q", rt)
 	}
@@ -45,7 +55,7 @@ func runtimeFor(rt model.Runtime, policy string) (Runtime, error) {
 	case model.RuntimeProcess:
 		return &processRuntime{}, nil
 	case model.RuntimeLua:
-		return &luaRuntime{policy: policy}, nil
+		return &luaRuntime{policy: policy, caps: reg}, nil
 	case model.RuntimeGoHost:
 		return &goHostRuntime{}, nil
 	default:

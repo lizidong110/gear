@@ -114,10 +114,10 @@ func (s *ExecStore) migrate() {
 
 // LogEntry 是一条执行日志（stdout/stderr 行，关联到 exec + step）。
 type LogEntry struct {
-	ExecID string `json:"exec_id"`
-	StepID string `json:"step_id"`
-	Stream string `json:"stream"` // stdout | stderr
-	Line   string `json:"line"`
+	ExecID string    `json:"exec_id"`
+	StepID string    `json:"step_id"`
+	Stream string    `json:"stream"` // stdout | stderr
+	Line   string    `json:"line"`
 	TS     time.Time `json:"ts"`
 }
 
@@ -151,8 +151,9 @@ func (s *ExecStore) Logs(execID string) []LogEntry {
 	return out
 }
 
-// logSink 把 ExecStore 适配为 engine.LogSink（供 RunFlowExec 注入）。
-func (s *ExecStore) logSink() engine.LogSink {
+// LogSink 把 ExecStore 适配为 engine.LogSink（供 RunFlowExec 注入）。
+// 导出：server.New 在构造引擎时引用（engine.WithLogSink(s.execs.LogSink())）。
+func (s *ExecStore) LogSink() engine.LogSink {
 	return func(execID, stepID, stream, line string) {
 		s.Log(execID, stepID, stream, line)
 	}

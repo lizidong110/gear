@@ -1,76 +1,328 @@
 package cli
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"fmt"
-	"net/http"
+	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
-	"gear/internal/model"
+	"gear/internal/engine"
+	"gear/internal/registry"
 )
 
-// aiCmd 是 AI 闭环（S6c）的 CLI 入口：自然语言 → Flow。
-// 实现为 REST 客户端：打到执行面的 /api/ai/infer（推断器在执行面侧，可就近访问 Ollama / 远端网关）。
+// aiCmd 管理 AI 生成（ext.ai 结构化多阶段 agent，PRD §9 去内置化）。
 func aiCmd() *cobra.Command {
-	c := &cobra.Command{Use: "ai", Short: "AI 闭环：自然语言 → Flow（S6c）"}
-	c.AddCommand(aiGenCmd())
-	return c
-}
-
-// aiGenCmd 用自然语言生成 Flow；--register 时直接落到本地 registry。
-// 默认仅打印生成的 YAML，便于人工复核后再决定注册（fail-open 的 AI 输出不应静默入库）。
-func aiGenCmd() *cobra.Command {
-	var register bool
-	c := &cobra.Command{
-		Use:   "gen <prompt>",
-		Short: "用自然语言生成 Flow（打到 REST 执行面的 /api/ai/infer）",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			flow, err := requestInfer(args[0])
-			if err != nil {
-				return err
-			}
-			if register {
-				reg, err := openRegistry()
-				if err != nil {
-					return err
-				}
-				defer reg.Close()
-				if err := reg.UpsertFlow(flow); err != nil {
-					return err
-				}
-				cmd.Printf("✓ 已注册生成的 Flow: %s（steps=%d）\n", flow.ID, len(flow.Steps))
-				return nil
-			}
-			out, err := yaml.Marshal(flow)
-			if err != nil {
-				return err
-			}
-			cmd.Print(string(out))
-			return nil
-		},
+	c := &cobra.Command{Use: "ai", Short: "AI 生成 Flow / Tool（ext.ai 结构化多阶段 agent）"}
+	c.AddCommand(genCmd())
+	c.AddCommand(&cobra.Command{
+		Use:   "capabilities",
+		Short: "列出当前所有原子能力（内核 builtin + pure 原语 + 已注册 ext.*）及其方法参数 schema",
+		Long: "打印引擎当前装配的宿主能力目录：内核门禁原语（http/call/db/kv/secret/event/subscribe）+ " +
+			"纯函数原子（time/template/crypto，始终可用、无需声明）+ 所有已注册 " +
+			"ext.* 扩展，每条带方法名、参数类型与必填标记。\n" +
+			"这是 agent 生成 Tool 时锚定的同一份目录（ext.registry.capabilities() / ext.ai.capabilities()），" +
+			"随 extensions 配置动态变化——新增扩展会自动出现在这里。",
+		RunE: func(cmd *cobra.Command, args []string) error { return runAICapabilities(cmd) },
+	})
+	reactC := &cobra.Command{
+		Use:   "react [任务描述]",
+		Short: "跑 ReAct 智能体（LLM 逐步调用内置工具完成任务）",
+		Long: "用自然语言任务驱动一个 ReAct 循环：LLM 每步思考并调用一个内置工具（http/call/db/kv/secret/event" +
+			"或已注册 ext.*），观察结果后继续，直到给出 Final Answer。\n" +
+			"等价于在 Tool 的 entry 里调 ctx.ext.ai.react({ task = \"...\" })。需要联网 LLM（key/provider 经参数传入，dev CLI 可用 GEAR_AI_* 注入）。",
+		RunE: func(cmd *cobra.Command, args []string) error { return runAIReact(cmd, args) },
 	}
-	c.Flags().BoolVar(&register, "register", false, "生成后直接注册到本地 registry")
+	reactC.Flags().Int("max-steps", 6, "最大步数")
+	reactC.Flags().StringSlice("allow", nil, "限制可用工具（如 http,kv）；默认全部")
+	reactC.Flags().String("model", "", "模型名（可选，缺省读 GEAR_AI_MODEL）")
+	reactC.Flags().String("provider", "", "模型厂商（可选，缺省读 GEAR_AI_PROVIDER）")
+	reactC.Flags().String("base-url", "", "API base（可选，缺省读 GEAR_AI_BASE_URL）")
+	reactC.Flags().String("api-key", "", "API key（可选，缺省读 GEAR_AI_API_KEY）")
+	c.AddCommand(reactC)
 	return c
 }
 
-// requestInfer 调用执行面的 /api/ai/infer，把 prompt 收敛为 Flow。
-func requestInfer(prompt string) (*model.Flow, error) {
-	body, _ := json.Marshal(map[string]string{"prompt": prompt})
-	resp, err := http.Post(execBaseURL()+"/api/ai/infer", "application/json", bytes.NewReader(body))
+// runAIReact 实现 `ai react "任务"`：构造进程内 ext.ai agent，跑 React 循环并打印结果。
+func runAIReact(cmd *cobra.Command, args []string) error {
+	task := strings.Join(args, " ")
+	if strings.TrimSpace(task) == "" {
+		return fmt.Errorf("请提供任务描述：gear ai react \"...\"")
+	}
+	reg, err := registry.Open(fmt.Sprintf("file:gear_ai_cli_%d?mode=memory&cache=shared", os.Getpid()))
 	if err != nil {
-		return nil, fmt.Errorf("连接执行面失败（%s）: %w", serverAddr, err)
+		return fmt.Errorf("打开内存 registry 失败: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("AI 生成失败: %s", respStatus(resp))
+	defer reg.Close()
+	eng, err := cliEngine(reg)
+	if err != nil {
+		return err
 	}
-	var f model.Flow
-	if err := json.NewDecoder(resp.Body).Decode(&f); err != nil {
-		return nil, err
+	agent := eng.AIAgent()
+	if agent == nil {
+		return fmt.Errorf("ext.ai 未装配（SetupExtensions 失败？）")
 	}
-	return &f, nil
+	maxSteps, _ := cmd.Flags().GetInt("max-steps")
+	allow, _ := cmd.Flags().GetStringSlice("allow")
+	opts := engine.ReactOpts{MaxSteps: maxSteps, Allow: allow}
+	if s, _ := cmd.Flags().GetString("model"); s != "" {
+		opts.Model = s
+	}
+	if s, _ := cmd.Flags().GetString("provider"); s != "" {
+		opts.Provider = s
+	}
+	if s, _ := cmd.Flags().GetString("base-url"); s != "" {
+		opts.BaseURL = s
+	}
+	if s, _ := cmd.Flags().GetString("api-key"); s != "" {
+		opts.APIKey = s
+	}
+	// 开发便利：flag 未给时回退到 GEAR_AI_* 环境变量（原子能力本身只读调用参数，不读 env）。
+	if opts.Provider == "" {
+		opts.Provider = os.Getenv("GEAR_AI_PROVIDER")
+	}
+	if opts.Model == "" {
+		opts.Model = os.Getenv("GEAR_AI_MODEL")
+	}
+	if opts.BaseURL == "" {
+		opts.BaseURL = os.Getenv("GEAR_AI_BASE_URL")
+	}
+	if opts.APIKey == "" {
+		opts.APIKey = os.Getenv("GEAR_AI_API_KEY")
+	}
+	res, err := agent.React(context.Background(), task, opts)
+	if err != nil {
+		return fmt.Errorf("react 失败: %w", err)
+	}
+	cmd.Println(renderReactResult(res))
+	return nil
+}
+
+// renderReactResult 把 React 返回 {answer,steps,used_tools} 渲染成可读文本。
+func renderReactResult(res interface{}) string {
+	m, ok := res.(map[string]interface{})
+	if !ok {
+		b, _ := yaml.Marshal(res)
+		return string(b)
+	}
+	var sb strings.Builder
+	sb.WriteString("=== ReAct 结果 ===\n")
+	if ans, _ := m["answer"].(string); ans != "" {
+		sb.WriteString("Final Answer:\n" + ans + "\n")
+	}
+	if tools, ok := m["used_tools"].([]string); ok && len(tools) > 0 {
+		sb.WriteString("\n使用的工具：\n- " + strings.Join(tools, "\n- ") + "\n")
+	}
+	if steps, ok := m["steps"].([]map[string]interface{}); ok && len(steps) > 0 {
+		sb.WriteString(fmt.Sprintf("\n步骤（%d）：\n", len(steps)))
+		for i, s := range steps {
+			act, _ := s["action"].(string)
+			obs, _ := s["observation"].(string)
+			if act == "" {
+				act = "(Final Answer)"
+			}
+			sb.WriteString(fmt.Sprintf("\n[%d] 行动: %s\n    观察: %s\n", i+1, act, truncateForCLI(obs, 500)))
+		}
+	}
+	return sb.String()
+}
+
+// truncateForCLI 按 rune 数截断（复用引擎逻辑的可读版本，避免跨包依赖细节）。
+func truncateForCLI(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "...(truncated)"
+}
+
+// runAICapabilities 打印当前实时能力目录（人/Agent 同源：CapabilitiesMethod）。
+func runAICapabilities(cmd *cobra.Command) error {
+	reg, err := registry.Open(fmt.Sprintf("file:gear_ai_cli_%d?mode=memory&cache=shared", os.Getpid()))
+	if err != nil {
+		return fmt.Errorf("打开内存 registry 失败: %w", err)
+	}
+	defer reg.Close()
+	eng, err := cliEngine(reg)
+	if err != nil {
+		return err
+	}
+	agent := eng.AIAgent()
+	if agent == nil {
+		return fmt.Errorf("ext.ai 未装配（SetupExtensions 失败？）")
+	}
+	sums, err := agent.CapabilitiesMethod()
+	if err != nil {
+		return fmt.Errorf("获取能力目录失败: %w", err)
+	}
+	cmd.Println(renderCapabilities(sums))
+	return nil
+}
+
+// renderCapabilities 把 CapabilitiesMethod 返回的目录渲染成可读树（单一真相源，与提示词同源）。
+func renderCapabilities(sums interface{}) string {
+	rows, ok := sums.([]map[string]interface{})
+	if !ok {
+		b, _ := yaml.Marshal(sums)
+		return string(b)
+	}
+	var sb strings.Builder
+	sb.WriteString("当前原子能力目录（内核 builtin + pure 原语 + 已注册 ext.*，随 extensions 配置动态变化）：\n")
+	nBuiltin, nPure, nExt := 0, 0, 0
+	for _, r := range rows {
+		name, _ := r["name"].(string)
+		kind, _ := r["kind"].(string)
+		switch kind {
+		case "builtin":
+			nBuiltin++
+		case "pure":
+			nPure++
+		default:
+			nExt++
+		}
+		sb.WriteString(fmt.Sprintf("\n[%s] %s\n", kind, name))
+		switch ms := r["methods"].(type) {
+		case map[string]engine.MethodSchema:
+			for m, sch := range ms {
+				sb.WriteString(fmt.Sprintf("  - %s: %s\n", m, sch.Description))
+				for k, ps := range sch.Parameters {
+					req := ""
+					if ps.Required {
+						req = " (必填)"
+					}
+					sb.WriteString(fmt.Sprintf("      · %s: %s — %s%s\n", k, ps.Type, ps.Description, req))
+				}
+			}
+		case map[string]interface{}:
+			for m := range ms {
+				sb.WriteString(fmt.Sprintf("  - %s\n", m))
+			}
+		}
+	}
+	sb.WriteString(fmt.Sprintf("\n共 %d 个门禁原语、%d 个纯函数原子（始终可用、无需声明）、%d 个扩展原语。\n", nBuiltin, nPure, nExt))
+	return sb.String()
+}
+
+// genCmd 是 `ai gen` 的父命令，承载公共选项（--intent / --register）。
+// 参考配方来自内嵌默认（examples/ai/recipes/*.yaml），可用 GEAR_AI_RECIPES 覆盖目录。
+func genCmd() *cobra.Command {
+	c := &cobra.Command{Use: "gen", Short: "生成 Flow 或 Tool"}
+	c.PersistentFlags().StringP("intent", "i", "", "自然语言意图（也可用位置参数）")
+	c.PersistentFlags().Bool("register", false, "通过后自动把草稿注册进 registry（否则仅打印草稿供人工确认）")
+	c.AddCommand(
+		&cobra.Command{
+			Use:   "flow",
+			Short: "用自然语言意图生成 Flow（组合已有 Tool）",
+			RunE:  func(cmd *cobra.Command, args []string) error { return runAIGen(cmd, "flow", args) },
+		},
+		&cobra.Command{
+			Use:   "tool",
+			Short: "用自然语言意图生成单个 Tool（原子能力）草稿",
+			RunE:  func(cmd *cobra.Command, args []string) error { return runAIGen(cmd, "tool", args) },
+		},
+	)
+	return c
+}
+
+// runAIGen 实现 `ai gen flow/tool/hook`：构造进程内 ext.ai agent，注入真实工具目录后调用
+// Generate 得到草稿并打印；--register 时把草稿落库（取代原「跑 ai-create-flow YAML + sidecar」）。
+func runAIGen(cmd *cobra.Command, mode string, args []string) error {
+	intent, _ := cmd.Flags().GetString("intent")
+	if intent == "" {
+		intent = strings.Join(args, " ")
+	}
+	if strings.TrimSpace(intent) == "" {
+		return fmt.Errorf("请提供意图：--intent \"...\" 或位置参数")
+	}
+	register, _ := cmd.Flags().GetBool("register")
+
+	// 1) 打开持久 registry（取目录工具 + 落库草稿）
+	reg, err := openRegistry()
+	if err != nil {
+		return err
+	}
+	defer reg.Close()
+
+	// 2) 内存 registry 跑 agent（注入 intent/mode），不污染持久 registry。
+	refReg, err := registry.Open(fmt.Sprintf("file:gear_ai_cli_%d?mode=memory&cache=shared", os.Getpid()))
+	if err != nil {
+		return fmt.Errorf("打开内存 registry 失败: %w", err)
+	}
+	defer refReg.Close()
+
+	// 3) 引擎 + 进程内 ext.ai（SetupExtensions 注册 ext.ai 与 ext.registry）
+	eng, err := cliEngine(refReg)
+	if err != nil {
+		return err
+	}
+	if err := seedRefRegistry(refReg, reg); err != nil {
+		return fmt.Errorf("灌入真实工具目录失败: %w", err)
+	}
+
+	agent := eng.AIAgent()
+	if agent == nil {
+		return fmt.Errorf("ext.ai 未装配（SetupExtensions 失败？）")
+	}
+
+	opts := engine.GenerateOpts{}
+	if register {
+		opts.RegisterInto = reg
+	}
+	// 开发便利：生成阶段经 GEAR_AI_* 环境变量注入模型参数（原子能力本身不读 env）。
+	if v := os.Getenv("GEAR_AI_PROVIDER"); v != "" {
+		opts.Provider = v
+	}
+	if v := os.Getenv("GEAR_AI_MODEL"); v != "" {
+		opts.Model = v
+	}
+	if v := os.Getenv("GEAR_AI_BASE_URL"); v != "" {
+		opts.BaseURL = v
+	}
+	if v := os.Getenv("GEAR_AI_API_KEY"); v != "" {
+		opts.APIKey = v
+	}
+	res, err := agent.Generate(context.Background(), mode, intent, opts)
+	if err != nil {
+		return fmt.Errorf("AI 生成失败: %w", err)
+	}
+
+	b, err := yaml.Marshal(res.Def)
+	if err != nil {
+		return fmt.Errorf("序列化草稿失败: %w", err)
+	}
+	cmd.Printf("=== %s 草稿 ===\n%s\n", strings.ToUpper(mode), string(b))
+	if register {
+		cmd.Printf("✓ 已注册 %s\n", mode)
+	} else {
+		cmd.Println("\n（未注册：加 --register 可把草稿落库，或人工修订后再注册）")
+	}
+	return nil
+}
+
+// seedRefRegistry 把持久 registry 的真实工具/流程灌入内存 refReg，使 agent 经
+// ctx.ext.registry 读到真实目录（ext.registry 关闭于引擎执行所用的 registry，即 refReg）。
+// 只灌真实内容，不灌参考 Flow 自身的 ai-gen/ai-create-flow（那些由 runAIGen 另行 upsert）。
+// 灌入的是指针副本，不会写回持久 registry。
+func seedRefRegistry(refReg, reg *registry.Registry) error {
+	tools, err := reg.ListTools()
+	if err != nil {
+		return err
+	}
+	for _, t := range tools {
+		if err := refReg.UpsertTool(t); err != nil {
+			return err
+		}
+	}
+	flows, err := reg.ListFlows()
+	if err != nil {
+		return err
+	}
+	for _, f := range flows {
+		if err := refReg.UpsertFlow(f); err != nil {
+			return err
+		}
+	}
+	return nil
 }

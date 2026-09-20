@@ -207,7 +207,7 @@ func TestRunFlowRejectsInvalidInput(t *testing.T) {
 		t.Fatalf("注册 Tool 失败: %v", err)
 	}
 	flow := &model.Flow{
-		ID:   "bad",
+		ID:    "bad",
 		Steps: []model.Step{{ID: "s1", Call: "hello", Input: map[string]interface{}{}}},
 	}
 	if err := reg.UpsertFlow(flow); err != nil {

@@ -12,10 +12,10 @@ import (
 // luaToolWithCaps 构造一个声明了指定 capability 的 lua Tool（db/kv/secret/event/call/http）。
 func luaToolWithCaps(id string, caps []string, entry string) *model.Tool {
 	return &model.Tool{
-		ID:          id,
-		Name:        id,
-		Runtime:     model.RuntimeLua,
-		Entry:       entry,
+		ID:           id,
+		Name:         id,
+		Runtime:      model.RuntimeLua,
+		Entry:        entry,
 		InputSchema:  map[string]interface{}{"type": "object"},
 		OutputSchema: map[string]interface{}{"type": "object"},
 		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
@@ -29,9 +29,9 @@ func TestDefaultHostDBWorks(t *testing.T) {
 	reg := newTestRegistry(t)
 	defer reg.Close()
 	if err := reg.UpsertTool(luaToolWithCaps("dbtool", []string{"db"}, `
-		ctx.db.exec("CREATE TABLE t(id INTEGER, name TEXT)")
-		ctx.db.exec("INSERT INTO t VALUES(1, 'alice')")
-		local rows = ctx.db.query("SELECT id, name FROM t")
+		ctx.db.exec({ driver = "sqlite", sql = "CREATE TABLE t(id INTEGER, name TEXT)" })
+		ctx.db.exec({ driver = "sqlite", sql = "INSERT INTO t VALUES(1, 'alice')" })
+		local rows = ctx.db.query({ driver = "sqlite", sql = "SELECT id, name FROM t" })
 		return { count = #rows, first = rows[1].name }
 	`)); err != nil {
 		t.Fatalf("注册 Tool 失败: %v", err)

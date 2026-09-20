@@ -62,8 +62,8 @@ func TestGenerateFlowSuccess(t *testing.T) {
 // TestGenerateFlowRetry 验证「前两次非法、第三次合法」时仍能收敛成功（重试 ≤3）。
 func TestGenerateFlowRetry(t *testing.T) {
 	inf := &fakeInferrer{outputs: []string{
-		"这不是 YAML: foo",                    // 缺 id → Validate 失败
-		"id: bad\nsteps: []",                   // 仍缺合法 step → 若上面其实合法？这里第一步才是非法
+		"这不是 YAML: foo",      // 缺 id → Validate 失败
+		"id: bad\nsteps: []", // 仍缺合法 step → 若上面其实合法？这里第一步才是非法
 		"```yaml\nid: ok-flow\nsteps:\n  - id: s1\n    call: t1\n```",
 	}}
 	flow, err := GenerateFlow(context.Background(), inf, "p")

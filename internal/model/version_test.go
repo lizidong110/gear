@@ -16,7 +16,7 @@ func TestCanPromote(t *testing.T) {
 		{StateTesting, StateDraft, true}, // 回退复测
 		{StateTesting, StateRejected, true},
 		{StateTesting, StateDeprecated, false}, // testing 不能直接 deprecated
-		{StateStable, StateTesting, true},       // 回退复测
+		{StateStable, StateTesting, true},      // 回退复测
 		{StateStable, StateDeprecated, true},
 		{StateStable, StateRejected, true},
 		{StateStable, StateDraft, false}, // stable 不能跳级回 draft

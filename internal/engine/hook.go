@@ -7,7 +7,9 @@ import (
 	"sort"
 	"time"
 
+	"gear/internal/cap"
 	"gear/internal/model"
+	"gear/internal/sidecar/coord"
 )
 
 // ---- Hook 装配（PRD §5.3：显式装配，无隐式依赖）----
@@ -93,7 +95,7 @@ func (e *Engine) applyHooks(ctx context.Context, all []model.Hook, stage, flowID
 			continue
 		}
 
-		rt, err := runtimeFor(tool.Runtime, e.sandboxPolicy)
+		rt, err := runtimeForCaps(tool.Runtime, e.sandboxPolicy, e.capReg)
 		if err != nil {
 			if ferr := hookFail(h, fmt.Errorf("Hook %s: %w", h.ID, err)); ferr != nil {
 				return nil, rewritten, ferr
@@ -141,7 +143,7 @@ func (e *Engine) notifyError(ctx context.Context, all []model.Hook, toolID strin
 //  2. Flow 载体（#72）：Action 指向一个 Flow id，引擎**同步内联**执行子 Flow
 //     （复用 e.run，同 execID 上下文，结构性无递归）。
 //     - before_flow：子 Flow 的 RunResult.Steps 暴露进主 Flow 的 vars（key=子 Flow id），
-//       下游 step 可经 `vars.<flowID>.<stepID>.output` 引用其结果。
+//     下游 step 可经 `vars.<flowID>.<stepID>.output` 引用其结果。
 //     - on_success：子 Flow 仅作收尾副作用执行，其输出不影响主结果。
 //
 // 失败语义（fail-closed）：critical（含留空）载体失败即返回错误终止编排；
@@ -185,7 +187,7 @@ func (e *Engine) applyFlowScopedHooks(ctx context.Context, rc *runContext, all [
 // applyFlowScopedToolHook 执行 Flow 级 Hook 的 Tool 载体（action = Tool id）。
 func (e *Engine) applyFlowScopedToolHook(ctx context.Context, rc *runContext, h model.Hook, stage string) error {
 	tool, _ := e.reg.GetTool(h.Action) // 已确认非 nil（调用方解析过）
-	rt, err := runtimeFor(tool.Runtime, e.sandboxPolicy)
+	rt, err := runtimeForCaps(tool.Runtime, e.sandboxPolicy, e.capReg)
 	if err != nil {
 		if ferr := hookFail(h, fmt.Errorf("Hook %s: %w", h.ID, err)); ferr != nil {
 			return ferr
@@ -250,20 +252,34 @@ func (e *Engine) applyFlowScopedFlowHook(ctx context.Context, rc *runContext, h 
 
 // ---- step 生命周期的共享执行路径（run 与 Supervise 共用，保证 Hook 语义一致）----
 
-// prepareStepInput 解析 step.input 并应用 before_step Hook，随后按 Tool.input_schema 校验
-// （含「Hook 改写后重校验」——保住单一 Schema 真理源不可绕过）。
-func (e *Engine) prepareStepInput(ctx context.Context, rc *runContext, hooks []model.Hook, flowID string, step model.Step, tool *model.Tool) (map[string]interface{}, error) {
+// prepareStepInput 解析 step.input 并应用 before_step Hook，随后按调用载体校验：
+//   - Tool 载体：按 Tool.input_schema 校验；
+//   - 原语载体：按能力的方法级参数 schema 校验（缺必填 / 未知参数即拒）。
+//
+// 两条分支都保留「Hook 改写后重校验」——保住单一 Schema 真理源不可绕过。
+func (e *Engine) prepareStepInput(ctx context.Context, rc *runContext, hooks []model.Hook, flowID string, step model.Step, call resolvedCall) (map[string]interface{}, error) {
 	input, err := resolveInput(step.Input, rc)
 	if err != nil {
 		return nil, fmt.Errorf("step %s 解析 input 失败: %w", step.ID, err)
 	}
 
-	input, rewritten, err := e.applyHooks(ctx, hooks, model.StageBeforeStep, flowID, tool.ID, input)
+	input, rewritten, err := e.applyHooks(ctx, hooks, model.StageBeforeStep, flowID, call.id(), input)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := validate(tool.InputSchema, input); err != nil {
+	if call.isPrimitive() {
+		// 模板与 before_step Hook 都可能改写 input，故这一层是最终把关（不只依赖注册期校验）。
+		if err := e.validatePrimitiveArgs(call.prim, call.method, input); err != nil {
+			if rewritten {
+				return nil, fmt.Errorf("step %s input 经 Hook 改写后校验失败: %w", step.ID, err)
+			}
+			return nil, fmt.Errorf("step %s input 校验失败: %w", step.ID, err)
+		}
+		return input, nil
+	}
+
+	if err := validate(call.tool.InputSchema, input); err != nil {
 		if rewritten {
 			return nil, fmt.Errorf("step %s input 经 Hook 改写后校验失败: %w", step.ID, err)
 		}
@@ -272,22 +288,51 @@ func (e *Engine) prepareStepInput(ctx context.Context, rc *runContext, hooks []m
 	return input, nil
 }
 
+// stepExecutable 按调用载体给出「本次执行三件套」(runtime, entry, host)：
+//   - Tool 载体：自身 runtime / entry，宿主视图按 Tool.Capabilities 最小授权；
+//   - 原语载体：Lua runtime + buildActionEntry 编出的入口（与 ext.ai.react /
+//     POST /api/capabilities/invoke 同一条通道），宿主视图只放行该能力（书写即授权）。
+func (e *Engine) stepExecutable(call resolvedCall, input map[string]interface{}, rc *runContext) (Runtime, string, *cap.Context, error) {
+	if !call.isPrimitive() {
+		rt, err := runtimeForCaps(call.tool.Runtime, e.sandboxPolicy, e.capReg)
+		if err != nil {
+			return nil, "", nil, err
+		}
+		return rt, call.tool.Entry, e.hostFor(call.tool, rc), nil
+	}
+	entry, err := buildActionEntry(call.prim, call.method, input)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	rt, err := runtimeForCaps(model.RuntimeLua, e.sandboxPolicy, e.capReg)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	host, err := e.primitiveHost(call.prim, rc)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	return rt, entry, host, nil
+}
+
 // runOnceStep 执行一个 once step 的完整生命周期：
-// before_step Hook → 执行 → after_step Hook（下游看到改后值）→ output 重校验；
+// when → before_step Hook + 校验 → 执行 → after_step Hook（下游看到改后值）→ output 重校验；
 // 执行失败时触发 on_error（仅补偿，不恢复）。
-func (e *Engine) runOnceStep(ctx context.Context, rc *runContext, hooks []model.Hook, flowID string, step model.Step, tool *model.Tool) (input, output map[string]interface{}, err error) {
+//
+// 两种载体（Tool / 直调原子能力）共用本路径，因此 Hook 的织入点、失败语义、日志关联完全一致。
+func (e *Engine) runOnceStep(ctx context.Context, rc *runContext, hooks []model.Hook, flowID string, step model.Step, call resolvedCall) (input, output map[string]interface{}, err error) {
 	// when 必须**先于** input 解析：条件为假时若仍去解析 input，
 	// 会去读一个可能已被跳过的上游输出，报出误导性的「尚未执行」而不是「跳过」。
 	if err := e.whenHolds(rc, step); err != nil {
 		return nil, nil, err
 	}
 
-	input, err = e.prepareStepInput(ctx, rc, hooks, flowID, step, tool)
+	input, err = e.prepareStepInput(ctx, rc, hooks, flowID, step, call)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rt, err := runtimeFor(tool.Runtime, e.sandboxPolicy)
+	rt, entry, host, err := e.stepExecutable(call, input, rc)
 	if err != nil {
 		return nil, nil, fmt.Errorf("step %s: %w", step.ID, err)
 	}
@@ -298,44 +343,63 @@ func (e *Engine) runOnceStep(ctx context.Context, rc *runContext, hooks []model.
 	}
 
 	stepCtx, cancel := context.WithTimeout(ctx, defaultExecTimeout)
-	host := e.hostFor(tool, rc)
-	output, err = rt.Run(stepCtx, tool.Entry, input, host)
+	output, err = rt.Run(stepCtx, entry, input, host)
 	cancel()
 	if err != nil {
 		stepErr := fmt.Errorf("step %s 执行失败: %w", step.ID, err)
-		if hookErr := e.notifyError(ctx, hooks, tool.ID, err, input); hookErr != nil {
+		if hookErr := e.notifyError(ctx, hooks, call.id(), err, input); hookErr != nil {
 			return nil, nil, fmt.Errorf("%w（另：%v）", stepErr, hookErr)
 		}
 		return nil, nil, stepErr
 	}
+	if call.isPrimitive() {
+		// 原语返回值统一包成 {result: ...}（与 POST /api/capabilities/invoke 同形），
+		// 下游按 ${steps.<id>.output.result} 引用。
+		// Lua 表里 `result = nil` 会让该键消失，此处补一个显式 null——否则「返回 nil」
+		// 与「返回空表」在 output 里同形，下游无法区分。
+		if _, ok := output["result"]; !ok {
+			output["result"] = nil
+		}
+	}
 
-	output, rewritten, err := e.applyHooks(ctx, hooks, model.StageAfterStep, flowID, tool.ID, output)
+	output, rewritten, err := e.applyHooks(ctx, hooks, model.StageAfterStep, flowID, call.id(), output)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if err := validate(tool.OutputSchema, output); err != nil {
-		if rewritten {
-			return nil, nil, fmt.Errorf("step %s output 经 Hook 改写后校验失败: %w", step.ID, err)
+	// 原语直调没有 output_schema（能力目录只声明**入参** schema，不声明返回值形状）→ 跳过校验。
+	// Tool 载体照旧：§9.1 不可绕过 Schema。
+	if !call.isPrimitive() {
+		if err := validate(call.tool.OutputSchema, output); err != nil {
+			if rewritten {
+				return nil, nil, fmt.Errorf("step %s output 经 Hook 改写后校验失败: %w", step.ID, err)
+			}
+			return nil, nil, fmt.Errorf("step %s output 校验失败: %w", step.ID, err)
 		}
-		return nil, nil, fmt.Errorf("step %s output 校验失败: %w", step.ID, err)
 	}
 	return input, output, nil
 }
 
 // startServiceStep 应用 before_step Hook + 校验后拉起 service。
 // 注意：service step 永不结束，故 after_step 对其不适用（PRD §14.2）。
-func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []model.Hook, flowID string, step model.Step, tool *model.Tool) (*ServiceHandle, error) {
+func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []model.Hook, flowID string, step model.Step, call resolvedCall) (*ServiceHandle, error) {
+	// 直调原子能力是进程内 Lua，没有「长驻」形态：注册期已由 resolveStepCall 拦截，
+	// 此处再兜一层，避免任何旁路把它送到 rt.Start。
+	if call.isPrimitive() {
+		return nil, fmt.Errorf("step %s 直调原子能力 %s 不支持 mode=service（长驻请用 process runtime 的 Tool）", step.ID, step.Call)
+	}
+	tool := call.tool
+
 	if err := e.whenHolds(rc, step); err != nil {
 		return nil, err
 	}
 
-	input, err := e.prepareStepInput(ctx, rc, hooks, flowID, step, tool)
+	input, err := e.prepareStepInput(ctx, rc, hooks, flowID, step, call)
 	if err != nil {
 		return nil, err
 	}
 
-	rt, err := runtimeFor(tool.Runtime, e.sandboxPolicy)
+	rt, err := runtimeForCaps(tool.Runtime, e.sandboxPolicy, e.capReg)
 	if err != nil {
 		return nil, fmt.Errorf("step %s: %w", step.ID, err)
 	}
@@ -347,6 +411,29 @@ func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []m
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("step %s 拉起 service 前已被取消: %w", step.ID, err)
 	}
+
+	// service ext：走 coord 握手（注册优先 / 竞态退让 / 看门狗心跳）。
+	// 优先向侧车 Register 自身 PID；若无人监听则本 gear 当 owner 拉起 sidecar，
+	// 否则退让为 client 复用同一实例（同主机多 gear 共享单个 sidecar，避免端口冲突）。
+	if cli := e.capReg.SvcExt[tool.ID]; cli != nil {
+		sess, err := cli.RegisterOrStart(func() (coord.Process, error) {
+			return rt.Start(context.Background(), tool.Entry, input, host)
+		})
+		if err != nil {
+			stepErr := fmt.Errorf("step %s 启动 service ext 协调失败: %w", step.ID, err)
+			if hookErr := e.notifyError(ctx, hooks, tool.ID, err, input); hookErr != nil {
+				return nil, fmt.Errorf("%w（另：%v）", stepErr, hookErr)
+			}
+			return nil, stepErr
+		}
+		return &ServiceHandle{
+			StepID: step.ID, Runtime: tool.Runtime, Proc: sess.Proc(), Entry: tool.Entry, Input: input, Host: host,
+			Probe:     tool.HealthProbe,
+			StartedAt: time.Now(),
+			Coord:     sess,
+		}, nil
+	}
+
 	proc, err := rt.Start(context.Background(), tool.Entry, input, host)
 	if err != nil {
 		stepErr := fmt.Errorf("step %s 拉起 service 失败: %w", step.ID, err)
@@ -358,7 +445,7 @@ func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []m
 
 	return &ServiceHandle{
 		StepID: step.ID, Runtime: tool.Runtime, Proc: proc, Entry: tool.Entry, Input: input, Host: host,
-		Probe: tool.HealthProbe, // service 健康检查探针（REQ-APP-HEALTH / #75）；nil = 不探
-		StartedAt: time.Now(), // 供 Supervisor 判定「存活时长」以决定是否重置退避
+		Probe:     tool.HealthProbe, // service 健康检查探针（REQ-APP-HEALTH / #75）；nil = 不探
+		StartedAt: time.Now(),       // 供 Supervisor 判定「存活时长」以决定是否重置退避
 	}, nil
 }

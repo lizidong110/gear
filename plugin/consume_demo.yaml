@@ -1,0 +1,47 @@
+# 演示 Tool：直接调用 P2 消息原子的 consume（证明 consume 是「直接可调」的一等方法，
+# 而不是只能经 ctx.subscribe 的单一特例）。
+#
+# mode=pull（默认）拉取一批返回；无 broker 时会 error，被 pcall 隔离。
+# 注册：gear tool register --registry <db> -
+# 运行：gear tool run consume.probe --registry <db> --input '{"topic":"hr","kafka_brokers":"127.0.0.1:9092","queue":"hr-q"}'
+id: consume.probe
+name: 消费探测（Kafka + RabbitMQ consume 直接调用）
+runtime: lua
+capabilities: [ext.kafka, ext.rabbitmq]
+input_schema:
+  type: object
+  properties:
+    topic: {type: string, description: "Kafka 主题"}
+    kafka_brokers: {type: string, description: "Kafka broker 列表（逗号分隔）"}
+    queue: {type: string, description: "RabbitMQ 队列"}
+  required: [topic]
+output_schema:
+  type: object
+  properties:
+    kafka: {type: object, description: "Kafka consume 结果或错误"}
+    rabbitmq: {type: object, description: "RabbitMQ consume 结果或错误"}
+versions:
+  - version: 1.0.0
+    state: stable
+entry: |
+  local out = {}
+
+  -- Kafka：pull 拉取最多 2 条（broker 连不上则 error，由 pcall 隔离）
+  local ok, r = pcall(function()
+    return ctx.ext.kafka.consume({
+      topic = ctx.input.topic, brokers = ctx.input.kafka_brokers,
+      mode = "pull", max_messages = 2, timeout = "1s", start = "latest",
+    })
+  end)
+  out.kafka = ok and r or { error = tostring(r) }
+
+  -- RabbitMQ：pull 拉取最多 2 条（端口用 1 保证无 broker，路径可测）
+  ok, r = pcall(function()
+    return ctx.ext.rabbitmq.consume({
+      queue = ctx.input.queue, host = "127.0.0.1", port = 1,
+      mode = "pull", max_messages = 2,
+    })
+  end)
+  out.rabbitmq = ok and r or { error = tostring(r) }
+
+  return out

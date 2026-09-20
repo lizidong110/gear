@@ -1,0 +1,95 @@
+# examples/news-top10.yaml
+# GET /api/news 服务化示例：Flow + Lua 工具直接调 ctx.http 抓取并整理百度热搜榜 Top10。
+#
+# 形态（被 cli_test.go 锁定的多文档回归）：前导注释块 + `---` + Tool + `---` + Flow。
+# `tool/flow register` 单次只接受单篇，故手动注册请拆分；`gear serve --seed` 可一次灌入两篇。
+#
+# 真实运行：`gear serve --seed examples/news-top10.yaml` 后访问 GET /api/news。
+# 默认抓百度热搜榜（见 news.top10.vars.url）；测试里会把 step input 的 url 覆盖成本地 mock。
+
+---
+id: news.fetch
+name: 热搜榜抓取器
+description: 抓取百度热搜榜（Baidu 形状 JSON），整理成统一 items 列表（rank/title/url/hotTag）。
+runtime: lua
+entry: |
+  -- news.fetch：直接调 ctx.http（内核原语，capabilities 声明 http）+ ctx.json（纯函数，无条件注入）。
+  -- 不依赖任何 ext.* 侧车，是「Flow + Lua 工具直接干活」的对外服务化范例。
+  local url = ctx.input.url
+  if not url or url == "" then
+    return { error = "url 必填" }
+  end
+
+  local r = ctx.http.Request("GET", url)
+  local status = tonumber(r.status) or 0
+  if status < 200 or status >= 300 then
+    return { error = "HTTP 状态码 " .. tostring(r.status) }
+  end
+
+  -- ctx.json.decode(str) 在「成功」时只返回 1 个值（解析结果 table），「失败」时返回 nil + 错误串。
+  -- 故只取第一个返回值：data 为 nil 即解析失败。
+  local data = ctx.json.decode(r.body)
+  if data == nil then
+    return { error = "响应不是合法 JSON" }
+  end
+
+  -- 百度热搜榜形状：data.cards[].content[].content[] = [{index,word,url,hotTag}, ...]
+  local items = {}
+  local d = data and data.data
+  local cards = d and d.cards
+  if cards then
+    for _, card in ipairs(cards) do
+      local contents = card.content
+      if contents then
+        for _, c in ipairs(contents) do
+          local list = c.content
+          if list then
+            for _, it in ipairs(list) do
+              items[#items + 1] = {
+                rank   = it.index,
+                title  = it.word,
+                url    = it.url,
+                hotTag = it.hotTag,
+              }
+            end
+          end
+        end
+      end
+    end
+  end
+
+  return { items = items }
+capabilities:
+  - http
+input_schema:
+  type: object
+  properties:
+    url:
+      type: string
+      description: 热搜榜接口地址
+  required:
+    - url
+output_schema:
+  type: object
+  properties:
+    items:
+      type: array
+      description: 整理后的热搜条目列表
+    error:
+      type: string
+      description: 抓取/解析失败时的错误信息（成功时缺省）
+versions:
+  - version: 1.0.0
+    state: stable
+
+---
+id: news.top10
+name: 百度热搜榜 Top10
+description: 抓取并整理百度热搜榜 Top10，供 GET /api/news 服务化（server.handleNews 直接跑本 Flow）。
+vars:
+  url: "https://top.baidu.com/board?platform=wise&tab=realtime"
+steps:
+  - id: gen
+    call: news.fetch
+    input:
+      url: "${vars.url}"

@@ -2,7 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -19,10 +18,10 @@ func hookCmd() *cobra.Command {
 func hookRegisterCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "register <file.yaml>",
-		Short: "从 YAML 注册/更新一个 Hook",
+		Short: "从 YAML 注册/更新一个 Hook（路径写 - 表示从 stdin 读）",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			raw, err := os.ReadFile(args[0])
+			raw, err := readFileOrStdin(args[0])
 			if err != nil {
 				return err
 			}

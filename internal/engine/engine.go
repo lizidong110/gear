@@ -30,7 +30,7 @@ const DefaultMaxParallel = 4
 //   - SandboxPermissive：在 strict 基础上额外开放 coroutine/utf8（纯计算安全），仍禁文件加载逃逸。
 //     不提供 none/unsafe：Lua 逃逸宿主是 P0 级风险，配置项不应能关掉沙箱本身。
 const (
-	SandboxStrict    = "strict"
+	SandboxStrict     = "strict"
 	SandboxPermissive = "permissive"
 )
 
@@ -43,11 +43,24 @@ type Engine struct {
 	// host 是宿主能力原语的实现集合（M5，PRD §6）。nil 表示不提供任何宿主能力
 	// （Tool 若声明了 capability，运行期访问会收到 ErrCapabilityUnavailable）。
 	host *cap.Providers
+	// capReg 是扩展原语目录（用户/插件注册的 ctx.<name>）。nil 时 New 会用空目录兜底
+	// （仅内核原语可用，行为与历史一致）。
+	capReg *CapabilityRegistry
+	// ai 是进程内 ext.ai agent（generate/complete/catalog/...）；由 SetupExtensions 注入。
+	// nil 表示未装配 ext.ai（声明了 ext.ai 的 Tool 运行期收到 ErrCapabilityUnavailable）。
+	ai *AIAgent
+	// subscriber 是通用订阅管理器（ctx.subscribe 原语实现）。New 时装配并写入 host.Subscribe；
+	// serve 监听时经 SetSubscribeCallbackBase 注入回推基址。nil 表示未装配（不会发生，
+	// New 恒创建；仅防御性判空）。
+	subscriber *Subscriber
 	// logSink 是执行日志采集器（REQ-API-LOGS / #71）；nil 表示不记日志。
 	logSink LogSink
+	// secret 是宿主注入的运行期密钥源（WithSecret）；nil 表示用 host 自带（默认 nil →
+	// 声明 secret 的 Tool 收到 ErrCapabilityUnavailable，fail-closed）。
+	secret cap.Secret
 }
 
-// New 构造引擎。可用 WithMaxParallel / WithHost / WithSandbox 等选项覆盖默认行为。
+// New 构造引擎。可用 WithMaxParallel / WithHost / WithSandbox / WithCapabilities 等选项覆盖默认行为。
 func New(reg *registry.Registry, opts ...func(*Engine)) *Engine {
 	e := &Engine{reg: reg, maxParallel: DefaultMaxParallel, sandboxPolicy: SandboxStrict}
 	for _, o := range opts {
@@ -59,10 +72,103 @@ func New(reg *registry.Registry, opts ...func(*Engine)) *Engine {
 	if e.host == nil {
 		e.host = defaultProviders()
 	}
+	// 密钥源注入（REQ-API-SECRETS）：WithSecret 提供的密钥源覆盖默认 nil；
+	// 调用方已显式 WithHost 自带 Secret 时尊重调用方配置（不静默覆盖）。
+	if e.secret != nil && e.host.Secret == nil {
+		e.host.Secret = e.secret
+	}
+	// 默认扩展目录（无扩展能力时仅内核原语可用，行为与历史一致）。
+	if e.capReg == nil {
+		e.capReg = NewCapabilityRegistry()
+	}
 	if e.host.Resolver == nil {
 		e.host.Resolver = e.newResolver()
 	}
+	// 通用订阅管理器（ctx.subscribe）：装配并注入 host.Subscribe（与 Event 平级）。
+	// serve 监听时由 server.SetSubscribeCallbackBase 再注入回推基址。
+	if e.host.Subscribe == nil {
+		e.subscriber = newSubscriber(e)
+		e.host.Subscribe = e.subscriber
+	}
+	e.bindAIAgent()
 	return e
+}
+
+// bindAIAgent 把引擎的工具执行器注入进程内 ext.ai agent（react 方法需要它来跑单步工具调用），
+// 并把 Flow 静态校验指向引擎自身实现——使 agent 的「生成 → 校验」与 CLI/REST/MCP 的注册校验
+// 共用同一份规则，不产生第二套判定（PRD §9.2 单一真相源）。
+// 引擎未装配 ext.ai（e.ai 为 nil）时静默跳过。
+func (e *Engine) bindAIAgent() {
+	if e.ai == nil {
+		return
+	}
+	e.ai.exec = func(ctx context.Context, entry string, input map[string]interface{}) (map[string]interface{}, error) {
+		host := e.newReactHost()
+		rt, err := runtimeForCaps(model.RuntimeLua, e.sandboxPolicy, e.capReg)
+		if err != nil {
+			return nil, err
+		}
+		return rt.Run(ctx, entry, input, host)
+	}
+	e.ai.validateFlow = e.ValidateFlowStatic
+}
+
+// newReactHost 为 react 构造「声明全部 capability」的宿主视图：内核原语（builtin + pure）+ 已注册 ext.* 全部放行，
+// 并注入各 ext 的原生实现——使 react 能复用与真实 Tool 完全相同的 ctx.* 通道使用任何内置工具。
+// react 是引擎受信的内置 agent，故可全量声明；其执行在 Lua 沙箱内，不会超出宿主能力边界。
+func (e *Engine) newReactHost() *cap.Context {
+	grants := cap.Grants{}
+	for p := range cap.KnownPrimitives {
+		grants[p] = true
+	}
+	e.capReg.mu.Lock()
+	for name := range e.capReg.exts {
+		grants[cap.Primitive(name)] = true
+	}
+	e.capReg.mu.Unlock()
+	c := cap.New(grants, e.host)
+	e.capReg.mu.Lock()
+	for name, ext := range e.capReg.exts {
+		if v, err := ext.Provider(c); err == nil {
+			c.SetExtension(name, v)
+		}
+	}
+	e.capReg.mu.Unlock()
+	return c
+}
+
+// InvokeCapability 直接执行一个原子能力的方法（供 REST POST /api/capabilities/invoke
+// 与前端「能力目录」页的调用测试使用）。复用与 react 完全相同的宿主通道：
+// newReactHost 全量授权 + Lua 沙箱，内置原语按位置参数、ext.* 按单 table 调用。
+//
+// args 是「以参数名为键」的 map（与 capabilities() 的 schema 对齐）：内置原语经
+// builtinParamOrder 重排为位置参数，ext.* 原样作为单具名 table 传入；缺省的可选参数
+// 自动补 nil。调用前按方法级参数 schema 校验 args（缺必填 / 未知参数一律拒绝）——
+// 与 Flow 直调原子能力共用 validatePrimitiveArgs，两个入口的严格度不会漂移。
+func (e *Engine) InvokeCapability(name, method string, args map[string]interface{}) (interface{}, error) {
+	if name == "" || method == "" {
+		return nil, fmt.Errorf("invoke 需要 name 与 method 均非空")
+	}
+	if err := e.validatePrimitiveArgs(name, method, args); err != nil {
+		return nil, err
+	}
+	entry, err := buildActionEntry(name, method, args)
+	if err != nil {
+		return nil, err
+	}
+	host := e.newReactHost()
+	rt, err := runtimeForCaps(model.RuntimeLua, e.sandboxPolicy, e.capReg)
+	if err != nil {
+		return nil, err
+	}
+	out, err := rt.Run(context.Background(), entry, map[string]interface{}{}, host)
+	if err != nil {
+		return nil, fmt.Errorf("调用 %s.%s 失败: %w", name, method, err)
+	}
+	if r, ok := out["result"]; ok {
+		return r, nil
+	}
+	return out, nil
 }
 
 // capDBSeq 为每次默认宿主的内存 SQLite 生成唯一 DSN，避免进程内多个引擎共享同一内存库
@@ -75,17 +181,15 @@ var capDBSeq int64
 func defaultProviders() *cap.Providers {
 	seq := atomic.AddInt64(&capDBSeq, 1)
 	dsn := fmt.Sprintf("file:gear_cap_%d?mode=memory&cache=shared", seq)
-	var dbCap cap.DB
-	if db, err := cap.NewSQLiteDB(dsn); err == nil {
-		dbCap = db
-	}
-	// 注意：dbCap 用接口类型承载，出错时保持 nil 接口（而非 *SQLiteDB 的 typed-nil），
-	// 否则 cap.Context.DB() 的 `c.prov.DB == nil` 判定会失效、对已授权 db 调用 panic。
+	// 内置多后端 DB：默认 scratch 内存 SQLite（dsn），mysql/postgres 由调用方显式传 dsn。
+	// NewMultiDB 永不返回 nil，故 Providers.DB 用接口承载时不会出现 typed-nil。
+	dbCap := cap.NewMultiDB(dsn)
 	return &cap.Providers{
-		KV:    cap.NewMemKV(),
-		HTTP:  &http.Client{Timeout: 30 * time.Second},
-		Event: cap.NewMemEvent(),
-		DB:    dbCap,
+		KV:       cap.NewMemKV(),
+		HTTP:     &http.Client{Timeout: 30 * time.Second},
+		Event:    cap.NewMemEvent(),
+		DB:       dbCap,
+		Sessions: cap.NewMemSessionRegistry(), // session 作用域 KV 命名空间（M-KV-LIFECYCLE）
 	}
 }
 
@@ -104,6 +208,53 @@ func WithMaxParallel(n int) func(*Engine) {
 func WithHost(p *cap.Providers) func(*Engine) {
 	return func(e *Engine) {
 		e.host = p
+	}
+}
+
+// WithSecret 注入运行期密钥源（REQ-API-SECRETS）：声明了 secret capability 的 Tool
+// 即可 ctx.secret.get(name)，Flow 的 ${secrets.x} 也由此解析。密钥源的**写入**属于
+// 宿主管理面（REST /api/secrets、GEAR_SECRET_* 环境变量播种），运行期视图只读——
+// 明文密钥绝不落库，Flow/Tool 定义只存引用。
+func WithSecret(s cap.Secret) func(*Engine) {
+	return func(e *Engine) {
+		e.secret = s
+	}
+}
+
+// WithCapabilities 注入扩展原语目录（用户/插件注册的 ctx.<name>）。
+// 不调用时使用空目录（仅内核原语可用，行为与历史一致）。
+// 例：reg := engine.NewCapabilityRegistry(); reg.Register("ext.slack", ...); engine.New(r, engine.WithCapabilities(reg))
+//
+// WithAIAgent 注入进程内 ext.ai agent（generate/complete/catalog/domains/validate/capabilities）。
+// 由 SetupExtensions 在注册 ext.ai 时一并调用；不调用则引擎无 AI 能力。
+func WithAIAgent(a *AIAgent) func(*Engine) {
+	return func(e *Engine) { e.ai = a }
+}
+
+// AIAgent 返回进程内 ext.ai agent（未装配时 nil）。
+func (e *Engine) AIAgent() *AIAgent { return e.ai }
+
+// SetSubscribeCallbackBase 注入订阅回推基址（serve 监听时由 server 调用）。
+// 未装配订阅管理器时静默跳过（不会发生，New 恒创建）。
+func (e *Engine) SetSubscribeCallbackBase(base string) {
+	if e.subscriber != nil {
+		e.subscriber.SetCallbackBase(base)
+	}
+}
+
+// Subscriber 返回通用订阅管理器（未装配时 nil）。
+func (e *Engine) Subscriber() *Subscriber { return e.subscriber }
+
+// Deliver 把一条事件投递给指定订阅句柄（server 的回推端点调用）。
+func (e *Engine) Deliver(handle string, payload interface{}) error {
+	if e.subscriber == nil {
+		return fmt.Errorf("subscribe 原语未装配")
+	}
+	return e.subscriber.Deliver(handle, payload)
+}
+func WithCapabilities(reg *CapabilityRegistry) func(*Engine) {
+	return func(e *Engine) {
+		e.capReg = reg
 	}
 }
 
@@ -130,30 +281,61 @@ func WithSandbox(policy string) func(*Engine) {
 	}
 }
 
+// callChainOf 从 runContext 拼出本次执行的调用链（祖先 Flow 链 + 本 Flow），空元素已剔除。
+// 调用链有两个用途（见 withCallChain），且**只有此处一处拼法**：
+// Tool 载体（hostFor）与直调原子能力（primitiveHost）共用，避免两条路径的守卫口径漂移。
+func callChainOf(rc *runContext) []string {
+	if rc == nil {
+		return nil
+	}
+	var via []string
+	for _, id := range rc.ancestors {
+		if id != "" {
+			via = append(via, id)
+		}
+	}
+	if rc.flowID != "" {
+		via = append(via, rc.flowID)
+	}
+	return via
+}
+
+// withCallChain 把调用链写入宿主视图：
+//   - ctx.call 的循环守卫依据（复用 #72 祖先链语义）；
+//   - 会话命名空间 id = 调用链末元素（最内层 flow id）：同一次 flow run 的所有 step
+//     共享同一份 session 作用域 KV（ScopeSession），run 结束经 SessionRegistry 回收。
+func withCallChain(c *cap.Context, via []string) *cap.Context {
+	if len(via) > 0 {
+		c.SetCallChain(via)
+		c.SetSession(via[len(via)-1])
+	}
+	return c
+}
+
 // hostFor 为一次执行构建宿主能力视图：按 Tool.Capabilities 精确授权，从引擎持有
 // 的宿主实现集中取原语。rc 非空时把当前执行链写入 ctx（供 ctx.call 递归守卫）；
 // 注册期已校验 Capabilities 合法（model.Tool.Validate），故此处忽略错误。
 func (e *Engine) hostFor(tool *model.Tool, rc *runContext) *cap.Context {
-	var via []string
+	c := e.hostForChain(tool, callChainOf(rc))
 	if rc != nil {
-		for _, id := range rc.ancestors {
-			if id != "" {
-				via = append(via, id)
-			}
-		}
-		if rc.flowID != "" {
-			via = append(via, rc.flowID)
-		}
+		c.SetSubscriptionOwner(cap.SubscriptionOwner{FlowID: rc.flowID, ExecID: rc.execID})
 	}
-	return e.hostForChain(tool, via)
+	return c
 }
 
 // hostForChain 用给定的调用链构造宿主视图（调用链用于 ctx.call 循环守卫，复用 #72 祖先链语义）。
 func (e *Engine) hostForChain(tool *model.Tool, via []string) *cap.Context {
 	grants, _ := cap.GrantsFromStrings(tool.Capabilities)
-	c := cap.New(grants, e.host)
-	if len(via) > 0 {
-		c.SetCallChain(via)
+	c := withCallChain(cap.New(grants, e.host), via)
+	// 注入 Tool 声明、且已注册的扩展原语：经 Provider 取原生实现对象填进 c.exts。
+	// 未在此处注入的扩展名（如声明了但 Provider 报错）会经 cap.Context.Extension 返回
+	// ErrCapabilityUnavailable，与内置原语「授权但未实现」同语义。
+	for _, name := range tool.Capabilities {
+		if ext, ok := e.capReg.Lookup(name); ok {
+			if v, err := ext.Provider(c); err == nil {
+				c.SetExtension(name, v)
+			}
+		}
 	}
 	return c
 }
@@ -166,7 +348,7 @@ func (e *Engine) newResolver() cap.Resolver {
 	return func(target string, input map[string]interface{}, via []string) (map[string]interface{}, error) {
 		// 1) Tool 优先（call 的主通道是调用一个已注册 Tool）。
 		if tool, err := e.reg.GetTool(target); err == nil && tool != nil {
-			rt, err := runtimeFor(tool.Runtime, e.sandboxPolicy)
+			rt, err := runtimeForCaps(tool.Runtime, e.sandboxPolicy, e.capReg)
 			if err != nil {
 				return nil, err
 			}
@@ -271,6 +453,29 @@ func (e *Engine) RunFlowResultObserved(flowID string, observe ToolObserver) (*Ru
 // `GET /api/executions/{id}/logs` 查询。execID 为空则行为与 RunFlowResultObserved 完全一致
 // （不记日志，兼容历史调用点与测试）。
 func (e *Engine) RunFlowExec(flowID, execID string, observe ToolObserver) (*RunResult, error) {
+	return e.runFlow(flowID, execID, observe, nil)
+}
+
+// RunFlowWithVars 与 RunFlowResult 相同，但把 vars **覆盖合并**进 Flow 声明的初始 vars
+// （覆盖优先；只作用于本次运行，**不写回 registry**）。
+//
+// 这是「运行时给 Flow 传参」的入口：Flow 定义里的 vars 视为默认值，调用方按需覆盖；
+// 合并结果作为 rc.vars，before_flow Hook 仍可在此基础上继续改写。
+// vars 为空/nil 时行为等价于 RunFlowResult。
+func (e *Engine) RunFlowWithVars(flowID string, vars map[string]interface{}) (*RunResult, error) {
+	return e.runFlow(flowID, "", nil, vars)
+}
+
+// RunFlowExecWithVars 是 RunFlowExec 与 RunFlowWithVars 的合体入口：
+// 带 exec id（step 日志经 logSink 落盘 + 运行期注销守卫上报）**且**支持 vars
+// 运行时覆盖。MCP 执行面用这个：同步等结果、要日志、要传参，三者都要。
+// vars 为 nil 时行为与 RunFlowExec 完全一致。
+func (e *Engine) RunFlowExecWithVars(flowID, execID string, observe ToolObserver, vars map[string]interface{}) (*RunResult, error) {
+	return e.runFlow(flowID, execID, observe, vars)
+}
+
+// runFlow 是 RunFlowExec / RunFlowWithVars 的公共前置：取 Flow → 拒绝 service step → 执行。
+func (e *Engine) runFlow(flowID, execID string, observe ToolObserver, varsOverride map[string]interface{}) (*RunResult, error) {
 	flow, err := e.reg.GetFlow(flowID)
 	if err != nil {
 		return nil, err
@@ -283,10 +488,85 @@ func (e *Engine) RunFlowExec(flowID, execID string, observe ToolObserver) (*RunR
 			return nil, fmt.Errorf("step %s 是 service 模式（长驻），不能用 flow run 一次性执行；请用 `app run %s` 监管", s.ID, flowID)
 		}
 	}
-	return e.run(flow, observe, execID, nil)
+	return e.runWithVars(flow, observe, execID, nil, varsOverride)
 }
 
-// plannedToolIDs 计算一次运行可能用到的 Tool id：step 的 call ∪ 生效 Hook 的 action。
+// mergeVars 把运行期覆盖合并进 Flow 声明的 vars（覆盖优先），返回新 map。
+// 不修改任何入参——flow.Vars 来自 registry 快照，绝不能被就地改写。
+func mergeVars(base, override map[string]interface{}) map[string]interface{} {
+	if len(override) == 0 {
+		return base
+	}
+	out := make(map[string]interface{}, len(base)+len(override))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range override {
+		out[k] = v
+	}
+	return out
+}
+
+// RunTool 一次性执行单个 Tool（供 `gear tool run` 与「单跑一个原子能力」的调用方）。
+//
+// 语义与「在 Flow 里执行一个 step」**完全一致**：input_schema 校验 → capability 门禁 →
+// runtime 执行（受 defaultExecTimeout 限制）→ step 级 Hook（before_step / after_step，按 tool id 匹配）
+// → output_schema 校验。返回该 Tool 的 output。
+//
+// 会触发按 tool id 匹配的 **step 级** Hook；**不**触发 Flow 级 Hook（before_flow / on_success
+// 需依附某个 Flow，此处没有 Flow 可依附）。session 作用域命名空间用 tool id（等价于「只含一步的 Flow」），
+// 运行结束即回收。
+func (e *Engine) RunTool(toolID string, input map[string]interface{}) (map[string]interface{}, error) {
+	return e.RunToolExec(toolID, input, "")
+}
+
+// RunToolExec 是 RunTool 的带执行 id 版本：execID 非空时把运行日志经 logSink 上报，
+// 供 `GET /api/executions/{id}/logs` 查询（与 RunFlowExec 同语义）。
+func (e *Engine) RunToolExec(toolID string, input map[string]interface{}, execID string) (map[string]interface{}, error) {
+	tool, err := e.reg.GetTool(toolID)
+	if err != nil {
+		return nil, err
+	}
+	if tool == nil {
+		return nil, fmt.Errorf("Tool 不存在: %s", toolID)
+	}
+	if input == nil {
+		input = map[string]interface{}{}
+	}
+
+	// session 作用域 KV 以 tool id 命名空间隔离；结束回收（同 runWithVars 对 flow.ID 的处置）。
+	if e.host != nil && e.host.Sessions != nil {
+		e.host.Sessions.Acquire(toolID)
+		defer e.host.Sessions.Release(toolID)
+	}
+
+	hooks, err := e.loadHooks()
+	if err != nil {
+		return nil, err
+	}
+	rc := &runContext{
+		vars:      map[string]interface{}{},
+		steps:     map[string]map[string]interface{}{},
+		secretGet: e.secretResolver(),
+		execID:    execID,
+		logSink:   e.logSinkFor(execID),
+		flowID:    toolID, // 供 hostFor 拼调用链 + 定 session 命名空间
+	}
+	// step.ID 用 tool id：出错时「step <id> 执行失败」能直接指出是哪个 Tool。
+	step := model.Step{ID: toolID, Call: toolID, Input: input}
+	_, out, err := e.runOnceStep(context.Background(), rc, hooks, toolID, step, resolvedCall{tool: tool})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// plannedToolIDs 计算一次运行可能用到的调用目标：step 的 call ∪ 生效 Hook 的 action。
+//
+// step.Call 可能是已注册 Tool，也可能是「能力.方法」直调的原子能力（见 primitive.go）——
+// 这里**原样上报 step.Call**，不做区分：上报结果用于 §8.2「运行中不可注销」守卫，
+// 而该守卫判的正是「字符串是否与待注销的 id 相等」，两种载体天然一致（同名 Tool 优先解析，
+// 因此「Tool 名恰好等于某能力方法名」时上报的也正是那个 Tool，语义正确）。
 //
 // Hook 的选择规则**复用 hooksFor**（applyHooks 用的同一个函数），不在此重写匹配逻辑——
 // 否则「哪些 Hook 会触发」就出现了第二处判定，日后加 stage 或改 target 语义时必漏一处
@@ -316,6 +596,24 @@ func plannedToolIDs(flow *model.Flow, hooks []model.Hook) []string {
 }
 
 func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string, ancestors []string) (*RunResult, error) {
+	return e.runWithVars(flow, observe, execID, ancestors, nil)
+}
+
+// runWithVars 执行一个**已加载**的 Flow（run 的执行内核）。varsOverride 非空时与 flow.Vars
+// 合并后作为初始 vars（覆盖优先）——用于「运行时给 Flow 传参」，不改动 registry 里的 Flow 快照；
+// 合并结果随后仍会被 before_flow Hook 改写。
+func (e *Engine) runWithVars(flow *model.Flow, observe ToolObserver, execID string, ancestors []string, varsOverride map[string]interface{}) (*RunResult, error) {
+	// session 作用域 KV 按 flow.ID 命名空间隔离；run 开始 Acquire、结束 Release（引用计数，
+	// 并发同 flow 互不干扰，最后一个结束才回收）。内存态、重启即失（方法论 §0 第14条）。
+	if e.host != nil && e.host.Sessions != nil && flow.ID != "" {
+		e.host.Sessions.Acquire(flow.ID)
+		defer e.host.Sessions.Release(flow.ID)
+	}
+	// 订阅所属按 Flow/Exec 回收（运行结束 defer，与 session 引用计数同源思路）：
+	// 本次运行中经 ctx.subscribe.start 建立的订阅在此一并 StopByOwner。
+	if e.subscriber != nil && flow.ID != "" {
+		defer e.subscriber.StopByOwner(cap.SubscriptionOwner{FlowID: flow.ID, ExecID: execID})
+	}
 	ctx := context.Background() // 同 execLevel：运行期取消由层级 ctx 负责，run() 顶层用 Background
 	levels, err := topoLevels(flow.Steps)
 	if err != nil {
@@ -334,7 +632,7 @@ func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string, ance
 	}
 
 	rc := &runContext{
-		vars:      flow.Vars,
+		vars:      mergeVars(flow.Vars, varsOverride),
 		steps:     map[string]map[string]interface{}{},
 		secretGet: e.secretResolver(),
 		execID:    execID,
@@ -374,14 +672,14 @@ func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string, ance
 
 	// S4：分层执行——同一层内无依赖的 step 并行调度（PRD §4.3），受 maxParallel 限流。
 	for _, level := range levels {
-		err := e.execLevel(flow.Steps, level, func(ctx context.Context, step model.Step, tool *model.Tool) error {
+		err := e.execLevel(flow.Steps, level, func(ctx context.Context, step model.Step, call resolvedCall) error {
 			if reason, ok := skipReasonFor(step.ID); ok {
 				markSkipped(step.ID, reason)
 				fmt.Printf("- step %s 跳过（%s）\n", step.ID, reason)
 				return nil
 			}
 
-			input, output, err := e.runOnceStep(ctx, rc, hooks, flow.ID, step, tool)
+			input, output, err := e.runOnceStep(ctx, rc, hooks, flow.ID, step, call)
 			if errors.Is(err, ErrStepSkipped) {
 				markSkipped(step.ID, "when=false")
 				fmt.Printf("- step %s 跳过（when=false）\n", step.ID)
@@ -418,10 +716,13 @@ func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string, ance
 
 // execLevel 并发执行一层 step（受 maxParallel 限制）。
 //
+// 每个 step 的 `call` 在此统一解析成可执行单元（resolveStepCall）：已注册 Tool，或
+// 「能力.方法」直调的原子能力——解析失败即 fail-closed，不会拿一个不存在的目标去执行。
+//
 // 失败语义（fail-closed）：首个错误即取消本层上下文（阻止未启动的 step 起跑，
 // 并让在跑的子进程随 ctx 被杀），等待本层全部 goroutine 收尾后返回该错误；
 // 后续层不再执行。
-func (e *Engine) execLevel(steps []model.Step, level []int, fn func(ctx context.Context, step model.Step, tool *model.Tool) error) error {
+func (e *Engine) execLevel(steps []model.Step, level []int, fn func(ctx context.Context, step model.Step, call resolvedCall) error) error {
 	lvlCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -452,21 +753,14 @@ loop:
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			tool, err := e.reg.GetTool(step.Call)
+			// 唯一解析点：step.Call 先按已注册 Tool 解析，再按「能力.方法」直调原语兜底
+			// （规则与注册期 ValidateFlowStatic 共用 resolveStepCall，不在此重写判定）。
+			call, err := e.resolveStepCall(step)
 			if err != nil {
 				record(err)
 				return
 			}
-			if tool == nil {
-				record(fmt.Errorf("step %s 引用的 Tool 不存在: %s", step.ID, step.Call))
-				return
-			}
-			resolved, err := resolveToolVersion(tool, step)
-			if err != nil {
-				record(err)
-				return
-			}
-			if err := fn(lvlCtx, step, resolved); err != nil {
+			if err := fn(lvlCtx, step, call); err != nil {
 				record(err)
 			}
 		}(step)
@@ -600,6 +894,15 @@ func resolveInput(in map[string]interface{}, ctx *runContext) (map[string]interf
 func resolveValue(v interface{}, ctx *runContext) (interface{}, error) {
 	switch x := v.(type) {
 	case string:
+		// 整串为单一引用（如 `${vars.tools}`、`${vars.max_retries}`）时返回原始值，
+		// 让 map/slice/number 等复杂值原样穿过输入层到达 ctx.input，而不是被字符串化；
+		// 其余（含字面量的嵌入引用，如 `prefix-${vars.x}`）仍走字符串展开。
+		if refs, err := scanTemplateRefs(x); err == nil && len(refs) == 1 &&
+			refs[0].Start == 0 && refs[0].End == len(x)-1 {
+			if val, lerr := lookup(refs[0], ctx); lerr == nil {
+				return val, nil
+			}
+		}
 		return expandString(x, ctx)
 	case map[string]interface{}:
 		m := make(map[string]interface{}, len(x))

@@ -9,7 +9,7 @@ import (
 )
 
 // HostFunc 是 go-host runtime 注册的「进程内 Go 函数」：接收执行 ctx、已解析的 input、
-// 以及宿主能力视图 host（M5 6 原语，按 Tool.Capabilities 精确授权），返回 Tool 的 output。
+// 以及宿主能力视图 host（M5 内核原语，按 Tool.Capabilities 精确授权），返回 Tool 的 output。
 //
 // 与 process/lua 不同，go-host 是**同进程可信代码**：由部署方在启动时经 RegisterHostFunc
 // 显式登记，entry 即函数名。它可直接调用 host.HTTP/KV/Call/... 使用宿主原语，

@@ -1,0 +1,16 @@
+id: demo
+name: Demo Flow
+description: 两步顺序 demo，第二步依赖第一步并引用其输出（演示 vars/跨 step 数据流）
+vars:
+  topic: world
+steps:
+  - id: s1
+    call: hello
+    input:
+      name: "${vars.topic}"
+  - id: s2
+    call: hello
+    depends_on:
+      - s1
+    input:
+      name: "${steps.s1.output.name}-reply"

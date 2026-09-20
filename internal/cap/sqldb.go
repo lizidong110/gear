@@ -3,45 +3,144 @@ package cap
 import (
 	"database/sql"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
-	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动，注册名 "sqlite"，无需 cgo
+	_ "github.com/go-sql-driver/mysql" // mysql/mariadb 驱动
+	_ "github.com/jackc/pgx/v5/stdlib" // postgres 驱动（注册名 pgx）
+	_ "modernc.org/sqlite"             // 纯 Go SQLite 驱动，注册名 "sqlite"，无需 cgo
 )
 
-// SQLiteDB 是 cap.DB 原语的 SQLite 实现（PRD §6 / M5：db 原语此前只有接口、无实现，
-// 调用恒返回 ErrCapabilityUnavailable；本文件补齐宿主实现）。
+// MultiDB 是 cap.DB 原语的多后端实现（PRD §6 / 核心原子「尽量原始」）。
 //
-// 设计要点：
-//   - 复用项目既有的 modernc.org/sqlite（registry 同款纯 Go 驱动，无 cgo 依赖），
-//     与内核「单二进制分发、依赖最小」取向一致。
-//   - 单连接（SetMaxOpenConns(1)）：结构化数据原语是低吞吐的宿主能力，串行化足以
-//     避免 SQLite 多连接下共享缓存 / WAL 的边界问题，同时保证行为确定。
-//   - DSN 由调用方决定：文件（持久）或 `file:<name>?mode=memory&cache=shared`（进程内）。
-//     引擎默认宿主用「每引擎唯一 DSN 的内存库」，进程级共享、重启即丢（M5  scratch 语义，
-//     持久化留待后续切片）；需要落盘时传文件路径即可。
-type SQLiteDB struct {
-	db *sql.DB
+// 一次调用通过 driver/dsn 路由到 sqlite / mysql / postgres 任一后端；连接按
+// (driver, dsn) 懒开并缓存复用，避免每次调用重建连接的开销与握手。这与「结构化数据
+// 读写不绑定具体产品」的核心原子取向一致——同样的 db.query 既能落本地 SQLite 文件，
+// 也能直连生产 MySQL / Postgres，差异只是参数，不是新 Tool。
+//
+// driver 别名（大小写不敏感）：
+//
+//	sqlite / sqlite3           -> modernc.org/sqlite（纯 Go，无 cgo）
+//	mysql / mariadb            -> go-sql-driver/mysql
+//	postgres / postgresql / pg -> jackc/pgx/v5/stdlib
+//
+// dsn 缺省（空串）且 driver 为 sqlite 时，回退到引擎注入的 defaultSQLiteDSN
+// （每引擎唯一的内存 scratch 库，进程级共享、重启即丢，保留 M5 scratch 语义，
+// 便于测试/Tool 内临时状态）。mysql/postgres 必须显式传 dsn——含口令时优先用
+// Flow 里的 ${secrets.*} 或 env，不要硬编码进 YAML。
+type MultiDB struct {
+	defaultSQLiteDSN string
+	mu               sync.Mutex
+	pool             map[string]*sql.DB
 }
 
-// NewSQLiteDB 打开（必要时创建）一个 SQLite 数据库并返回 cap.DB 实现。
-// path 为 SQLite DSN：传文件路径持久化，或 `file:cap_<n>?mode=memory&cache=shared` 内存态。
-func NewSQLiteDB(path string) (*SQLiteDB, error) {
-	db, err := sql.Open("sqlite", path)
+// NewMultiDB 构造多后端 DB 实现。defaultSQLiteDSN 是「db 调用省略 dsn 时的 sqlite 默认库」，
+// 引擎默认宿主传每引擎唯一的内存 DSN（见 engine.defaultProviders）。函数永不返回 nil，
+// 故 Providers.DB 用接口承载时不会出现 typed-nil 触发 Context.DB() 误判。
+func NewMultiDB(defaultSQLiteDSN string) *MultiDB {
+	return &MultiDB{defaultSQLiteDSN: defaultSQLiteDSN, pool: make(map[string]*sql.DB)}
+}
+
+// normDriver 把 driver 别名归一为 database/sql 的驱动注册名。
+func normDriver(driver string) string {
+	switch strings.ToLower(driver) {
+	case "", "sqlite", "sqlite3":
+		return "sqlite"
+	case "mysql", "mariadb":
+		return "mysql"
+	case "postgres", "postgresql", "pg":
+		return "pgx"
+	default:
+		return strings.ToLower(driver)
+	}
+}
+
+// db 按 (driver, dsn) 取得（必要时懒开并缓存）一个 *sql.DB 连接池。
+// 并发安全：锁仅覆盖查/建缓存这一段；sqlite 单连接（SetMaxOpenConns(1)）序列化写、
+// 保证与原 SQLiteDB 一致的行为确定性；mysql/postgres 放开连接数。
+func (m *MultiDB) db(driver, dsn string) (*sql.DB, error) {
+	drv := normDriver(driver)
+	if drv == "sqlite" && dsn == "" {
+		dsn = m.defaultSQLiteDSN
+	}
+	if dsn == "" {
+		return nil, fmt.Errorf("db(%s) 需要 dsn：mysql/postgres 必须显式连接串", drv)
+	}
+	key := drv + "\x00" + dsn
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.pool[key]; ok {
+		return c, nil
+	}
+	c, err := sql.Open(drv, dsn)
 	if err != nil {
-		return nil, fmt.Errorf("打开 cap db 失败: %w", err)
+		return nil, fmt.Errorf("打开 %s 连接失败: %w", drv, err)
 	}
-	db.SetMaxOpenConns(1) // 单连接：确定性与并发安全（见类型注释）
-	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("初始化 cap db 失败: %w", err)
+	if drv == "sqlite" {
+		c.SetMaxOpenConns(1) // 单连接：确定性与并发安全（SQLite 共享缓存边界）
+		if _, err := c.Exec("PRAGMA busy_timeout=5000"); err != nil {
+			_ = c.Close()
+			return nil, fmt.Errorf("初始化 %s 连接失败: %w", drv, err)
+		}
+	} else {
+		c.SetMaxOpenConns(10)
+		c.SetConnMaxLifetime(5 * time.Minute)
 	}
-	return &SQLiteDB{db: db}, nil
+	m.pool[key] = c
+	return c, nil
 }
 
-// Query 执行查询，将每行转成 map[string]interface{}（列名 → 值），整体返回 []interface{}。
-// 类型归一：BLOB([]byte)→字符串；time.Time→RFC3339；其余（int64/float64/string/nil）原样。
-func (d *SQLiteDB) Query(query string, args ...interface{}) ([]interface{}, error) {
-	rows, err := d.db.Query(query, args...)
+// Query 参数化查询，返回 []interface{}（每行一个 map[string]interface{}）。
+func (m *MultiDB) Query(driver, dsn, query string, args ...interface{}) ([]interface{}, error) {
+	c, err := m.db(driver, dsn)
+	if err != nil {
+		return nil, err
+	}
+	return queryRows(c, query, args...)
+}
+
+// Exec 执行 DDL/DML（INSERT/UPDATE/DELETE/CREATE 等），不返回行。
+func (m *MultiDB) Exec(driver, dsn, query string, args ...interface{}) error {
+	c, err := m.db(driver, dsn)
+	if err != nil {
+		return err
+	}
+	if _, err := c.Exec(query, args...); err != nil {
+		return fmt.Errorf("db exec 失败: %w", err)
+	}
+	return nil
+}
+
+// Ping 探活（mysql/postgres 跨网络连得通、sqlite 文件可打开即 ok）。
+func (m *MultiDB) Ping(driver, dsn string) error {
+	c, err := m.db(driver, dsn)
+	if err != nil {
+		return err
+	}
+	if err := c.Ping(); err != nil {
+		return fmt.Errorf("db ping 失败: %w", err)
+	}
+	return nil
+}
+
+// Close 关闭全部缓存连接（引擎默认宿主一般不主动关；测试收尾用）。
+func (m *MultiDB) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var firstErr error
+	for k, c := range m.pool {
+		if err := c.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		delete(m.pool, k)
+	}
+	return firstErr
+}
+
+// queryRows 把查询结果规整成 []interface{}（行集合），类型按 normalizeSQLValue 归一。
+func queryRows(c *sql.DB, query string, args ...interface{}) ([]interface{}, error) {
+	rows, err := c.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("db query 失败: %w", err)
 	}
@@ -62,8 +161,8 @@ func (d *SQLiteDB) Query(query string, args ...interface{}) ([]interface{}, erro
 			return nil, fmt.Errorf("db scan 失败: %w", err)
 		}
 		row := make(map[string]interface{}, len(cols))
-		for i, c := range cols {
-			row[c] = normalizeSQLValue(vals[i])
+		for i, cname := range cols {
+			row[cname] = normalizeSQLValue(vals[i])
 		}
 		out = append(out, row)
 	}
@@ -73,18 +172,7 @@ func (d *SQLiteDB) Query(query string, args ...interface{}) ([]interface{}, erro
 	return out, nil
 }
 
-// Exec 执行 DDL/DML（INSERT/UPDATE/DELETE/CREATE 等），不返回行。
-func (d *SQLiteDB) Exec(query string, args ...interface{}) error {
-	if _, err := d.db.Exec(query, args...); err != nil {
-		return fmt.Errorf("db exec 失败: %w", err)
-	}
-	return nil
-}
-
-// Close 关闭底层连接（引擎默认宿主为进程级内存库，一般不主动关闭）。
-func (d *SQLiteDB) Close() error { return d.db.Close() }
-
-// normalizeSQLValue 把 SQLite 驱动返回的原生类型归一成 JSON 友好的值。
+// normalizeSQLValue 把驱动返回的原生类型归一成 JSON 友好的值。
 func normalizeSQLValue(v interface{}) interface{} {
 	switch x := v.(type) {
 	case []byte:

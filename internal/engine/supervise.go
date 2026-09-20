@@ -9,6 +9,7 @@ import (
 
 	"gear/internal/cap"
 	"gear/internal/model"
+	"gear/internal/sidecar/coord"
 )
 
 // ServiceHandle 是某个 service 模式 step 的长驻子进程句柄，由 app.Supervisor 监管。
@@ -23,6 +24,10 @@ type ServiceHandle struct {
 	Probe     *model.HealthProbe     // service 健康检查探针（nil = 不探）；仅 service 模式生效
 	Restarts  int                    // 已重启次数（restart=always 时 > 0）
 	StartedAt time.Time              // 本次（重）启动时间；Supervisor 据此判断存活时长以重置退避
+	// Coord 是 service ext 的协调会话（仅当该 step 引用 service ext 时非空）。
+	// 持有看门狗心跳；Supervisor.stopAll 杀进程后调用其 Close() 完成 Deregister
+	//（占用列表空则侧车自动退出，见 EXT_SERVICE_DESIGN.md §12）。
+	Coord *coord.Session
 }
 
 // ProcKill 在锁内杀掉当前 service 进程（探针与停机共用，避免与 Relaunch 并发写 Proc 竞争）。
@@ -113,6 +118,7 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 		vars:      flow.Vars,
 		steps:     map[string]map[string]interface{}{},
 		secretGet: e.secretResolver(),
+		flowID:    flowID,
 	}
 	res := &SuperviseResult{FlowID: flowID}
 	var svcMu sync.Mutex // 并行 goroutine 都会追加 service 句柄
@@ -141,7 +147,7 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 
 	// S4：与 run() 同样走分层并行；service 与 once 共用同一执行路径。
 	for _, level := range levels {
-		err := e.execLevel(flow.Steps, level, func(ctx context.Context, step model.Step, tool *model.Tool) error {
+		err := e.execLevel(flow.Steps, level, func(ctx context.Context, step model.Step, call resolvedCall) error {
 			if reason, ok := skipReasonFor(step.ID); ok {
 				markSkipped(step.ID, reason)
 				fmt.Printf("- step %s 跳过（%s）\n", step.ID, reason)
@@ -149,7 +155,7 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 			}
 
 			if step.IsService() {
-				h, err := e.startServiceStep(ctx, rc, hooks, flowID, step, tool)
+				h, err := e.startServiceStep(ctx, rc, hooks, flowID, step, call)
 				if errors.Is(err, ErrStepSkipped) {
 					markSkipped(step.ID, "when=false")
 					fmt.Printf("- step %s 跳过（when=false）\n", step.ID)
@@ -165,7 +171,7 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 				return nil
 			}
 
-			input, output, err := e.runOnceStep(ctx, rc, hooks, flowID, step, tool)
+			input, output, err := e.runOnceStep(ctx, rc, hooks, flowID, step, call)
 			if errors.Is(err, ErrStepSkipped) {
 				markSkipped(step.ID, "when=false")
 				fmt.Printf("- step %s 跳过（when=false）\n", step.ID)
@@ -194,7 +200,7 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 // Relaunch 重启一个已退出的 service step（restart=always 时由 Supervisor 调用）。
 // 按原 runtime 重新分发，复用 Entry 与已校验的 input，Restarts 计数 +1。
 func (e *Engine) Relaunch(h *ServiceHandle) error {
-	rt, err := runtimeFor(h.Runtime, e.sandboxPolicy)
+	rt, err := runtimeForCaps(h.Runtime, e.sandboxPolicy, e.capReg)
 	if err != nil {
 		return fmt.Errorf("restart step %s: %w", h.StepID, err)
 	}

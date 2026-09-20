@@ -66,7 +66,10 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 		t.Fatal(err)
 	}
 
-	srv := server.New(reg)
+	srv, err := server.New(reg)
+	if err != nil {
+		t.Fatalf("构造 Server 失败: %v", err)
+	}
 	ts := httptest.NewServer(srv.Handler())
 	// 先停 HTTP，再 Shutdown（后者会关闭 ExecStore 释放 SQLite 句柄，使 t.TempDir 清理成功）。
 	t.Cleanup(ts.Close)

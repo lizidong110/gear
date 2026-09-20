@@ -1,0 +1,47 @@
+/*
+ * 次级文字的**单一定义处**。
+ *
+ * 为什么单独一个文件：之前每个视图各写一份 `opacity: 0.6`（有的 0.55、有的 0.65），
+ * 而 `opacity` 是把整个元素（含文字）往下压 —— 在暗色主题下**等于自己降低对比度**，
+ * 六个页面于是糊得各有各的程度，而且没法统一调。编排图那次的「看不清」就是同一个病根。
+ *
+ * 现在一律走 Naive UI 的主题文字色阶（由 NConfigProvider 全局注入，主题切换自动跟随）：
+ *   text-color-base  正文
+ *   text-color-2     次级（标签、说明的正文）
+ *   text-color-3     三级（辅助说明、行内提示、占位说明）
+ * 想整体调深浅，只改这一处；不要在组件里再写 opacity 压字。
+ */
+
+.text-2 {
+  color: var(--n-text-color-2);
+  font-size: 12px;
+}
+
+.text-3 {
+  color: var(--n-text-color-3);
+  font-size: 12px;
+}
+
+/* 标识符 / 代码片段（step id、tool id、flow id、命令） */
+.text-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+/* 表单里字段下方的解释文字 */
+.hint-line {
+  display: block;
+  font-size: 12px;
+  line-height: 1.75;
+  color: var(--n-text-color-3);
+  margin: -4px 0 12px;
+}
+
+/* 行内代码：给个主题化的浅底，别用写死的白/黑 */
+code {
+  background: var(--n-action-color, rgba(255, 255, 255, 0.08));
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}

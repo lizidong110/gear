@@ -21,9 +21,9 @@ var defaultExecTimeout = 30 * time.Second
 type processRuntime struct {
 	// execID/stepID 用于把子进程日志关联到具体执行（REQ-API-LOGS / #71）；
 	// sink 为 nil 时不记日志（兼容无日志采集的调用方）。
-	execID  string
-	stepID  string
-	sink    func(stepID, stream, line string)
+	execID string
+	stepID string
+	sink   func(stepID, stream, line string)
 }
 
 func (p *processRuntime) Run(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context) (map[string]interface{}, error) {
@@ -167,7 +167,7 @@ func startProcess(ctx context.Context, entry string, input map[string]interface{
 	cmd.Stdin = bytes.NewReader(inBytes)
 	cmd.Stdout = serviceOut
 	cmd.Stderr = serviceOut
-	configureProcessTree(cmd)                       // 平台钩子：Unix 置 Setpgid；Windows 无操作
+	configureProcessTree(cmd)                                 // 平台钩子：Unix 置 Setpgid；Windows 无操作
 	cmd.Cancel = func() error { return killProcessTree(cmd) } // ctx 取消也走级联回收（非只杀 sh）
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("%v", err)

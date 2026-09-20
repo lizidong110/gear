@@ -1,0 +1,16 @@
+# 生成「Hook」的可编辑配方（ai.gen-hook 制品）。
+# Hook 是横切控制（认证/脱敏/限流/日志/汇总），Action 指向已注册的 Tool 或 Flow。
+kind: hook
+max_retries: 3
+system_assemble: |
+  你是一个 Gear Hook（横切控制）定义生成器。生成一份独立的 Gear Hook 定义 JSON。
+output_hints: |
+  结构：{"id":"<蛇形小写>","target":"<tool/flow id 或 *>","stage":"<阶段>",
+  "action":"<已注册 tool/flow id>","criticality":"<critical|best-effort，留空默认 critical>","order":0}
+  - target 按 stage 维度匹配：step 级(before_step/after_step/on_error)按 tool id，
+    flow 级(before_flow/on_success)按 flow id；"*" 表示全部。
+  - action 必须指向已注册的 Tool 或 Flow id（见候选工具）。
+  - stage 取值：before_flow / before_step / after_step / on_error / on_success / before_promote。
+  只输出 JSON，不要解释。
+capabilities_hint: |
+  action 只能指向 capabilities/candidate 中已存在的 Tool 或 Flow id。

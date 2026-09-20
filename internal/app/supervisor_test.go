@@ -138,10 +138,10 @@ func TestProbeRestartsUnhealthyService(t *testing.T) {
 	defer reg.Close()
 	tool := svcTool("sleep 3") // 进程活着，但从不监听端口 → tcp 探针必败
 	tool.HealthProbe = &model.HealthProbe{
-		Kind:     model.ProbeKindTCP,
-		Addr:     "127.0.0.1:1", // 端口 1 通常无监听，拨号必败
-		Interval: "150ms",
-		Timeout:  "100ms",
+		Kind:      model.ProbeKindTCP,
+		Addr:      "127.0.0.1:1", // 端口 1 通常无监听，拨号必败
+		Interval:  "150ms",
+		Timeout:   "100ms",
 		Threshold: 1,
 	}
 	if err := reg.UpsertTool(tool); err != nil {

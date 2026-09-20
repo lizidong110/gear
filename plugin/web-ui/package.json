@@ -1,0 +1,44 @@
+{
+  "name": "gear-web-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Gear 自动化编排框架的 Web 管理端（插件形态：只经 REST /api 访问内核，不进 go module）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "gen:enums": "node scripts/gen-enums.mjs",
+    "check:contract": "node scripts/check-contract.mjs",
+    "check:syntax": "node scripts/check-syntax.mjs",
+    "test:local": "node --experimental-transform-types scripts/run-local-tests.mjs",
+    "gate": "npm run check:contract && npm run build && npm run test",
+    "gate:local": "npm run check:contract && npm run check:syntax && npm run test:local"
+  },
+  "dependencies": {
+    "@codemirror/lang-json": "^6.0.1",
+    "@codemirror/lang-yaml": "^6.1.1",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/legacy-modes": "^6.5.4",
+    "@codemirror/theme-one-dark": "^6.1.2",
+    "codemirror": "^6.0.1",
+    "js-yaml": "^4.1.0",
+    "naive-ui": "^2.40.1",
+    "pinia": "^2.2.6",
+    "vue": "^3.5.13",
+    "vue-router": "^4.4.5"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.10.2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/test-utils": "^2.4.6",
+    "happy-dom": "^15.11.7",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3",
+    "vitest": "^2.1.8",
+    "vue-tsc": "^2.1.10"
+  }
+}
