@@ -1,7 +1,7 @@
 # 插件化自动化编排框架 · PRD
 
-> **版本**：v4.0（最终版）
-> **日期**：2026-09-12
+> **版本**：v4.0（持续修订；本文件随代码落地持续回填，不另起版本号）
+> **日期**：2026-09-20（持续修订；以 `REQUIREMENTS.md` 为可执行契约，凡标 `implemented` 的功能均已随代码落地）
 > **状态**：Draft — 用于交付 AI 协作开发
 > **定位**：内核定位 · 机制优先 · AI 编排
 
@@ -32,7 +32,7 @@
 
 ### 1.1 一句话定位
 
-一个自动化操作系统的内核。框架只提供原语（机制），不内置任何具体业务行为（策略）；所有业务能力——包括 Web 管理界面——都以 Flow 形式存在（`app run` 启动），由用户通过配置组装出自己的自动化系统。
+一个面向 AI 的插件化自动化编排框架。现实是：企业应用多为固定流程，由 AI 直接驱动既低效又易产生幻觉；因此本产品不为 AI 造轮子，而是先分层沉淀不变的原语（原语、Tool、Flow 三层），基于插件自由扩展，并以 Hook 提供切面监控，让 AI 在这个框架之上安全、可控地组装出属于自己的企业应用。
 
 ### 1.2 核心哲学：机制与策略分离
 
@@ -108,21 +108,21 @@ output_schema:
 
 | Runtime | 说明 | 实现状态 |
 |---------|------|---------|
-| go-host | Go 函数直接注册 | ⏳ 计划 S7 后续 |
+| go-host | Go 函数直接注册（进程内 Go 函数，经 `RegisterHostFunc` 注册） | ✅ #76 已实现（once；service 显式报错） |
 | lua | Lua 脚本，沙箱执行（gopher-lua / Lua 5.1，纯 Go） | ✅ S7a 已实现（once；service 不支持） |
 | process | 外部进程（py/sh/node），stdin/stdout 传 JSON | ✅ S1 已实现 |
 | wasm | WASM 模块，强隔离多语言 | ❌ 后期（V3） |
 
 > 实现状态：引擎按 `Tool.Runtime` 分发（`internal/engine/runtime.go`），未实现的 runtime 显式报错，不静默降级。每条 runtime 的状态见 `REQUIREMENTS.md`。
 >
-> **注册期守卫（S2 修复 G1）**：`Tool.Validate` 在**注册期**即拒绝未知 runtime（如 `foobar`）与已知但未实现的 runtime（go-host/wasm），避免「能入库、跑时才炸」。lua 已于 S7a 实现，可注册。
+> **注册期守卫（S2 修复 G1）**：`Tool.Validate` 在**注册期**即拒绝未知 runtime（如 `foobar`）与已知但未实现的 runtime（仅 wasm 仍为 V3 deferred），避免「能入库、跑时才炸」。lua 已于 S7a 实现，可注册。
 >
 > **分发收敛（S2 修复 M10 剩余）**：`Runtime` 接口同时暴露 `Run`（once）与 `Start`（service 长驻），once 与 service **共用唯一分发点** `runtimeFor`；「已实现 runtime」以 `model.ImplementedRuntimes` 为单一来源，引擎不再维护第二份白名单。
 >
 > **lua 专项（S7a）**：
 > - `entry` = **inline Lua 源码**（非文件路径）；沙箱只开 base/string/table/math，不加载 os/io/package/debug，并移除 dofile/loadfile/require/module —— **脚本无法接触宿主**（实测 `os.system` 报错）。
 > - 超时/取消：`L.SetContext(ctx)`，死循环会被打断（与 process 的 `defaultExecTimeout` 对称）。
-> - **不支持 service**（`Start` 显式报错）：长驻需 `ctx.*` 宿主能力（M5），否则 lua 服务只能空转。
+> - **不支持 service**（`Start` 显式报错，REQ-LUA-SERVICE deferred，V3 前不做）：长驻请用 process。
 
 ### 3.3 参数交互统一协议
 
@@ -162,8 +162,8 @@ steps:
 # - Flow 级 input/output 声明（旧稿）当前模型未支持，已移除。
 # - when 条件执行（已实现） / parallel 并行（S4 起无依赖本就并行） 见 §4.3；
 #   **use_version 钉版本已实现**（S5）：钉版本解析走 `resolveToolVersion`，版本级 Entry/Schema 覆盖 Tool 级；未知版本注册期即拒绝（见 REQUIREMENTS.md REQ-USEVERSION）。
-# - 模板支持 ${vars.x} / ${steps.id.output.field}；**${secrets.x} 尚未实现**
-#   （secret 原语随 ctx.* 落地，见 REQ-TMPL-SECRETS），注册期显式拒绝而非执行期才报错。
+# - 模板支持 ${vars.x} / ${steps.id.output.field} / ${secrets.x}（**REQ-TMPL-SECRETS / REQ-API-SECRETS 已实现**：
+#   注册期放开该前缀，运行期经宿主 secret 源解析；密钥缺失运行期报错，明文不落库）。
 ```
 
 ### 4.2 版本层与参数层分离
@@ -185,7 +185,7 @@ steps:
 - `mode`：`once`（默认，执行完返回，走 stdin/stdout 契约）/ `service`（**S2 已实现**，拉起进程不等待，Flow 借此成为长驻「服务」）。
   - service step 不能作为其他 step 的依赖（它永不结束）；service 模式当前仅 `process` runtime 支持。
   - 含 service step 的 Flow 必须用 `app run` 启动；`flow run` 会在执行前显式拒绝（见 §14.2）。
-- 变量引用前缀：`${vars.x}` / `${steps.id.output.field}`。注意：旧稿的 `${step.output.x}` / `${input.x}` 不支持（`input` 非模型字段、step 输出路径需带 step id）——以本稿为准；`${secrets.x}` 当前**未实现**（secret 原语随 ctx.* 落地，注册期显式拒绝，见 REQUIREMENTS.md REQ-TMPL-SECRETS）。
+- 变量引用前缀：`${vars.x}` / `${steps.id.output.field}`。注意：旧稿的 `${step.output.x}` / `${input.x}` 不支持（`input` 非模型字段、step 输出路径需带 step id）——以本稿为准；`${secrets.x}` **已实现**（REQ-TMPL-SECRETS + REQ-API-SECRETS：注册期放开前缀、运行期经宿主 secret 源解析、明文不落库；密钥名经 REST `/api/secrets` 管理、可 `GEAR_SECRET_*` 环境变量播种）。
 
 ### 4.4 触发方式
 
@@ -290,8 +290,10 @@ hooks:
 - **只提供原语，不提供业务**：发邮件、接钉钉都是普通 Tool，内部通过 http 实现。
 - **capability 精确放行**：未声明的调用一律拒绝，权限遵循最小权限原则。
 - **secret 只读**：插件看不到明文存储位置，只能通过 `ctx.secret.get` 获取。
-- **未声明的原语不出现在 `ctx` 上**（lua）/ 不被注入 `ctx.capabilities`（process）：防御纵深——脚本连该字段都读不到，无法探测宿主能力边界；已声明但未提供实现的（如 `db`）调用时返回明确错误，而非静默成功。
+- **未声明的原语不出现在 `ctx` 上**（lua）/ 不被注入 `ctx.capabilities`（process）：防御纵深——脚本连该字段都读不到，无法探测宿主能力边界；已声明但宿主未提供实现的调用时返回明确错误，而非静默成功。
 - **调用形态（M5 落地）**：lua 侧 `ctx.{http,call,db,kv,secret,event,subscribe}`（http/db 为对象方法 `ctx.http.Request` / `ctx.db.query`；kv/secret/event/subscribe 为子表方法 `ctx.kv.get` / `ctx.secret.get` / `ctx.event.notify` / `ctx.subscribe.start`；call 是**裸函数** `ctx.call(target, input)`）；process 侧运行期以 `input.ctx.capabilities`（字符串数组）与 `input.ctx.sandbox`（bool）透传声明，供进程自检。
+
+- **引擎默认宿主装配（#69）**：`engine.New` 未显式 `WithHost` 时自动注入 KV/HTTP/Event/DB 原语实现与 `call` 解析器；声明了对应 capability 的 Tool 在生产环境直接可用（不再恒 `ErrCapabilityUnavailable`）。secret 默认仍无密钥源（fail-closed）；Server 经 `WithSecret` 注入 `SecretStore`（REQ-API-SECRETS）。
 
 ### 6.2 call 与 event 的边界
 
@@ -481,6 +483,8 @@ local r = ctx.ext.db.query({ driver = "postgres", dsn = ctx.input.dsn,
 - **`--registry` 是 gear 的「目录库」，不是你应用的数据库**。默认 `~/.gear/registry.db`；gear 会在此文件建 `tools`/`flows`/`hooks` 三张表。若你把它指向业务库（如 `--registry ./myapp.db`），gear 会把注册表建进你的库里——CLI 检测到该文件含非 gear 表时会打印警告（不阻断）。`ext.db` 要连的业务库用 `driver`/`dsn` 传给 sidecar，**与 `--registry` 是两回事**。
 - **Tool 用 `gear tool register`，Flow 用 `gear flow register`**。用错子命令时（如把 Tool YAML 交给 `flow register`），CLI 会在**打开 registry 之前**就报出可操作提示，并**不创建/污染**任何库文件。
 
+**⑥ 内置扩展原子家族（ext.* sidecar）**：除 `ext.ai`/`ext.registry`/`ext.tls` 参考形态外，框架内置一批开箱即用的扩展原子——`ext.email` / `ext.sms` / `ext.wecom` / `ext.webhook` / `ext.rabbitmq` / `ext.kafka` / `ext.mqtt`——均以 sidecar 形态经 `gear ext <name>` 拉起，按 stdio 协议（`{"method","args"}` → `{"result|error"}`）逐次调用，Tool 声明 `capabilities:[ext.x]` 即可在 Lua 里 `ctx.ext.x.method({...})` 调用。它们**不是内核原语**，而是「用户装好即可用」的扩展层示例；长驻订阅类（rabbitmq/kafka/mqtt）另走 service ext（声明 `service:true` + `listen`，常驻侧车 + `/caps` 自描述，见 `EXT_SERVICE_DESIGN.md`）。**红线（`email_test.go:TestExtAtomsMustNotReadEnv` 机械守护）**：扩展原子的凭据（user/pass/key/apikey/sign）与连接配置一律从调用参数（args）传，**禁止读 `os.Getenv`**——原子契约与环境解耦，凭据由调用方负责。
+
 **已知调优边界**：单 step 执行超时硬编码 30s（`internal/engine/process.go` 的 `defaultExecTimeout`），多轮调用远端 LLM 的 agent 贴近该边界；后续宜开 per-step `timeout` 字段 / CLI flag。agent 侧的 LLM 输出容错（如 `depends_on` 归一化）属**易变层（Lua）职责**，稳定层（Go 反序列化 / 静态校验）保持严格。
 
 ---
@@ -527,18 +531,20 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 | POST | `/api/executions` | 触发执行（**异步**：202 + execution id） |
 | GET | `/api/executions` | 列出全部执行记录 ✅ |
 | GET | `/api/executions/:id` | 查询执行状态（running / succeeded / failed + RunResult） |
-| GET | `/api/executions/:id/logs` | 查看日志 ⏳ 需日志 Hook 产出 |
+| GET | `/api/executions/:id/logs` | 查看日志 ✅ #71（processRuntime 把 step stdout/stderr 经 `WithLogSink` 落 `ExecStore`；红线：只含运行期输出、绝不落 input/secret 明文） |
 | GET / POST | `/api/hooks` | 列出 / 添加 Hook |
 | POST | `/api/apps` | 启动 Flow 为受管进程（对应 `app run`） |
 | GET | `/api/apps` | 列出运行中的 Flow 进程 |
 | DELETE | `/api/apps/{id}` | 停止 Flow 进程（cancel ⇒ 杀掉 service 子进程） |
 | POST | `/api/tools/{id}/versions/{v}/promote` | 用户显式晋升 ✅ S5（CLI `gear tool promote <id> <v> <target>` 与 REST `POST /api/tools/{id}/versions/{v}/promote` 均已实现，均走 `engine.PromoteTool` + before_promote 门禁） |
 
-> **实现状态（S6a+S5；AI 改 `ext.ai` 扩展，2026-09-14）**：除 `GET /api/executions/{id}/logs` 外均已实现，端到端可用（`gear serve --addr`；晋升经 CLI `tool promote` 与 REST promote 端点均可触发）。**注意**：AI 已去内置化——不再是引擎内建原语，而是 `ext.ai` 扩展（sidecar 载体，`examples/gear-ai-sidecar`，结构化多阶段 agent）；REST 端点 `/api/ai/infer` 仍不存在（AI 不经独立端点），改由 `gear ai gen` 薄壳命令或 Flow 内 `ctx.ext.ai.*` 调用（见 §9）。`internal/ai` 旧包已删除。
+> **实现状态（S6a+S5；AI 改 `ext.ai` 扩展，2026-09-14）**：**均已实现**（含 `GET /api/executions/{id}/logs` #71；晋升经 CLI `tool promote` 与 REST promote 端点均可触发），端到端可用（`gear serve --addr`）。另见 §11 末尾「第四种执行面：MCP」。**注意**：AI 已去内置化——不再是引擎内建原语，而是 `ext.ai` 扩展（sidecar 载体，`examples/gear-ai-sidecar`，结构化多阶段 agent）；REST 端点 `/api/ai/infer` 仍不存在（AI 不经独立端点），改由 `gear ai gen` 薄壳命令或 Flow 内 `ctx.ext.ai.*` 调用（见 §9）。`internal/ai` 旧包已删除。
 > - **执行是异步的**：`POST /api/executions` 立即返回 `202 {id, status}`，结果经 `GET /api/executions/{id}` 查询（三态：running / succeeded / failed，失败带 `error`）。
-> - **状态是内存态**（显式声明）：执行记录与 app 句柄都存活在服务进程内，**进程重启即丢失**。持久化执行历史属后续切片，勿当作已持久化。
+> - **执行记录已持久化（#70，REQ-EXEC-PERSIST）**：`ExecStore` 改为 SQLite 持久化（`GEAR_EXEC_DB`，缺省 `build/gear.db`），重启可恢复全部执行历史与日志；`Server.Shutdown` 关闭 SQLite 句柄释放 WAL 侧车。app 句柄（运行中进程）仍存活在服务进程内、重启即丢失（属进程态，非执行记录）。
 > - **统一错误体**：`{"error": "..."}`；状态码语义 400 参数/校验、404 不存在、409 仍被引用。
 > - 实现用标准库 `net/http`（Go 1.22+ 方法路由），未引入 web 框架——保持单二进制与最小依赖。
+
+> **第四种执行面：MCP（#16，REQ-MCP-*）**：`gear mcp` 把目录管理 / 静态校验 / 执行能力经 Model Context Protocol 暴露给任意 MCP 客户端（Claude Desktop / WorkBuddy / Cursor…）。默认 stdio（客户端以子进程拉起，`{"mcpServers":{"gear":{"command":"gear","args":["mcp"]}}}`），`--http :port` 改走 streamable HTTP（端点 `/mcp`）。已注册 Flow 反向暴露为 `flow__{id}` 工具；复用 cliEngine，密钥源/扩展/守卫与 REST 完全一致（无「MCP 少了某个装配」的漂移）。MCP 面 19 个工具，与 REST 同源守卫（删除守卫、运行中不可注销、状态机非法迁移均复用）。
 
 ---
 
@@ -546,7 +552,7 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 
 | 阶段 | 范围 | 不做 |
 |------|------|------|
-| V1 MVP | 单节点；**process runtime（S1）+ lua 沙箱 runtime（S7a）**（go-host 计划后续）；Flow 顺序执行 + input/output schema 校验 + 拓扑依赖；**`step.mode: service` 长驻 step + `app run` 监管（restart/信号停止，S2）**；**Hook 切面（before_step/after_step/on_error/before_promote，改写+重校验+fail-closed+criticality，S3+S5）**；**无依赖 step 并行 + 依赖推断 + 并发上限/背压（S4）**；**`when` 条件执行 + 三态跳过（表达式引擎）**；**REST 执行面（S6a+S5+S6c：healthz/tools/flows/hooks/executions(+列表)/apps/ai-infer，`gear serve`）**；本地 Registry + 版本声明（含钉版本 use_version 与状态机 promote）；`app run` 进程模型 + CLI 管理面（含 `exec` / `tool promote` / `ai gen`） | 无 WASM、无 go-host、**REST 一端点待做（`GET /api/executions/{id}/logs`）**、**Hook 仅 before_step/after_step/on_error/before_promote（before_flow/on_success 待做；target 仅精确 id 或 `*`）**、无 ctx.* 宿主能力（M5）、**无健康探针 / 队列背压（S2+/S4）**、lua 不支持 service、无自动解析下载、无分布式调度 |
+| V1 MVP | 单节点；**process runtime（S1）+ lua 沙箱 runtime（S7a）**（go-host 已于 #76 实现；wasm 仍 V3）；Flow 顺序执行 + input/output schema 校验 + 拓扑依赖；**`step.mode: service` 长驻 step + `app run` 监管（restart/信号停止，S2）**；**Hook 切面（before_step/after_step/on_error/before_promote，改写+重校验+fail-closed+criticality，S3+S5）**；**无依赖 step 并行 + 依赖推断 + 并发上限/背压（S4）**；**`when` 条件执行 + 三态跳过（表达式引擎）**；**REST 执行面（S6a+S5+S6c：healthz/tools/flows/hooks/executions(+列表)/apps/ai-infer，`gear serve`）**；本地 Registry + 版本声明（含钉版本 use_version 与状态机 promote）；`app run` 进程模型 + CLI 管理面（含 `exec` / `tool promote` / `ai gen`） | 无 WASM（go-host 已实现）、**Hook 仍不含 service 长驻 Flow 级（#72 起 before_flow/on_success 在 once 模式生效；target 仍仅精确 id/`*`）**、ctx.* 宿主能力已落地（M5+#69；secret 需显式注入）、**健康探针（#75）+ 跨进程并发闸门（#73）已实现；step 级 maxParallel（S4）保留**、lua 不支持 service、无自动解析下载、无分布式调度 |
 | V2 | AI 编排闭环；Hook 完整（含 before_promote）；依赖自动解析；灰度发布 | 无审批默认开关、无多租户 |
 | V3 | WASM runtime；event 触发；Web UI 作为可选 Flow（任意版本可 `app run`） | 无租户级隔离 |
 | V4 | 分布式调度、高可用、水平扩展 | — |
@@ -566,8 +572,8 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 | 7 | CAS 是否要求严格预期版本匹配？ | 宽松策略（见 §7.3） |
 | 8 | Web UI 插件是否纳入首批 MVP？ | 否；UI 为可选 Flow，管理面靠 CLI（见 §14） |
 | 9 | 长驻 / 阻塞 step 的形态（daemon 标记 or server Tool）？ | **已定（S2）**：`step.mode: service`（§14.2） |
-| 10 | `app run` 默认 restart 策略与健康检查机制？ | restart **已定（S2）**：默认 `always`，`--restart=never` 可关；健康检查**待定**（当前仅存活，探针 deferred） |
-| 11 | 执行入口的并发上限 / 进程池大小？ | **step 级已定（S4）**：`maxParallel` 默认 4（`--max-parallel` 可调，`app run --max` 管 Flow 数）；**跨进程统一队列/进程池仍待定**（§14.5，REQ-CONCURRENCY-CROSS） |
+| 10 | `app run` 默认 restart 策略与健康检查机制？ | restart **已定（S2）**：默认 `always`，`--restart=never` 可关；健康检查**已实现（#75）**：`health_probe`（http/tcp/cmd，连续失败达阈值只杀当前进程由 Relaunch 重启），注册期校验配置（REQ-APP-HEALTH） |
+| 11 | 执行入口的并发上限 / 进程池大小？ | **step 级已定（S4）**：`maxParallel` 默认 4（`--max-parallel` 可调，`app run --max` 管 Flow 数）；**跨进程队列/进程池已实现（#73）**：`ConcurrencyGate` 固定 worker 池 + 有界队列，满则拒（429 / `StatusRejected`），详见 §14.5（REQ-CONCURRENCY-CROSS） |
 | 12 | CLI 如何鉴权到 daemon、是否走同一套 capability？ | 待定 |
 | 13 | Hook 默认 criticality（日志类是否默认 best-effort）？ | 建议日志类 best-effort，待定（§5.4） |
 | 14 | 安全：process / go-host 绕过 capability、secret 经 argv 的处理？ | 暂搁置（deferred） |
@@ -600,7 +606,7 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 守卫（F3，注册/执行期显式拒绝而非静默）：
 - service step **不能作为其他 step 的依赖**——它永不结束，依赖它无意义（`Engine.Supervise` 拒绝）。
 - 含 service step 的 Flow **不能用 `flow run` 一次性执行**，必须 `app run`（`Engine.RunFlow` 在执行前拒绝并提示）。
-- service 模式当前**仅 `process` runtime 支持**；lua 的 service 依赖 `ctx.*` 宿主能力落地（M5，架构债），当前 `Start` 显式报错「不支持 service」（见 REQUIREMENTS.md REQ-LUA-SERVICE）；go-host 的 service 随 go-host runtime（S7）。
+- service 模式当前**仅 `process` runtime 支持**；lua / go-host 的 service 均 `Start` 显式报错「不支持 service」（REQ-LUA-SERVICE deferred，V3 前不做；原「依赖 M5」理由已随 M5 落地失效）。长驻请用 process。
 
 ### 14.3 app run 的重启与存活（S2 已实现）
 
@@ -611,13 +617,13 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 - 崩溃循环**指数退避**已实现（S4）：`restartBase=50ms` 起翻倍、上限 `restartMax=5s`；存活 ≥ `stableWindow=1s` 即重置计数，避免偶发崩溃被永久惩罚（见 REQUIREMENTS.md REQ-RESTART-BACKOFF）。
 - 停止时杀掉所有 service 子进程（`Supervisor.stopAll`）。
 
-仍 deferred：**健康检查探针**（HTTP / 命令探针）。当前仅以「进程是否退出」判活；主动探针未实现（见 REQUIREMENTS.md REQ-APP-HEALTH）。
+**健康检查探针已实现（#75，REQ-APP-HEALTH）**：Tool 声明 `health_probe`（kind: http/tcp/cmd，含 addr/path/cmd/interval/timeout/threshold）；Supervisor 每 service 句柄起探针 goroutine，连续失败达阈值只杀当前进程、由既有 Relaunch 路径重启（共用崩溃退避）；Proc 读写加锁避免探针与 Relaunch/停机并发竞争；注册期 Resolve 校验配置。
 
 ### 14.4 子进程归属（已定方向）
 
 调度类 Flow 触发其他 Flow 时，**一律通过内核执行入口（REST / `call`）**，子进程归内核持有；调度 Flow 自身只做「何时触发」的判断，不持有子进程。以此避免进程树孤儿、端口冲突、崩溃清理问题。「一个 app run 一个进程」对叶子 Flow 成立；调度 Flow 不持有被触发 Flow 的进程。
 
-### 14.5 并发上限与进程池（S4：step 级闸门已实现；跨进程池待定）
+### 14.5 并发上限与进程池（S4：step 级闸门已实现；跨进程闸门 #73 已实现）
 
 高扇出（一次性 Flow 同时上千）不能逐次 fork 进程；`app run` / 执行入口需有进程池或队列 + 并发上限，超出进入排队或拒绝。
 
@@ -627,7 +633,7 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 - **背压语义**：并发槽占满时后续 step 排队等待；同层某 step 失败即取消本层未启动者，后续层不执行（fail-closed）。
 - `app run --max=N`：`Supervisor.maxConcurrent`，限制一个 `app run` 同时监管的 Flow 数。
 
-**仍未实现**：跨进程/执行入口级别的**统一队列与进程池**（多 `app run` 之间的全局配额、排队拒绝策略）——见 `REQUIREMENTS.md` REQ-CONCURRENCY-CROSS。
+**已实现（#73，REQ-CONCURRENCY-CROSS）**：`internal/server/gate.go` 的 `ConcurrencyGate` 固定 worker 池（= 最大并发执行数）+ 有界队列；worker 全忙且队列满时 `Submit` 返回 false → 入口拒绝（背压）回 `429`、执行记录置 `StatusRejected`（区别于 running/succeeded/failed，可查询）；`Server.New` 默认 64 worker / 256 队列，支持 `WithMaxConcurrent` / `WithExecQueueSize`。区别于 S4 step 级 `maxParallel`（限单 Flow 内 step 并发）与 S2 `app run --max`（限 Flow 数）。
 
 > 注意：**service 长驻进程不绑层级上下文**。层级结束会 `cancel()`，若把 service 子进程绑在该 ctx 上会被立刻杀掉；实现上在拉起前响应取消、拉起后脱离层级 ctx。
 
@@ -643,10 +649,15 @@ CLI 是 V1 永久原生管理面（不同用户对 UI 需求不同，UI 以可�
 | `gear flow register / list / inspect / validate` | Flow 注册 / 列举 / 查看 / 静态校验（仅校验不注册；`register`/`validate` 路径写 `-` 表示从 stdin 读 YAML；**`register` 支持多文档**，同样全成功或全不写） |
 | `gear flow run <id> [--var k=v ...] [--input '<json>'] [--max-parallel=N]` | 执行 Flow。**`--var`/`--input` 运行时覆盖 Flow 变量**（覆盖 Flow 声明的默认值；只作用于本次运行、**不写回 registry**，仍会被 `before_flow` Hook 进一步改写）；也可从 **stdin 管道**读 vars |
 | `gear hook register - / list / show / remove` | Hook 配置（`register` 路径写 `-` 表示从 stdin 读 YAML）。注：Hook **无独立执行命令**——它只在 Flow/step 执行时被触发 |
+| `gear scaffold tool\|flow\|hook [name] [-o <file>] [--runtime process\|lua\|go-host] [--force]` | 一键生成「可直接 register」的 Tool/Flow/Hook YAML 骨架（文件内**就地标注每个字段的用途、取值与示例**；`gear scaffold tool --help` 等子命令内嵌完整字段表/取值）。默认打印 stdout，`-o` 落盘，`-f` 覆盖已存在文件。「不知 YAML 怎么写」时替代手改示例的最快路径 |
 | `gear app run <flow>` | 把 Flow 作为受管进程启动（`mode: service` 长驻 step 用；`flow run` 遇 service step 会拒绝并提示改用它） |
 | `gear exec <flow>` | 触发 REST 执行面执行（`--addr` 指定执行面） |
 | `gear serve [--seed <yaml>] [--addr]` | 启动 REST 执行面（管理契约供 UI/程序调用，见 §11）。`--seed` 可灌入**含 Tool 与 Flow 混合**的多文档文件（按 Tool → Flow 顺序落库，因 Flow 静态校验需其 call 目标已存在）；任一对象失败则**回滚**本次全部写入 |
-| `gear ai gen flow\|tool --intent "..." [--register]` | AI 生成 Flow/Tool 草稿（`ext.ai`，见 §9） |
+| `gear ai gen flow\|tool --intent "..." [--register]` | AI 生成 Flow/Tool 草稿（`ext.ai`，见 §9）；同 `ai` 命令另含 `react`（见下）与 `capabilities` |
+| `gear ai react "<task>" [--max-steps N] [--allow http,kv] [--model/--provider/--base-url/--api-key]` | 跑 ReAct 智能体（LLM 逐步调内置/已注册工具完成任务，需联网 LLM；等价于 Tool entry 里 `ctx.ext.ai.react`） |
+| `gear ai capabilities` | 打印当前装配的原子能力目录（内核 builtin + pure 原语 + 已注册 ext.*，与 agent 提示词同源，随 extensions 配置动态变化） |
+| `gear ext <name>` | 运行内置扩展原语 sidecar（email / sms / wecom / webhook / rabbitmq / kafka / mqtt …；`echo '{"method":"...","args":{...}}' \| gear ext email` 可调试） |
+| `gear mcp [--http :port]` | 以 MCP 执行面暴露 Gear（stdio 默认；`--http` 改 streamable HTTP，端点 `/mcp`），见 §11 第四种执行面 |
 
 **统一输入约定（Unix 管道直觉，`internal/cli/input.go`）**——JSON 入参与 YAML 文件都吃管道：
 

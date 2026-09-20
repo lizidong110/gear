@@ -114,6 +114,18 @@ for pkg in $COVER_PACKAGES; do
 done
 
 echo
+echo "───── ⑦ 文档↔代码审计 tools/doc_audit.py ─────"
+# 机械 doc↔code 一致性核对（恢复当年丢失在 gitignored build/ 的脚本，已迁 tools/）：
+# ⑥ REST 端点双向核对、⑦ CLI 子命令双向核对计入闸门；① Test 名 / ② .go 路径为 advisory。
+if command -v python >/dev/null 2>&1; then
+  python tools/doc_audit.py
+  rc=$?
+  if [ "$rc" -eq 0 ]; then echo "✅ doc_audit（退出码 0）"; else echo "❌ doc_audit（exit=$rc）"; FAILED=1; fi
+else
+  echo "⚠️ 未找到 python，跳过 doc_audit（需 python3 才能跑机械审计；不会因此阻断闸门）"
+fi
+
+echo
 echo "══════════ Gate 汇总 ══════════"
 if [ "$FAILED" -eq 0 ]; then
   echo "GATE RESULT: PASS"

@@ -77,7 +77,7 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 | `model` | 核心数据模型唯一真相源 + 校验规则 |
 | `registry` | SQLite 持久化 tool/flow/hook，含删除守卫与示例 YAML 多文档加载 |
 | `engine` | 编排内核：Flow 拓扑执行、Hook 装配、runtime 分发、表达式、版本灰度 |
-| `cap` | 宿主能力层：**7 个受 capability 门禁的原语**（http/call/db/kv/secret/event/subscribe）的接口与内存实现（最小权限门禁、KV 会话作用域、事件总线、订阅生命周期）。纯函数原子（time/template/crypto）刻意不进此门禁，见 `engine/purefunc.go` |
+| `cap` | 宿主能力层：**7 个受 capability 门禁的原语**（http/call/db/kv/secret/event/subscribe）的接口与内存实现（最小权限门禁、KV 会话作用域、事件总线、订阅生命周期）。纯函数原子（time/template/crypto）刻意不进此门禁，见 `internal/engine/purefunc.go` |
 | `server` | REST 执行面：路由、并发闸门、执行记录持久化、受管 app 托管 |
 | `app` | `app run` 监管器：把一个 / 多个 Flow 变成受管进程 |
 | `cli` | CLI 管理面：cobra 命令树、`gear`/`exec`/`ai`/`mcp` 客户端、extensions 装配 |
@@ -227,6 +227,28 @@ type Hook struct {
 
 > 注：根命令暂无 `version` 子命令；版本号需经 `go build -ldflags` 注入或看 `build/gear.exe`。
 
+### 命令树（续）：`gear scaffold`（生成骨架）
+
+**`gear scaffold`** 一键生成「可直接 register」的 Tool / Flow / Hook YAML 模板，并在文件内**就地标注每个字段的用途、取值与示例**（YAML 注释），解决「不知道 YAML 怎么写」的痛点。
+
+| 子命令 | 参数 | 说明 |
+|---|---|---|
+| `tool <name>` | `-o/--output <file>`、`-f/--force`、`--runtime process\|lua\|go-host` | 生成 Tool 骨架（默认 `runtime: process`） |
+| `flow <name>` | `-o`、`-f` | 生成 Flow 骨架（起步 step 用纯函数原子 `crypto.hash`，注册即可跑通） |
+| `hook <name>` | `-o`、`-f` | 生成 Hook 骨架 |
+
+默认打印到 stdout（管道友好）；`-o` 落盘，`-f` 覆盖已存在文件。每个子命令的 `--help` 内含该资源的**完整字段表、取值与示例**（等于把本 §8 搬进命令行）。
+
+```bash
+gear scaffold tool my-tool -o my-tool.yaml && gear tool register my-tool.yaml
+gear scaffold flow my-flow -o my-flow.yaml && gear flow register my-flow.yaml
+gear scaffold hook my-hook -o my-hook.yaml && gear hook register my-hook.yaml
+# 想看某类资源的完整字段说明：
+gear scaffold tool --help
+gear scaffold flow --help
+gear scaffold hook --help
+```
+
 ---
 
 ## 5. REST API 接口
@@ -286,7 +308,7 @@ Gear 以「**能力原语**」为单位扩展：内核原语分两类（受门�
 | 类型 | kind / 标识 | 载体 | 调用协议 |
 |---|---|---|---|
 | 受门禁内核原语（builtin） | `http`/`call`/`db`/`kv`/`secret`/`event`/`subscribe` | 硬编码 Go 闭包 | `http`/`call` 位置参数；`db`/`subscribe` 单 table `ctx.db.query({driver,dsn,sql,params})` / `ctx.subscribe.start({source,config,callback})`（多后端 sqlite/mysql/postgres）；`kv`/`secret`/`event` 子表方法。**须声明 `capabilities` 才能用** |
-| 纯函数内核原语（pure） | `time`/`template`/`crypto` | 硬编码 Go 闭包（`engine/purefunc.go`） | 单具名 table，如 `ctx.time.now({format,tz})` / `ctx.crypto.hash({algo,data})` / `ctx.template.render({text,vars})`。**始终可用、无需声明 capabilities**；也可作 Flow step 直调目标（`call: crypto.hash`） |
+| 纯函数内核原语（pure） | `time`/`template`/`crypto` | 硬编码 Go 闭包（`internal/engine/purefunc.go`） | 单具名 table，如 `ctx.time.now({format,tz})` / `ctx.crypto.hash({algo,data})` / `ctx.template.render({text,vars})`。**始终可用、无需声明 capabilities**；也可作 Flow step 直调目标（`call: crypto.hash`） |
 | sidecar 子进程 | `kind=sidecar`（默认 `""`） | `CommandTransport` 起子进程 | stdin `{method,args}` → stdout 末行 `{result}`/`{error}` |
 | 进程内 Go agent | `kind=agent`（目前仅 `ext.ai`） | `InProcessExtension` 闭包 | 直接 Go 函数调用 |
 | ext.registry | 始终进程内 | `RegistryExtension` | `ctx.ext.registry.tools/flows/capabilities` |
@@ -306,9 +328,9 @@ Gear 以「**能力原语**」为单位扩展：内核原语分两类（受门�
 
 ### sidecar 子进程协议（最小实现）
 
-stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error":...}`。任意语言可充当 sidecar（见 `examples/slack-sidecar/main.go`）。
+stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error":...}`。任意语言可充当 sidecar（现存示例见 `plugin/mqtt-sidecar/main.go`）。
 
-完整示例见 `examples/slack-sidecar/main.go`（任意语言可充当 sidecar）。`ext.db` 侧车示例的源码 **已移除**（能力由内置 `db` 原语覆盖，见下），`extensions.example.yaml` 的 `ext.db` 段默认**注释**，仅作「用自定义 sidecar 承载 DB」的形态参考。
+完整 sidecar 协议示例见 `plugin/mqtt-sidecar/main.go`（任意语言可充当 sidecar，现存）。`ext.db` / `slack-sidecar` 等旧 sidecar 示例的源码 **已移除**（ext.db 能力由内置 `db` 原语覆盖，见下），`extensions.example.yaml` 的 `ext.db` 段默认**注释**，仅作「用自定义 sidecar 承载 DB」的形态参考。
 
 > **内置 `db` 已原生支持多后端（sqlite / mysql / postgres）**：`ctx.db.query/exec/ping` 接收
 > `{driver, dsn, sql, params}`，`dsn` 缺省回退引擎内存 scratch 库；mysql/postgres 需显式 `dsn`
@@ -345,6 +367,8 @@ stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error
 | `capabilities` | `[]string` | 否 | 允许使用的宿主原语，最小权限 |
 | `health_probe` | object | 否 | service 模式健康检查（`kind` http/tcp/cmd） |
 
+> **`runtime` 补充说明**：`process`=外部命令（stdin 进 JSON、stdout 末行出 JSON）；`lua`=嵌入式 Lua 脚本（`entry` 即脚本本体，沙箱，不支持 service）；`go-host`=进程内 Go 函数（`entry` 为函数名，须在 Go 代码 `engine.RegisterHostFunc("myFunc", ...)` 登记，否则注册期即拒；不支持 service）；`wasm` 已知未实现，注册期即拒。`capabilities` 合法值见上「通用写法」一节：受门禁 7 原语须声明才可用、纯函数 3 原子无需声明、`ext.*` 须 `extensions.yaml` 登记。
+
 ### Flow / Step
 
 | 字段 | 类型 | 必填 | 含义 |
@@ -369,6 +393,28 @@ stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error
 | `action` | string | 是 | 已注册 Tool id 或 Flow id |
 | `criticality` | string | 否 | `critical`(默认, 失败即终止) / `best-effort` |
 | `order` | int | 否 | 装配顺序（升序） |
+
+### 通用写法：step.call / 模板引用 / when 条件
+
+这些写法在 Flow 的 step 与 Hook 中通用，是写完一个「能跑」的 Flow 必须知道的（YAML 速查之外，也是 `gear scaffold flow --help` 的内嵌说明）：
+
+**step.call 两种写法**（解析规则见 `engine.resolveStepCall`，已注册 Tool 优先）：
+1. 已注册 Tool 的 id（如 `my-tool`）；
+2. 原子能力直调「能力.方法」（如 `crypto.hash` / `http.Request` / `kv.put` / `db.query` / `ext.ai.complete` / `call.Call`）——免去为用一次原语先注册一层 Tool 包装；此时 `input` 即该方法的参数表，输出统一为 `{result: <返回值>}`。
+
+   直调原子分三类（与方法级 schema 共用同一份静态校验，见 `builtinCapabilitySchemas`）：
+   - 受门禁内核原语（http/call/db/kv/secret/event/subscribe）：须 Tool 声明 `capabilities` 才可用；
+   - 纯函数原子（time/template/crypto）：始终可用、无需声明；
+   - 扩展原语 `ext.*`：须 `extensions.yaml` 登记，方法名/参数写错**注册期即拒**（不拖到运行期）。
+
+**模板引用**（只出现在 `step.input` 的值里；合法前缀仅 `vars`/`steps`/`secrets`，注册期校验）：
+- `${vars.x}`：Flow 变量（x 须是 `Flow.Vars` 顶层键；`flow run --var` 可覆盖）；
+- `${steps.id.output.field}`：上游 step 出参（id 须存在；出现即隐式 `depends_on`）；
+- `${secrets.name}`：密钥（运行期从 `GEAR_SECRET_<NAME>` 或 `/api/secrets` 取，**明文绝不落库、任何端点不回明文**）。
+
+**when 条件执行**（step 级，表达式而非模板）：用表达式引擎求值，三态 skip（跳过 ≠ 失败）。
+例如 `when: "steps.s1.output.n > 1"`、`when: "steps.hash.output.result != ''"`。
+红线：`when` 里**不能**写 `${...}` 模板——表达式与模板是两套语法，必须分离。
 
 ### 关键环境变量
 
@@ -411,6 +457,23 @@ curl http://127.0.0.1:8787/api/executions/<id>                                  
 gear app run service_flow --restart always
 ```
 
+**不会写 YAML？用 `gear scaffold` 从零生成骨架**：它产出一份带字段注释、且能直接 register 的模板，不用先去翻文档：
+
+```bash
+# 生成三类骨架（默认打印到 stdout，-o 落盘，-f 覆盖已存在文件）
+gear scaffold tool my-tool -o my-tool.yaml        # 默认 runtime=process；--runtime lua|go-host 切换
+gear scaffold flow my-flow -o my-flow.yaml        # 起步 step 用 crypto.hash，注册即可跑通
+gear scaffold hook my-hook -o my-hook.yaml
+
+# 填好 TODO 注释后直接注册、运行
+gear tool register my-tool.yaml
+gear flow register my-flow.yaml
+gear flow run my-flow --var topic=world
+
+# 每个子命令 --help 内含该资源的完整字段表、取值与示例
+gear scaffold tool --help
+``````
+
 **统一输入约定（Unix 管道）**：
 ```bash
 cat vars.json | gear flow run demo
@@ -438,10 +501,8 @@ gear serve --seed examples/news-top10.yaml
 
 ### 真实例子
 
-- **news-demo**（零 LLM、零 mock，真实抓取百度热搜 Top10）：
+- **真实抓取百度热搜 Top10**（零 LLM、零 mock，用内置示例 `examples/news-top10.yaml`；旧 `examples/news-demo` Go 示例**已移除**）：
   ```bash
-  go run ./examples/news-demo          # 开内存 registry → 加载示例 → 注册 → RunFlowResult("news.top10")
-  # 或：
   gear serve --seed examples/news-top10.yaml && curl http://127.0.0.1:8787/api/news
   ```
 - **连各种数据库**：直接用内置 `db` 原语，**不需要 sidecar**——Tool 声明 `capabilities:[db]`，Lua 内：
@@ -459,7 +520,7 @@ gear mcp
 
 - 含 `mode: service` 长驻 step 的 Flow **必须** `gear app run`，`flow run` 会显式拒绝。
 - `--var` / `--input` 的运行时覆盖**只作用于本次运行，不写回 registry**。
-- `build/` 下是本地编译产物（不入库）：`gear.exe` 用 `go build -o build/gear.exe ./cmd/gear`；`examples/` 下的 Go 示例（`news-demo` / `slack-sidecar` / `gear-ai-sidecar`）同样需自行 `go build`。
+- `build/` 下是本地编译产物（不入库）：`gear.exe` 用 `go build -o build/gear.exe ./cmd/gear`。`examples/` 下的旧 Go 示例（`news-demo` / `slack-sidecar` / `gear-ai-sidecar`）**已整体移除**，无需再 build。
 
 ---
 
@@ -484,7 +545,7 @@ gear mcp
 | `REQUIREMENTS.md` | 需求可追溯矩阵（可执行规格契约），为每条 PRD 行为打需求 ID + 状态 + 断言测试 |
 | `GEAR_工程方法_v1.md` | 交付宪法：17 条红线与质量闸门，贡献代码前必读 |
 | `extensions.example.yaml` | 扩展原语配置模板（复制为 `extensions.yaml` 启用自定义扩展） |
-| `examples/` | 示例 YAML（hello / sleeper / service / news-top10）、Go 示例（slack-sidecar / news-demo / gear-ai-sidecar）、AI 配方（`examples/ai/recipes/*.yaml`） |
+| `examples/` | 示例 YAML（hello / sleeper / service / news-top10）、AI 配方（`examples/ai/recipes/*.yaml`）；旧 Go 示例（slack-sidecar / news-demo / gear-ai-sidecar）**已移除** |
 
 ---
 

@@ -31,7 +31,7 @@ func newRootCmd() *cobra.Command {
 	root.PersistentFlags().StringVar(&serverAddr, "addr", defaultAddr(),
 		"REST 执行面地址（默认 127.0.0.1:8787，可用 GEAR_ADDR 覆盖）")
 
-	root.AddCommand(toolCmd(), flowCmd(), appCmd(), hookCmd(), serveCmd(), execCmd(), aiCmd(), mcpCmd(), extCmd())
+	root.AddCommand(toolCmd(), flowCmd(), appCmd(), hookCmd(), serveCmd(), execCmd(), aiCmd(), mcpCmd(), extCmd(), scaffoldCmd())
 	return root
 }
 

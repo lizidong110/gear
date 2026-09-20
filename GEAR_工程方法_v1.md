@@ -67,7 +67,7 @@ gear/
 
 **约定**
 - 所有校验报错用 **golden 文件**（`testdata/*.golden`）比对，保证错误信息稳定、可评审。
-- 测试命名：`Test<包>_<场景>_<预期>`，例 `TestEngine_WhenFalse_SkipStep`。
+- 测试命名：`Test<场景>_<预期>`（实际代码不写包名前缀），例 `TestWhenFalseSkipsStep`。
 - 不可达分支（如 `default` 防御）用显式注释 + `t.Error("unreachable")` 兜底，避免"假覆盖"。
 
 ---
@@ -132,6 +132,8 @@ gear/
 - **M-KV-LIFECYCLE（KV 生命周期维度）** ✅（2026-09-13）：`kv` 原语增 `Scope`（`global` 进程级持久 / `session` 绑定 flow 执行跨 step 共享）+ `SessionRegistry`（引用计数回收，run 结束归零即删命名空间）；`engine.run` 按 flow.ID 做 `Acquire`/`defer Release`，`hostForChain` 把 sessionID 设为 flow.ID；`lua` ctx.kv 增可选 scope 参数（缺省 global，向后兼容）；全部内存态、重启即失（显式满足 §0 第14条）。覆盖 T-kv-01..05（`cap_test.go`）、E-kvl-01..02（`kv_session_test.go`）。
 - **M-EXT-AI（AI 去内置化 → ext.ai 扩展）** ✅（2026-09-14）：移除 built-in `internal/ai`（包已删）；新增 `examples/gear-ai-sidecar`（Go 实现，SiliconFlow 默认 + Ollama 兜底，key 走 sidecar 环境变量）承载**稳定原语**：`complete`（参数化 LLM，provider/model/base_url/api_key/temperature/format 任意模型、`mock` 离线）、`catalog`（BM25 域内检索）、`domains`（按 namespace 归类）、`validate`（复用 `ValidateFlowStatic`）；**多阶段 agent 编排（能力域概览 → LLM 拆解 → 域内检索 → 组装 Flow/Tool → 校验 → ≤N 次重来 → 人工确认/注册）于 2026-09-14 第十三次重构全部移入 Lua（`examples/ai-create-flow.yaml` 的 `ai-gen` 入口），改 agent 行为不重编 Go**；引擎侧 `ext.ai` 经 `SidecarExtension` 接线（`engine.AIExtension` + `ctx.ext.ai.complete/catalog/domains/validate`，未声明即 `ErrCapabilityDenied`）+ 静态校验；server/cli 默认装配 `ext.ai`（sidecar 二进制缺失时 fail-closed 返回 `ErrCapabilityUnavailable`）；参考 Flow `examples/ai-create-flow.yaml`（注入 `tool_id+desc+schema`）+ 薄 CLI 壳 `gear ai gen flow|tool [--register]`；PRD §9 翻 `implemented (as ext.ai)`、REQ-API-AI 翻 `ext`；`ext.ai` 单测（`TestExtAIReachable`/`TestExtAINotDeclaredDenied`）+ sidecar 内部测试（mock LLM，覆盖成功/重试/全失败/校验拒未知工具/域概览检索/normalize）。复用 M-KV-LIFECYCLE 的 session 作用域做 agent 中间态跨 step 缓存。
 
+- **（注，2026-09-15 整体删除）**：`examples/gear-ai-sidecar` 示例与 `gear-ai-sidecar.exe` 已于本日整体删除；ext.ai 改为**进程内扩展**（无独立 sidecar 二进制，二进制缺失时 fail-closed 回 `ErrCapabilityUnavailable`）。本文件 M-EXT-AI / M-EXT-AI-LAYER / 第十六次真机验证等小节中出现的 `examples/gear-ai-sidecar/*` 与 `gear-ai-sidecar.exe` 均为当时记录，非现状；agent 编排现活在 Lua `examples/ai-create-flow.yaml` 的 `ai-gen` 入口。
+
 ---
 
 ## 5. 质量闸门（CI，解决"怎么保证没 bug"）
@@ -167,12 +169,12 @@ gear/
 
 1. **按「未覆盖语句数」排序定位，而不是按文件/按百分比**。
    `go tool cover -func` 只给每个函数的百分比，看不出大函数的哪个分支没跑到。
-   用 `python build/cov_report.py <coverprofile> [topN]`：先按**未覆盖语句数**倒序列文件与函数，
+   用 `python tools/cov_report.py <coverprofile> [topN]`：先按**未覆盖语句数**倒序列文件与函数，
    加 `lines` 参数还能直接打印未覆盖块的源码行。本轮就是这样定位到
    `ai_llm.go`（265 条全 0%）、`cap/secretstore.go`（56 条全 0%）、`mcp.ServeHTTP`（12 条全 0%）等单点。
 2. **每条新测试都要做负向验证**（改坏实现 → 测试必须变红 → 还原 → 必须变绿）。
    只跑「绿灯」证明不了测试有效：断言写反、分支写错的测试同样显示 PASS。
-   用 `python build/negcheck.py <文件> <旧片段> <新片段> <包> [测试名...]` 一条命令完成，
+   用 `python tools/negcheck.py <文件> <旧片段> <新片段> <包> [测试名...]` 一条命令完成，
    并强制校验文件已逐字节还原（防「改坏了没还原」）。本轮 12 条新测试全部经此验证。
 
 > 环境坑（会伪装成代码回归）：Windows 的 Git-Bash / CI 沙箱里 PATH 常不含 `sh`，
@@ -592,7 +594,7 @@ gear/
 - **改了什么**
   - **`ctx.json` 引擎内建稳定原语**（`internal/engine/lua.go`）：`decode(str) → table|nil,err`、`encode(table) → string`。gopher-lua 不带 json，原先 `ctx.http.Request` 返回字符串 body 无法结构化——这是所有 http 工具的命脉，故作为随引擎编译的静态能力无条件提供（不属 capabilities 门禁）。复用既有 `toLuaValue`/`fromLuaValue`。
   - **真实 worker 示例 `examples/news-top10.yaml`**：Tool `news.fetch`（Lua + `capabilities:[http]`，`ctx.http.Request` 抓百度热搜榜真实接口 `top.baidu.com/api/board?platform=wise&tab=realtime`，`ctx.json.decode` 解析 `data.data.cards[].content[].content[]` 取 Top10：`rank/title/url/hot`）+ Flow `news.top10`（单步调 `news.fetch`）。**零 LLM、零 mock、真实网络**。
-  - **独立演示 `examples/news-demo/main.go`**：开内存 registry → `registry.LoadExamples` 解析 YAML → 注册 → `engine.RunFlowResult("news.top10")` → 打印真实 Top10（`go run ./examples/news-demo` 实测抓到真实榜单）。
+  - **独立演示 `examples/news-demo/main.go`（示例目录已移除）**：开内存 registry → `registry.LoadExamples` 解析 YAML → 注册 → `engine.RunFlowResult("news.top10")` → 打印真实 Top10（当时 `go run ./examples/news-demo` 实测抓到真实榜单；该示例现已移除，等效行为由 `examples/news-top10.yaml` + `gear serve --seed` 承载）。
   - **`GET /api/news` 端点**（`internal/server/server.go`）：同步 `RunFlowResult("news.top10")` 取 step `gen` 的 `output`，附 `served_at` 时间戳返回；Flow 未注册 → 404（提示用 `--seed`）。
   - **`gear serve --seed <yaml>`**（`internal/cli/serve.go`）：启动时把示例 Tool/Flow 灌入注册表，使 `/api/news` 开箱即用；共享解析器 `registry.LoadExamples`（多文档 YAML，按 `steps` 区分 Flow/Tool）。
   - **复用既有能力**：`defaultProviders()` 已自带 HTTP 客户端，故 `ctx.http` 在 `engine.New(reg)` 下即可用；`RunResult.Steps[stepID]["output"]` 取工具返回值。
@@ -652,7 +654,7 @@ gear/
   - `gear tool run db.people --input '{"dsn":"./demo-people.db","city":"北京"}'` → 参数化查询返回 1 行。
   - 缺必填字段 → `input 校验失败: ... missing properties: 'dsn'`（fail-closed，不静默）。
   - `gear flow run demo-db-people --var city=北京` → INSERT+SELECT 均按「北京」执行；随后 `flow inspect` 确认 registry 里仍是 `city: 上海`（**未写回**）。
-  - 测试：`internal/engine/runtool_test.go`（`TestRunTool` / `TestRunToolRejectsInvalidInput` / `TestRunToolUnknown` / `TestRunFlowWithVars`，后者额外断言「不写回 registry」）+ `internal/cli/cli_test.go` 的 `TestBuildToolInput`（三种给法 + 混用/非法 JSON/非法 k=v/空输入）。
+  - 测试：`internal/engine/runtool_test.go`（`TestRunTool` / `TestRunToolRejectsInvalidInput` / `TestRunToolUnknown` / `TestRunFlowWithVars`，后者额外断言「不写回 registry」）+ `internal/cli/cli_tool_test.go` 的 `TestToolRunExecutesAndPrintsOutput`（三种给法 `--input`/`--input-file`/`--arg` 均覆盖）+ `internal/cli/cli_test.go` 的 `TestResolveInput`（解析层：混用/非法 JSON/非法 k=v/空输入）。
 - **文档**：PRD §14.6 CLI 管理面表按**实际命令树**修正（原表把 `tool unregister/inspect`、`flow save`、`gear secret` 等写错或已不存在），并补 `tool run` 与 `flow run --var` 两行。
 - **验证**：`go build ./...` 通过；受影响包测试全绿；gofmt 已应用。
 

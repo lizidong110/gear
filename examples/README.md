@@ -14,3 +14,16 @@
 | `sleeper_tool.yaml` | 示例 Tool：`sleep` 工具，供 `service_flow.yaml` 调用。 |
 | `ai-create-flow.yaml` | `gear ai gen` 的 `ai-gen` 配方来源（含 `ai-gen` Tool 的 Lua entry，是生成逻辑的单一真相源）。 |
 | `news-top10.yaml` | `gear serve --seed examples/news-top10.yaml` 灌入的 `news.top10` Flow + `news.fetch` Tool 示例，提供 `/api/news` 演示。 |
+
+## 不会写 YAML？用 `gear scaffold`
+
+如果不知道某种资源怎么写，直接用命令生成带注释、且能直接 `register` 的骨架，比从示例改更快：
+
+```bash
+gear scaffold tool my-tool -o my-tool.yaml     # --runtime lua|go-host 切换 runtime
+gear scaffold flow my-flow -o my-flow.yaml
+gear scaffold hook my-hook -o my-hook.yaml
+gear scaffold tool --help                       # 内嵌完整字段表 / 取值 / 示例
+```
+
+生成物填好 `TODO` 注释后即可 `gear tool register` / `flow register` / `hook register`。
