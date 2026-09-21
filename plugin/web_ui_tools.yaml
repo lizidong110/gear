@@ -1,0 +1,46 @@
+# Web UI 起服 Flow 用到的 Tool（配套 Flow 见 plugin/web_ui_flow.yaml）。
+#
+# 注册：gear tool register --registry <db> plugin/web_ui_tools.yaml
+#（本文件只含 Tool。tool register / flow register 都不接受 Tool+Flow 混合文件，
+#  故 Flow 单独放 plugin/web_ui_flow.yaml。）
+
+# 排序锚点：engine 明确拒绝「依赖 service step」（service 永不结束，supervise.go 会报错），
+# 而「把 ext.serve 的 /start 下发出去」必须等侧车就绪。用本 once 步作为 depends_on 目标，
+# 把 site step 推到下一层 —— 同层并发、跨层串行，据此保证 /start 时侧车已在监听。
+id: web_ui.anchor
+name: Web UI 起服排序锚点
+description: once 占位步（返回 {ready:true}）。唯一作用：作为 depends_on 目标，把 /start 步推到侧车就绪之后的下一层。
+runtime: lua
+capabilities: []
+input_schema:
+  type: object
+  properties: {}
+output_schema:
+  type: object
+  properties:
+    ready: {type: boolean, description: "恒为 true"}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  -- 不做任何事：只提供一个「已完成」的依赖点，用于分层。
+  return { ready = true }
+
+---
+# UI 的后端（其「后台」）：用 process 长驻起 gear REST 执行面。
+#
+# entry 与 --registry 都是相对路径，**须从仓库根目录**启动本 Flow（gear app run ...）才有意义。
+id: web_ui.api
+name: Gear REST 后端（web-ui 的后台）
+description: 以 process 长驻方式启动 gear REST 执行面（/api/**），作为 web-ui 的后台。默认监听 127.0.0.1:8787。
+runtime: process
+entry: "build/gear.exe serve --registry build/ui-registry.db --addr 127.0.0.1:8787"
+input_schema:
+  type: object
+  properties: {}
+output_schema:
+  type: object
+  properties: {}
+versions:
+  - version: "1.0.0"
+    state: stable

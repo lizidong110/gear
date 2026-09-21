@@ -1,0 +1,47 @@
+# web_ui.up：一个 Flow 把 web-ui（静态站）与它的后端一起跑起来。
+#
+# 四个 step（两个长驻 + 两个一次）：
+#   · serve  —— mode: service，call: ext.serve。ext.serve 是 service ext，SetupExtensions
+#               会为它生成一个虚拟 process Tool；service step 引用它即走 coord 握手
+#               拉起并「持有」serve-sidecar 侧车（占用列表非空 → 侧车不被 OnEmpty 回收）。
+#   · api    —— mode: service，call: web_ui.api。process 长驻起 gear REST 后端（/api）。
+#   · anchor —— once，call: web_ui.anchor。排序锚点：service step 不能作为依赖，
+#               用本步把 site 推到下一层，确保 /start 时侧车已就绪。
+#   · site   —— once，call: static_site.serve。向侧车下发 /start：把 dist 托管到 :8080，
+#               并把 /api 反代到后端 8787（proxy 规则）——静态与接口同源，UI 才真连得上内核。
+#
+# 注册：gear flow register --registry <db> plugin/web_ui_flow.yaml
+# 运行：GEAR_EXT_CONFIG=plugin/extensions.yaml \
+#         gear app run web_ui.up --registry build/ui-registry.db
+#（须从仓库根目录运行：web_ui.api 的 entry 与 site 的 dir 皆为相对路径。）
+#
+# 前置：build/gear.exe、build/serve-sidecar.exe 已构建（go build）。
+id: web_ui.up
+name: Web UI 起服（静态站 + 后端，同源）
+description: 用 ext.serve 把 web-ui 的 dist 托管为静态站并把 /api 反代到后端，用 process 起 gear REST 后端；一个 Flow 管两个长驻服务，静态与接口同源。
+steps:
+  - id: anchor
+    call: web_ui.anchor
+    input: {}
+  # 长驻 1：ext.serve 侧车（类 nginx 的静态网站服务），持有占用使其不被回收。
+  - id: serve
+    call: ext.serve
+    mode: service
+    input: {}
+  # 长驻 2：gear REST 后端（web-ui 的后台）。
+  - id: api
+    call: web_ui.api
+    mode: service
+    input: {}
+  # 一次：下发 /start，把 dist 托管出去（依赖 anchor → 落在下一层，侧车必已就绪），
+  # 并把 /api 反代到后端（UI 是同源应用：dev 时由 vite proxy 承担这层，生产就是这里）。
+  - id: site
+    call: static_site.serve
+    depends_on: [anchor]
+    input:
+      port: 8080
+      dir: build/dist
+      host: 127.0.0.1
+      proxy:
+        - path: /api
+          target: http://127.0.0.1:8787
