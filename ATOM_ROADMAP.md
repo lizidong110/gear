@@ -49,7 +49,7 @@
 > ✅ `ext.email` / `ext.webhook` / `ext.wecom` 已于 2026-09-17 落地，**并以 Go 单二进制载体 `gear ext <name>` 实现**
 > （取代原先 Python sidecar——免去 pip 装镜像包、分发带解释器的痛点；引擎零改动，仅 `extensions.yaml`
 > 的 `cmd` 切到 `["build/gear.exe","ext",<name>]`）。`plugin/verify.py` 端到端 **24/24 全绿**（2026-09-19）：
-> webhook 真实接收 / webhook.listen 监听入站 URL 回推 / email log 落盘 / email read·list（IMAP）/
+> webhook 真实接收 / webhook.subscribe 监听入站 URL 回推 / email log 落盘 / email read·list（IMAP）/
 > wecom 失败 fail-closed / Gear 链路跑通 / rabbitmq·kafka 无 broker fail-closed / sms 真实 POST /
 > **consume 直接调用（pull/push）** / 红线校验（含 `/caps` 声明↔实现）/ 注册表含 6 ext。
 >
@@ -69,11 +69,19 @@
 >   「yaml 能声明一个侧车根本没实现的方法」的缺口。
 > - 说明：`internal/ext/*.go`（如 `internal/ext/kafka.go` 只有 `produce`）是**非 service（once/CommandTransport）路径**的
 >   handler；service ext 声明了 `listen`，能力调用全走侧车（`internal/engine/extensions.go`），故进程内 handler 不参与——不是缺口，但易误读。
+>
+> **2026-09-21 协调地址收敛为单一真相源（`listen`）**：service ext 的 `listen` 此前有两份独立定义——
+> yaml 的 `listen`（引擎用它去连）与侧车 `os.Getenv("COORD_ADDR")` 的默认值（侧车用它 bind），
+> 改任意一处都变成「引擎连 A、侧车听 B」的静默失联。现在引擎在拉起侧车时按 `listen` 注入
+> `COORD_ADDR`（侧车默认值降级为手工单跑兜底），且 `health_probe.addr` 省略即取 `listen`、
+> 显式不一致则装配期 fail-closed（探错地址 → 监管无限重启）。实现：
+> `internal/engine/extensions.go:prepareServiceExt`；守卫：`extensions_test.go` 6 例（含探针一致性）；
+> 权威/示例 yaml 的 service ext 段已不再写 probe 的 `addr`。
 
 | 原子 | 桥接 | 状态 | 验收标 |
 |---|---|---|---|
 | `ext.email` | SMTP（含 TLS） | ✅ 已落地 | `ctx.ext.email.send({to,subject,body})` 真实发信（SSL/STARTTLS，dev `log` 后端落盘自测）；`ctx.ext.email.read` / `ctx.ext.email.list`（IMAP 一次型，连取即关）补齐收件能力 |
-| `ext.webhook` | 任意 HTTP 回调 | ✅ 已落地 | `ctx.ext.webhook.send({url, payload, headers})` 真实 POST JSON；`ctx.ext.webhook.listen({path, callback_url})` 经常驻侧车监听入站 URL 并回推事件 |
+| `ext.webhook` | 任意 HTTP 回调 | ✅ 已落地 | `ctx.ext.webhook.send({url, payload, headers})` 真实 POST JSON；`ctx.ext.webhook.subscribe({path, callback_url})` 经常驻侧车监听入站 URL 并回推事件 |
 | `ext.wecom` | 企业微信（群机器人） | ✅ 已落地 | `ctx.ext.wecom.send({key, content, msgtype})` text/markdown |
 | `ext.ai`（即 LLM 原子） | 大模型（进程内 Eino agent） | ✅ 内核已内建 | **无需新建 `ext.llm`**——`ext.ai` 始终注册，`ctx.ext.ai.complete/catalog/validate/generate/capabilities/react` 直接可用 |
 
@@ -88,7 +96,7 @@
 ### Phase 3 — 数据/文件/身份/检索
 | 原子 | 桥接 | 理由 | 验收标 |
 |---|---|---|---|
-| `ext.serve` | 静态网站服务（类 nginx） | 给定一个端口 + 静态目录，起 HTTP 服务即可在浏览器访问 | `start({port,dir,host})` 起服并返回 URL / `stop()` 释放端口；目录不存在、缺参 fail-closed；`plugin/verify.py` 已覆盖起服→访问→停止 |
+| `ext.serve` | 静态网站 + 反向代理（类 nginx） | 给定一个端口 + 静态目录，起 HTTP 服务即可在浏览器访问；带 `proxy` 规则时把某些前缀（如 `/api`）反向代理到后端，**静态与接口同源**（dev 下 Vite 代理的生产等价物） | `start({port,dir,host,proxy})` 起服并返回 URL（含生效规则回显）/ `stop()` 释放端口；`proxy=[{path,target,strip_prefix}]` 最长前缀优先、`path` 非法或 `target` 非 http(s) 则 fail-closed、后端不可达返回 502；目录不存在、缺参 fail-closed；`plugin/verify.py` 已覆盖起服→访问→停止 + 反代转发/静态回落/非法规则拒绝 |
 | `ext.s3` / `ext.minio` / `ext.oss` | 对象存储 | 附件/文件类业务（合同/头像/导出） | put/get/delete 对象 |
 | `ext.ldap` / `ext.oauth` / `ext.sso` | 企业身份 | 对接现有账号体系、做审批人校验 | 查用户/校验令牌 |
 | `ext.embedding` / `ext.vector` | 向量库 | RAG/语义检索，配合 `ext.llm` | embed / upsert / search |

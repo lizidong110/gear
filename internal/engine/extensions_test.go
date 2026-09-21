@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gear/internal/cap"
@@ -390,5 +391,115 @@ func TestRegistryCapabilities(t *testing.T) {
 	dbMethods := dbSum["methods"].(map[string]MethodSchema)
 	if q, ok := dbMethods["query"]; !ok || !q.Parameters["sql"].Required {
 		t.Fatalf("ext.db.query.sql 应必填: %v", dbMethods)
+	}
+}
+
+// ───────── service ext：协调地址的唯一真相源（extensions.yaml 的 listen） ─────────
+
+// serviceExtYAML 生成一段最小可用的 service ext 配置（schemas 必填是红线，不能省）。
+// probeAddr 为空 = 不写 health_probe.addr，用于验证「省略即取 listen」。
+func serviceExtYAML(name, listen, probeAddr string) string {
+	y := name + ":\n" +
+		"  cmd: [\"echo\"]\n" +
+		"  methods: [ping]\n" +
+		"  service: true\n" +
+		"  listen: \"" + listen + "\"\n" +
+		"  health_probe:\n    kind: tcp\n"
+	if probeAddr != "" {
+		y += "    addr: \"" + probeAddr + "\"\n"
+	}
+	return y + "  schemas:\n    ping:\n      parameters: {}\n"
+}
+
+// setupServiceExt 装配一个 service ext，返回它被包成的虚拟 process Tool（装配失败返回 err）。
+func setupServiceExt(t *testing.T, name, listen, probeAddr string) (*model.Tool, error) {
+	t.Helper()
+	capReg := NewCapabilityRegistry()
+	reg := newTestRegistry(t)
+	t.Cleanup(func() { reg.Close() })
+	if _, err := SetupExtensions(capReg, reg, writeExtConfig(t, serviceExtYAML(name, listen, probeAddr))); err != nil {
+		return nil, err
+	}
+	tool, err := reg.GetTool(name)
+	if err != nil {
+		t.Fatalf("service ext 应包成虚拟 process Tool: %v", err)
+	}
+	return tool, nil
+}
+
+// TestServiceExtEntryInjectsCoordAddr：引擎拉起 service ext 时必须把 extensions.yaml 的
+// listen 以 COORD_ADDR 注入侧车进程环境——这是「listen 是协调地址唯一真相源」的落点。
+// 没有它，yaml 的 listen 与侧车 os.Getenv("COORD_ADDR") 的默认值就是两份独立定义：
+// 改任意一处都会变成「引擎连 A、侧车听 B」，进程都活着却永远连不上（静默失联）。
+func TestServiceExtEntryInjectsCoordAddr(t *testing.T) {
+	tool, err := setupServiceExt(t, "ext.svc", "127.0.0.1:8090", "127.0.0.1:8090")
+	if err != nil {
+		t.Fatalf("合法 service ext 应装配成功: %v", err)
+	}
+	want := "COORD_ADDR='127.0.0.1:8090'"
+	if !strings.HasPrefix(tool.Entry, want) {
+		t.Fatalf("Entry 必须以 %s 作前缀（否则该赋值不属于本条命令），实际 %q", want, tool.Entry)
+	}
+	if !strings.Contains(tool.Entry, "echo") {
+		t.Fatalf("Entry 应保留原 cmd，实际 %q", tool.Entry)
+	}
+}
+
+// TestServiceExtProbeAddrDefaultsToListen：探针 addr 省略即取 listen（侧车静态可知的
+// 监听地址只有协调端口这一处）。堵的是「改了 listen 忘了改探针地址」——那会让监管
+// 把活着的侧车判死并无限重启（与 service 重启循环同一故障形态）。
+func TestServiceExtProbeAddrDefaultsToListen(t *testing.T) {
+	tool, err := setupServiceExt(t, "ext.svc", "127.0.0.1:8091", "")
+	if err != nil {
+		t.Fatalf("装配失败: %v", err)
+	}
+	if tool.HealthProbe == nil || tool.HealthProbe.Addr != "127.0.0.1:8091" {
+		t.Fatalf("探针 addr 应自动取 listen，实际 %+v", tool.HealthProbe)
+	}
+}
+
+// TestServiceExtProbeAddrMismatchRejected：探针地址与 listen 显式不一致 → 装配期即拒，
+// 不留到运行期变成「无限重启」。
+func TestServiceExtProbeAddrMismatchRejected(t *testing.T) {
+	if _, err := setupServiceExt(t, "ext.svc", "127.0.0.1:8092", "127.0.0.1:9999"); err == nil {
+		t.Fatal("探针 addr 与 listen 不一致应被拒绝")
+	}
+}
+
+// TestServiceExtProbeAddrEquivalentHostAccepted：写法不同但等价（localhost ↔ 127.0.0.1）
+// 不应被误判为不一致。
+func TestServiceExtProbeAddrEquivalentHostAccepted(t *testing.T) {
+	if _, err := setupServiceExt(t, "ext.svc", "127.0.0.1:8093", "localhost:8093"); err != nil {
+		t.Fatalf("等价主机名不应被拒绝: %v", err)
+	}
+}
+
+// TestPrepareServiceExtWithoutListenIsNoop：无 listen（纯 daemon 守护，引擎不主动调它）
+// 时不注入 COORD_ADDR、也不改探针，Entry 原样拼接 cmd。
+func TestPrepareServiceExtWithoutListenIsNoop(t *testing.T) {
+	probe := &model.HealthProbe{Kind: model.ProbeKindTCP, Addr: "127.0.0.1:1"}
+	entry, got, err := prepareServiceExt(ExtSpec{Cmd: []string{"echo", "hi"}, HealthProbe: probe})
+	if err != nil {
+		t.Fatalf("无 listen 不应报错: %v", err)
+	}
+	if entry != "echo hi" {
+		t.Fatalf("Entry 应原样拼接 cmd，实际 %q", entry)
+	}
+	if got != probe {
+		t.Fatal("无 listen 时探针应原样透传")
+	}
+}
+
+// TestCoordAddrKeyNormalizes：地址键归一——等价主机不误判，端口差异必须判出，
+// 不可解析时退回小写字面量。
+func TestCoordAddrKeyNormalizes(t *testing.T) {
+	if coordAddrKey("127.0.0.1:8090") != coordAddrKey("localhost:8090") {
+		t.Fatal("127.0.0.1 与 localhost 应视为同一目标")
+	}
+	if coordAddrKey("127.0.0.1:8090") == coordAddrKey("127.0.0.1:8091") {
+		t.Fatal("端口不同不应视为同一目标")
+	}
+	if got := coordAddrKey("NoPort"); got != "noport" {
+		t.Fatalf("不可解析的地址应退回小写字面量，实际 %q", got)
 	}
 }

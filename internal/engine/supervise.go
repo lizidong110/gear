@@ -71,6 +71,10 @@ type SuperviseResult struct {
 // Supervise 执行 once 步骤并拉起 service 步骤，返回句柄（不阻塞等待）。
 // 实际阻塞 / 重启 / 信号处理由 app.Supervisor 负责（PRD §14.2 / §14.3）。
 //
+// 执行期若任一 step 出错（含某 service 启动失败），已拉起的长驻 service 会在返回 error 前
+// 被 stopStartedServices 回收——它们用 context.Background() 起、不随层级 ctx 取消，若在此
+// 不回收即成孤儿进程（见该函数的注释）。
+//
 // 约束（F3 严格守卫）：
 //   - service step 不能作为任何 step 的依赖（它永不「完成」，依赖它无意义）
 //   - service 与 once 共用同一 runtime 分发（runtimeFor）；未实现 runtime 由 runtimeFor 统一报错，
@@ -185,7 +189,13 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			// 部分步骤失败（某 step 执行出错 / 某 service 启动失败）：已拉起的长驻 service
+			// 用 context.Background() 起、脱离层级 ctx（见 startServiceStep：层结束的
+			// cancel() 杀不到它），若不在此显式回收就会脱离监管成孤儿进程
+			//（用户 2026-09-21 实测：flow 内两 serve，site 失败 → api(pid=8512) 残留）。
+			// 返回 res（含已回收句柄）便于上层 / 测试观测，且即使上层忽略 res 也不泄漏。
+			e.stopStartedServices(res)
+			return res, err
 		}
 	}
 
@@ -195,6 +205,22 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 		fmt.Printf("✓ Flow %s 执行完成（纯 once），共 %d 步\n", flowID, len(flow.Steps))
 	}
 	return res, nil
+}
+
+// stopStartedServices 回收本次 Supervise 已拉起的全部 service 子进程（Flow 执行失败时调用，
+// 防长驻进程脱离监管成孤儿）。service ext 还会 Deregister 自身 PID（Coord.Close，占用列表空
+// 则侧车自动退出，见 EXT_SERVICE_DESIGN.md §12）。
+func (e *Engine) stopStartedServices(res *SuperviseResult) {
+	if len(res.Services) == 0 {
+		return
+	}
+	fmt.Printf("• 清理 %d 个已启动的 service（Flow 执行失败，防孤儿进程）\n", len(res.Services))
+	for _, h := range res.Services {
+		_ = h.ProcKill()
+		if h.Coord != nil {
+			_ = h.Coord.Close()
+		}
+	}
 }
 
 // Relaunch 重启一个已退出的 service step（restart=always 时由 Supervisor 调用）。

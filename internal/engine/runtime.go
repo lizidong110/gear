@@ -30,6 +30,17 @@ type Process interface {
 	Wait() error
 }
 
+// ExitReporter 是 Process 的**可选**扩展：能报出「退出码 + 输出尾部」的进程实现它。
+//
+// 为什么需要单列一个接口：service 子进程的输出不继承调用方管道（红线 16），
+// 若不给监管一个出口，「拉起即秒退」类故障（端口被占、配置写错）只会表现为无限重启，
+// 原因完全不可见（2026-09-21 实测）。监管侧按类型断言取用，未实现者退化为
+// 「只会说退出了」——绝不静默假装拿到了原因。
+type ExitReporter interface {
+	// ExitInfo 返回退出码与输出尾部若干行；退出码不可知时报 -1（不伪装成 0）。
+	ExitInfo() (code int, tail []string)
+}
+
 // runtimeFor 按 Tool.Runtime 返回对应适配器。
 //
 // 「已实现」判定以 model.ImplementedRuntimes 为**唯一来源**（C），本函数不再维护第二份白名单：

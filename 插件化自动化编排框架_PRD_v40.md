@@ -483,7 +483,16 @@ local r = ctx.ext.db.query({ driver = "postgres", dsn = ctx.input.dsn,
 - **`--registry` 是 gear 的「目录库」，不是你应用的数据库**。默认 `~/.gear/registry.db`；gear 会在此文件建 `tools`/`flows`/`hooks` 三张表。若你把它指向业务库（如 `--registry ./myapp.db`），gear 会把注册表建进你的库里——CLI 检测到该文件含非 gear 表时会打印警告（不阻断）。`ext.db` 要连的业务库用 `driver`/`dsn` 传给 sidecar，**与 `--registry` 是两回事**。
 - **Tool 用 `gear tool register`，Flow 用 `gear flow register`**。用错子命令时（如把 Tool YAML 交给 `flow register`），CLI 会在**打开 registry 之前**就报出可操作提示，并**不创建/污染**任何库文件。
 
-**⑥ 内置扩展原子家族（ext.* sidecar）**：除 `ext.ai`/`ext.registry`/`ext.tls` 参考形态外，框架内置一批开箱即用的扩展原子——`ext.email` / `ext.sms` / `ext.wecom` / `ext.webhook` / `ext.rabbitmq` / `ext.kafka` / `ext.mqtt`——均以 sidecar 形态经 `gear ext <name>` 拉起，按 stdio 协议（`{"method","args"}` → `{"result|error"}`）逐次调用，Tool 声明 `capabilities:[ext.x]` 即可在 Lua 里 `ctx.ext.x.method({...})` 调用。它们**不是内核原语**，而是「用户装好即可用」的扩展层示例；长驻订阅类（rabbitmq/kafka/mqtt）另走 service ext（声明 `service:true` + `listen`，常驻侧车 + `/caps` 自描述，见 `EXT_SERVICE_DESIGN.md`）。**红线（`email_test.go:TestExtAtomsMustNotReadEnv` 机械守护）**：扩展原子的凭据（user/pass/key/apikey/sign）与连接配置一律从调用参数（args）传，**禁止读 `os.Getenv`**——原子契约与环境解耦，凭据由调用方负责。
+**⑥ 内置扩展原子家族（ext.* sidecar）**：除 `ext.ai`（进程内 agent）/`ext.registry`（读引擎注册表）由内核**始终装配**外，框架内置一批开箱即用的扩展原子，权威注册表是 `plugin/extensions.yaml`（用户模板见 `extensions.example.yaml`），按用途分三类：
+- **P1 通知类**：`ext.email`（send/read/list）、`ext.wecom`（send）、`ext.webhook`（send/subscribe/unsubscribe）；
+- **P2 消息 / 短信类**：`ext.rabbitmq`（publish/declare/consume/unsubscribe）、`ext.kafka`（produce/consume/unsubscribe）、`ext.sms`（send）；
+- **P3 文件 / 网站类**：`ext.serve`（start/stop：静态目录托管 + `proxy` 反代，类 nginx）。
+
+载体形态有两种。**once 侧车**（`ext.email` / `ext.wecom` / `ext.sms`）经 `gear ext <name>` 拉起，按 stdio 协议（`{"method","args"}` → `{"result|error"}`）逐次调用；**常驻 service ext**（`ext.webhook` / `ext.rabbitmq` / `ext.kafka` / `ext.serve`）声明 `service:true` + `listen`（另有可选 `source` / `health_probe`），被引擎自动包成虚拟 process Tool，由 flow 的 `service` step 持有并受 Supervisor 监管，能力调用走本地 HTTP 长连接、长驻订阅经 `ctx.subscribe.start` 回推（详见 `EXT_SERVICE_DESIGN.md`）。`ext.tls` / `ext.db` 仅作自定义 sidecar 的形态参考（`ext.db` 的能力已由内置 `db` 原语覆盖），`ext.mqtt` 是 service ext 的完整参考样板。Tool 声明 `capabilities:[ext.x]` 后即可在 Lua 里 `ctx.ext.x.method({...})` 调用；它们**不是内核原语**，而是「用户装好即可用」的扩展层示例。
+
+**协调地址的单一真相源（2026-09-21）**：service ext 的 `listen` 既决定引擎连哪个地址，也由引擎以 `COORD_ADDR=<listen>` 注入侧车进程环境——侧车不再自持一份默认端口，**改 `listen` 一处即可让两侧同源**（此前 yaml 与侧车各写一份相同字面量，改任意一处都变成「引擎连 A、侧车听 B」的静默失联）；`health_probe.addr` 省略即取 `listen`，显式写出却与 `listen` 不一致则装配期 fail-closed（不留到运行期变成监管无限重启）。
+
+**红线（`email_test.go:TestExtAtomsMustNotReadEnv` 机械守护）**：扩展原子的凭据（user/pass/key/apikey/sign）与连接配置一律从调用参数（args）传，**禁止读 `os.Getenv`**——原子契约与环境解耦，凭据由调用方负责。（`COORD_ADDR` 是侧车自身的运行位置、由引擎按 `listen` 注入，不属此列。）
 
 **已知调优边界**：单 step 执行超时硬编码 30s（`internal/engine/process.go` 的 `defaultExecTimeout`），多轮调用远端 LLM 的 agent 贴近该边界；后续宜开 per-step `timeout` 字段 / CLI flag。agent 侧的 LLM 输出容错（如 `depends_on` 归一化）属**易变层（Lua）职责**，稳定层（Go 反序列化 / 静态校验）保持严格。
 
@@ -656,7 +665,7 @@ CLI 是 V1 永久原生管理面（不同用户对 UI 需求不同，UI 以可�
 | `gear ai gen flow\|tool --intent "..." [--register]` | AI 生成 Flow/Tool 草稿（`ext.ai`，见 §9）；同 `ai` 命令另含 `react`（见下）与 `capabilities` |
 | `gear ai react "<task>" [--max-steps N] [--allow http,kv] [--model/--provider/--base-url/--api-key]` | 跑 ReAct 智能体（LLM 逐步调内置/已注册工具完成任务，需联网 LLM；等价于 Tool entry 里 `ctx.ext.ai.react`） |
 | `gear ai capabilities` | 打印当前装配的原子能力目录（内核 builtin + pure 原语 + 已注册 ext.*，与 agent 提示词同源，随 extensions 配置动态变化） |
-| `gear ext <name>` | 运行内置扩展原语 sidecar（email / sms / wecom / webhook / rabbitmq / kafka / mqtt …；`echo '{"method":"...","args":{...}}' \| gear ext email` 可调试） |
+| `gear ext <name>` | 运行内置扩展原语的 once 载体（email / sms / wecom / webhook / rabbitmq / kafka；`echo '{"method":"...","args":{...}}' \| gear ext email` 可调试）。service ext（webhook/rabbitmq/kafka/serve）的常规形态是常驻侧车 + 本地 HTTP，见 §9⑥ |
 | `gear mcp [--http :port]` | 以 MCP 执行面暴露 Gear（stdio 默认；`--http` 改 streamable HTTP，端点 `/mcp`），见 §11 第四种执行面 |
 
 **统一输入约定（Unix 管道直觉，`internal/cli/input.go`）**——JSON 入参与 YAML 文件都吃管道：

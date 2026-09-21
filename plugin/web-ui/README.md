@@ -50,6 +50,42 @@ server {
 }
 ```
 
+不想另装 nginx 时，可以用 **Gear 自己**的静态网站能力（`ext.serve`，类 nginx：静态目录 + `proxy` 反代规则）起服。
+仓库自带 Flow `web_ui.up`（`plugin/web_ui_flow.yaml` + `plugin/web_ui_tools.yaml`），
+用**一个 Flow 起两个长驻服务**：`ext.serve` 侧车托管 `dist/`（:8080）并把 `/api` 反代到后端，`process` 起 gear REST 后端（:8787）。
+
+```bash
+export GEAR_EXT_CONFIG=plugin/extensions.yaml
+go build -o build/gear.exe ./cmd/gear
+go build -o build/serve-sidecar.exe ./plugin/serve-sidecar
+# 注册（一次性；须从仓库根目录）
+gear tool register --registry build/ui-registry.db plugin/static_site_demo.yaml   # static_site.serve
+gear tool register --registry build/ui-registry.db plugin/web_ui_tools.yaml       # web_ui.anchor / web_ui.api
+gear flow register --registry build/ui-registry.db plugin/web_ui_flow.yaml        # web_ui.up
+# 起服（Ctrl+C 一并回收两个长驻服务）
+gear app run web_ui.up --registry build/ui-registry.db
+#  → UI   http://127.0.0.1:8080/      后端 http://127.0.0.1:8787/
+```
+
+> `ext.serve` 支持 `proxy` 规则，等价 nginx 的 `location /api/ { proxy_pass …; }`——
+> 所以这一个 Flow 起服后 **UI 与 `/api` 同源，页面直接可用**（不必再套 nginx）。规则写在 Flow 的 `site` step：
+>
+> ```yaml
+> - id: site
+>   call: static_site.serve
+>   input:
+>     port: 8080
+>     dir: build/dist
+>     proxy:
+>       - path: /api                      # 匹配前缀（边界化：/api 命中 /api 与 /api/x，不命中 /apix）
+>         target: http://127.0.0.1:8787   # 后端基址
+>         # strip_prefix: true            # 可选：转发时去掉该前缀（等价 proxy_pass http://host/）
+> ```
+>
+> 命中 `path` 前缀的请求转发到 `target`（多条命中取**最长前缀**），其余走静态文件。
+> 规则非法（如 `path` 不以 `/` 开头、`target` 非 http(s) URL）会**报错**而不是被静默丢弃；
+> 后端不可达返回 **502**（不静默 200）——避免又变成「页面看着在跑、数据全空」。
+
 > 为什么默认同源：内核**没有 CORS 头**。若在「连接设置」里填跨域 origin，浏览器会拦下请求。
 > 真要跨域，得在内核前面套一层反代（或给内核加 CORS 中间件——那是内核切片，不属于本插件）。
 

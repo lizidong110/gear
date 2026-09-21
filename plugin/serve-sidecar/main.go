@@ -3,7 +3,9 @@
 //   - 绑定声明端口（listen / COORD_ADDR，127.0.0.1 only），对外暴露 RPC
 //     （/start /stop /caps）+ coord 协调端点（/register 等）；
 //   - /start 在「另一个端口」起一个静态网站 HTTP 服务（类似 nginx：给定端口 + 静态目录，
-//     浏览器即可访问）。port / dir / host 全部从 args 传入（不读 os.Getenv，缺参即报错）；
+//     浏览器即可访问），并可带 proxy 规则把某些前缀（如 /api）反向代理到后端——
+//     静态与接口同源，vite dev proxy 的生产等价物（见 proxy.go）。
+//     port / dir / host / proxy 全部从 args 传入（不读 os.Getenv，缺参即报错）；
 //   - /stop 平滑关闭静态网站服务、释放端口；
 //   - /caps 返回本侧车已实现的方法名（供「声明 ↔ 实现」红线校验）；
 //   - 维护占用列表，无人需要则自动退出（OnEmpty）。
@@ -15,7 +17,8 @@
 //
 // 两者必须分开：RPC 路由是固定的 /start /stop，会和网站根路径 '/' 上托管的静态资源冲突。
 //
-// 环境变量：COORD_ADDR（默认 127.0.0.1:8095）。注意这只是「侧车自己的协调端口」，
+// 环境变量：COORD_ADDR（默认 127.0.0.1:8095；引擎拉起时按 extensions.yaml 的 listen 注入，
+// 此处默认值仅供不经引擎的手工单跑兜底）。注意这只是「侧车自己的协调端口」，
 // 与网站端口无关——网站端口永远来自 /start 的 args.port（遵循 ext 原子红线：配置从参数传）。
 package main
 
@@ -36,10 +39,11 @@ import (
 // Service 是 serve-sidecar 的业务核心。
 type Service struct {
 	mu      sync.Mutex
-	srv     *http.Server // 静态网站服务（复用 srv.Serve 绑定 ln）
+	srv     *http.Server // 网站服务（静态 + 可选反代；复用 srv.Serve 绑定 ln）
 	ln      net.Listener // 静态网站监听套接字
 	port    int          // 当前网站端口
 	dir     string       // 当前网站根目录
+	proxy   []proxyRule  // 当前反向代理规则（空 = 纯静态）
 	serving bool         // 是否正在服务
 }
 
@@ -56,19 +60,21 @@ func (s *Service) Handlers() map[string]http.HandlerFunc {
 	}
 }
 
-// Stop 平滑停止静态网站服务。
+// Stop 平滑停止网站服务。
 func (s *Service) Stop() {
 	s.mu.Lock()
 	srv := s.srv
 	s.serving = false
+	s.proxy = nil
 	s.mu.Unlock()
 	if srv != nil {
 		_ = srv.Shutdown(context.Background())
 	}
 }
 
-// handleStart 在指定端口起静态网站服务（类似 nginx）。
-// args：port（必填，数字）、dir（必填，本地目录）、host（可选，默认 0.0.0.0）。
+// handleStart 在指定端口起「静态网站 + 可选反向代理」服务（类似 nginx）。
+// args：port（必填，数字）、dir（必填，本地目录）、host（可选，默认 0.0.0.0）、
+// proxy（可选，反向代理规则数组：[{path,target,strip_prefix}]，见 proxy.go）。
 func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	args, err := decodeArgs(r)
 	if err != nil {
@@ -92,13 +98,23 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	host := strOr(args, "host", "0.0.0.0")
+	// fail-closed：规则写错就报错（缺 path/target、target 非 http(s) URL…），绝不静默丢弃——
+	// 静默丢弃正是「UI 的 /api 全 404」这类问题的成因。放在幂等判断之前，保证错误必被报出。
+	proxyRules, err := parseProxyRules(args["proxy"])
+	if err != nil {
+		writeJSON(w, map[string]interface{}{"error": err.Error()})
+		return
+	}
 
 	s.mu.Lock()
 	if s.serving {
 		// 幂等：已经在服务则直接返回当前 URL，避免重复绑定端口冲突。
 		url := s.currentURL()
+		curDir, curProxy := s.dir, s.proxy
 		s.mu.Unlock()
-		writeJSON(w, map[string]interface{}{"result": map[string]interface{}{"url": url, "port": s.port, "dir": s.dir, "serving": true}})
+		writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
+			"url": url, "port": s.port, "dir": curDir, "serving": true, "proxy": proxyRulesJSON(curProxy),
+		}})
 		return
 	}
 	s.mu.Unlock()
@@ -109,16 +125,16 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fs := http.FileServer(http.Dir(dir))
-	srv := &http.Server{Handler: fs}
+	handler := newSiteHandler(dir, proxyRules)
+	srv := &http.Server{Handler: handler}
 
 	s.mu.Lock()
-	s.ln, s.srv, s.port, s.dir, s.serving = ln, srv, port, dir, true
+	s.ln, s.srv, s.port, s.dir, s.proxy, s.serving = ln, srv, port, dir, proxyRules, true
 	s.mu.Unlock()
 
 	go func() {
 		if e := srv.Serve(ln); e != nil && e != http.ErrServerClosed {
-			log.Printf("[serve] 文件服务异常退出: %v", e)
+			log.Printf("[serve] 网站服务异常退出: %v", e)
 		}
 	}()
 
@@ -127,6 +143,7 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		"port":    port,
 		"dir":     dir,
 		"serving": true,
+		"proxy":   proxyRulesJSON(proxyRules),
 	}})
 }
 
@@ -144,6 +161,7 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 	wasServing := s.serving
 	srv := s.srv
 	s.serving = false
+	s.proxy = nil
 	s.mu.Unlock()
 
 	if !wasServing {

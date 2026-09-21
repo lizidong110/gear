@@ -6,6 +6,11 @@ Gear 负向验证仪式（negcheck）。
 只跑绿灯证明不了测试有效——断言写反的测试同样 PASS。本脚本把「破坏实现 → 必须变红 →
 还原 → 必须变绿」固化成一条命令，并**逐字节校验文件已还原**，杜绝「负向验证跑完文件没还原」。
 
+⚠ Windows 行尾坑（2026-09-20 修）：所有 open() 必须带 newline=""。若用文本模式默认 newline，
+写回时 Python 会把 `\n` 翻译成 `\r\n`——既污染被改文件的行尾（gofmt 立刻报「需格式化」，
+看起来像自己改坏了代码），又让「逐字节还原」的字符串比较被换行规范化蒙混过关（读了等于没坏）。
+加 newline="" 后读写都是原字节，才配得上「逐字节」三个字。
+
 替代当年丢失在 gitignored build/ 里的同名脚本，迁到入库的 tools/ 目录。
 
 用法：
@@ -33,7 +38,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def deref(arg):
     if arg.startswith("@"):
-        with open(arg[1:], "r", encoding="utf-8") as f:
+        with open(arg[1:], "r", encoding="utf-8", newline="") as f:
             return f.read()
     return arg
 
@@ -73,7 +78,7 @@ def main():
     old = deref(old_arg)
     new = deref(new_arg)
 
-    original = open(path, "r", encoding="utf-8").read()
+    original = open(path, "r", encoding="utf-8", newline="").read()
     if old not in original:
         print(f"[negcheck] 旧片段不在 {file_arg} 中，无法定位注入点。", file=sys.stderr)
         print("  旧片段预览:", repr(old[:80]), file=sys.stderr)
@@ -83,7 +88,7 @@ def main():
     try:
         # 1) 注入坏实现
         broken = original.replace(old, new, 1)
-        open(path, "w", encoding="utf-8").write(broken)
+        open(path, "w", encoding="utf-8", newline="").write(broken)
         print(f"[negcheck] 已注入坏实现到 {file_arg}（旧片段 → 新片段）")
 
         # 2) 破坏后必须变红
@@ -96,10 +101,10 @@ def main():
             print("[negcheck] ✅ 破坏实现后测试变红（符合预期）")
     finally:
         # 3) 无论如何先逐字节还原
-        open(path, "w", encoding="utf-8").write(original)
+        open(path, "w", encoding="utf-8", newline="").write(original)
 
     # 4) 校验逐字节还原
-    restored = open(path, "r", encoding="utf-8").read()
+    restored = open(path, "r", encoding="utf-8", newline="").read()
     if restored != original:
         print("[negcheck] ❌ 文件未逐字节还原，请检查！", file=sys.stderr)
         ok = False

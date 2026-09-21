@@ -201,6 +201,7 @@ type Hook struct {
 
 **`gear app`**
 - `app run <flow-id>...`：`--restart always|never`（默认 always）、`--max <n>`（并发闸门）。把 Flow 变成受管进程（service 长驻 + 重启策略 + 退避）。
+  service 退出时打印**退出码 + 输出尾部**（`✗ step <id> service 退出 (exit=N)` 后的 `│ <行>`），用于定位「拉起即秒退」类故障（端口被占、命令写错、依赖缺失）——不再只报「重启 第 N 次」。
 
 **`gear serve`**
 - `serve`：`--seed <examples.yaml>`（启动时灌入示例 Tool/Flow，如 `examples/news-top10.yaml`）。启动 REST 执行面，复用 `--addr`。
@@ -347,6 +348,7 @@ stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error
 - **内核地址**：`127.0.0.1:8787`（可用 `GEAR_ADDR` 覆盖）。
 - **构建**：`npm run dev`（端口 5173，Vite 反代 `/api` → `GEAR_API` 或 `http://127.0.0.1:8787`）；`npm run build` → `dist/`。
 - **托管**：`dist/` 由任意静态服务器 / 反向代理托管，并把 `/api` 转发到内核——内核本身**不托管**其构建产物。
+- **用 Gear 自己的能力托管（静态 + 反代，推荐）**：`ext.serve`（类 nginx）既托管静态目录，也支持 `proxy` 规则把 `/api` 反代到内核——**静态与接口同源**，正是 dev 下 Vite 代理的生产等价物。仓库自带 Flow `web_ui.up`（`plugin/web_ui_tools.yaml` + `plugin/web_ui_flow.yaml`），用**一个 Flow 起两个长驻服务**（`ext.serve` 静态站 + `/api` 反代 + `process` 起 gear REST 后端）：`GEAR_EXT_CONFIG=plugin/extensions.yaml gear app run web_ui.up --registry build/ui-registry.db`。详见 `plugin/web-ui/README.md`。
 
 ---
 

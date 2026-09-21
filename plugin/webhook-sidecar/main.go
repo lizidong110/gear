@@ -2,6 +2,8 @@
 //
 //   - 绑定两个端口：
 //     · listen（COORD_ADDR，默认 127.0.0.1:8089）：coord 协调 + RPC（/subscribe /unsubscribe）；
+//     引擎拉起时按 extensions.yaml 的 listen 注入 COORD_ADDR（协调地址的唯一真相源），
+//     此处默认值仅供不经引擎、手工单跑侧车时兜底；
 //     · webhook_addr（WEBHOOK_ADDR，默认 :8088）：外部系统 POST 进来的入站回调地址。
 //   - /subscribe 登记一条入站路由（path -> handle -> callback_url）；外部 POST 到 /in/{path}
 //     时，侧车把（handle, path, headers, body）POST 回 gear 的 callbackURL，由引擎回推事件；
@@ -271,7 +273,7 @@ func main() {
 	go func() {
 		log.Printf("webhook 入站监听 %s（外部 POST 到 /in/{path}）", webhookAddr)
 		if err := http.ListenAndServe(webhookAddr, svc.inboundMux()); err != nil {
-			log.Printf("webhook 入站监听失败（listen 能力不可用，coord 端口不受影响）: %v", err)
+			log.Printf("webhook 入站端口监听失败（入站订阅不可用，coord 端口不受影响）: %v", err)
 		}
 	}()
 

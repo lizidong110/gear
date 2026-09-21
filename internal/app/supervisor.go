@@ -182,6 +182,9 @@ func (s *Supervisor) superviseOne(ctx context.Context, flowID string) error {
 			s.stopAll(res.Services)
 			return nil // ctx 取消
 		}
+		// 先说清「为什么退出」，再谈重启：否则端口占用 / 配置写错这类秒退
+		// 只会表现为无限重启，原因完全不可见。
+		reportServiceExit(h)
 		if s.policy == RestartNever {
 			s.stopAll(res.Services)
 			return nil
@@ -202,6 +205,29 @@ func (s *Supervisor) superviseOne(ctx context.Context, flowID string) error {
 		fmt.Printf("↻ step %s service 重启 (第 %d 次)\n", h.StepID, h.Restarts)
 		// 重启后该 handle 的进程已换柄，启动新一轮探针（旧探针循环已在 procKill 后退出）。
 		go s.probeLoop(ctx, h)
+	}
+}
+
+// reportServiceExit 打印 service 的退出原因：退出码 + 输出尾部若干行。
+//
+// 为什么必须有这个出口：service 子进程的输出**不继承调用方管道**（红线 16，避免孤儿
+// 孙进程占住 `go test` 的管道），所以它天然看不见自己的输出。若不给一个出口，
+// 「拉起即秒退」的故障（端口被占用、命令写错、依赖缺失）在监管侧就只剩下
+// 「↻ 重启 第 N 次」——2026-09-21 就是这样：`:8787` 被占，`gear serve` 秒退，
+// 用户看到无限重启却拿不到任何线索。
+//
+// 该 runtime 的 Process 未实现 ExitReporter 时如实说明「拿不到退出信息」，
+// 不静默假装知道。
+func reportServiceExit(h *engine.ServiceHandle) {
+	rep, ok := h.CurrentProc().(engine.ExitReporter)
+	if !ok {
+		fmt.Printf("✗ step %s service 退出（该 runtime 未提供退出信息）\n", h.StepID)
+		return
+	}
+	code, tail := rep.ExitInfo()
+	fmt.Printf("✗ step %s service 退出 (exit=%d)\n", h.StepID, code)
+	for _, ln := range tail {
+		fmt.Printf("    │ %s\n", ln)
 	}
 }
 

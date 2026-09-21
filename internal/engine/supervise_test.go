@@ -118,3 +118,52 @@ func TestSupervisePureOnce(t *testing.T) {
 		t.Fatalf("纯 once 不应有 service，实际 %d", len(res.Services))
 	}
 }
+
+// failTool 构造一个必定失败的 process Tool（once 步骤执行即报错；sleep 0.3 确保同层并行的
+// service 兄弟先完成拉起，避免「cancel 竞态」让 service 还没起来就随层失败，从而掩盖孤儿 bug）。
+func failTool() *model.Tool {
+	return &model.Tool{
+		ID: "fail", Name: "fail", Runtime: model.RuntimeProcess, Entry: "sleep 0.3; exit 1",
+		InputSchema:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		OutputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
+	}
+}
+
+// S2-sup-4：Flow 执行失败时，已拉起的长驻 service 必须被回收，不残留孤儿进程（回归
+// 用户 2026-09-21 实测：flow 内两 serve，site 失败 → api 残留 pid）。
+func TestSuperviseKillsStartedServicesOnFailure(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	if err := reg.UpsertTool(svcTool("sleep 5")); err != nil {
+		t.Fatalf("注册 Tool 失败: %v", err)
+	}
+	if err := reg.UpsertTool(failTool()); err != nil {
+		t.Fatalf("注册 Tool 失败: %v", err)
+	}
+	flow := &model.Flow{ID: "flaky", Steps: []model.Step{
+		{ID: "keep", Call: "svc", Mode: "service", Input: map[string]interface{}{}},
+		{ID: "boom", Call: "fail", Mode: "once", Input: map[string]interface{}{}},
+	}}
+	if err := reg.UpsertFlow(flow); err != nil {
+		t.Fatalf("注册 Flow 失败: %v", err)
+	}
+
+	res, err := New(reg).Supervise("flaky")
+	if err == nil {
+		t.Fatal("Flow 含失败 step，Supervise 应返回错误")
+	}
+	if len(res.Services) != 1 {
+		t.Fatalf("应有 1 个已启动 service（keep），实际 %d", len(res.Services))
+	}
+	// 断言 keep 进程已被回收（不残留孤儿）：Wait 必须在短时窗内返回。
+	h := res.Services[0]
+	done := make(chan error, 1)
+	go func() { done <- h.Proc.Wait() }()
+	select {
+	case <-done:
+		// 进程已退出，回收成功
+	case <-time.After(3 * time.Second):
+		t.Fatal("keep service 未被回收，残留为孤儿进程")
+	}
+}

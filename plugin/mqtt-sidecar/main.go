@@ -6,7 +6,8 @@
 //   - 占用列表空 → 自动退出（无人需要该 MQTT 桥接服务）；
 //   - 端口被占用（EADDRINUSE）→ 退让退出（其 owner gear 会改以 client 复用本实例）。
 //
-// 环境变量：MQTT_BROKER（默认 tcp://test.mosquitto.org:1883）、COORD_ADDR（默认 127.0.0.1:1884）。
+// 环境变量：MQTT_BROKER（默认 tcp://test.mosquitto.org:1883）、COORD_ADDR（默认 127.0.0.1:1884；
+// 引擎拉起时按 extensions.yaml 的 listen 注入，此处默认值仅供不经引擎的手工单跑兜底）。
 package main
 
 import (

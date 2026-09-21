@@ -1,13 +1,17 @@
 package engine
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"gear/internal/cap"
@@ -32,11 +36,16 @@ func (p *processRuntime) Run(ctx context.Context, entry string, input map[string
 
 // Start 拉起一个长驻 process（service 模式），不等待其结束，返回可监管句柄。
 func (p *processRuntime) Start(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context) (Process, error) {
-	cmd, err := startProcess(ctx, entry, input, host)
+	sp, err := startProcess(ctx, entry, input, host)
 	if err != nil {
 		return nil, err
 	}
-	return &execProcess{cmd: cmd, kill: func() error { return killProcessTree(cmd) }}, nil
+	return &execProcess{
+		cmd:     sp.cmd,
+		kill:    func() error { return killProcessTree(sp.cmd) },
+		tail:    sp.tail,
+		drained: sp.drained,
+	}, nil
 }
 
 // execProcess 把 *exec.Cmd 适配成 engine.Process 抽象（避免上层依赖 os/exec）。
@@ -45,13 +54,61 @@ func (p *processRuntime) Start(ctx context.Context, entry string, input map[stri
 type execProcess struct {
 	cmd  *exec.Cmd
 	kill func() error
+	// tail/drained 承载子进程输出尾部与「抽干完成」信号（见 serviceTail），
+	// 供 ExitInfo 在进程退出后回答「为什么退出」。
+	tail    *serviceTail
+	drained chan struct{}
+
+	mu      sync.Mutex
+	waitErr error
+	waited  bool
 }
 
 func (e *execProcess) Pid() int { return e.cmd.Process.Pid }
 
 func (e *execProcess) Kill() error { return e.kill() }
 
-func (e *execProcess) Wait() error { return e.cmd.Wait() }
+// Wait 等待子进程结束，并**记住**退出结果：ExitInfo 依赖它把退出码报给监管侧。
+func (e *execProcess) Wait() error {
+	err := e.cmd.Wait()
+	e.mu.Lock()
+	e.waitErr, e.waited = err, true
+	e.mu.Unlock()
+	return err
+}
+
+// ExitInfo 实现 ExitReporter：返回子进程退出码与输出尾部（service 诊断用）。
+//
+// 已 Wait 过时先**有界**等待抽干 goroutine 收尾（serviceDrainTimeout），否则可能丢掉
+// 进程临死前最后几行——而那几行通常正是失败原因。
+func (e *execProcess) ExitInfo() (int, []string) {
+	e.mu.Lock()
+	waited, waitErr := e.waited, e.waitErr
+	e.mu.Unlock()
+
+	if waited && e.drained != nil {
+		select {
+		case <-e.drained:
+		case <-time.After(serviceDrainTimeout):
+		}
+	}
+
+	// 退出码：正常退出为 0；带退出码的失败取真实码；其余（被信号杀、Wait 重复调用、
+	// I/O 错误等）报 -1 —— 绝不伪装成「正常退出」。
+	code := 0
+	if waitErr != nil {
+		var ee *exec.ExitError
+		if errors.As(waitErr, &ee) {
+			code = ee.ExitCode()
+		} else {
+			code = -1
+		}
+	}
+	if e.tail == nil {
+		return code, nil
+	}
+	return code, e.tail.snapshot()
+}
 
 // runProcess 执行 process runtime 的 Tool：把 input 序列化为 JSON 经 stdin 传入，
 // 读取 stdout 的最后一行非空内容作为 JSON 输出（见 PRD §3.3 的 process 契约）。
@@ -133,44 +190,101 @@ func withHostCapabilities(input map[string]interface{}, host *cap.Context) map[s
 	return input
 }
 
-// serviceOut 是 service 模式子进程的 stdout/stderr 汇（默认丢到 os.DevNull）。
-//
-// 关键约束（红线 16：service 子进程不得继承调用方 stdout/stderr）：
-// service 通过 `sh -c <entry>` 拉起，其孙进程（如 `sleep`）在父 sh 被 Kill() 后会成为
-// 孤儿并继续持有继承来的文件描述符。若直接继承 os.Stdout（go test 的管道），孤儿进程会
-// 长期占用该管道 → "Test I/O incomplete"。将输出脱离调用方管道可彻底消除该泄漏。
-// 结构化 service 日志（按 service 落盘 / 上报 Supervisor）留待后续日志切片，本处仅保证
-// 生命周期与 fd 正确性。
-var serviceOut *os.File
+const (
+	// serviceTailLines 是每个 service 子进程保留的输出行数上限（诊断用，内存恒定）。
+	serviceTailLines = 50
+	// serviceDrainTimeout 是 ExitInfo 等待「最后几行落进缓冲」的上限。
+	// 必须有界：若孙进程仍持有写端（级联回收完成前的窗口），读到 EOF 可能永远等不到。
+	serviceDrainTimeout = 300 * time.Millisecond
+)
 
-func init() {
-	f, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	if err != nil {
-		// os.DevNull 几乎不可能打开失败；极端情况下退回 os.Stderr（仍可能继承管道，
-		// 但仅在 DevNull 异常时触发，属不可达分支）。
-		serviceOut = os.Stderr
-		return
+// serviceTail 是 service 子进程输出的内存环形缓冲（只留尾部 serviceTailLines 行）。
+//
+// 为什么需要它 —— 红线 16 的第二次修正：service 子进程**不能**继承调用方的
+// os.Stdout/os.Stderr（孙进程成为孤儿后会长期占住该管道，令 `go test` 报
+// "Test I/O incomplete"，故早期实现把服务输出直接丢进 os.DevNull）；
+// 但「丢进 DevNull」把**进程为什么退出**也一并丢了：2026-09-21 实测 `:8787` 被占
+// 导致 `gear serve` 秒退，监管侧只有「↻ 重启 第 N 次」，原因完全不可见。
+//
+// 解法：父子之间**自开一根管道**（不碰调用方 fd），父侧后台 goroutine 持续抽干并存入
+// 本缓冲；进程退出时由 ExitInfo 取尾部交给监管打印。孤儿孙进程最多让这根自有管道晚一点
+// EOF（抽干 goroutine 多活一会儿），不会污染调用方管道，也不会阻塞任何事。
+type serviceTail struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+// push 追加一行；超出上限则丢弃最旧的行（内存恒定，崩溃循环下也不会无限增长）。
+func (t *serviceTail) push(line string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.lines = append(t.lines, line)
+	if len(t.lines) > serviceTailLines {
+		t.lines = append([]string(nil), t.lines[len(t.lines)-serviceTailLines:]...)
 	}
-	serviceOut = f
+}
+
+// snapshot 返回当前保留行的副本（调用方不得依赖其与后续 push 的一致性）。
+func (t *serviceTail) snapshot() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]string, len(t.lines))
+	copy(out, t.lines)
+	return out
+}
+
+// drainServiceTail 把自有管道按行抽干进缓冲，直到 EOF（写端全关时触发）后关闭读端。
+func drainServiceTail(rc io.ReadCloser, t *serviceTail) {
+	defer rc.Close()
+	sc := bufio.NewScanner(rc)
+	// 单行上限提到 1MB：默认 64KB 会让超长行提前终止抽取，连带丢掉其后（可能含失败原因）的行。
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		t.push(sc.Text())
+	}
+}
+
+// startedProcess 是 startProcess 的产物：命令本体 + 输出缓冲 + 抽干完成信号。
+type startedProcess struct {
+	cmd     *exec.Cmd
+	tail    *serviceTail
+	drained chan struct{}
 }
 
 // startProcess 拉起一个 process 子进程但**不等待其结束**（service 模式用，见 PRD §14.2）。
-// input 经 stdin 传入；stdout/stderr 统一导向 serviceOut（见上方红线 16 说明，不继承调用方管道）。
-// 返回的 *exec.Cmd 由调用方负责在监管结束时 Kill（Supervisor.stopAll）。
-func startProcess(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context) (*exec.Cmd, error) {
+// input 经 stdin 传入；stdout/stderr 汇入**自有管道**（见 serviceTail：既不继承调用方
+// 管道，也不丢进 DevNull），由父侧 goroutine 抽干进内存缓冲，供监管诊断退出原因。
+// 返回的 startedProcess 由调用方负责在监管结束时 Kill（Supervisor.stopAll）。
+func startProcess(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context) (*startedProcess, error) {
 	input = withHostCapabilities(input, host)
 	inBytes, err := json.Marshal(input)
 	if err != nil {
 		return nil, fmt.Errorf("序列化 input 失败: %w", err)
 	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("创建 service 输出管道失败: %v", err)
+	}
 	cmd := exec.CommandContext(ctx, "sh", "-c", entry)
 	cmd.Stdin = bytes.NewReader(inBytes)
-	cmd.Stdout = serviceOut
-	cmd.Stderr = serviceOut
+	cmd.Stdout = pw
+	cmd.Stderr = pw
 	configureProcessTree(cmd)                                 // 平台钩子：Unix 置 Setpgid；Windows 无操作
 	cmd.Cancel = func() error { return killProcessTree(cmd) } // ctx 取消也走级联回收（非只杀 sh）
 	if err := cmd.Start(); err != nil {
+		_ = pr.Close()
+		_ = pw.Close()
 		return nil, fmt.Errorf("%v", err)
 	}
-	return cmd, nil
+	// 父侧立刻关闭写端：子进程已在 Start 时拿到自己的 fd 副本，父侧若继续持有写端，
+	// 读端在子进程退出后将永远等不到 EOF（抽干 goroutine 一直挂着）。
+	_ = pw.Close()
+
+	tail := &serviceTail{}
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		drainServiceTail(pr, tail)
+	}()
+	return &startedProcess{cmd: cmd, tail: tail, drained: drained}, nil
 }

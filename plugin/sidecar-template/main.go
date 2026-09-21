@@ -6,6 +6,9 @@
 //   - 占用列表空 → 自动退出（无人需要该服务）；
 //   - 端口被占用（EADDRINUSE）→ 退让退出（其 owner gear 会改以 client 复用本实例）。
 //
+// 环境变量：COORD_ADDR（引擎拉起时按 extensions.yaml 的 listen 注入，是协调地址的唯一真相源；
+// 下面的默认值 127.0.0.1:1884 仅供不经引擎、手工单跑侧车时兜底）。
+//
 // 真实场景（如 mqtt-sidecar）把 /publish 换成真正的 MQTT publish，把后台 goroutine
 // 换成真正的 MQTT subscribe（收到消息经 Gear REST / event 回调）。本骨架不含真实协议，
 // 仅把"常驻 + 协调"的骨架跑通。

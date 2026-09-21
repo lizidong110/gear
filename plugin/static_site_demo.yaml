@@ -3,10 +3,14 @@
 # 注册：gear tool register --registry <db> -   （stdin 喂本文件）
 # 运行：gear tool run static_site.serve --registry <db> --input '{"port":8080,"dir":"./site"}'
 #   → 返回 {"url":"http://0.0.0.0:8080/"}，打开浏览器访问该地址即可看到 dir 下的静态页。
+# 带反代（静态与接口同源，UI 场景）：
+#   gear tool run static_site.serve --registry <db> --input \
+#     '{"port":8080,"dir":"./dist","proxy":[{"path":"/api","target":"http://127.0.0.1:8787"}]}'
+#   → /api/** 转发到 8787，其余走 dir 下的静态文件。
 # 停止：gear tool run static_site.stop --registry <db> '{}'
 #   （不手动 stop 也没关系：gear 进程退出后占用列表清空，侧车会自动退出释放端口）
 id: static_site.serve
-name: 静态网站服务（ext.serve 起服）
+name: 静态网站服务（ext.serve 起服，可选反向代理）
 runtime: lua
 capabilities: [ext.serve]
 input_schema:
@@ -15,19 +19,22 @@ input_schema:
     port: {type: number, description: "对外服务端口（必填，传给 ext.serve）"}
     dir: {type: string, description: "静态网站根目录（本地路径，必填，传给 ext.serve）"}
     host: {type: string, description: "绑定地址（默认 0.0.0.0 即所有网卡；改 127.0.0.1 仅本机）"}
+    proxy: {type: array, description: "反向代理规则（可选，传给 ext.serve）：[{path,target,strip_prefix}]，命中前缀转发到 target、其余走静态；用于让 SPA 的 /api 与静态站同源"}
   required: [port, dir]
 output_schema:
   type: object
   properties:
     url: {type: string, description: "网站访问地址"}
     serving: {type: boolean, description: "是否正在服务"}
+    proxy: {type: array, description: "实际生效的反向代理规则（回显，便于起服时核对）"}
 versions:
   - version: 1.0.0
     state: stable
 entry: |
   local r = ctx.ext.serve.start({
-    port = ctx.input.port,
-    dir  = ctx.input.dir,
-    host = ctx.input.host,
+    port  = ctx.input.port,
+    dir   = ctx.input.dir,
+    host  = ctx.input.host,
+    proxy = ctx.input.proxy,
   })
   return r

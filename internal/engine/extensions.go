@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -776,14 +777,20 @@ func SetupExtensions(capReg *CapabilityRegistry, reg *registry.Registry, cfgPath
 			// service ext：自动包成一个虚拟 process Tool（service 路径载体），并登记协调客户端。
 			// 这样 flow 的 service step 引用 ext.<name> 时走 processRuntime.Start + Supervisor
 			// 监管（复用现有 service 闭环），同时同主机多 gear 经 coord 共享单个 sidecar 实例。
+			// prepareServiceExt 把 `listen` 落到侧车进程环境（COORD_ADDR）并收敛探针地址，
+			// 令 extensions.yaml 成为协调地址的唯一真相源（详见该函数注释）。
+			entry, probe, err := prepareServiceExt(spec)
+			if err != nil {
+				return nil, fmt.Errorf("service ext %q 配置非法: %w", name, err)
+			}
 			vt := &model.Tool{
 				ID:           name,
 				Runtime:      model.RuntimeProcess,
-				Entry:        strings.Join(spec.Cmd, " "),
+				Entry:        entry,
 				InputSchema:  map[string]interface{}{"type": "object"},
 				OutputSchema: map[string]interface{}{"type": "object"},
 				Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
-				HealthProbe:  spec.HealthProbe,
+				HealthProbe:  probe,
 			}
 			if err := reg.UpsertTool(vt); err != nil {
 				return nil, fmt.Errorf("注册 service ext %q 的虚拟 Tool 失败: %w", name, err)
@@ -822,4 +829,78 @@ func SetupExtensions(capReg *CapabilityRegistry, reg *registry.Registry, cfgPath
 		}
 	}
 	return agent, nil
+}
+
+// ───────── service ext：协调地址的唯一真相源 ─────────
+
+// prepareServiceExt 为 service ext 派生「虚拟 process Tool」的两个字段，落实一条约定：
+// **extensions.yaml 的 `listen` 是该 ext 协调/RPC 地址的唯一真相源**。
+//
+// 背景（改一处即静默失联的双份定义）：侧车自己读 COORD_ADDR 决定 bind 哪个端口，
+// 而引擎用 spec.Listen 去连；两侧历史上各写一份相同字面量（yaml listen ↔ 侧车
+// os.Getenv 的默认值），改任意一处就会变成「引擎连 A、侧车听 B」——进程都活着，
+// 连不上也不报错，只在真正调用时超时。
+//
+// 对策两件：
+//  1. Entry：把 listen 以 `COORD_ADDR=<listen>` 前置注入侧车进程环境（值经单引号
+//     转义，不会成为 shell 元字符）。侧车那侧的 os.Getenv 默认值随即降级为
+//     「不经引擎、手工单跑侧车」时的兜底。
+//  2. HealthProbe：tcp/http 探针的 addr 省略时即取 listen（侧车静态可知的监听地址
+//     只有它）；显式写了却与 listen 不一致则**注册期报错**——探错地址的后果是监管
+//     无限重启，属「能静态校验就不许留到运行期」的红线范围，不静默放过。
+//
+// listen 为空（纯 daemon 守护，引擎不主动调它）时不注入、不校验，Entry 原样返回 cmd。
+func prepareServiceExt(spec ExtSpec) (string, *model.HealthProbe, error) {
+	entry := strings.Join(spec.Cmd, " ")
+	if spec.Listen == "" {
+		return entry, spec.HealthProbe, nil
+	}
+	probe, err := serviceExtProbe(spec)
+	if err != nil {
+		return "", nil, err
+	}
+	return "COORD_ADDR=" + shellQuoteValue(spec.Listen) + " " + entry, probe, nil
+}
+
+// serviceExtProbe 收敛 service ext 的健康探针地址：省略即取 listen，显式不一致即报错。
+func serviceExtProbe(spec ExtSpec) (*model.HealthProbe, error) {
+	p := spec.HealthProbe
+	if p == nil {
+		return nil, nil
+	}
+	// cmd 探测（跑命令判活）与地址无关，原样保留。
+	if p.Kind != model.ProbeKindHTTP && p.Kind != model.ProbeKindTCP {
+		return p, nil
+	}
+	if p.Addr == "" {
+		cp := *p // 复制一份再填 addr：不就地改写配置对象
+		cp.Addr = spec.Listen
+		return &cp, nil
+	}
+	if coordAddrKey(p.Addr) != coordAddrKey(spec.Listen) {
+		return nil, fmt.Errorf("health_probe.addr=%q 与 listen=%q 不一致：探针只可能探侧车的协调端口，"+
+			"两处写不同地址会让监管反复判死并无限重启；请删掉 addr（自动取 listen）或改为一致",
+			p.Addr, spec.Listen)
+	}
+	return p, nil
+}
+
+// coordAddrKey 把 host:port 归一成可比较的键（localhost / ::1 与 127.0.0.1 视为同一目标），
+// 避免「写法不同但等价」被误判为不一致。无法解析时退回小写字面量（交给 Resolve 去报错）。
+func coordAddrKey(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return strings.ToLower(addr)
+	}
+	switch strings.ToLower(host) {
+	case "", "localhost", "127.0.0.1", "::1":
+		host = "127.0.0.1"
+	}
+	return host + ":" + port
+}
+
+// shellQuoteValue 用单引号包裹值，使其在 `sh -c` 下不被当作 shell 元字符解释
+// （值来自配置文件，属准可信输入，但不转义就等于把 shell 解析权交了出去）。
+func shellQuoteValue(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

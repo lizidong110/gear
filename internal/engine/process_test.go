@@ -108,3 +108,124 @@ func TestProcessTreeKillNoOrphan(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// ─── 2026-09-21：service 子进程输出留底与退出原因上报 ───────────────────────────
+// 背景：service 输出原先丢进 os.DevNull（红线 16 的取舍），导致「拉起即秒退」的故障
+// （端口被占、配置写错）在监管侧只剩「↻ 重启 第 N 次」，原因完全不可见。
+// 现改为自有管道 + 内存缓冲，由 ExitInfo 交出「退出码 + 输出尾部」。
+
+// 非零退出：退出码取真实值，stderr 内容留在尾部（失败原因不能丢）。
+func TestServiceProcessExitInfoReportsCodeAndStderr(t *testing.T) {
+	rt := processRuntime{}
+	p, err := rt.Start(context.Background(), "echo svc-boom 1>&2; exit 3", map[string]interface{}{}, nil)
+	if err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	_ = p.Wait()
+
+	rep, ok := p.(ExitReporter)
+	if !ok {
+		t.Fatal("service Process 必须实现 ExitReporter（否则监管无从打印退出原因）")
+	}
+	code, tail := rep.ExitInfo()
+	if code != 3 {
+		t.Fatalf("退出码应为 3，实际 %d", code)
+	}
+	if !tailHas(tail, "svc-boom") {
+		t.Fatalf("输出尾部应含 stderr 内容，实际 %v", tail)
+	}
+}
+
+// 正常退出：退出码 0，stdout 同样留底（如 `gear serve` 的启动横幅）。
+func TestServiceProcessExitInfoCleanExitKeepsStdout(t *testing.T) {
+	rt := processRuntime{}
+	p, err := rt.Start(context.Background(), "echo svc-banner", map[string]interface{}{}, nil)
+	if err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	_ = p.Wait()
+
+	code, tail := p.(ExitReporter).ExitInfo()
+	if code != 0 {
+		t.Fatalf("正常退出码应为 0，实际 %d", code)
+	}
+	if !tailHas(tail, "svc-banner") {
+		t.Fatalf("stdout 应留底，实际 %v", tail)
+	}
+}
+
+// 被 Kill 的 service 退出码不得为 0：否则「被杀」会被监管报成「正常退出」。
+func TestServiceProcessExitInfoNonZeroWhenKilled(t *testing.T) {
+	rt := processRuntime{}
+	p, err := rt.Start(context.Background(), "sleep 5", map[string]interface{}{}, nil)
+	if err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	if err := p.Kill(); err != nil {
+		t.Fatalf("Kill 失败: %v", err)
+	}
+	_ = p.Wait()
+	if code, _ := p.(ExitReporter).ExitInfo(); code == 0 {
+		t.Fatal("被杀的 service 退出码不应为 0")
+	}
+}
+
+// 红线 16 回归守卫：service 子进程的输出**不得**继承调用方 os.Stdout。
+// 做法：把 os.Stdout 换成临时文件，再跑一个会 echo 的 service。若实现回归成
+// cmd.Stdout = os.Stdout，marker 就会落进该文件（并进而让孤儿孙进程占住调用方管道）。
+func TestServiceProcessDoesNotInheritCallerStdout(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "caller-stdout")
+	if err != nil {
+		t.Fatalf("建临时文件失败: %v", err)
+	}
+	defer f.Close()
+
+	saved := os.Stdout
+	os.Stdout = f
+
+	rt := processRuntime{}
+	p, err := rt.Start(context.Background(), "echo leak-marker", map[string]interface{}{}, nil)
+	if err != nil {
+		os.Stdout = saved
+		t.Fatalf("启动失败: %v", err)
+	}
+	_ = p.Wait()
+	_, tail := p.(ExitReporter).ExitInfo()
+	os.Stdout = saved
+
+	if !tailHas(tail, "leak-marker") {
+		t.Fatalf("service 输出应进自有缓冲，实际 %v", tail)
+	}
+	if data, _ := os.ReadFile(f.Name()); len(data) != 0 {
+		t.Fatalf("service 输出泄漏进调用方 stdout: %q", string(data))
+	}
+}
+
+// 尾部缓冲有界：崩溃循环下内存恒定，不随输出总量增长。
+func TestServiceTailKeepsOnlyLastLines(t *testing.T) {
+	tail := &serviceTail{}
+	total := serviceTailLines * 3
+	for i := 0; i < total; i++ {
+		tail.push(fmt.Sprintf("line-%d", i))
+	}
+	got := tail.snapshot()
+	if len(got) != serviceTailLines {
+		t.Fatalf("应只保留 %d 行，实际 %d", serviceTailLines, len(got))
+	}
+	if want := fmt.Sprintf("line-%d", total-1); got[len(got)-1] != want {
+		t.Fatalf("末行应为 %s，实际 %s", want, got[len(got)-1])
+	}
+	if want := fmt.Sprintf("line-%d", total-serviceTailLines); got[0] != want {
+		t.Fatalf("首行应为 %s，实际 %s", want, got[0])
+	}
+}
+
+// tailHas 判断输出尾部是否含某子串。
+func tailHas(tail []string, sub string) bool {
+	for _, ln := range tail {
+		if containsSubstr(ln, sub) {
+			return true
+		}
+	}
+	return false
+}

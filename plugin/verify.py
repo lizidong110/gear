@@ -5,13 +5,13 @@
 
 本期（2026-09-18）webhook / rabbitmq / kafka 已升级为「常驻能力（service ext）」：
   - 侧车长驻，能力调用走本地 HTTP（LocalHTTPTransport，复用长连接）；
-  - webhook.listen / rabbitmq.consume / kafka.consume 经通用订阅原语 ctx.subscribe
+  - webhook.subscribe / rabbitmq.consume / kafka.consume 经通用订阅原语 ctx.subscribe
     回推事件，本脚本直接起侧车验证「监听一个 URL / 消费队列」的路径。
 email / wecom / sms 仍是一次型（once）原子，保持原 stdin/stdout 验证。
 
 P1：
   1) ext.webhook ：起侧车，经 /send 真实 POST 接收（service 路径）
-  1b) ext.webhook.listen：/subscribe 登记入站路由 + POST /in/{path} -> 侧车回推（监听一个 URL）
+  1b) ext.webhook.subscribe：/subscribe 登记入站路由 + POST /in/{path} -> 侧车回推（监听一个 URL）
   2) ext.email ：log 模式真实落盘（代码路径与真实 SMTP 一致，仅 sink 不同）
   3) ext.wecom ：用假 key 真实请求 -> 必须返回 {"error":...}（fail-closed 证明）
   4) Gear 链路 ：gear tool run notify.all，ctx.ext.webhook.send 经侧车真实跑通
@@ -25,8 +25,10 @@ P2：
  10) 统一注册表 plugin/extensions.yaml 加载后，gear ai capabilities 应含全部 6 个 ext
 """
 import os
+import re
 import sys
 import json
+import socket
 import subprocess
 import tempfile
 import threading
@@ -75,6 +77,25 @@ class Sink(BaseHTTPRequestHandler):
 
 def start_sink():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1]
+
+
+class ApiMock(BaseHTTPRequestHandler):
+    """最小后端桩：把收到的请求路径回写成 JSON，供 ext.serve 反代断言（8c）。"""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"path": self.path, "from": "backend"}).encode("utf-8"))
+
+    def log_message(self, *a):
+        pass
+
+
+def start_api():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), ApiMock)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, srv.server_address[1]
 
@@ -197,6 +218,33 @@ def build_sidecar(rel, outname):
     subprocess.run(["go", "build", "-o", out, rel], cwd=ROOT, env=env, check=True)
 
 
+def parse_ext_methods(path):
+    """从 extensions.yaml 解析 {ext 名: [方法名...]}（零依赖正则，不引入 pyyaml）。
+
+    为什么必须**现读**而不是在测试里硬编码一份期望值：硬编码副本自身会漂移，于是「声明 ⊆ 实现」
+    这条红线退化成「测试的错期望 ⊆ 实现」，两边一起错还能互证通过。2026-09-19 就真的发生过——
+    把 yaml 对齐到测试里写错的 `listen`，而没有对齐侧车 `/caps` 的 `subscribe`，
+    结果 `ctx.ext.webhook.listen` POST 到一个侧车根本不存在的路由（404）却全程无人发现。
+    """
+    out = {}
+    cur = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r"^ext\.([A-Za-z0-9_]+)\s*:\s*$", line)
+                if m:
+                    cur = "ext." + m.group(1)
+                    continue
+                if cur is None:
+                    continue
+                m = re.match(r"^\s+methods\s*:\s*\[(.*)\]", line)
+                if m:
+                    out[cur] = [x.strip() for x in m.group(1).split(",") if x.strip()]
+    except OSError:
+        return {}
+    return out
+
+
 def main():
     # 环境坑：本机 HTTP_PROXY=http://127.0.0.1:xxxxx 会拦截所有 127.0.0.1 调用（Go http.Client
     # 出站 / 侧车回推 / urllib 探针全中招，表现为 502 / WinError 10054）。直连侧车与 gear 都走
@@ -219,6 +267,10 @@ def main():
     srv, port = start_sink()
     sink_url = "http://127.0.0.1:%d/sink" % port
 
+    # 反代用的后端桩（供 8c 断言 ext.serve 的 proxy 规则真的把 /api 转了出去）
+    api_srv, api_port = start_api()
+    api_url = "http://127.0.0.1:%d" % api_port
+
     tmp = tempfile.mkdtemp(prefix="ext-")
     reg = os.path.join(tmp, "ext.db")
     email_log = os.path.join(tmp, "email.out.log")
@@ -226,23 +278,59 @@ def main():
     env = dict(os.environ)
     env["GEAR_EXT_CONFIG"] = EXT
 
+    # 前置：coord 端口必须空闲。若有残留侧车占着端口，我们起的实例会「退让退出」（ExitAddrInUse），
+    # 于是整轮 verify 实际打的是**那个旧进程——很可能是旧二进制**：结果看似通过却毫无意义
+    # （2026-09-20 真踩过：用旧 serve-sidecar 跑，proxy 全 404 却以为是代码问题）。
+    # 宁可在这里明确失败，也不要静默跑出一份不可信的报告。
+    for _name, _addr in (("webhook", WEBHOOK_COORD), ("rabbitmq", RABBITMQ_COORD),
+                         ("kafka", KAFKA_COORD), ("serve", SERVE_COORD)):
+        _host, _, _port = _addr.partition(":")
+        _s = socket.socket()
+        _s.settimeout(0.5)
+        try:
+            _s.connect((_host, int(_port)))
+            print("[FATAL] %s 侧车已在 %s 上运行（残留进程）：本轮会打到旧二进制，结论不可信。" % (_name, _addr))
+            print("        请先结束残留侧车再重跑，例如：")
+            print("        taskkill /F /IM serve-sidecar.exe /IM webhook-sidecar.exe"
+                  " /IM rabbitmq-sidecar.exe /IM kafka-sidecar.exe")
+            sys.exit(2)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
+        finally:
+            _s.close()
+
     # 起三个常驻侧车（webhook 同时监听 coord:8089 与 inbound:8088）
     wh = start_sidecar(os.path.join(ROOT, "build", "webhook-sidecar.exe"), WEBHOOK_COORD)
     rmq = start_sidecar(os.path.join(ROOT, "build", "rabbitmq-sidecar.exe"), RABBITMQ_COORD)
     kfk = start_sidecar(os.path.join(ROOT, "build", "kafka-sidecar.exe"), KAFKA_COORD)
     sv = start_sidecar(os.path.join(ROOT, "build", "serve-sidecar.exe"), SERVE_COORD)
 
+    # 所有起过的侧车都要登记：8b 可能**再拉起一个** serve 实例（占用心跳偶发超时兜底），
+    # 若只 terminate 最后那个变量，前一个就变成残留进程——它会一直占着 coord 端口，
+    # 让下一轮 verify 起的新侧车「退让退出」，于是跑的还是**旧二进制**（结果假绿/假红）。
+    procs = [wh, rmq, kfk, sv]
+
     try:
         # ---- 0) 红线：extensions.yaml 声明的方法，必须都被侧车真正实现（/caps）----
-        # 堵住「yaml 能声明一个侧车根本没实现的方法」的缺口。期望值与 plugin/extensions.yaml
-        # 各 ext 的 methods 保持一致（subset 断言：声明 ⊆ 实现）。
+        # 堵住「yaml 能声明一个侧车根本没实现的方法」的缺口。期望值**从权威 schema 现读**
+        # （不再硬编码——硬编码副本会与 yaml 各自漂移，见 parse_ext_methods 注释）。
+        _decl = parse_ext_methods(EXT)
         caps_expect = {
-            "ext.webhook": (WEBHOOK_COORD, {"send", "listen", "unsubscribe"}),
-            "ext.rabbitmq": (RABBITMQ_COORD, {"publish", "declare", "consume", "unsubscribe"}),
-            "ext.kafka": (KAFKA_COORD, {"produce", "consume", "unsubscribe"}),
-            "ext.serve": (SERVE_COORD, {"start", "stop"}),
+            "ext.webhook": WEBHOOK_COORD,
+            "ext.rabbitmq": RABBITMQ_COORD,
+            "ext.kafka": KAFKA_COORD,
+            "ext.serve": SERVE_COORD,
         }
-        for _name, (_coord, _want) in caps_expect.items():
+        for _name, _coord in caps_expect.items():
+            _want = set(_decl.get(_name, []))
+            # fail-closed：解析不到（文件缺失/格式变了）必须报错，**不能拿空集去比**——
+            # 空集对任何集合都是子集，会静默通过，红线形同虚设。
+            if not _want:
+                check("红线：%s 声明的方法都被侧车实现(/caps)" % _name, False,
+                      "无法从 %s 解析出 %s 的 methods（文件缺失或格式变化）" % (EXT, _name))
+                continue
             _cap = http_get_json("http://%s/caps" % _coord)
             _got = set(_cap.get("result", {}).get("methods", []) or [])
             check("红线：%s 声明的方法都被侧车实现(/caps)" % _name, _want <= _got,
@@ -255,7 +343,7 @@ def main():
         ok = "result" in j and Sink.received
         check("P1 ext.webhook 经侧车 send 真实 POST 接收", ok, "sink 收到 %d 条" % len(Sink.received))
 
-        # ---- 1b) ext.webhook.listen：/subscribe + POST /in/{path} -> 侧车回推 ----
+        # ---- 1b) ext.webhook.subscribe：/subscribe + POST /in/{path} -> 侧车回推 ----
         before = len(Sink.received)
         js = http_post_json("http://%s/subscribe" % WEBHOOK_COORD,
                             {"args": {"handle": "h1", "callback_url": sink_url, "path": "demo"}})
@@ -270,7 +358,7 @@ def main():
                 pushed = True
                 break
             time.sleep(0.1)
-        check("P1 ext.webhook.listen 监听入站 URL 回推事件", subscribed and pushed,
+        check("P1 ext.webhook.subscribe 监听入站 URL 回推事件", subscribed and pushed,
               "subscribed=%s 回推=%s" % (subscribed, pushed))
 
         # ---- 1c) ext.kafka.consume / ext.rabbitmq.consume 直接调用（不再只经 ctx.subscribe 特例）----
@@ -378,8 +466,8 @@ def main():
         # 这里先探测 /caps，已退出则重新拉起专用实例，避免 P3 偶发失败。
         if "result" not in http_get_json("http://%s/caps" % SERVE_COORD):
             sv = start_sidecar(os.path.join(ROOT, "build", "serve-sidecar.exe"), SERVE_COORD)
+            procs.append(sv)
             time.sleep(1.2)
-        import socket
         s0 = socket.socket()
         s0.bind(("127.0.0.1", 0))
         serve_port = s0.getsockname()[1]
@@ -403,6 +491,44 @@ def main():
         check("P3 ext.serve 起静态网站并可访问后停止", started and fetched and stopped,
               "start=%s fetch=%s stop=%s %s" % (started, fetched, stopped, serr))
 
+        # ---- 8c) ext.serve 反向代理（proxy 配置）：/api 转发到后端、静态照常、非法规则 fail-closed ----
+        # 这是「UI 同源 /api 全 404」的修复面：起服时给 proxy 规则，命中前缀的请求进后端，
+        # 其余仍走静态文件；规则写错（如 path 不以 / 开头）必须报错，不得静默丢弃。
+        s1 = socket.socket()
+        s1.bind(("127.0.0.1", 0))
+        proxy_port = s1.getsockname()[1]
+        s1.close()
+        j2 = http_post_json("http://%s/start" % SERVE_COORD,
+                            {"args": {"port": proxy_port, "dir": site,
+                                      "proxy": [{"path": "/api", "target": api_url}]}})
+        started2 = "result" in j2
+        echoed = j2.get("result", {}).get("proxy") if started2 else None
+        proxied = False
+        static_ok = False
+        perr = ""
+        if started2:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/api/healthz" % proxy_port, timeout=5) as r:
+                    body = json.loads(r.read().decode("utf-8", "ignore"))
+                    proxied = (body.get("path") == "/api/healthz" and body.get("from") == "backend")
+            except Exception as e:
+                perr = str(e)
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/index.html" % proxy_port, timeout=5) as r:
+                    static_ok = (r.read().decode("utf-8", "ignore") == "<h1>hello gear serve</h1>")
+            except Exception as e:
+                perr += " static:" + str(e)
+        # 规则非法（path 缺前导 /）必须 fail-closed
+        jbad = http_post_json("http://%s/start" % SERVE_COORD,
+                              {"args": {"port": proxy_port, "dir": site,
+                                        "proxy": [{"path": "api", "target": api_url}]}})
+        bad_rejected = "error" in jbad
+        http_post_json("http://%s/stop" % SERVE_COORD, {"args": {}})
+        check("P3 ext.serve 反向代理：/api 转发后端 + 静态照常 + 非法规则 fail-closed",
+              started2 and bool(echoed) and proxied and static_ok and bad_rejected,
+              "start=%s echo=%s proxy=%s static=%s bad_reject=%s %s"
+              % (started2, bool(echoed), proxied, static_ok, bad_rejected, perr))
+
         # ---- 9) 红线：methods/schemas 不一致的 ext 必须启动 fail-closed ----
         bad = os.path.join(tmp, "bad.yaml")
         with open(bad, "w", encoding="utf-8") as f:
@@ -419,12 +545,13 @@ def main():
         six = {"ext.email", "ext.webhook", "ext.wecom", "ext.rabbitmq", "ext.kafka", "ext.sms", "ext.serve"}
         check("统一注册表含 6 个 ext", six.issubset(caps), "发现: %s" % sorted(caps))
     finally:
-        for p in (wh, rmq, kfk, sv):
+        for p in procs:
             try:
                 p.terminate()
             except Exception:
                 pass
         srv.shutdown()
+        api_srv.shutdown()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print("\n==== 汇总 %d/%d 通过 ====" % (passed, len(RESULTS)))

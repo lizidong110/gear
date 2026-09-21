@@ -151,7 +151,7 @@ registerService(ServiceSpec{
 
 ```yaml
 ext.mqtt:
-  cmd: ["./mqtt-sidecar"]        # 侧车启动命令（任意语言；可改为 ["build/gear.exe","ext","mqtt"] 若内核内建）
+  cmd: ["./mqtt-sidecar"]        # 侧车启动命令（任意语言）
   methods: [publish, subscribe]  # 暴露的方法（仅用于 schema/agent 锚定，非强制）
   schemas:                       # 必填（红线：缺 schemas 启动 fail-closed）
     publish:  { description: "...", parameters: {...} }
@@ -159,14 +159,31 @@ ext.mqtt:
   service: true                  # ★ 新：声明为常驻能力
   listen: "127.0.0.1:1884"       # ★ 新：rpc 本地 HTTP 监听地址；省略则仅 daemon 守护
   health_probe:                  # ★ 新：复用 Tool.HealthProbe，Supervisor 探活
-    tcp: "127.0.0.1:1884"        #   支持 tcp / http 两种探针
-    interval: 5s
-    failures: 3
+    kind: tcp                    #   实现口径为 kind(http|tcp|cmd) + addr / cmd（本节原先的
+    interval: 5s                 #   `tcp: host:port` / `failures:` 是早期草案字段，已被实现取代）
+    threshold: 3
 ```
 
 - `service` 缺省为 `false`：维持 once 模型，完全向后兼容；
 - `listen` 省略 + `service:true`：纯 daemon 守护（侧车自运行，Gear 不主动调它）；
 - `listen` 存在：rpc 生效，Gear 经本地 HTTP 调其方法（连接复用）。
+
+### ★ 2026-09-21：`listen` 是协调地址的唯一真相源
+实现见 `internal/engine/extensions.go:prepareServiceExt`（守卫：`extensions_test.go` 的
+`TestServiceExtEntryInjectsCoordAddr` / `TestServiceExtProbeAddrDefaultsToListen` /
+`TestServiceExtProbeAddrMismatchRejected` / `TestServiceExtProbeAddrEquivalentHostAccepted`）。
+
+- **注入**：引擎把 `listen` 以 `COORD_ADDR=<listen>`（值经单引号转义）**注入侧车进程环境**。
+  侧车（webhook / rabbitmq / kafka / serve / mqtt）里 `os.Getenv("COORD_ADDR")` 的默认值因此
+  降级为「不经引擎、手工单跑侧车」时的兜底。此前 yaml 与侧车**各写一份相同字面量**，
+  改任意一处都会变成「引擎连 A、侧车听 B」——进程都活着、连不上也不报错，只在调用时超时。
+- **探针收敛**：`health_probe.addr` 省略即取 `listen`；显式写出却与 `listen` 不一致
+  （`host:port` 归一后比较，`localhost` ↔ `127.0.0.1` 视为同一目标）则**装配期 fail-closed**。
+  探错地址会让监管反复判死并无限重启，属「能静态校验就不许留到运行期」的红线范围。
+- **配置后果**：权威 `plugin/extensions.yaml` 与用户模板 `extensions.example.yaml` 的
+  service ext 段**一律不写** probe 的 `addr`（写了就是多一份会漂移的定义）。
+- 反证方式：把某 service ext 的 `listen` 改成非默认端口后起 flow，侧车会**听在那个端口**、
+  其内置默认端口无人监听——即「改一处即两侧同源」。
 
 ---
 
@@ -200,7 +217,7 @@ stdin/stdout 换成 HTTP，便于连接复用与并发：
 2. flow 的 service step `call: ext.mqtt`（或 `ext.mqtt.__svc__`）`mode: service`
    → 引擎 `Supervise` 该 flow 时对此 step 走 `processRuntime.Start`；
 3. `Supervisor` 对返回的 `ServiceHandle` 启动 `probeLoop`（复用 `health_probe`），
-   崩溃按 `RestartAlways/Never` 策略 + 指数退避重启，进程树级联回收（红线 16）；
+   崩溃按 `RestartAlways/Never` 策略 + 指数退避重启，进程树级联回收（红线 16）；退出时打印退出码 + 输出尾部（`ExitReporter`，见 §11·2026-09-21）；
 4. flow 取消 → `stopAll` 杀掉所有 service 子进程（含该 ext 侧车）。
 
 > 注：`gear serve` 的 `RunFlow` 已具备"按 `req.Restart` 选策略 + Supervise + cancel 杀进程"
