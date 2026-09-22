@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"gear/internal/engine"
+	"gear/internal/gearhome"
 
 	_ "modernc.org/sqlite"
 )
@@ -53,12 +54,14 @@ type ExecStore struct {
 	mu sync.Mutex // 保护「读-改-写」类操作（如 SetTools 需先取再存）
 }
 
-// execDBPath 解析数据库文件路径（env 优先，缺省 build/gear.db）。
+// execDBPath 解析数据库文件路径。
+//
+// 委托给 gearhome：**绝不用 cwd 相对路径**。曾经的默认值 `build/gear.db` 让执行历史跟着
+// 调用方的工作目录走——`gear mcp` 被客户端以任意 cwd 派生时，历史会落到 `<cwd>/build/gear.db`
+// （顺手在用户目录里凭空造出 `build/`），换个 cwd 再跑就「查不到刚才那次执行」。
+// 现默认 `<GEAR_HOME|~>/.gear/exec.db`，与 registry 同目录；GEAR_EXEC_DB 仍可显式覆盖。
 func execDBPath() string {
-	if p := os.Getenv("GEAR_EXEC_DB"); p != "" {
-		return p
-	}
-	return filepath.Join("build", "gear.db")
+	return gearhome.ExecDBPath()
 }
 
 // NewExecStore 打开（必要时创建）SQLite 库并完成建表。

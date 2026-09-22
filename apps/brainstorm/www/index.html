@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>头脑风暴 · Gear</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#fff; --line:#e3e6ea; --text:#1f2328; --muted:#656d76;
+    --accent:#3b6ef5; --accent-soft:#eaf0ff; --ok:#1a7f37; --warn:#bc4c00; --err:#cf222e;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:24px 20px 64px}
+  header{display:flex;align-items:baseline;gap:12px;margin-bottom:20px}
+  h1{font-size:20px;margin:0}
+  .sub{color:var(--muted);font-size:12px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+  label{display:block;font-size:12px;color:var(--muted);margin:0 0 6px}
+  input[type=text],textarea,select{
+    width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;
+    font:inherit;background:#fff;color:var(--text);outline:none}
+  input[type=text]:focus,textarea:focus{border-color:var(--accent)}
+  textarea{resize:vertical;min-height:64px}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row>*{flex:1;min-width:200px}
+  button{
+    padding:9px 16px;border-radius:8px;border:1px solid var(--accent);
+    background:var(--accent);color:#fff;font:inherit;cursor:pointer}
+  button:hover{filter:brightness(1.06)}
+  button:disabled{opacity:.55;cursor:not-allowed}
+  button.ghost{background:#fff;color:var(--accent)}
+  button.mini{padding:4px 10px;font-size:12px}
+  .btns{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
+  .hint{font-size:12px;color:var(--muted);margin-top:8px}
+  #status{font-size:12px;color:var(--muted)}
+  #status.err{color:var(--err)} #status.ok{color:var(--ok)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+  .idea{border:1px solid var(--line);border-radius:9px;padding:12px;background:#fff;
+        display:flex;flex-direction:column;gap:8px}
+  .idea .t{font-weight:600;line-height:1.45}
+  .idea .d{font-size:12px;color:var(--muted)}
+  .idea .act{display:flex;gap:6px;margin-top:auto;flex-wrap:wrap}
+  .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:20px;
+       background:var(--accent-soft);color:var(--accent)}
+  .children{margin:10px 0 0 14px;padding-left:12px;border-left:2px solid var(--line);
+            display:flex;flex-direction:column;gap:6px}
+  .children li{font-size:13px}
+  .empty{color:var(--muted);font-size:13px;text-align:center;padding:28px 0}
+  pre{background:#f6f8fa;border:1px solid var(--line);border-radius:8px;padding:10px;
+      overflow:auto;font-size:12px;max-height:240px}
+  .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .bar .sp{flex:1}
+  details{margin-top:10px}
+  summary{cursor:pointer;font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>头脑风暴</h1>
+    <span class="sub">由 Gear 的 ext.ai 驱动 · 想法归你，过程可见</span>
+  </header>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>主题 / 问题</label>
+        <textarea id="topic" placeholder="例如：如何让小区居民更愿意垃圾分类"></textarea>
+      </div>
+      <div>
+        <label>视角（可选，叠加更聚焦）</label>
+        <input type="text" id="lens" placeholder="例如：低成本、一周内能落地">
+        <label style="margin-top:10px">每次生成条数</label>
+        <select id="count">
+          <option>5</option><option selected>8</option><option>12</option>
+        </select>
+      </div>
+    </div>
+    <div style="margin-top:12px">
+      <label>模型 API Key（仅存本机 localStorage，直接发给模型厂商，不经本页保存）</label>
+      <input type="text" id="apikey" placeholder="sk-...">
+      <div class="hint">默认厂商 siliconflow；可在下方改 base_url / model。</div>
+    </div>
+    <div class="btns">
+      <button id="gen">生成想法</button>
+      <button id="demo" class="ghost">演示数据（不调 AI）</button>
+      <button id="stop" class="ghost" disabled>停止</button>
+      <span id="status"></span>
+    </div>
+    <details>
+      <summary>高级：模型与端点</summary>
+      <div class="row" style="margin-top:10px">
+        <div><label>base_url</label><input type="text" id="baseurl" placeholder="留空用厂商默认"></div>
+        <div><label>model</label><input type="text" id="model" placeholder="留空用默认"></div>
+        <div><label>provider</label><input type="text" id="provider" placeholder="siliconflow"></div>
+        <div><label>temperature</label><input type="text" id="temp" value="0.9"></div>
+      </div>
+    </details>
+  </div>
+
+  <div class="card">
+    <div class="bar" style="margin-bottom:12px">
+      <strong>想法</strong><span class="sp"></span>
+      <button id="cluster" class="mini ghost" disabled>聚类归纳</button>
+      <button id="export" class="mini ghost" disabled>导出 Markdown</button>
+      <button id="clear" class="mini ghost" disabled>清空</button>
+    </div>
+    <div class="grid" id="ideas"><div class="empty">还没有想法。填好主题和 Key，点「生成想法」。</div></div>
+  </div>
+
+  <div class="card" id="summaryCard" style="display:none">
+    <strong>聚类归纳</strong>
+    <div id="summary" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <strong>调用明细</strong>
+    <div class="hint">每次 AI 调用都走 Gear 的 <code>/api/capabilities/invoke</code>，下面保留最近一帧，便于排障。</div>
+    <pre id="debug">（空）</pre>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const ideas = [];              // {title, desc, children:[]}
+let seq = 0, stopped = false;
+
+const KEY = 'gear.brainstorm.key';
+$('#apikey').value = localStorage.getItem(KEY) || '';
+$('#apikey').addEventListener('change', () => localStorage.setItem(KEY, $('#apikey').value.trim()));
+
+function setStatus(msg, cls){
+  const el = $('#status');
+  el.textContent = msg || '';
+  el.className = cls || '';
+}
+function busy(on){
+  $('#gen').disabled = on;
+  $('#stop').disabled = !on;
+  stopped = !on ? false : stopped;
+}
+
+// 调 Gear 的原子能力：等价于 Flow 里的 step 直调 ext.ai.complete
+async function invoke(name, method, args){
+  const r = await fetch('/api/capabilities/invoke', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name, method, args})
+  });
+  const text = await r.text();
+  $('#debug').textContent = text;
+  if(!r.ok) throw new Error('HTTP ' + r.status + ' — ' + text.slice(0,300));
+  let j; try{ j = JSON.parse(text); }catch(e){ throw new Error('返回非 JSON：' + text.slice(0,300)); }
+  if(j && j.error) throw new Error(j.error);
+  return j;
+}
+
+function aiArgs(prompt, fmt){
+  const a = {prompt, temperature: parseFloat($('#temp').value || '0.9')};
+  if(fmt) a.format = fmt;
+  const k = $('#apikey').value.trim();
+  if(k) a.api_key = k;
+  const bu = $('#baseurl').value.trim(); if(bu) a.base_url = bu;
+  const md = $('#model').value.trim();   if(md) a.model = md;
+  const pv = $('#provider').value.trim();if(pv) a.provider = pv;
+  return a;
+}
+
+function parseIdeas(raw){
+  // ext.ai.complete(format=json) 返回 {data}；容错：也可能是 {text} 包着 JSON
+  let d = raw && raw.data !== undefined ? raw.data : raw;
+  if(typeof d === 'string'){ try{ d = JSON.parse(d); }catch(e){} }
+  if(typeof raw === 'string'){ try{ const t = JSON.parse(raw); d = t.data !== undefined ? t.data : t; }catch(e){} }
+  let arr = Array.isArray(d) ? d : (d && Array.isArray(d.ideas) ? d.ideas : null);
+  if(!arr){
+    // 退化：按行切文本
+    const tx = (raw && (raw.text || raw)) || '';
+    arr = String(tx).split('\n').map(s=>s.replace(/^\s*[-*\d.)\s]+/,'').trim())
+                    .filter(Boolean).map(t=>({title:t, desc:''}));
+  }
+  return arr.map(x => typeof x === 'string'
+      ? {title:x, desc:''}
+      : {title:x.title || x.idea || x.name || String(x), desc:x.desc || x.description || ''});
+}
+
+function render(){
+  const box = $('#ideas');
+  if(!ideas.length){
+    box.innerHTML = '<div class="empty">还没有想法。填好主题和 Key，点「生成想法」。</div>';
+    $('#cluster').disabled = $('#export').disabled = $('#clear').disabled = true;
+    return;
+  }
+  $('#cluster').disabled = $('#export').disabled = $('#clear').disabled = false;
+  box.innerHTML = '';
+  for(const it of ideas){
+    const el = document.createElement('div');
+    el.className = 'idea';
+    el.innerHTML =
+      '<div class="t">' + esc(it.title) + '</div>' +
+      (it.desc ? '<div class="d">' + esc(it.desc) + '</div>' : '') +
+      (it.children && it.children.length
+        ? '<ul class="children">' + it.children.map(c=>'<li>'+esc(c)+'</li>').join('') + '</ul>'
+        : '') +
+      '<div class="act"></div>';
+    const act = el.querySelector('.act');
+    const b1 = document.createElement('button');
+    b1.className = 'mini ghost'; b1.textContent = '深化';
+    b1.onclick = () => expand(it, b1);
+    act.appendChild(b1);
+    const b2 = document.createElement('button');
+    b2.className = 'mini ghost'; b2.textContent = '删除';
+    b2.onclick = () => { ideas.splice(ideas.indexOf(it),1); render(); };
+    act.appendChild(b2);
+    box.appendChild(el);
+  }
+}
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+async function expand(it, btn){
+  const topic = $('#topic').value.trim();
+  const lens  = $('#lens').value.trim();
+  btn.disabled = true; btn.textContent = '深化中…';
+  setStatus('正在深化：' + it.title.slice(0,20) + '…');
+  try{
+    const p = '主题：' + topic + (lens ? '\n视角：' + lens : '') +
+      '\n\n已有一条想法：' + it.title + (it.desc ? '（' + it.desc + '）' : '') +
+      '\n请围绕它给出 4 条更具体的落地动作，每条不超过 20 字。' +
+      '\n严格只输出 JSON：{"items":["...","..."]}';
+    const r = await invoke('ext.ai', 'complete', aiArgs(p, 'json'));
+    let items = (r && r.data && r.data.items) || [];
+    if(!items.length && typeof r === 'string'){
+      try{ items = JSON.parse(r).items || []; }catch(e){}
+    }
+    if(!items.length && r && r.text){
+      try{ items = JSON.parse(r.text).items || []; }catch(e){
+        items = r.text.split('\n').map(s=>s.replace(/^\s*[-*\d.)\s]+/,'').trim()).filter(Boolean);
+      }
+    }
+    it.children = items.map(String);
+    render();
+    setStatus('已深化 ' + items.length + ' 条', 'ok');
+  }catch(e){
+    setStatus('深化失败：' + e.message, 'err');
+  }finally{
+    btn.disabled = false; btn.textContent = '深化';
+  }
+}
+
+$('#demo').onclick = () => {
+  const t = $('#topic').value.trim() || '如何让小区居民更愿意垃圾分类';
+  ideas.length = 0;
+  [
+    {title:'投放积分兑换日用品', desc:'每次正确投放扫码积分，月度兑换洗洁精等'},
+    {title:'楼层红黑榜', desc:'每月公示各楼栋准确率，用荣誉感驱动'},
+    {title:'撤桶并点 + 定时开放', desc:'减少投放点、固定时段，降低监督成本'},
+    {title:'厨余换花草肥', desc:'把厨余就地堆肥，居民可领回家养花'},
+    {title:'让孩子当监督员', desc:'亲子活动形式，孩子带动家庭'}
+  ].forEach(x => ideas.push({id:++seq, title:x.title, desc:x.desc, children:[]}));
+  render();
+  setStatus('演示数据已载入（未调用 AI）——填好 Key 后点「生成想法」即为真实生成', 'ok');
+};
+
+$('#gen').onclick = async () => {
+  const topic = $('#topic').value.trim();
+  if(!topic){ setStatus('先填主题', 'err'); return; }
+  if(!$('#apikey').value.trim()){ setStatus('需要 API Key（默认厂商 siliconflow）', 'err'); return; }
+  const n = parseInt($('#count').value, 10) || 8;
+  const lens = $('#lens').value.trim();
+  busy(true); setStatus('正在生成…');
+  const p = '你是资深头脑风暴主持人。\n主题：' + topic + (lens ? '\n视角约束：' + lens : '') +
+    '\n请给出 ' + n + ' 条彼此不重复、具体可执行的想法。' +
+    '\n严格只输出 JSON（不要代码块、不要解释）：{"ideas":[{"title":"不超过18字","desc":"一句话说明怎么做"}, ...]}';
+  try{
+    const r = await invoke('ext.ai', 'complete', aiArgs(p, 'json'));
+    const arr = parseIdeas(r);
+    for(const x of arr) ideas.push({id: ++seq, title: x.title, desc: x.desc, children: []});
+    render();
+    setStatus('生成 ' + arr.length + ' 条', 'ok');
+  }catch(e){
+    setStatus('生成失败：' + e.message, 'err');
+  }finally{ busy(false); }
+};
+
+$('#stop').onclick = () => { stopped = true; setStatus('已请求停止（下次调用不再发起）'); busy(false); };
+
+$('#cluster').onclick = async () => {
+  const topic = $('#topic').value.trim();
+  setStatus('正在聚类…');
+  const list = ideas.map((x,i)=>(i+1)+'. '+x.title+(x.desc?'（'+x.desc+'）':'')).join('\n');
+  const p = '主题：' + topic + '\n以下是头脑风暴产生的想法：\n' + list +
+    '\n请归纳成 3-5 个主题簇，给出每簇名称、包含的编号、以及一句点评。' +
+    '\n用 Markdown 输出。';
+  try{
+    const r = await invoke('ext.ai', 'complete', aiArgs(p, 'text'));
+    const tx = (r && (r.text || r.data)) || '';
+    $('#summaryCard').style.display = '';
+    $('#summary').innerHTML = '<div style="white-space:pre-wrap">' + esc(tx) + '</div>';
+    setStatus('聚类完成', 'ok');
+  }catch(e){ setStatus('聚类失败：' + e.message, 'err'); }
+};
+
+$('#export').onclick = () => {
+  const topic = $('#topic').value.trim() || '头脑风暴';
+  let md = '# ' + topic + '\n\n';
+  ideas.forEach(x=>{
+    md += '- **' + x.title + '**' + (x.desc ? ' — ' + x.desc : '') + '\n';
+    (x.children||[]).forEach(c=> md += '  - ' + c + '\n');
+  });
+  const blob = new Blob([md], {type:'text/markdown;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'brainstorm.md';
+  a.click();
+};
+
+$('#clear').onclick = () => { ideas.length = 0; render(); $('#summaryCard').style.display='none'; setStatus(''); };
+</script>
+</body>
+</html>

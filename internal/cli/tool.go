@@ -2,11 +2,13 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
+	"gear/internal/cmdline"
 	"gear/internal/model"
 	"gear/internal/registry"
 )
@@ -63,6 +65,15 @@ func toolRegisterCmd() *cobra.Command {
 			for _, t := range tools {
 				if err := t.Validate(); err != nil {
 					return fmt.Errorf("Tool %s 校验失败（本次未写入任何 Tool）: %w", t.ID, err)
+				}
+			}
+			// entry 里给路径类 flag 传了相对路径 → stderr 提示。判据与 MCP 的 gear_validate
+			// 共用 internal/cmdline 那一份，两个入口结论必然一致。
+			// ⚠ 只提示不阻断：相对值在「就地手跑」时合法，但换个 cwd 就会静默指向别处——
+			// 2026-09-22 正是这么踩到「应用自带 REST 面读了另一个库、列表永远为空」的。
+			for _, t := range tools {
+				for _, f := range cmdline.RelPathFlagsInLine(t.Entry) {
+					fmt.Fprintf(os.Stderr, "⚠ %s\n", cmdline.RelPathFlagHint("tool "+t.ID, f))
 				}
 			}
 			registered := make([]string, 0, len(tools))

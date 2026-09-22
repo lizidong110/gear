@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gear app 存活探针</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f5f6f8; color: #1c1c1e;
+  }
+  .card {
+    background: #fff; border: 1px solid #e3e4e8; border-radius: 12px;
+    padding: 32px 36px; min-width: 420px;
+  }
+  h1 { margin: 0 0 4px; font-size: 18px; font-weight: 500; }
+  .sub { margin: 0 0 20px; font-size: 13px; color: #6b6b70; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 8px 20px; margin: 0; font-size: 13px; }
+  dt { color: #6b6b70; }
+  dd { margin: 0; font-variant-numeric: tabular-nums; }
+  .ok { color: #0f6e56; font-weight: 500; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1c1c1e; color: #f2f2f7; }
+    .card { background: #2c2c2e; border-color: #3a3a3c; }
+    .sub, dt { color: #98989d; }
+    .ok { color: #5dcaa5; }
+  }
+</style>
+</head>
+<body>
+  <main class="card">
+    <h1>gear app 存活探针</h1>
+    <p class="sub">由 ext.serve 侧车托管的静态页面</p>
+    <dl>
+      <dt>应用</dt><dd>smoke.up</dd>
+      <dt>服务端口</dt><dd>8080</dd>
+      <dt>状态</dt><dd class="ok">serving</dd>
+      <dt>页面加载于</dt><dd id="loaded">—</dd>
+    </dl>
+  </main>
+  <script>
+    document.getElementById('loaded').textContent = new Date().toLocaleString('zh-CN');
+  </script>
+</body>
+</html>

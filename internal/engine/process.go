@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"gear/internal/cap"
+	"gear/internal/cmdline"
 )
 
 // defaultExecTimeout 是单次 process 执行的默认超时（F4：防止挂死工具占住执行线程）。
@@ -50,7 +51,9 @@ func (p *processRuntime) Start(ctx context.Context, entry string, input map[stri
 
 // execProcess 把 *exec.Cmd 适配成 engine.Process 抽象（避免上层依赖 os/exec）。
 // kill 是平台化的「级联回收」函数（见 process_unix.go / process_windows.go）：
-// 不仅杀 sh，还要一并杀掉其孙进程（如 `sleep`），否则孤儿会脱离监管（红线 16 的延伸）。
+// 不仅杀包装器本体，还要一并杀掉其孙进程（如 `sleep`），否则孤儿会脱离监管
+// （红线 16 的延伸）。注意包装器**可能是 shell**（entry 含元字符时），也可能就是目标
+// 进程本身（原生路径），两种形态都由 killProcessTree 统一处理。
 type execProcess struct {
 	cmd  *exec.Cmd
 	kill func() error
@@ -113,8 +116,11 @@ func (e *execProcess) ExitInfo() (int, []string) {
 // runProcess 执行 process runtime 的 Tool：把 input 序列化为 JSON 经 stdin 传入，
 // 读取 stdout 的最后一行非空内容作为 JSON 输出（见 PRD §3.3 的 process 契约）。
 //
-// 当前通过 `sh -c <entry>` 启动命令（开发环境为 Git Bash，sh 可用）。
-// 跨平台/生产化时再抽成可配置的 shell 解析器。
+// 命令解析交给 cmdline（**默认不经 shell**）：entry 里的 `NAME=value` 前缀与引号由 gear
+// 自己解析成 argv + 环境变量。此前写死 `sh -c <entry>`，而 Windows 系统 PATH 里通常没有
+// sh（Git 只把 git.exe 放进 `Git\cmd`）⇒ GUI 宿主派生的 gear 拉不起任何 process 型 Tool
+// ⇒ 服务侧车全起不来（2026-09-21 实测）。仅当 entry 含未加引号的 shell 元字符
+// （管道 / 重定向 / && / 通配 / 变量展开）时才回落到 shell，且找不到 shell 即 fail-closed。
 // ctx 用于超时控制：超时时命令被杀死并返回错误（F4）。
 func runProcess(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context, execID, stepID string, sink func(stepID, stream, line string)) (map[string]interface{}, error) {
 	input = withHostCapabilities(input, host)
@@ -123,7 +129,10 @@ func runProcess(ctx context.Context, entry string, input map[string]interface{},
 		return nil, fmt.Errorf("序列化 input 失败: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", entry)
+	cmd, err := cmdline.Command(ctx, entry)
+	if err != nil {
+		return nil, procFail(err.Error(), entry, nil, nil)
+	}
 	cmd.Stdin = bytes.NewReader(inBytes)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -265,7 +274,12 @@ func startProcess(ctx context.Context, entry string, input map[string]interface{
 	if err != nil {
 		return nil, fmt.Errorf("创建 service 输出管道失败: %v", err)
 	}
-	cmd := exec.CommandContext(ctx, "sh", "-c", entry)
+	cmd, err := cmdline.Command(ctx, entry)
+	if err != nil {
+		_ = pr.Close()
+		_ = pw.Close()
+		return nil, err
+	}
 	cmd.Stdin = bytes.NewReader(inBytes)
 	cmd.Stdout = pw
 	cmd.Stderr = pw

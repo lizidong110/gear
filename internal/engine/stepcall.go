@@ -61,11 +61,33 @@ func (c resolvedCall) id() string {
 // 不能静默忽略：静默 no-op 会让用户以为钉了版本 / 起了长驻服务，实际都没发生（M1「when 被静默忽略」、
 // M6「use_version 被静默忽略」修掉的正是这一类漂移）。运行期另一入口 startServiceStep 有同款兜底。
 func (e *Engine) resolveStepCall(step model.Step) (resolvedCall, error) {
+	return e.resolveStepCallView(step, nil)
+}
+
+// resolveStepCallView 是 resolveStepCall 的「带额外可见 Tool」版本。
+//
+// 为什么需要它：MCP 的 `gear_validate` / `gear_apply` 要校验一个 **bundle**——里面的 Tool 与
+// Flow 互相引用，而此刻那些 Tool **还没落库**。若只按 registry 解析，合法的 bundle 会被判成
+// `UNKNOWN_CALL_TARGET`，「先校验后落库」这条路径就永远走不通。
+//
+// extra 是「本次一起提交、尚未落库」的 Tool 视图；解析顺序是 extra → registry。
+// 判定规则（Tool 优先、直调兜底、方法级 schema 校验）与不带 extra 时**完全同一份代码**，
+// 不存在第二套「bundle 专用解析」。
+func (e *Engine) resolveStepCallView(step model.Step, extra map[string]*model.Tool) (resolvedCall, error) {
+	var tool *model.Tool
 	// ① 已注册 Tool 优先（「Tool 名恰好等于某能力方法名」时按 Tool 解析——
-	//    plannedToolIDs 的上报口径与此一致，语义才是自洽的）。
-	if tool, err := e.reg.GetTool(step.Call); err != nil {
-		return resolvedCall{}, err
-	} else if tool != nil {
+	//    plannedToolIDs 的上报口径与此一致，语义才是自洽的）。bundle 内待落库的 Tool 先看。
+	if extra != nil {
+		tool = extra[step.Call]
+	}
+	if tool == nil {
+		registered, err := e.reg.GetTool(step.Call)
+		if err != nil {
+			return resolvedCall{}, err
+		}
+		tool = registered
+	}
+	if tool != nil {
 		eff, err := resolveToolVersion(tool, step)
 		if err != nil {
 			return resolvedCall{}, err
@@ -78,17 +100,27 @@ func (e *Engine) resolveStepCall(step model.Step) (resolvedCall, error) {
 	//    会把能力名切错成 `ext`（实测踩过：注册期报「未知的原子能力 "ext"」）。
 	if prim, method := splitToolMethod(step.Call, ""); prim != "" && method != "" {
 		if err := e.checkCapabilityMethod(prim, method); err != nil {
-			return resolvedCall{}, fmt.Errorf("step %s: %w", step.ID, err)
+			return resolvedCall{}, diagWrap(CodeUnknownCapability, fmt.Errorf("step %s: %w", step.ID, err), step.ID, "step("+step.ID+").call",
+				"能力名与方法名以 gear_capabilities 为准；ext.* 还必须在 extensions.yaml 注册")
 		}
 		if step.UseVersion != "" {
-			return resolvedCall{}, fmt.Errorf("step %s 直调原子能力 %s 不支持 use_version（版本灰度只对已注册 Tool 的版本列表生效）", step.ID, step.Call)
+			return resolvedCall{}, diagWrap(CodeDirectCallLimited,
+				fmt.Errorf("step %s 直调原子能力 %s 不支持 use_version（版本灰度只对已注册 Tool 的版本列表生效）", step.ID, step.Call),
+				step.ID, "step("+step.ID+").use_version",
+				"要去掉 use_version，或把这段逻辑包装成一个已注册 Tool（Tool 才有版本）")
 		}
 		if step.IsService() {
-			return resolvedCall{}, fmt.Errorf("step %s 直调原子能力 %s 不支持 mode=service（长驻请用 process runtime 的 Tool）", step.ID, step.Call)
+			return resolvedCall{}, diagWrap(CodeDirectCallLimited,
+				fmt.Errorf("step %s 直调原子能力 %s 不支持 mode=service（长驻请用 process runtime 的 Tool）", step.ID, step.Call),
+				step.ID, "step("+step.ID+").mode",
+				"长驻 step 的 call 必须是已注册 Tool（用 process runtime），不能直调原子能力")
 		}
 		return resolvedCall{prim: prim, method: method}, nil
 	}
-	return resolvedCall{}, fmt.Errorf("step %s 的 call %q 既不是已注册 Tool，也不是「能力.方法」形式的原子能力直调", step.ID, step.Call)
+	return resolvedCall{}, diagWrap(CodeUnknownCallTarget,
+		fmt.Errorf("step %s 的 call %q 既不是已注册 Tool，也不是「能力.方法」形式的原子能力直调", step.ID, step.Call),
+		step.ID, "step("+step.ID+").call",
+		"先用 gear_catalog(kind=tool) 确认 Tool，或改用「能力.方法」直调（清单见 gear_capabilities）")
 }
 
 // checkCapabilityMethod 校验「能力.方法」是否为已知可调用的组合（红线 15：解析点拒绝未知值）。

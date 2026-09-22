@@ -10,12 +10,19 @@
 #   · site   —— once，call: static_site.serve。向侧车下发 /start：把 dist 托管到 :8080，
 #               并把 /api 反代到后端 8787（proxy 规则）——静态与接口同源，UI 才真连得上内核。
 #
-# 注册：gear flow register --registry <db> plugin/web_ui_flow.yaml
-# 运行：GEAR_EXT_CONFIG=plugin/extensions.yaml \
-#         gear app run web_ui.up --registry build/ui-registry.db
-#（须从仓库根目录运行：web_ui.api 的 entry 与 site 的 dir 皆为相对路径。）
+# 注册（**约定 cwd = 仓库根**）：gear flow register plugin/web_ui_flow.yaml
+# 运行（同样在仓库根）：GEAR_EXT_CONFIG=plugin/extensions.yaml \
+#         gear app run web_ui.up
+#       ／后台：gear app start web_ui.up --port 8080 --port 8787 --wait 10
 #
-# 前置：build/gear.exe、build/serve-sidecar.exe 已构建（go build）。
+# 为什么两个命令里都没有 `--registry`：**不要**给应用自带的 REST 面写死库路径。
+# 起服进程会把本次生效的 registry 绝对化后写进 GEAR_REGISTRY，应用内步骤直接继承——
+# 于是 UI 里的列表与你 CLI 的 `gear flow list` 必然同源（2026-09-22 的修法，详见
+# plugin/web_ui_tools.yaml 里 web_ui.api 的注释）。真要隔离就传**绝对路径**的 --registry。
+#
+# 前置：build/gear.exe、build/serve-sidecar.exe 已构建（go build / scripts/build.sh）。
+# cwd 约定的可见证据：本文件的 `dir: build/dist` 与 web_ui.api 的 `entry: build/gear.exe`
+# 都按「仓库根」解析——docs/README 里的注册与运行示例也都在仓库根执行。
 id: web_ui.up
 name: Web UI 起服（静态站 + 后端，同源）
 description: 用 ext.serve 把 web-ui 的 dist 托管为静态站并把 /api 反代到后端，用 process 起 gear REST 后端；一个 Flow 管两个长驻服务，静态与接口同源。

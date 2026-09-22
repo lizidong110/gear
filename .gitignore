@@ -10,8 +10,11 @@
 # 测试日志落盘（scripts/gate.sh 产出，不纳入版本控制）
 /build/testlogs/
 
-# 执行记录 SQLite 持久化库及其 WAL 侧车文件（execstore.go 默认 build/gear.db，
-# 测试时落在 internal/server/build/、internal/cli/build/ 等；WAL 模式会生成 -shm/-wal）
+# 执行记录 SQLite 持久化库及其 WAL 侧车文件。
+# 2026-09-21 起默认落点不再是相对 cwd 的 build/gear.db，而是 <GEAR_HOME>/exec.db
+# （GEAR_HOME 未设时 <HOME>/.gear/exec.db，见 internal/gearhome/gearhome.go）；
+# 测试由 gearhome.IsolateForTest() 重定向到临时目录。
+# 保留这三个忽略项仅为防止历史遗留产物被误入库（WAL 模式会生成 -shm/-wal）。
 **/gear.db
 **/gear.db-shm
 **/gear.db-wal

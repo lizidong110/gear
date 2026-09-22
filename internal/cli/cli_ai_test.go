@@ -12,12 +12,17 @@ import (
 // 文本、不联网（见 internal/engine/ai_llm.go），因此这些用例在离线环境也能跑，
 // 不依赖任何真实 key。
 
-// withTempRegistry 把全局 --registry 指向临时库，避免写到用户目录 ~/.gear/registry.db。
-func withTempRegistry(t *testing.T) {
+// withTempRegistry 把本次测试用到的 registry 指向临时库，避免读写用户目录 ~/.gear/registry.db。
+//
+// ⚠ 它必须经 testRegistryOverride 生效（见其注释）：只改全局 registryPath 是**无效**的，
+// newRootCmd 的 StringVar 会用默认值把它覆盖回去。
+func withTempRegistry(t *testing.T) string {
 	t.Helper()
-	old := registryPath
-	registryPath = tempDB(t)
-	t.Cleanup(func() { registryPath = old })
+	db := tempDB(t)
+	oldOverride, oldPath := testRegistryOverride, registryPath
+	testRegistryOverride, registryPath = db, db
+	t.Cleanup(func() { testRegistryOverride, registryPath = oldOverride, oldPath })
+	return db
 }
 
 func TestAICapabilitiesPrintsCatalog(t *testing.T) {

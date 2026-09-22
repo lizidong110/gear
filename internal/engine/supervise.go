@@ -154,7 +154,7 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 		err := e.execLevel(flow.Steps, level, func(ctx context.Context, step model.Step, call resolvedCall) error {
 			if reason, ok := skipReasonFor(step.ID); ok {
 				markSkipped(step.ID, reason)
-				fmt.Printf("- step %s 跳过（%s）\n", step.ID, reason)
+				e.progressf("- step %s 跳过（%s）\n", step.ID, reason)
 				return nil
 			}
 
@@ -162,7 +162,7 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 				h, err := e.startServiceStep(ctx, rc, hooks, flowID, step, call)
 				if errors.Is(err, ErrStepSkipped) {
 					markSkipped(step.ID, "when=false")
-					fmt.Printf("- step %s 跳过（when=false）\n", step.ID)
+					e.progressf("- step %s 跳过（when=false）\n", step.ID)
 					return nil
 				}
 				if err != nil {
@@ -171,21 +171,21 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 				svcMu.Lock()
 				res.Services = append(res.Services, h)
 				svcMu.Unlock()
-				fmt.Printf("• step %s (%s) 作为 service 长驻启动 (pid=%d)\n", step.ID, step.Call, h.Proc.Pid())
+				e.progressf("• step %s (%s) 作为 service 长驻启动 (pid=%d)\n", step.ID, step.Call, h.Proc.Pid())
 				return nil
 			}
 
 			input, output, err := e.runOnceStep(ctx, rc, hooks, flowID, step, call)
 			if errors.Is(err, ErrStepSkipped) {
 				markSkipped(step.ID, "when=false")
-				fmt.Printf("- step %s 跳过（when=false）\n", step.ID)
+				e.progressf("- step %s 跳过（when=false）\n", step.ID)
 				return nil
 			}
 			if err != nil {
 				return err
 			}
 			rc.setStep(step.ID, input, output)
-			fmt.Printf("✓ step %s (%s) -> %v\n", step.ID, step.Call, output)
+			e.progressf("✓ step %s (%s) -> %v\n", step.ID, step.Call, output)
 			return nil
 		})
 		if err != nil {
@@ -200,9 +200,9 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 	}
 
 	if len(res.Services) > 0 {
-		fmt.Printf("• Flow %s 进入监管态（%d 个 service 长驻）\n", flowID, len(res.Services))
+		e.progressf("• Flow %s 进入监管态（%d 个 service 长驻）\n", flowID, len(res.Services))
 	} else {
-		fmt.Printf("✓ Flow %s 执行完成（纯 once），共 %d 步\n", flowID, len(flow.Steps))
+		e.progressf("✓ Flow %s 执行完成（纯 once），共 %d 步\n", flowID, len(flow.Steps))
 	}
 	return res, nil
 }
@@ -214,7 +214,7 @@ func (e *Engine) stopStartedServices(res *SuperviseResult) {
 	if len(res.Services) == 0 {
 		return
 	}
-	fmt.Printf("• 清理 %d 个已启动的 service（Flow 执行失败，防孤儿进程）\n", len(res.Services))
+	e.progressf("• 清理 %d 个已启动的 service（Flow 执行失败，防孤儿进程）\n", len(res.Services))
 	for _, h := range res.Services {
 		_ = h.ProcKill()
 		if h.Coord != nil {

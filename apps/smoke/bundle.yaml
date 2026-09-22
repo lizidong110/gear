@@ -1,0 +1,71 @@
+# gear app 存活探针 —— 最小长驻应用（App 交付的最小完整形态）
+#
+# 用途：验证 gear_app 的完整生命周期（gear_apply → gear_app start → status / stop），
+#       以及「静态站 + 反向代理」这类典型应用的起服链路是否真的落地。
+#
+# 实测结论（2026-09-21，Windows + WorkBuddy harness）：
+#   1) 通过 CLI 起服：**通**。cwd=<repo>/build + PATH 含 sh 时，
+#      `gear app start smoke.up --port 8080 --wait 10` → running，
+#      8080 与 8095（侧车 coord）双 LISTENING，curl 取回 HTTP 200 与页面内容。
+#   2) 通过 MCP 起服：**不通**。WorkBuddy 派生的 gear 进程 cwd 不在 build/、PATH 无 sh，
+#      两条环境缺陷各自都能单独让应用起不来（详见 .workbuddy/memory/2026-09-21.md）。
+#   3) 跨命令/跨会话存活：**不通**。start 派生的是 detach 进程，但退化后仍留在调用方 Job 内，
+#      命令返回即被连坐回收（list 报 unknown + pid-gone）。
+#
+# 注意 site 步用的是 registry 里**已修正**的 static_site.serve（1.0.0，含 proxy 空表规范化）。
+# 本应用原本自带 smoke__serve Tool 以规避该 Tool 的历史版本问题，但**未能落库**：
+# 声明 ext.* capability 的 Tool 在 MCP 侧会被拒（extensions.yaml 按 ./extensions.yaml 定位，
+# cwd 不符时 ext 名单为空 ⇒ `未知的 capability "ext.serve"`）。
+#
+# 起服：cd <repo>/build && ./gear.exe app start smoke.up --port 8080 --wait 10
+# 停止：cd <repo>/build && ./gear.exe app stop <app_id>     （app_id 见 app list）
+kind: App
+id: smoke
+name: gear app 存活探针
+description: 最小长驻应用：ext.serve 侧车托管静态目录，用于验证 gear_app 生命周期与跨会话存活
+entry_flow: smoke.up
+layout:
+  workdir: apps/smoke
+  files:
+    - {path: apps/smoke/www/index.html, required: true}
+start:
+  restart: always
+  ports: [8080]
+requires:
+  sidecars: [serve]
+  capabilities: [ext.serve]
+---
+kind: Tool
+id: smoke__config
+name: smoke 配置锚点
+description: 排序锚点（service step 不能作为依赖目标，用它把 site 推到下一层）
+runtime: lua
+entry: |
+  return {}
+input_schema:
+  type: object
+output_schema:
+  type: object
+versions:
+  - version: "1.0.0"
+    state: stable
+---
+kind: Flow
+id: smoke.up
+name: smoke 起服
+description: 持有 serve 侧车，把 www 目录托管到 127.0.0.1:8080
+steps:
+  - id: anchor
+    call: smoke__config
+    input: {}
+  - id: serve
+    call: ext.serve
+    mode: service
+    input: {}
+  - id: site
+    call: static_site.serve
+    depends_on: [anchor]
+    input:
+      port: 8080
+      dir: D:/gadern/gear/apps/smoke/www
+      host: 127.0.0.1

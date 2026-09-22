@@ -1,6 +1,7 @@
 # Web UI 起服 Flow 用到的 Tool（配套 Flow 见 plugin/web_ui_flow.yaml）。
 #
-# 注册：gear tool register --registry <db> plugin/web_ui_tools.yaml
+# 注册（**约定 cwd = 仓库根**，本文件与配套 Flow 的相对路径都按它解析）：
+#   gear tool register plugin/web_ui_tools.yaml
 #（本文件只含 Tool。tool register / flow register 都不接受 Tool+Flow 混合文件，
 #  故 Flow 单独放 plugin/web_ui_flow.yaml。）
 
@@ -29,12 +30,20 @@ entry: |
 ---
 # UI 的后端（其「后台」）：用 process 长驻起 gear REST 执行面。
 #
-# entry 与 --registry 都是相对路径，**须从仓库根目录**启动本 Flow（gear app run ...）才有意义。
+# entry 里的可执行文件路径是**相对于本 Flow 的 cwd 约定（仓库根）**的。
+#
+# ⚠ 刻意**不写 `--registry`**：那个子进程的库应当由**启动它的进程**决定，而不是在 entry 里写死。
+#   它现在会从环境变量 GEAR_REGISTRY 继承（起服方 openRegistry 时把生效路径绝对化后注入），
+#   于是「应用自带的 REST 面」与「你 CLI 里的库」永远同一个——这正是 2026-09-22 那个
+#   「http://127.0.0.1:8080/api/flows 返回 []、而 `gear flow list` 有 10 条」的根因：
+#   这里曾写死 `--registry ./ui-registry.db`，子进程按**自己的 cwd** 解析，读到了另一次实验
+#   留下的空库（flows=0、tools=4），且完全静默——页面只是空列表，日志一个字都没有。
+#   「换个 cwd 就静默指向另一个库」这类 entry 会在注册/校验期收到提示（见 gear_validate 的 warnings）。
 id: web_ui.api
 name: Gear REST 后端（web-ui 的后台）
 description: 以 process 长驻方式启动 gear REST 执行面（/api/**），作为 web-ui 的后台。默认监听 127.0.0.1:8787。
 runtime: process
-entry: "build/gear.exe serve --registry build/ui-registry.db --addr 127.0.0.1:8787"
+entry: "build/gear.exe serve --addr 127.0.0.1:8787"
 input_schema:
   type: object
   properties: {}

@@ -146,7 +146,7 @@ func TestExtSidecarForward(t *testing.T) {
 					return 0
 				}
 				args := map[string]interface{}{}
-				if m, ok := fromLuaValue(L.Get(1)).(map[string]interface{}); ok {
+				if m, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{}); ok {
 					args = m
 				}
 				res, err := p.(*SidecarProvider).Call("ping", args)

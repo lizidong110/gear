@@ -1,0 +1,179 @@
+package mcp
+
+// common.go：工具面的公共部件——结构化错误与参数类型。
+//
+// 错误形态（MCP_AGENT_DESIGN.md §6.2⑨ / §9.1）：
+//   - **执行失败**（Flow 跑挂了、应用没起来）不是协议错误：工具**成功返回**记录（status: failed），
+//     让智能体从 status/error/diagnostics 里定位问题步骤；
+//   - **前置条件不满足**（对象不存在、参数非法、被守卫拒绝）才是工具错误：IsError=true + 文本带码。
+//
+// 两类必须泾渭分明，否则智能体的判断逻辑会分裂（一会儿看 IsError、一会儿看 status）。
+
+import (
+	"strings"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"gear/internal/engine"
+)
+
+// toolError 构造携带错误码的 MCP 工具错误。
+//
+// 形态：IsError=true + Content 文本 `[CODE] message` / `hint: …`。
+// 为什么把码放进文本而不是 structuredContent：MCP 规范对 IsError 响应的 structuredContent
+// 没有约定，严格客户端（WorkBuddy 用 zod 校验）只对成功响应做对象校验；把码写进文本是
+// **所有客户端都读得到**的形态，而成功路径才用 structuredContent（顶层必须是对象）。
+func toolError(code, msg string, hint ...string) *mcp.CallToolResult {
+	text := "[" + code + "] " + msg
+	var hs []string
+	for _, h := range hint {
+		if strings.TrimSpace(h) != "" {
+			hs = append(hs, h)
+		}
+	}
+	if len(hs) > 0 {
+		text += "\nhint: " + strings.Join(hs, "；")
+	}
+	return &mcp.CallToolResult{
+		IsError: true,
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
+	}
+}
+
+// toolErrorFrom 把一个 error 转成工具错误：能取出结构化诊断就带上 code 与 hint。
+//
+// fallbackCode 只在错误链里没有诊断时使用（例如 registry 层的守卫拒绝）——
+// 不让「没做结构化」的错误变成一个没有码的裸文本。
+func toolErrorFrom(fallbackCode string, err error) *mcp.CallToolResult {
+	if err == nil {
+		return nil
+	}
+	if diags := engine.Diagnostics(err); len(diags) > 0 {
+		d := diags[0]
+		code := d.Code
+		if code == "" || code == engine.CodeUnclassified {
+			code = fallbackCode
+		}
+		return toolError(code, d.Message, d.Hint)
+	}
+	return toolError(fallbackCode, err.Error())
+}
+
+// diagnosticsJSON 把诊断渲染成 JSON 友好的切片（用于 gear_validate / gear_apply 的返回体）。
+//
+// 空切片转成 `[]` 而非 null：客户端拿到 null 还要自己判空，而「没有诊断」是明确的事实。
+func diagnosticsJSON(diags []engine.Diagnostic) []map[string]any {
+	out := make([]map[string]any, 0, len(diags))
+	for _, d := range diags {
+		m := map[string]any{
+			"code":    d.Code,
+			"message": d.Message,
+		}
+		if d.Step != "" {
+			m["step"] = d.Step
+		}
+		if d.Field != "" {
+			m["field"] = d.Field
+		}
+		if d.Hint != "" {
+			m["hint"] = d.Hint
+		}
+		if d.Code != "" {
+			m["docs"] = "gear://guide/errors#" + d.Code
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// diagError 把「一条诊断」包成 error，便于在解析阶段（还没到校验）就产出可自愈的错误。
+func diagError(code, field, hint, format string, args ...any) error {
+	return engine.Diagf(code, field, hint, format, args...)
+}
+
+// ---- 工具入参类型（SDK 据此自动生成 input schema）----
+
+// IDArgs 是「按 id 操作」类工具的公共入参。
+type IDArgs struct {
+	ID string `json:"id" jsonschema:"对象 id（Tool id / Flow id / Hook id / 执行 id）"`
+}
+
+// DescribeArgs 是 gear_describe 的入参。
+type DescribeArgs struct {
+	Kind string `json:"kind" jsonschema:"对象类型：tool | flow | hook | app"`
+	ID   string `json:"id" jsonschema:"对象 id"`
+}
+
+// CatalogArgs 是 gear_catalog 的入参。
+type CatalogArgs struct {
+	Kind  string `json:"kind,omitempty" jsonschema:"要看哪类：tool | flow | hook | execution | app | all（默认 all）"`
+	Limit int    `json:"limit,omitempty" jsonschema:"最多返回条数（默认 100）"`
+}
+
+// GuideArgs 是 gear_guide 的入参。
+type GuideArgs struct {
+	Topic string `json:"topic,omitempty" jsonschema:"手册主题：overview/authoring/service-app/atoms/errors/primitive-gap/examples/security（默认 overview）"`
+}
+
+// ValidateArgs 是 gear_validate 的入参。
+type ValidateArgs struct {
+	YAML string `json:"yaml" jsonschema:"Gear bundle YAML 文本（多文档：kind: App 清单 + Tool/Flow/Hook）"`
+}
+
+// ApplyArgs 是 gear_apply 的入参。
+type ApplyArgs struct {
+	Bundle    string `json:"bundle" jsonschema:"Gear bundle YAML 文本（多文档）"`
+	DryRun    bool   `json:"dry_run,omitempty" jsonschema:"只校验与检查冲突，不落库（等价于 gear_validate + 覆盖检测）"`
+	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"允许覆盖内容不同但 id 已存在的对象（默认 false，仅更新内容相同的定义）"`
+}
+
+// DeleteArgs 是 gear_delete 的入参。
+type DeleteArgs struct {
+	Kind string `json:"kind" jsonschema:"对象类型：tool | flow | hook"`
+	ID   string `json:"id" jsonschema:"对象 id"`
+}
+
+// PromoteArgs 是 gear_promote 的入参。
+type PromoteArgs struct {
+	ToolID  string `json:"tool_id" jsonschema:"Tool id"`
+	Version string `json:"version" jsonschema:"目标版本号"`
+	Target  string `json:"target" jsonschema:"目标状态：draft/testing/stable/deprecated/rejected"`
+}
+
+// RunArgs 是 gear_run 的入参。
+//
+// ⚠ 标签文案的硬约束：jsonschema 库用 `^[^ \t\n]*=` 判定「保留写法」（不许以 `WORD=` 开头，
+// 那是给未来的关键字留的位），所以描述里**不能以 `xxx=` 开头**——写成「kind 为 tool 时…」
+// 而不是「kind=tool 时…」，否则 AddTool 在注册期直接 panic（踩过一次）。
+type RunArgs struct {
+	Kind        string         `json:"kind" jsonschema:"跑什么：tool（同步返回结果）| flow（异步返回 execution_id）"`
+	ID          string         `json:"id" jsonschema:"Tool id 或 Flow id"`
+	Input       map[string]any `json:"input,omitempty" jsonschema:"kind 为 tool 时的入参"`
+	Vars        map[string]any `json:"vars,omitempty" jsonschema:"kind 为 flow 时覆盖 Flow vars"`
+	WaitSeconds int            `json:"wait_seconds,omitempty" jsonschema:"kind 为 flow 时最多等这么多秒再返回结果快照；0 表示立即返回，建议 15-30"`
+}
+
+// ExecutionArgs 是 gear_execution 的入参。
+type ExecutionArgs struct {
+	ID       string `json:"id,omitempty" jsonschema:"执行 id；留空 = 列出最近执行"`
+	WithLogs bool   `json:"with_logs,omitempty" jsonschema:"附带各 step 的 stdout/stderr 日志"`
+	Tail     int    `json:"tail,omitempty" jsonschema:"with_logs 时只取末 N 行（0=全部）"`
+}
+
+// AppArgs 是 gear_app 的入参。
+type AppArgs struct {
+	Action      string `json:"action" jsonschema:"start | stop | status | list | prune"`
+	FlowID      string `json:"flow_id,omitempty" jsonschema:"start：要监管的入口 Flow（须含 mode: service 的长驻 step）；prune：只清该 Flow 的台账（留空=全部）"`
+	AppID       string `json:"app_id,omitempty" jsonschema:"stop/status：应用 id（来自 start 或 list）"`
+	Restart     string `json:"restart,omitempty" jsonschema:"start：restart 策略 always | never（默认 always）"`
+	Replace     bool   `json:"replace,omitempty" jsonschema:"start：同 flow 已有活跃实例时先停再启"`
+	WaitSeconds int    `json:"wait_seconds,omitempty" jsonschema:"start：短等秒数确认启动结果（默认 0）"`
+	Ports       []int  `json:"ports,omitempty" jsonschema:"start：声明的服务端口（用于台账探活与 stop 后复检）"`
+	DryRun      bool   `json:"dry_run,omitempty" jsonschema:"prune：只汇报将清理哪些台账项，不实际删除"`
+}
+
+// FlowExposeArgs 是 flow__{id} 反向暴露工具的入参（只收可选 vars，id 固定为 Flow id）。
+type FlowExposeArgs struct {
+	Vars        map[string]any `json:"vars,omitempty" jsonschema:"覆盖 Flow 的 vars（模板 ${vars.x} 引用）"`
+	WaitSeconds int            `json:"wait_seconds,omitempty" jsonschema:"最多等这么多秒再返回结果快照；0 表示立即返回"`
+}

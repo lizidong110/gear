@@ -37,4 +37,13 @@ entry: |
     host  = ctx.input.host,
     proxy = ctx.input.proxy,
   })
-  return r
+  -- 未配置反向代理时侧车返回 proxy: []，而 lua 的空数组在回程编码成 {}（空对象）——
+  -- lua 的空 table 无法区分 array 与 object。这与 output_schema 声明的 array 冲突，
+  -- 实测报 `'/proxy' ... expected array, but got object`，让**整个 step 输出校验失败**、
+  -- 进而拖垮整条 Flow（应用起不来）。语义上「没有规则」就是没有这个字段，这里规范化掉，
+  -- 不让「空集合的表示差异」变成假失败。
+  local out = { url = r.url, serving = r.serving }
+  if type(r.proxy) == "table" and next(r.proxy) ~= nil then
+    out.proxy = r.proxy
+  end
+  return out

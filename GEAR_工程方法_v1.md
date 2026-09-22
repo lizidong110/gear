@@ -143,11 +143,18 @@ gear/
 | 编译 | `go build ./...` | 阻断合并 |
 | 静态 | `go vet ./...` + `staticcheck ./...`（规则取舍见根目录 `staticcheck.conf`；当前零告警） | 阻断合并 |
 | 格式化 | `gofmt -l` 零差异 | 阻断合并 |
-| **闸门入口** | `bash scripts/gate.sh`（一次跑完①–⑥，退出码即结果，日志落盘） | 见 §5.0 |
+| **闸门入口** | `bash scripts/gate.sh`（一次跑完①–⑧，退出码即结果，日志落盘） | 见 §5.0 |
 | **覆盖率** | `go test -coverprofile`；**引擎/内核包 ≥80%，model/registry 关键路径 100%** | 低于门槛阻断合并；PR 须附报告 |
 | 并发/竞态 | `go test -race` 于 registry/engine | 竞态即阻断 |
 | 契约 | §11 端点 ↔ 矩阵自动比对 | 偏差阻断 |
+| **文档机械审计** | `python tools/doc_audit.py`（Test 名 / `.go` 路径 / REST 端点 / CLI 子命令双向核对） | 存在「文档声称有、代码却没有」即阻断 |
+| **扩展契约审计** | `python tools/extensions_audit.py`（见 §11·2026-09-21 第二十二次） | 代码判必填、配置未标 `required` 即阻断 |
 | 评审 | 每切片覆盖率报告 + 矩阵更新，用户签批 | 未签批不进下一刀 |
+
+> ⑧ 那条为什么值得单列：2026-09-21 实证 `ext.sms.gateway` 与 `ext.wecom.key` 在 Go 里明确必填、
+> 却没标进 `extensions.yaml` 的 schemas——而 schemas 正是**给智能体用于组装入参的唯一依据**。
+> 漏标的后果不会在注册期显形，只会推迟到某次真实调用才炸，且错误信息指向「缺参数」而非「配置漂移」，
+> 排查成本极高。这类「两处各写一遍、靠人记得同步」的地方，一律改由机器来守。
 
 > 覆盖率门槛默认可调；如你认为某包应更高/更低，在签批时改。
 
@@ -180,6 +187,11 @@ gear/
 > 环境坑（会伪装成代码回归）：Windows 的 Git-Bash / CI 沙箱里 PATH 常不含 `sh`，
 > 而引擎 process runtime 的用例**真的会 exec `sh`** —— 缺了会整片假红
 > （`exec: "sh": executable file not found in %PATH%`）。`gate.sh` 已按需补齐 PATH（只在目录存在时前置）。
+>
+> **2026-09-21 已治本（§11 第二十二次）**：process runtime 不再默认依赖 `sh`——改由 `internal/cmdline`
+> 自行拆分 argv 并 `exec.LookPath` 找可执行文件，只在出现真正的 shell 元字符（管道/重定向/变量展开等）
+> 时才回落 `sh -c`。上条描述的「缺 `sh` 就整片假红」已不再是常态；保留此段是为了说明 `gate.sh` 为什么
+> 仍要补 PATH——含有 shell 元字符的 entry（以及历史上的测试用例）依然走 shell 分支。
 
 ### 5.1 测试日志落盘（避免「管道日志用完就扔」）
 
@@ -365,6 +377,7 @@ gear/
 **关键教训（本会话）**
 - 全量闸门 `go test -race -cover -p 1 ./...` 在 Bash 工具 2 分钟默认超时下**被掐断**，表现为「exit 1、日志全 `ok`、`server` 包整包缺失」——`server` 在依赖序最末、串行跑完 engine(31s)+其他后超时。修复：用 `run_in_background` 或显式 `timeout=600000`。**闸门超时 ≠ 测试失败**，须看完整日志。
 - 重磅坑：`engine/version_test.go` 的 process entry 原写 `sh -c 'echo {"v":"2"}'`，Git Bash 的 `sh` 把双引号**词法去引号**成 `{v:2}`（非法 JSON）→ 运行期 `解析 stdout 失败`。修复：entry 改为 `echo '{"v":"2"}'`（**外层单引号、JSON 内双引号**）。凡用 `sh -c` 让进程吐 JSON，此约定是铁律（红线清单待补第 17 条）。
+  - **2026-09-21 处置**：第 17 条**不再单独立进红线**。process runtime 改由 `internal/cmdline` 拆分 argv 后直接 exec，不再包一层 `sh -c`（§11 第二十二次）——这条坑的**成因**已从根上移除。留下此句的作用只剩一个：提醒仍在写含 shell 元字符的 entry 时，引号这件事照样会咬人。理由是原则性的——能用「少一层包装」消除的坑，不靠「多一条红线」去约束。
 
 **全量闸门结果**：engine 86.2% / model 98.7% / registry 84.8% / server 85.1% / ai 85.5% / cap 86.7% / app 86.0% / cli 72.8%（cli 为管理面客户端非内核，exec/ai 均配集成测试）。
 
@@ -678,6 +691,81 @@ gear/
 - **踩坑记录**：`go build ./...` **不会**产出根目录 `gear.exe`；只跑它会导致「拿旧二进制验证新功能」——真机验证前须 `go build -o gear.exe ./cmd/gear`。
 - **文档**：PRD §14.6 表补 stdin 说明 + 「统一输入约定」小节（含 5 条规则与 `hook` 不适用 JSON 管道的说明，因 hook 无执行命令）。
 - **验证**：`go build ./...` 通过；受影响包测试全绿；gofmt 已应用。
+
+### 2026-09-21（第二十一次）· `service` 子进程输出改「自有管道 + 环形缓冲 + ExitReporter」
+> **补记说明**：本条原始记录遗失（与 `tools/doc_audit.py` 同源——当年落在 gitignored 目录里），而 §0 红线 16、§5.1 已引用「§11·2026-09-21 第二十一次」三次，属**悬空引用**。此处据那两处的表述补登记目本体，内容以其为准，不补虚构细节。
+- **改了什么**：`internal/engine/process.go` 的 `startProcess`（service 模式）不再把 `cmd.Stdout/Stderr` 指向调用方的管道，改为自有管道 + 内存环形缓冲；进程退出时由 `ExitReporter` 把尾部输出交给监管打印。
+- **为什么不直接丢 `os.DevNull`**：只丢 DevNull 确实满足「fd 不继承」，但会把**进程为什么退出**一起丢掉。「端口被占」这类秒退于是只剩无限重启、无从诊断——这是把一类可观测故障降级成了神秘故障。
+- **边界**：本条只覆盖 `service` 长驻子进程；一次性 `runProcess` 的输出此前已进内存 buffer（见第七次「失败输出落盘」），不在本条范围内。
+
+### 2026-09-21（第二十二次）· 连代码治本：默认落盘去 cwd 依赖、process runtime 去 shell 依赖、派生如实上报
+- **触发**：把 gear 接到 WorkBuddy 的 MCP 通道后做端到端验收——目标是「宿主派生的 gear 能把应用真的起起来」。验收中暴露的**都不是单点 bug，而是同一类设计缺陷的多个实例**：默认路径/命令解析依赖「调用方给的 cwd 恰好是 `<repo>/build`」这一不成文约定，而宿主给的 cwd 不可控。
+- **改了什么**
+  1. **新增 `internal/gearhome`（gear 自身落盘位置的单一真相源）**：`GEAR_HOME` → `<HOME>/.gear` → `<exeDir>/.gear` 兜底，导出 `Home/RegistryPath/ExecDBPath/ArtifactDirs/PosixPathHint`。此前 registry、exec.db、doctor 侧车查找各自有一份 cwd 相对默认值——**三份默认值就是三处漂移**。
+  2. **exec.db 落点变更**：`internal/server/execstore.go` 的默认 `build/gear.db` → `<GEAR_HOME>/exec.db`。连带后果：`go test ./...` 会往用户真实库里写数据，故新增 `gearhome.IsolateForTest()`，并在 `server`/`cli`/`mcp` 三包加 `TestMain` 对齐。
+  3. **新增 `internal/cmdline`（无 shell 的命令解析器）**：process runtime 此前硬依赖 `exec sh -c <entry>`。Windows 系统 PATH 里没有 `sh`（它在 Git 的 `usr/bin`）——宿主派生的 gear **拉不起任何 process 型 Tool，任何应用都起不来**。改为自解析 argv + `exec.LookPath`，只在确有 shell 元字符时才回落 shell。
+  4. **`internal/engine/extensionpath.go`：配置与命令路径改 exe 锚优先**（`<exeDir>` → `<exeDir>/plugin` → `<repo>/plugin` → cwd 兜底）；`GEAR_EXT_CONFIG` 显式指定却读不到**报错**而非静默退回「无扩展」（fail-closed）。
+  5. **`PosixPathHint` 护栏**：Windows 下 `--registry`/`--apps-dir` 传 `/d/xxx` 会被当成「当前盘符根下的绝对路径」落到 `D:\d\xxx`，而 `filepath.IsAbs` 判为合法、任何校验都拦不住。现在.warn 且报出真实落点。同一坑此前在 `scripts/build.sh` 上已发作过一次。
+  6. **派生如实上报是否脱离 Job**：`launchDetached` 返回 `escaped bool`；未脱离时 `StartResult.Warning` + `escaped_job: false`（Windows 走 `CREATE_BREAKAWAY_FROM_JOB`）。**「起了就能跨会话存活」不是无条件成立的承诺**，宿主不允许脱离就必须说出口，否则用户会在很久之后才发现进程没了。
+  7. **`waitReady` 不再抢答 `running`**：未声明端口时原本在第 0 毫秒返回 `running`——把「刚起就崩」报成健康，正是此前 `.workbuddy` 记忆里那条「`running` 可能只是瞬态」的真因。改为等满窗口再判定。
+- **验证**
+  - 单测锁定：`TestWaitReadyWaitsFullWindowWhenNoPortsDeclared`、`TestWaitReadyReportsFailureForProcessDyingInsideWindow`、`TestStartReportsEscapedJob`、`TestDefaultsDoNotDependOnCwd`、`TestIsolateForTestRedirectsExecDB`、`TestArtifactDirsAnchorsOnExecutable`、`TestPosixPathHintDetectsMsysPaths`，及 `internal/cmdline/exec_test.go` 全套。
+  - Windows 下用 `TestAppShortLivedHelper` 复测「进程死在窗口内」时，未 `cmd.Process.Release()` 会导致 pid 探测仍谓存活（内核不销毁有句柄的进程）→ **测试自己也复刻了生产路径**，否则写成假绿。
+  - 端到端：模拟宿主环境（cwd 指向临时目录、PATH 无 `sh`/git）跑 `gear app start smoke.up --port 8080` → `running`、8080 LISTENING、首页 HTTP 200；同时正确输出「未脱离 Job」warning，且 cwd 下未再造出 `build/`。
+- **闸门**：`COVER_PACKAGES` 补 `./internal/app ./internal/cmdline ./internal/gearhome`，否则新包不在覆盖率分母里。
+- **文档**：README env 表（`GEAR_HOME` 新增、`GEAR_EXEC_DB`/`GEAR_EXT_CONFIG` 口径修正）、`gearhome` 包入 architecture 表、`app start` 跨会话语义加条件说明；REQUIREMENTS REQ-EXEC-PERSIST、`.gitignore` 注释、`plugin/web-ui/README.md`、PRD §11 的 `build/gear.db` 加变更注记（历史原文保留）。
+
+### 2026-09-22（第二十三次）· 用 MCP 面做一个真应用，把「卡住的地方」当缺陷清单逐条修掉
+- **触发**：用户要求「做一个带 AI 生成的头脑风暴功能」，并加了一条方法论约束——**不许翻源码，只能用 gear 的 MCP 面去做；做不成的地方就是 MCP 面的缺陷**。这是一次把「工具面的完备性」交给真实任务来证伪的验收。结论：应用**架构上完全跑通**（静态站 + `/api` 反代 + `ext.ai`），但过程中卡住 8 处，逐条修完。
+- **实证产物**：`apps/brainstorm/`（单页界面 + `DESIGN.md` 含方案与缺陷清单），registry 内 `brainstorm__config` / `brainstorm__api` / `brainstorm__ideate` / `brainstorm.up`，app 双端口 running。
+- **改了什么**（按严重度）
+  1. **【P0】引号外的反斜杠不再当转义符**（`internal/cmdline/parse.go`）：原先无条件把 `\x` 折成字面量 x，于是 Windows 绝对路径 `D:\gadern\gear\build\gear.exe` 被吃成 `D:gaderngearbuildgear.exe`，报错还指向 `PATH`（与真因无关）。改为**只在后跟空白/引号/`$`/反引号时转义**；`\\` 刻意不折半（否则破坏 UNC 路径）。行末孤立反斜杠保留字面量而不再报错。
+  2. **【P1】process entry 可达性提前到校验期**（`checkToolEntryResolvable` + 新诊断码 `ENTRY_EXE_UNRESOLVED`）：**只有绝对路径报 error**，相对路径与裸名字只给告警——运行时 cwd/PATH 可能与校验时不同，宁缺勿误杀。
+  3. **【P1】REST 补同步执行单个 Tool 的端点** `POST /api/tools/{id}/run`：此前 REST 只有异步 `/api/executions`（跑 Flow），MCP 却有 `gear_run(kind=tool)`——前端想复用 Tool 只能包 Flow 再轮询，或裸调原子（把 prompt 工程漏进前端 JS）。两边能力现在对齐。
+  4. **【P1·安全】收紧 `/api/capabilities/invoke`**：它能调**任意**能力（含 `secret.get` 读密钥明文、`db.query` 执行任意 SQL），而做带界面的应用必然经 `ext.serve` 反代把它暴露给浏览器。现在①带 `Origin` 且非本机来源 → 403（不带 `Origin` 的 curl/CLI 照常放行）；②`secret.*` 一律 403。**不是完备鉴权**（本机进程仍可调），完备鉴权是「对外暴露」场景的议题，不提前长出 token 体系。
+  5. **【P1】`gear_doctor` 增 AI 就绪块**（provider/model/key 是否存在 + 阻塞原因 + 修法，**绝不回显明文**）：此前没配 Key 只能撞到厂商的 `LLM HTTP 401 Token is invalid.`——那句话既不说缺哪个环境变量，也不说去哪配。
+  6. **【P1】手册新增 `rest-api` 主题**：8 个主题里没有一个给 REST 端点表，而做带界面的应用必须让前端调 `/api/**`。guide 目录是 `go:embed *.md`，新增文件即自动成为可达主题（无映射表要改）。
+  7. **【P2】`gear_doctor` 的 `missing_sidecars` 不再是空对象**：`sidecarIssue` 字段全未导出，Marshal 出来是 `[{},{},{}]`，真信息只藏在 warnings 中文文本里。改为导出字段 + json tag。
+  8. **【P2】`gear_app(action=prune)`**：台账堆了 12 条失败记录却只能逐个 `stop`。prune 只清**确定已终止**的项——`running` 与 **`unknown` 一律保留**（unknown 双判据矛盾，删了可能把「还在跑却无人可查」的进程变成真孤儿）。
+  9. **【P2】Lua 空数组回程不再变 `{}`**：`luaTableToGo` 靠「非空且全数字键」判数组，空表只能落进 map 分支 ⇒ `db.query` 查到 0 行时调用方**无法区分「0 行」与「出错」**。改为 Go→Lua 时给数组 table 挂 metatable 标记，回程据此定夺；标记放在 metatable 里，`pairs`/`ipairs`/`#` 都看不到，不污染数据。已知边界（写进注释与测试）：Lua 侧复制出的新表不带标记。
+- **验证**
+  - 每项都做了**负向验证**（改坏 → 必红 → 逐字节还原 → 必绿），8/8 通过。其中 `state` 类判定的 mutation 刻意避开「编译不过」，确保红的是**断言**而不是语法。
+  - 新增测试：`internal/cmdline/resolve_test.go`（含 `TestCommandRunsWindowsPathWithoutQuotes` —— 拿测试二进制自己当外部程序，路径**不加引号**，正是修复前必挂的形态）、`internal/engine/lua_conv_test.go`（空数组/空 map 成对断言，防只修一个方向）、`internal/server/run_tool_test.go`、`internal/app/prune_test.go`、`internal/mcp/entry_resolvable_test.go`、`internal/mcp/app_prune_test.go`。
+  - 端到端：`8088/` 静态页 200、`8088/api/healthz` → `{"status":"ok"}`（反代通）、经反代 `invoke ext.ai.complete` 用假 Key → 真打到厂商返回 401（**管线通，只缺凭据**）；跨站 Origin 403、无 Origin 放行、`secret.*` 403 均实测。
+- **留下的判断**：`ext.ai` 的**凭据不在 MCP 写入范围**（密钥由人经 CLI/`GEAR_SECRET_*` 播种）——这是设计而非缺口，但「不能配」不等于「不能诊断」，故 ⑤ 是必要补充。
+
+### 2026-09-22（第二十四次）· 把 prune 补齐到三个面；顺手修掉一处「自己都看不懂」的输出
+- **触发**：第二十三次把 `prune` 只做在 MCP 面，于是出现倒挂——**智能体能清僵尸台账，人不能清**，而台账恰恰是人排障时最想清干净的东西。用户要求「补齐」。
+- **第 1 件事：CLI 补 `gear app prune`**（`internal/cli/app.go`）：`--dry-run`（只汇报不动磁盘）、`--flow <id>`（只清该 Flow）、`--apps-dir`。与 MCP `gear_app(action=prune)` 共用 `internal/app` 的同一份 `Prune`——CLI 只是薄壳，不复制语义。
+- **第 2 件事：REST 补 `POST /api/apps/prune`**（`internal/server`）。这里**差点做错**：同前缀的 `GET/POST/DELETE /api/apps` 管的其实是**本进程内存里**的 `AppInstance`（等价 `gear app run`，进程一退即消失，**既没有台账也没有孤儿**），而 prune 清的是 `gear app start` 落下的**落盘台账**——两者不是同一个模型。照抄一个「同名前缀的 prune」毫无意义（内存侧无物可清）。最终按项目既有的「REST 与 MCP 能力对齐」原则（如 `POST /api/tools/{id}/run`）把它**明确指向落盘台账**，并在端点说明、README、`guide/rest-api.md` 三处都写清这层区别。
+  - 连带补上 `server.WithRegistryPath` / `WithAppsDir` 两个构造选项，由 `cli/serve.go` 注入：**不注入就会退回 `gearhome` 默认值，去清另一个库的台账**（清错对象比清不掉更难排查）。定位不到台账时**拒绝执行（500）**，不猜。
+- **第 3 件事：修掉 prune 输出自相矛盾**（`internal/app/record.go`）。dry-run 时看到 `state: startup_failed` 与 `reason: 仍在运行或状态不确定` 并排出现——连开发者都要停下来查代码才敢确认不是 bug。根因是 `PrunedItem` 只报了一个字段：**`state` 取的是台账里的 `FinalState`（当初怎么结的案）**，而**判定用的是实时 `Probe()`**（现在还敢不敢删）。pid 被系统复用后两者必然分叉。修法：`PrunedItem` 增 `probe_state` 字段把判定依据一并回传，`reason` 也改成「实时判据为 unknown（不能确定已终止）」。**表达缺陷也是缺陷**——一个需要读源码才能解释的输出，等于没解释。
+- **验证**
+  - 负向验证 **5/5**（改坏 → 必红 → 逐字节还原 → 必绿）：路由未注册、`prunableState` 不再保守（unknown 也敢删）、`probe_state` 不再分开报、CLI 未注册子命令、REST 拒绝分支失效——每一处都对应一个会红的断言。
+  - 新增测试：`internal/server/apps_prune_test.go`（dry-run 不动磁盘 / 真删只动终态 / `apps_dir` 必须是注入值 / `state` 与 `probe_state` 分得开 / flow 过滤 / 未注入 registry 路径必须 500 / 非法 body 400）、`internal/cli/cli_app_lifecycle_test.go` 的 `TestAppPruneCommand`。
+  - 真机：`gear app prune --dry-run` → 6 清 / 9 留；`gear serve --addr 127.0.0.1:8899` + `POST /api/apps/prune` → `apps_dir` 回显 `C:\Users\920\.gear\apps`（**证明 `serve.go` 的路径注入真的生效**）、6/9 与 CLI/MCP 完全一致；非法 body → 400。
+- **留下的判断**：三面（CLI / REST / MCP）现在都是 `internal/app` 的薄壳，语义只有一份。**没有为 REST 让 `GET /api/apps` 也改看台账**——那是把两套模型合并的大改，属于「UI 想看受管应用」的独立议题，不趁这次顺手做。
+
+### 2026-09-22（第二十五次）· `/api/flows` 返回 `[]` 的根因：应用的 REST 面读了另一个库 —— 让 registry 沿进程树继承
+
+- **触发**：用户报「`http://127.0.0.1:8080/api/flows` 返回 `[]`（显然有错，至少有 ui），而 CLI `flow list` 有 10 条」。
+- **诊断（全部实测，不看源码先看现象）**：8080 上跑的是 `web_ui.up`（`ext.serve` 托静态 + 反代 `/api` → 8787），8787 是它的 `api` 步（`web_ui.api`，`runtime: process` + `mode: service`）起的 `gear serve`。**REST 没坏、CLI 也没坏——两个进程读的不是同一个库**：
+  - 该 Tool 在注册表里的 entry 是 `./gear.exe serve --registry ./ui-registry.db --addr 127.0.0.1:8787`，`--registry` 是**相对值**，按子进程自己的 cwd 解析 ⇒ 读的是 `build/ui-registry.db`；
+  - 那个库是 2026-09-20 web-ui 联调实验的遗留：**tools=4 / flows=0**；
+  - 旁证：上一轮新加的 `POST /api/apps/prune` 会回显 `apps_dir`，这里返回**相对值 `"apps"`**（正常应是绝对 `C:\Users\920\.gear\apps`）——因为 `filepath.Dir("./ui-registry.db")` = `.`。**这一个字段就把「它的 registry 是相对路径」钉死了**；
+  - 决定性对照：同一份 gear.exe，`serve --addr 127.0.0.1:8897`（默认库）→ `flows=10`；8787 → `0`。**变量只有一个：`--registry`。**
+- **这是同一个根因第二次发作**（第一次在 `gear app start` 的 launcher 侧，当时的结论是「launch 必须显式传绝对路径」），这次发作在**应用自己的 Tool entry 里**——那里没有任何护栏。形态极讨厌：**完全静默**（serve 拿着一个「表结构完好、0 行」的库正常起服，页面只是空列表，日志一个字都没有）。
+- **根治（四步，都在内核而非个别应用）**
+  1. **registry 沿进程树继承**：`gearhome` 新增常量 `EnvRegistry`（`GEAR_REGISTRY`）；`RegistryPath()` 优先级变为 `GEAR_REGISTRY` → `<Home>/registry.db`。`internal/cli/root.go` 的 `openRegistry()` 新增 `pinRegistryEnv()`：把本次生效的 registry **绝对化**后写进该变量。**这是唯一的分叉点**——`cmdline` 的子进程环境以 `os.Environ()` 为基座、`app` 的 detached 派生也继承本进程，于是「我用的库」自动成为「我派生的一切用的库」，**`cmdline` 一行都不用改**。
+     - 为什么是环境变量而不是命令行参数：要继承的不只是 `app start` 派生的监管进程（那条路已显式拼 `--registry`），还有**监管进程内部 engine 拉起的长驻 Tool 进程**——后者的命令行完全由 Tool 定义决定，内核无从插手。
+     - **显式 flag 仍然优先**：机制只保证「没说的时候永远一致」，不替人说过的决定翻案。这是刻意保留的边界，也是「光加机制不改 entry 没用」的原因。
+  2. **让「指错库」当场可见**：`gear serve` 的 banner 从 `（registry=%s）` 改成 `（registry=%s, flows=%d, tools=%d）`。**这个坑本来三秒就能发现**——起服时打一行 `flows=0` 就够了。
+  3. **相对路径取值统一告警**：新增 `internal/cmdline/pathflags.go`（`PathValueFlags` / `ScanRelPathFlags` / `RelPathFlagsInLine` / `RelPathFlagHint`），**清单与措辞只有一份**，由 MCP 的 `checkToolEntryResolvable`（→ `gear_validate` 的 `warnings`）与 CLI 的 `tool register`（→ stderr）共同引用；`--registry` 传相对值另在 `openRegistry()` 里告警（含绝对化后的真实落点）。**只 warning 不 error**：相对值在「就地手跑」时合法，不能因为「换个 cwd 会坏」就拒绝注册一个眼下可用的 Tool。
+  4. **修应用定义与文档**：`plugin/web_ui_tools.yaml` 的 entry 改为 `build/gear.exe serve --addr 127.0.0.1:8787`（**刻意删掉 `--registry`**）；README、`plugin/web-ui/README.md`、`guide/rest-api.md` 同步；并写明 **cwd 约定 = 仓库根**（`dir: build/dist` 与 `entry: build/gear.exe` 都按它解析）。**源文件与注册数据此前也在漂移**：文件写 `build/dist`、库里存 `./dist`（两处各自自洽、合起来就是错的）——已按文件为准重新注册。
+- **验证**
+  - **两条对照（本次验收核心）**：① 仓库根 + **不带** `--registry` → `8080/api/flows` **= 10**，与 CLI 同源；② 把 `web_ui` 一套注册进隔离库后带 `--registry build/ui-registry.db` → 子进程报告 **`{"flows":1,"tools":7}`**（隔离库的计数，默认库是 10/27）⇒ **既证明继承生效，也证明显式值仍然赢**；stderr 收到相对路径提示。
+  - 负向验证（改坏→必红→逐字节还原→必绿）、`gate.sh` 全闸门、`plugin/verify.py` 端到端，见当日工作日志。
+- **留下的判断**：**没有**去动 entry 里其它 cwd 依赖（`./dist`、`plugin/*-sidecar.exe` 之类）——那属于 `extensionpath` 解析规则的范畴，是独立议题。也没有强制「entry 一律不许写 `--registry`」：显式表达仍被尊重，护栏只负责说清代价。
 
 ## 10. 签批页
 

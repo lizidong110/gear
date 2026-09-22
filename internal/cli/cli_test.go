@@ -46,10 +46,26 @@ criticality: critical
 order: 1
 `
 
+// testRegistryOverride 是测试期强制使用的 registry 路径（空 = 不干预）。
+//
+// 为什么需要这一层：newRootCmd 每次都执行
+// `StringVar(&registryPath, "registry", defaultRegistry())`，而 StringVar **会把默认值写回**
+// registryPath —— 于是「先设全局 registryPath、再 runCLI」这种写法**完全不起作用**，
+// 用例会静默去读用户真实的 ~/.gear/registry.db。
+// 后果不是「多写了一个文件」这么轻：用户库里一旦有个依赖外置扩展的工具
+// （例如 static_site.serve 声明 ext.serve，而测试进程里扩展未注册），
+// 用例就会因「未知的 capability」而红——纯环境耦合，与代码无关，极难定位。
+var testRegistryOverride string
+
 // runCLI 以给定参数执行一次根命令（每次都是独立的命令树，避免子命令间状态串扰）。
 func runCLI(t *testing.T, args ...string) error {
 	t.Helper()
 	root := newRootCmd()
+	if testRegistryOverride != "" {
+		// 前置注入：pflag 对重复的 string flag 取**最后一个**，所以显式自带 --registry 的
+		// 用例不受影响（它们自己的值在后面，仍然胜出）。
+		args = append([]string{"--registry", testRegistryOverride}, args...)
+	}
 	root.SetArgs(args)
 	return root.Execute()
 }

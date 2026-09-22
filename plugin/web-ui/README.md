@@ -58,14 +58,22 @@ server {
 export GEAR_EXT_CONFIG=plugin/extensions.yaml
 go build -o build/gear.exe ./cmd/gear
 go build -o build/serve-sidecar.exe ./plugin/serve-sidecar
-# 注册（一次性；须从仓库根目录）
-gear tool register --registry build/ui-registry.db plugin/static_site_demo.yaml   # static_site.serve
-gear tool register --registry build/ui-registry.db plugin/web_ui_tools.yaml       # web_ui.anchor / web_ui.api
-gear flow register --registry build/ui-registry.db plugin/web_ui_flow.yaml        # web_ui.up
+# 注册（一次性；**须从仓库根目录**——本目录下所有相对路径都按它解析）
+gear tool register plugin/static_site_demo.yaml   # static_site.serve
+gear tool register plugin/web_ui_tools.yaml       # web_ui.anchor / web_ui.api
+gear flow register plugin/web_ui_flow.yaml        # web_ui.up
 # 起服（Ctrl+C 一并回收两个长驻服务）
-gear app run web_ui.up --registry build/ui-registry.db
+gear app run web_ui.up
 #  → UI   http://127.0.0.1:8080/      后端 http://127.0.0.1:8787/
 ```
+
+> **不要给 `--registry` 传值**（2026-09-22）：起服进程会把生效的 registry 经环境变量
+> `GEAR_REGISTRY` 注入应用内的步骤，所以 UI 的列表与你 CLI 的 `gear flow list` **必然同源**。
+> 从前这里的命令带 `--registry build/ui-registry.db`，而 `web_ui.api` 的 entry 里也写死了
+> `--registry ./ui-registry.db`——子进程按**自己的 cwd** 解析，读到另一次实验留下的空库，
+> 于是 `:8080/api/flows` 返回 `[]` 而 CLI 有 10 条，且**完全静默**（页面只是空列表）。
+> 真要隔离就传**绝对路径**的 `--registry`（显式值仍然优先）；`gear serve` 的
+> banner 会打印 `flows=N, tools=N`，指向空库一眼可见。
 
 > `ext.serve` 支持 `proxy` 规则，等价 nginx 的 `location /api/ { proxy_pass …; }`——
 > 所以这一个 Flow 起服后 **UI 与 `/api` 同源，页面直接可用**（不必再套 nginx）。规则写在 Flow 的 `site` step：
@@ -238,7 +246,7 @@ pnpm 专属键在 npm 下只是无害警告）。
 | 状态 | 持久性 | 丢失条件 |
 |---|---|---|
 | Tools / Flows / Hooks | 持久（内核 SQLite registry） | — |
-| 执行记录 + 日志 | 持久（内核 SQLite，`GEAR_EXEC_DB`，缺省 `build/gear.db`） | 删库 |
+| 执行记录 + 日志 | 持久（内核 SQLite，`GEAR_EXEC_DB`，缺省 `<GEAR_HOME>/exec.db`，不随 cwd 变化） | 删库 |
 | **Apps（长驻进程）** | **内核内存态**（`server.apps` map） | 重启 `gear serve` 即清空，子进程不自动恢复 |
 | 连接设置 / 主题 | 浏览器 localStorage | 清浏览器数据 |
 

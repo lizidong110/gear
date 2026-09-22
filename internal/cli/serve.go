@@ -29,8 +29,13 @@ func serveCmd() *cobra.Command {
 					return err
 				}
 			}
-			fmt.Printf("Gear REST 服务监听 %s（registry=%s）\n", serverAddr, registryPath)
-			srv, err := server.New(reg)
+			// banner 带**库内计数**：不带的话，「指向了一个空库」这件事完全静默——
+			// 页面只是空列表，日志一个字都没有（2026-09-22 实测：应用自带的 REST 面读的是
+			// 另一次实验留下的空库，排查花了一整轮）。起服时打印一行 flows=0 就够了。
+			fmt.Print(serveBanner(serverAddr, registryPath, reg))
+			// WithRegistryPath：POST /api/apps/prune 要按「本进程真正在用的」registry 定位
+			// 落盘台账；不注入的话它会退回 gearhome 默认值，去清另一个库的台账。
+			srv, err := server.New(reg, server.WithRegistryPath(registryPath))
 			if err != nil {
 				return err
 			}
@@ -39,6 +44,18 @@ func serveCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&seed, "seed", "", "启动时从 YAML 灌入示例 Tool/Flow（多文档，每篇一个 Tool 或 Flow），如 examples/news-top10.yaml")
 	return c
+}
+
+// serveBanner 渲染起服横幅（抽成纯函数以便断言——它承载的是一条排障判据，不是装饰）。
+//
+// 为什么必须带计数：默认路径修好「不再依赖 cwd」之后，serve 可以拿着一个
+// **表结构完好但 0 行**的库正常起服。这种失败模式完全静默：服务在听、页面能开、只是列表为空，
+// 日志里没有任何异常。一行 `flows=0` 就能把「指错库了」与「库里真没东西」分开。
+func serveBanner(addr, registry string, reg *registry.Registry) string {
+	flows, _ := reg.ListFlows()
+	tools, _ := reg.ListTools()
+	return fmt.Sprintf("Gear REST 服务监听 %s（registry=%s, flows=%d, tools=%d）\n",
+		addr, registry, len(flows), len(tools))
 }
 
 // seedExamples 把示例 YAML 里的 Tool/Flow 灌入注册表（供 GET /api/news 等端点开箱即用）。

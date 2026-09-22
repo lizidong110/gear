@@ -91,8 +91,8 @@
 # 三者均为「桥接具体外部系统的原生单操作」，业务规则留给 Flow / 领域 Lua 工具。
 # AI 原子已是内核内置的 ext.ai（进程内 Eino agent，始终注册），无需在此声明。
 ext.email:
-  cmd: ["build/gear.exe", "ext", "email"]
-  methods: [send]
+  cmd: ["./gear.exe", "ext", "email"]
+  methods: [send, read, list]
   schemas:
     send:
       description: SMTP 发送邮件（单操作原子，无业务规则）
@@ -110,9 +110,31 @@ ext.email:
         ssl: {type: boolean, description: "是否 SSL（默认 true）"}
         mode: {type: string, description: "send 真实发送 / log 落盘（默认 send）"}
         log_path: {type: string, description: "log 模式落盘路径（默认 email.out.log）"}
+    list:
+      description: IMAP 列目录 / 列邮件摘要（target=mailboxes 列文件夹；target=messages 列某邮箱最近 N 封）
+      parameters:
+        host: {type: string, description: "IMAP 主机", required: true}
+        port: {type: number, description: "IMAP 端口（默认 993）"}
+        user: {type: string, description: "IMAP 账号", required: true}
+        pass: {type: string, description: "IMAP 密码", required: true}
+        ssl: {type: boolean, description: "是否隐式 TLS（默认 true，端口 993）"}
+        target: {type: string, enum: [mailboxes, messages], description: "mailboxes 列文件夹 / messages 列邮件（默认 messages）"}
+        mailbox: {type: string, description: "目标邮箱（默认 INBOX，仅 messages 用）"}
+        limit: {type: number, description: "messages 模式下返回最近几封（默认 20）"}
+    read:
+      description: IMAP 读单封完整内容（按 uid）
+      parameters:
+        host: {type: string, description: "IMAP 主机", required: true}
+        port: {type: number, description: "IMAP 端口（默认 993）"}
+        user: {type: string, description: "IMAP 账号", required: true}
+        pass: {type: string, description: "IMAP 密码", required: true}
+        ssl: {type: boolean, description: "是否隐式 TLS（默认 true，端口 993）"}
+        mailbox: {type: string, description: "目标邮箱（默认 INBOX）"}
+        uid: {type: number, description: "邮件 UID（来自 list 的 uid 字段）", required: true}
+        mark_seen: {type: boolean, description: "读后标记已读（默认 false）"}
 
 ext.webhook:
-  cmd: ["build/webhook-sidecar.exe"]   # 真实 webhook-sidecar 侧车（plugin/webhook-sidecar；需先 go build -o build/webhook-sidecar.exe ./plugin/webhook-sidecar）
+  cmd: ["plugin/webhook-sidecar.exe"]   # 真实 webhook-sidecar 侧车（plugin/webhook-sidecar；需先 go build -o build/plugin/webhook-sidecar.exe ./plugin/webhook-sidecar）
   methods: [send, subscribe, unsubscribe]
   service: true                        # 常驻能力：侧车长驻（coord:8089 + 入站回调:8088 两端口）
   source: webhook                      # 声明承载「webhook」事件源（供通用订阅原语 ctx.subscribe 使用）
@@ -140,7 +162,7 @@ ext.webhook:
         handle: {type: string, description: "subscribe 返回的订阅句柄", required: true}
 
 ext.wecom:
-  cmd: ["build/gear.exe", "ext", "wecom"]
+  cmd: ["./gear.exe", "ext", "wecom"]
   methods: [send]
   schemas:
     send:
@@ -173,7 +195,7 @@ ext.wecom:
 #           call: ext.mqtt          # 命中虚拟 process Tool（由 service ext 自动生成）
 #           mode: service           # 长驻
 ext.mqtt:
-  cmd: ["build/mqtt-sidecar.exe"]   # 真实 mqtt-sidecar 侧车（plugin/mqtt-sidecar；需先 go build -o build/mqtt-sidecar.exe ./plugin/mqtt-sidecar）
+  cmd: ["plugin/mqtt-sidecar.exe"]   # 真实 mqtt-sidecar 侧车（plugin/mqtt-sidecar；需先 go build -o build/plugin/mqtt-sidecar.exe ./plugin/mqtt-sidecar）
   methods: [publish, subscribe]
   service: true
   source: mqtt                      # 声明承载「mqtt」事件源（供通用订阅原语 ctx.subscribe 使用）
@@ -203,7 +225,7 @@ ext.mqtt:
 #   - 长驻可用 unsubscribe 按 handle 停掉（start/stop 闭环）。
 # 权威注册表见 plugin/extensions.yaml。
 ext.rabbitmq:
-  cmd: ["build/rabbitmq-sidecar.exe"]
+  cmd: ["plugin/rabbitmq-sidecar.exe"]
   methods: [publish, declare, consume, unsubscribe]
   service: true
   source: rabbitmq
@@ -251,7 +273,7 @@ ext.rabbitmq:
         handle: {type: string, description: "consume(mode=push) 返回的订阅句柄", required: true}
 
 ext.kafka:
-  cmd: ["build/kafka-sidecar.exe"]
+  cmd: ["plugin/kafka-sidecar.exe"]
   methods: [produce, consume, unsubscribe]
   service: true
   source: kafka
@@ -283,7 +305,7 @@ ext.kafka:
         handle: {type: string, description: "consume(mode=push) 返回的订阅句柄", required: true}
 
 ext.sms:
-  cmd: ["build/gear.exe", "ext", "sms"]
+  cmd: ["./gear.exe", "ext", "sms"]
   methods: [send]
   schemas:
     send:
@@ -291,7 +313,7 @@ ext.sms:
       parameters:
         phone: {type: string, description: "手机号（字符串或数组，多号批量）", required: true}
         content: {type: string, description: "直接正文（与 template_id 二选一）"}
-        gateway: {type: string, description: "网关 URL（可选参数，传给 ext.sms；缺省则报错）"}
+        gateway: {type: string, description: "短信网关 URL（必填，缺则运行期报错）", required: true}
         apikey: {type: string, description: "网关令牌（可选参数，传给 ext.sms）"}
         sign: {type: string, description: "短信签名（可选参数，传给 ext.sms）"}
 
@@ -303,7 +325,7 @@ ext.sms:
 # args.port 是网站对外服务端口（由 /start 入参决定）。
 # 权威注册表见 plugin/extensions.yaml。
 ext.serve:
-  cmd: ["build/serve-sidecar.exe"]     # 真实 serve-sidecar 侧车（plugin/serve-sidecar；需先 go build -o build/serve-sidecar.exe ./plugin/serve-sidecar）
+  cmd: ["plugin/serve-sidecar.exe"]     # 真实 serve-sidecar 侧车（plugin/serve-sidecar；需先 go build -o build/plugin/serve-sidecar.exe ./plugin/serve-sidecar）
   methods: [start, stop]
   service: true                        # 常驻能力：侧车长驻，对外起静态网站 HTTP 服务
   listen: "127.0.0.1:8095"            # coord + RPC 端口（本地 HTTP 调其方法，复用长连接）

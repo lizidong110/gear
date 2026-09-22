@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -58,6 +60,12 @@ type Engine struct {
 	// secret 是宿主注入的运行期密钥源（WithSecret）；nil 表示用 host 自带（默认 nil →
 	// 声明 secret 的 Tool 收到 ErrCapabilityUnavailable，fail-closed）。
 	secret cap.Secret
+	// progressOut 是执行进度（step 通过/跳过/service 启动）的输出目标；nil = os.Stdout。
+	//
+	// 为什么可替换：MCP 的 **stdio transport 下 stdout 只能承载协议帧**——一行 `✓ step …`
+	// 就足以让严格客户端解析失败（`plugin/mcp_wire_probe.py` 抓到的真实事故）。
+	// 默认仍是 os.Stdout（CLI 直接看得到），由传输层（`gear mcp`）按需改指 stderr。
+	progressOut io.Writer
 }
 
 // New 构造引擎。可用 WithMaxParallel / WithHost / WithSandbox / WithCapabilities 等选项覆盖默认行为。
@@ -92,6 +100,21 @@ func New(reg *registry.Registry, opts ...func(*Engine)) *Engine {
 	}
 	e.bindAIAgent()
 	return e
+}
+
+// SetProgressWriter 指定执行进度的输出目标（nil 表示回到默认 os.Stdout）。
+//
+// 传输层专用：`gear mcp` 必须指向 os.Stderr —— MCP 的 stdout 是协议专用通道。
+// 默认值在**调用时**解析（而非构造时），所以测试里临时替换 os.Stdout 的老办法照旧有效。
+func (e *Engine) SetProgressWriter(w io.Writer) { e.progressOut = w }
+
+// progressf 输出一行执行进度（目标见 SetProgressWriter）。
+func (e *Engine) progressf(format string, args ...any) {
+	w := e.progressOut
+	if w == nil {
+		w = os.Stdout
+	}
+	fmt.Fprintf(w, format, args...)
 }
 
 // bindAIAgent 把引擎的工具执行器注入进程内 ext.ai agent（react 方法需要它来跑单步工具调用），
@@ -675,21 +698,21 @@ func (e *Engine) runWithVars(flow *model.Flow, observe ToolObserver, execID stri
 		err := e.execLevel(flow.Steps, level, func(ctx context.Context, step model.Step, call resolvedCall) error {
 			if reason, ok := skipReasonFor(step.ID); ok {
 				markSkipped(step.ID, reason)
-				fmt.Printf("- step %s 跳过（%s）\n", step.ID, reason)
+				e.progressf("- step %s 跳过（%s）\n", step.ID, reason)
 				return nil
 			}
 
 			input, output, err := e.runOnceStep(ctx, rc, hooks, flow.ID, step, call)
 			if errors.Is(err, ErrStepSkipped) {
 				markSkipped(step.ID, "when=false")
-				fmt.Printf("- step %s 跳过（when=false）\n", step.ID)
+				e.progressf("- step %s 跳过（when=false）\n", step.ID)
 				return nil
 			}
 			if err != nil {
 				return err
 			}
 			rc.setStep(step.ID, input, output)
-			fmt.Printf("✓ step %s (%s) -> %v\n", step.ID, step.Call, output)
+			e.progressf("✓ step %s (%s) -> %v\n", step.ID, step.Call, output)
 			return nil
 		})
 		if err != nil {
@@ -697,11 +720,11 @@ func (e *Engine) runWithVars(flow *model.Flow, observe ToolObserver, execID stri
 		}
 	}
 
-	fmt.Printf("✓ Flow %s 执行完成，共 %d 步", flow.ID, len(flow.Steps))
+	e.progressf("✓ Flow %s 执行完成，共 %d 步", flow.ID, len(flow.Steps))
 	if n := len(skipped); n > 0 {
-		fmt.Printf("，跳过 %d 步", n)
+		e.progressf("，跳过 %d 步", n)
 	}
-	fmt.Println()
+	e.progressf("\n")
 
 	result := &RunResult{FlowID: flow.ID, Steps: rc.steps, Skipped: skipped}
 	rc.setResult(result)

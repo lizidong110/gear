@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,11 +15,11 @@ import (
 )
 
 // 本文件补两块此前完全没人走的区域：
-//   1. ServeHTTP —— streamable HTTP transport 的**监听与退出**路径。此前的测试只走
-//      httpHandler()（拿 handler 自己起 httptest），于是「ListenAndServe + 信号
-//      优雅退出」这 12 条语句一直是 0%，而它恰恰是 `gear mcp --http` 的真实入口。
-//   2. 各 handler 的**错误分支**——「id 不存在必须报错，绝不静默成功」是 Gear 的一贯
-//      口径，错误分支不测等于没测。
+//  1. ServeHTTP —— streamable HTTP transport 的**监听与退出**路径。此前的测试只走
+//     httpHandler()（拿 handler 自己起 httptest），于是「ListenAndServe + 信号
+//     优雅退出」这 12 条语句一直是 0%，而它恰恰是 `gear mcp --http` 的真实入口。
+//  2. 各 handler 的**错误分支**——「id 不存在必须报错，绝不静默成功」是 Gear 的一贯
+//     口径，错误分支不测等于没测。
 
 // newServeFixture 装配一个可直接起监听的 MCP Server（registry + 引擎 + 扩展已加载）。
 func newServeFixture(t *testing.T) (*registry.Registry, *engine.Engine, *Server) {
@@ -117,49 +118,73 @@ func TestServeHTTPRejectsUnusableAddr(t *testing.T) {
 	}
 }
 
-// TestMCPErrorPathsReportInsteadOfSilentSuccess 「不存在」类入参必须报错。
+// TestMCPErrorPathsReportInsteadOfSilentSuccess 「不存在」/「参数非法」类入参必须报错。
+//
+// 这一组是**自愈回路的地基**：智能体拿不到明确的失败信号，就会把「没报错」当成
+// 「已经生效」，然后在下一步拿到一个看似无关的错，开始乱改 YAML。
 func TestMCPErrorPathsReportInsteadOfSilentSuccess(t *testing.T) {
 	session := newSmokeSession(t)
 
 	cases := []struct {
-		tool, want string
-		args       map[string]any
+		name, tool, wantCode string
+		args                 map[string]any
 	}{
-		{"get_tool", "Tool 不存在", map[string]any{"id": "no_such_tool"}},
-		{"get_flow", "Flow 不存在", map[string]any{"id": "no_such_flow"}},
-		{"validate_flow", "Flow 不存在", map[string]any{"id": "no_such_flow"}},
-		{"get_execution", "执行记录不存在", map[string]any{"id": "no_such_exec"}},
-		{"get_execution_logs", "执行记录不存在", map[string]any{"id": "no_such_exec"}},
-		{"delete_tool", "", map[string]any{"id": "no_such_tool"}},
-		{"delete_flow", "", map[string]any{"id": "no_such_flow"}},
-		{"delete_hook", "", map[string]any{"id": "no_such_hook"}},
-		{"run_flow", "Flow 不存在", map[string]any{"id": "no_such_flow"}},
-		{"run_tool", "", map[string]any{"id": "no_such_tool"}},
-		{"promote_tool", "非法目标状态", map[string]any{"tool_id": "x", "version": "1.0.0", "target": "bogus"}},
+		{"tool 不存在", "gear_describe", "NOT_FOUND", map[string]any{"kind": "tool", "id": "no_such_tool"}},
+		{"flow 不存在", "gear_describe", "NOT_FOUND", map[string]any{"kind": "flow", "id": "no_such_flow"}},
+		{"hook 不存在", "gear_describe", "NOT_FOUND", map[string]any{"kind": "hook", "id": "no_such_hook"}},
+		{"describe 的 kind 非法", "gear_describe", "BAD_ARGUMENT", map[string]any{"kind": "bogus", "id": "x"}},
+		{"describe 的空 id", "gear_describe", "BAD_ARGUMENT", map[string]any{"kind": "tool", "id": ""}},
+		{"执行记录不存在", "gear_execution", "NOT_FOUND", map[string]any{"id": "no_such_exec"}},
+		{"删不存在的 tool", "gear_delete", "NOT_FOUND", map[string]any{"kind": "tool", "id": "no_such_tool"}},
+		{"删不存在的 flow", "gear_delete", "NOT_FOUND", map[string]any{"kind": "flow", "id": "no_such_flow"}},
+		{"删不存在的 hook", "gear_delete", "NOT_FOUND", map[string]any{"kind": "hook", "id": "no_such_hook"}},
+		{"delete 的 kind 非法", "gear_delete", "BAD_ARGUMENT", map[string]any{"kind": "bogus", "id": "x"}},
+		{"delete 的空 id", "gear_delete", "BAD_ARGUMENT", map[string]any{"kind": "tool", "id": ""}},
+		{"跑不存在的 flow", "gear_run", "NOT_FOUND", map[string]any{"kind": "flow", "id": "no_such_flow"}},
+		{"跑不存在的 tool", "gear_run", "NOT_FOUND", map[string]any{"kind": "tool", "id": "no_such_tool"}},
+		{"run 的 kind 非法", "gear_run", "BAD_ARGUMENT", map[string]any{"kind": "bogus", "id": "x"}},
+		{"run 的空 id", "gear_run", "BAD_ARGUMENT", map[string]any{"kind": "flow", "id": ""}},
+		{"promote 目标状态非法", "gear_promote", "BAD_ARGUMENT", map[string]any{"tool_id": "x", "version": "1.0.0", "target": "bogus"}},
+		{"validate 空 yaml", "gear_validate", "BAD_ARGUMENT", map[string]any{"yaml": "   "}},
+		{"apply 空 bundle", "gear_apply", "BAD_ARGUMENT", map[string]any{"bundle": ""}},
+		{"guide 主题不存在", "gear_guide", "UNKNOWN_TOPIC", map[string]any{"topic": "no_such_topic"}},
+		{"app 的 action 非法", "gear_app", "BAD_ARGUMENT", map[string]any{"action": "bogus"}},
+		{"app start 缺 flow_id", "gear_app", "BAD_ARGUMENT", map[string]any{"action": "start"}},
+		{"app status 缺 app_id", "gear_app", "BAD_ARGUMENT", map[string]any{"action": "status"}},
+		{"app stop 缺 app_id", "gear_app", "BAD_ARGUMENT", map[string]any{"action": "stop"}},
+		{"app_id 不在台账", "gear_app", "APP_NOT_FOUND", map[string]any{"action": "status", "app_id": "app_nope"}},
 	}
 	for _, c := range cases {
-		expectToolError(t, session, c.tool, c.args, c.want)
+		t.Run(c.name, func(t *testing.T) {
+			text := expectToolError(t, session, c.tool, c.args, "")
+			if !strings.Contains(text, "["+c.wantCode+"]") {
+				t.Fatalf("应带 [%s] 码，实际: %s", c.wantCode, text)
+			}
+		})
 	}
 }
 
-// TestMCPRunFlowRejectsServiceFlow Flow 含 service 长驻 step 时，MCP 同步运行面必须
-// 拒绝（须 gear app run 监管），与 REQ-FLOW-RUN-REJECTS-SERVICE 同口径。
-func TestMCPRunFlowRejectsServiceFlow(t *testing.T) {
+// TestMCPSchemaRequiredArgsFailLoudly 缺失**必填**参数由 SDK 的 input schema 校验挡下，
+// 报的是 JSON-RPC 层的错误文本（没有 [CODE] 前缀——它压根到不了我们的 handler）。
+//
+// 这不是缺口而是取舍：`id` 声明为必填后，客户端能就地发现漏参（省一次往返）；代价是这条
+// 错误没有码。本用例把该行为钉住——若哪天 SDK 改成静默放行（那才是真缺口），会立刻红。
+func TestMCPSchemaRequiredArgsFailLoudly(t *testing.T) {
 	session := newSmokeSession(t)
-	var created map[string]any
-	callTool(t, session, "create_tool", map[string]any{"yaml": smokeToolYAML}, &created)
-	callTool(t, session, "create_flow", map[string]any{"yaml": svcFlowYAML}, &created)
-	expectToolError(t, session, "run_flow", map[string]any{"id": "svc_demo"}, "service")
-
-	// service Flow 不反向暴露为同步工具：flow__svc_demo 根本不该出现在工具面里
-	// （未知工具在协议层就报错，故用 ListTools 断言「不存在」，而不是 CallTool）。
-	tools, err := session.ListTools(context.Background(), &mcp.ListToolsParams{})
-	if err != nil {
-		t.Fatalf("ListTools 失败: %v", err)
-	}
-	for _, tt := range tools.Tools {
-		if tt.Name == "flow__svc_demo" {
-			t.Fatal("service 长驻 Flow 不得反向暴露为同步 MCP 工具（会常驻不结束）")
+	for _, c := range []struct {
+		tool string
+		args map[string]any
+	}{
+		{"gear_describe", map[string]any{"kind": "tool"}},
+		{"gear_delete", map[string]any{"kind": "tool"}},
+		{"gear_run", map[string]any{"kind": "flow"}},
+	} {
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: c.tool, Arguments: c.args})
+		if err != nil {
+			t.Fatalf("%s: 协议层错误: %v", c.tool, err)
+		}
+		if text := contentText(res); !strings.Contains(text, "missing properties") {
+			t.Fatalf("%s 缺必填参数时应由 input schema 校验拒绝，实际: %s", c.tool, text)
 		}
 	}
 }

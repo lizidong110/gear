@@ -58,7 +58,7 @@ func (m *mockAI) buildLua(L *lua.LState, c *cap.Context) (lua.LValue, error) {
 	tbl := L.NewTable()
 	tbl.RawSetString("complete", L.NewFunction(func(L *lua.LState) int {
 		args := map[string]interface{}{}
-		if mt, ok := fromLuaValue(L.Get(1)).(map[string]interface{}); ok {
+		if mt, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{}); ok {
 			args = mt
 		}
 		sys, _ := args["system"].(string)
@@ -69,7 +69,7 @@ func (m *mockAI) buildLua(L *lua.LState, c *cap.Context) (lua.LValue, error) {
 	}))
 	tbl.RawSetString("catalog", L.NewFunction(func(L *lua.LState) int {
 		args := map[string]interface{}{}
-		if mt, ok := fromLuaValue(L.Get(1)).(map[string]interface{}); ok {
+		if mt, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{}); ok {
 			args = mt
 		}
 		L.Push(toLuaValue(L, map[string]interface{}{"tools": args["tools"]}))

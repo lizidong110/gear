@@ -1,0 +1,42 @@
+# Gear 心智模型（常驻摘要）
+
+Gear 是「机制内核」：只给 能力原语 + Tool（执行单元）+ Flow（编排）+ Hook（切面），不含业务策略。
+「应用」= 一个含 `mode: service` 长驻 step 的 Flow，用 `gear_app(action=start)` 起为后台进程。
+**「跨会话存活」不是无条件的**（Windows）：未能脱离调用方 Job Object 时，`start` 会返回 `escaped_job:false`
+并附 warning——该进程会随**发起启动的那次会话**结束被回收。它是 running，但活不到会话之后。
+
+## 四层模型
+- **能力原语（宿主提供）**：受门禁 7 个 `http/call/db/kv/secret/event/subscribe`（须声明才可用）；
+  免门禁纯函数 3 个 `time/template/crypto`（始终可用，**声明了反而被拒**）；`ext.*`（须注册且须声明）。
+  `json` **不是能力**（只是 Lua 的 `ctx.json` 绑定，Flow 不能直调）。
+- **Tool** = 能力 + 业务逻辑，可复用。**可复用的才建 Tool；一次性的直接在 `step.call` 写「能力.方法」**。
+- **Flow** = 编排执行单元（谁先谁后 / 何时跑 / 是否长驻）。
+- **Hook** = 生命周期插入与门禁（`before_flow/before_step/after_step/on_error/on_success/before_promote`）。
+
+锚点：一处定义多入口执行（CLI/REST/MCP 同源）；能静态校验的绝不留到运行期（fail-closed）。
+
+## 标准流程：创建并运行应用
+① `gear_doctor` → ② `gear_guide(topic)` + `gear_capabilities` → ③ **用你自己的文件工具**落盘静态资源
+→ ④ `gear_validate`（不落库，可无限重试）→ ⑤ `gear_apply`（原子落库）→ ⑥ `gear_app(start, flow_id)`
+→ ⑦ `gear_app(status)` + 端口探活 + 日志行 → ⑧ 汇报并**告知如何停止**。
+
+## 七条铁律
+1. 写「能力.方法」前先 `gear_capabilities`，不许猜（`crypto/time/template` 免门禁、`json` 不是能力、`ext.*` 必须声明）。
+2. 先 `gear_validate` 再 `gear_apply`，不要「先写进去再改」。
+3. 长驻应用只能用 `gear_app(action=start)`；`gear_run` 对 service Flow 必拒（设计如此，不是 bug）。
+4. 凭据只走 `${secrets.NAME}`，绝不内联明文；扩展原子禁止读环境变量。
+5. 所有 id 必须以 `<app-id>__` 或 `<app-id>.` 开头。
+6. 失败先读 `gear_execution` / `gear_app` 的日志定位到 step 再改；**禁止未验证就宣称成功**。
+7. **缺能力不许凑**（不 shell 外调、不造 `ext.*` 名、不读 env），按 `gear_guide("primitive-gap")` 上报并标注阻塞。
+
+## 工具
+`gear_guide`(手册) · `gear_catalog`(摘要) · `gear_describe`(全量) · `gear_capabilities`(能力与参数)
+· `gear_validate`(校验 YAML) · `gear_apply`(落库) · `gear_delete` · `gear_promote`
+· `gear_run`(一次性编排) · `gear_execution`(执行记录/日志) · `gear_app`(起停查应用) · `gear_doctor`(环境自检)
+
+## 完成的证据（缺一不可）
+`gear_validate` 的 `valid:true` + `gear_apply` 的 `applied` 清单 +
+（长驻：`gear_app(status)` 的 `state:running` 且端口 `listening:true`｜一次性：`gear_execution` 的 `status:succeeded`）
++ 告知停止方式（应用是独立后台进程，需显式 stop）。
+  **别只看 `state:running` 就报成功**：`escaped_job:false` 时须如实告诉用户「它只活到本次会话结束」，
+  别用「已在后台常驻」这种措辞——智能体最贵的错误是把「现在能访问」说成了「一直能访问」。

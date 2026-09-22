@@ -269,7 +269,7 @@ func sidecarExtension(name string, t SidecarTransport, methods []string) *Capabi
 						return 0
 					}
 					args := map[string]interface{}{}
-					if m, ok := fromLuaValue(L.Get(1)).(map[string]interface{}); ok {
+					if m, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{}); ok {
 						args = m
 					}
 					res, err := p.(*SidecarProvider).Call(method, args)
@@ -300,7 +300,7 @@ func InProcessExtension(name string, methods []string, fn func(method string, ar
 				method := m
 				tbl.RawSetString(method, L.NewFunction(func(L *lua.LState) int {
 					args := map[string]interface{}{}
-					if mt, ok := fromLuaValue(L.Get(1)).(map[string]interface{}); ok {
+					if mt, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{}); ok {
 						args = mt
 					}
 					res, err := fn(method, args)
@@ -625,16 +625,25 @@ type CapabilitySummary struct {
 	Methods map[string]MethodSchema `json:"methods"` // 方法名 -> 参数 schema
 }
 
-// LoadExtensionConfig 读 extensions.yaml。
-// path 为空时按 GEAR_EXT_CONFIG 环境变量，再回退 cwd 的 extensions.yaml。
-// 文件不存在返回空 map（调用方据此回退默认 ext.ai），解析失败才返回 error。
+// LoadExtensionConfig 读 extensions.yaml，并把每个 ext 的 `cmd[0]` 相对路径解析成绝对路径。
+//
+// path 为空时按 ResolveExtensionConfigPath 的候选序列定位（可执行文件同目录优先，cwd 兜底；
+// GEAR_EXT_CONFIG 可显式覆盖）。文件不存在返回空 map（调用方据此回退默认 ext.ai），
+// 解析失败才返回 error。
+//
+// cmd 的解析基准是**配置文件所在目录**（见 extensionCmdRoots）——配置里写
+// `plugin/serve-sidecar.exe` 就相对配置文件解析，于是 extensions.yaml 与 plugin/ 可以整体
+// 搬家而不改一个字，也不再随 cwd 漂移。
 func LoadExtensionConfig(path string) (map[string]ExtSpec, error) {
 	if path == "" {
-		if env := os.Getenv("GEAR_EXT_CONFIG"); env != "" {
-			path = env
-		} else {
-			path = "extensions.yaml"
+		p, err := ResolveExtensionConfigPath()
+		if err != nil {
+			return nil, err
 		}
+		path = p
+	}
+	if path == "" {
+		return map[string]ExtSpec{}, nil
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -649,6 +658,11 @@ func LoadExtensionConfig(path string) (map[string]ExtSpec, error) {
 	}
 	if specs == nil {
 		specs = map[string]ExtSpec{}
+	}
+	roots := extensionCmdRoots(path)
+	for name, spec := range specs {
+		spec.Cmd = resolveExtensionCmd(spec.Cmd, roots)
+		specs[name] = spec
 	}
 	return specs, nil
 }
@@ -842,16 +856,21 @@ func SetupExtensions(capReg *CapabilityRegistry, reg *registry.Registry, cfgPath
 // 连不上也不报错，只在真正调用时超时。
 //
 // 对策两件：
-//  1. Entry：把 listen 以 `COORD_ADDR=<listen>` 前置注入侧车进程环境（值经单引号
-//     转义，不会成为 shell 元字符）。侧车那侧的 os.Getenv 默认值随即降级为
-//     「不经引擎、手工单跑侧车」时的兜底。
+//  1. Entry：把 listen 以 `COORD_ADDR=<listen>` 前置注入侧车进程环境；listen 的值与
+//     cmd 里需要转义的 token 一律经单引号包裹（见 shellQuoteValue / quoteCmdToken）——
+//     entry 是一条以空格分词的命令行，绝对路径可能含空格，不转义就会被拆成两个参数。
+//     侧车那侧的 os.Getenv 默认值随即降级为「不经引擎、手工单跑侧车」时的兜底。
 //  2. HealthProbe：tcp/http 探针的 addr 省略时即取 listen（侧车静态可知的监听地址
 //     只有它）；显式写了却与 listen 不一致则**注册期报错**——探错地址的后果是监管
 //     无限重启，属「能静态校验就不许留到运行期」的红线范围，不静默放过。
 //
 // listen 为空（纯 daemon 守护，引擎不主动调它）时不注入、不校验，Entry 原样返回 cmd。
 func prepareServiceExt(spec ExtSpec) (string, *model.HealthProbe, error) {
-	entry := strings.Join(spec.Cmd, " ")
+	parts := make([]string, 0, len(spec.Cmd))
+	for _, c := range spec.Cmd {
+		parts = append(parts, quoteCmdToken(c))
+	}
+	entry := strings.Join(parts, " ")
 	if spec.Listen == "" {
 		return entry, spec.HealthProbe, nil
 	}
@@ -899,8 +918,35 @@ func coordAddrKey(addr string) string {
 	return host + ":" + port
 }
 
-// shellQuoteValue 用单引号包裹值，使其在 `sh -c` 下不被当作 shell 元字符解释
-// （值来自配置文件，属准可信输入，但不转义就等于把 shell 解析权交了出去）。
+// shellQuoteValue 用单引号包裹值，使其在 `sh -c` 与 gear 原生解析（cmdline.Parse）下
+// 都保持字面量语义（值来自配置文件，属准可信输入，但不转义就等于把解析权交了出去）。
 func shellQuoteValue(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// cmdTokenSafe 是「不需要加引号」的字符集（POSIX 的安全字符 + 常见路径字符）。
+var cmdTokenSafe = func() [128]bool {
+	var t [128]bool
+	for _, r := range "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@%+=:,./-" {
+		t[r] = true
+	}
+	return t
+}()
+
+// quoteCmdToken 只在必要时给 cmd token 加单引号。
+//
+// 为什么必须做：cmd 里的路径被 resolveExtensionCmd 解析成绝对路径后**可能含空格**
+// （`C:\Program Files\...`），而 entry 是一条「以空格分词的命令行」——不转义就会被拆成
+// 两个参数。历史实现直接 strings.Join，等于默认了「路径永远不含空格」这个不成立的假设。
+func quoteCmdToken(s string) string {
+	if s == "" {
+		return "''"
+	}
+	for _, r := range s {
+		if r < 128 && cmdTokenSafe[r] {
+			continue
+		}
+		return shellQuoteValue(s)
+	}
+	return s
 }

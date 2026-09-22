@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os/exec"
 	"time"
 
+	"gear/internal/cmdline"
 	"gear/internal/engine"
 	"gear/internal/model"
 )
@@ -92,8 +92,14 @@ func checkProbe(ctx context.Context, rp *model.ResolvedProbe) bool {
 	case model.ProbeKindCmd:
 		cmdCtx, cancel := context.WithTimeout(ctx, rp.Timeout)
 		defer cancel()
-		// 与 process runtime 一致，经 sh -c 执行健康检查命令（开发环境为 Git Bash）。
-		if err := exec.CommandContext(cmdCtx, "sh", "-c", rp.Cmd).Run(); err != nil {
+		// 与 process runtime 同一套解析（cmdline.Command，默认不经 shell）：
+		// 探针命令与 Tool entry 走两种不同的命令解释器，是「探针说活着、进程其实早死了」
+		// 这类假绿的老来源之一。
+		probe, err := cmdline.Command(cmdCtx, rp.Cmd)
+		if err != nil {
+			return false
+		}
+		if err := probe.Run(); err != nil {
 			return false
 		}
 		return true

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""plugin/verify.py —— 可扩展原子（P1 通知 + P2 消息/短信）端到端验证。
+"""plugin/verify.py —— 可扩展原子（P1 通知 + P2 消息/短信）与应用生命周期端到端验证。
 
 不依赖任何外部服务即可证明协议正确 + 真实跑通 Gear 调用链路。
 
@@ -23,6 +23,15 @@ P2：
 红线：
   9) methods/schemas 不一致的 ext 配置，gear 启动必须 fail-closed
  10) 统一注册表 plugin/extensions.yaml 加载后，gear ai capabilities 应含全部 6 个 ext
+P4（应用生命周期，2026-09-21 补）：
+ 11) gear app start：派生**独立后台进程**后立即返回 → 父命令退出后端口仍服务（自持）
+     → 同 flow 二次 start 幂等 → status/list 如实报 running → stop 终止进程并**真释放端口**。
+     这是 MCP 面 gear_app(start) 的同一条链路（两者共用 internal/app），
+     即「通过 MCP 创建并运行一个应用」落到**真进程**上的端到端证据。
+     关键前提：app 必须**自己**持有 ext.serve 的 coord 端口。若沿用本脚本常驻侧车已听的
+     8095，app 的 service 步会复用那个监听、随即完成 → app 进程秒退，而端口照样在服务
+     ——「自持」就成了假象（2026-09-21 实测踩到：served=True 却来自别人的侧车）。
+     故此处给 app 一份**独立 extensions 副本**（listen 换空闲端口 + cmd 换绝对路径）。
 """
 import os
 import re
@@ -273,6 +282,11 @@ def main():
 
     tmp = tempfile.mkdtemp(prefix="ext-")
     reg = os.path.join(tmp, "ext.db")
+    # 应用生命周期场景（P4）用**独立**的 registry 与台账目录：不与本轮的 ext 注册混在一起，
+    # 也让「stop 后端口释放」有一个干净的前后对照。
+    app_reg = os.path.join(tmp, "app.db")
+    app_apps = os.path.join(tmp, "apps")
+    started_apps = []  # 供 finally 兜底回收（stop 失败时不留残留后台进程）
     email_log = os.path.join(tmp, "email.out.log")
 
     env = dict(os.environ)
@@ -529,6 +543,160 @@ def main():
               "start=%s echo=%s proxy=%s static=%s bad_reject=%s %s"
               % (started2, bool(echoed), proxied, static_ok, bad_rejected, perr))
 
+        # ---- 11) 应用生命周期（REQ-APP-LAUNCH）：MCP 面的 gear_app(start) 与 CLI `app start`
+        #          共用 internal/app **同一份实现**，故这里用真实二进制验同一条链路：
+        #          派生独立后台进程 → 立即返回 → 端口真能服务 → 幂等 → stop 释放端口。
+        #          这是「通过 MCP 创建并运行应用」的最后一步落在一个**真进程**上的证据。
+        #
+        # 为什么用独立 registry/台账：不与本轮的 ext 注册混在一起，也让「stop 后端口释放」
+        # 有干净的前后对照（同库同名 Flow 的干扰会让失败归因变得不可能）。
+        app_site = os.path.join(tmp, "appsite")
+        os.makedirs(app_site, exist_ok=True)
+        with open(os.path.join(app_site, "index.html"), "w", encoding="utf-8") as f:
+            f.write("<h1>hello gear app</h1>")
+        _sa = socket.socket()
+        _sa.bind(("127.0.0.1", 0))
+        app_port = _sa.getsockname()[1]
+        _sa.close()
+
+        # app 专用 extensions 副本 —— 两处必须改，否则「自持」根本验不出来：
+        #   ① listen 换成空闲端口：否则 app 的 ext.serve 会复用本轮常驻侧车已在听的 8095，
+        #      service 步立即完成、app 进程秒退（端口照样被服务，但那是**别人的**侧车在服务，
+        #      于是 status 看到的 pid 已死、端口仍在听 → unknown 而非 running）。
+        #   ② cmd 换成绝对路径：原值 `plugin/serve-sidecar.exe` 是相对 cwd 的，而派生进程的
+        #      cwd 未必是 build/，找不到侧车就等于 service 步直接失败。
+        _sc = socket.socket()
+        _sc.bind(("127.0.0.1", 0))
+        app_coord_port = _sc.getsockname()[1]
+        _sc.close()
+        _ext_raw = open(EXT, encoding="utf-8").read()
+        # 锚点唯一性 fail-closed：extensions.yaml 形状变了就必须**显式失败**，而不是静默生成
+        # 一份「没改到点子上」的副本，让整个场景悄悄失去意义（那正是本轮踩过的坑）。
+        if _ext_raw.count('listen: "127.0.0.1:8095"') != 1:
+            raise RuntimeError("extensions.yaml 的 ext.serve listen 锚点不唯一，"
+                               "无法生成 app 专用副本（形状变了？）")
+        if _ext_raw.count('cmd: ["plugin/serve-sidecar.exe"]') != 1:
+            raise RuntimeError("extensions.yaml 的 serve cmd 锚点不唯一，"
+                               "无法生成 app 专用副本（形状变了？）")
+        _sidecar_abs = os.path.join(ROOT, "build", "plugin", "serve-sidecar.exe")
+        _ext_patched = _ext_raw.replace('listen: "127.0.0.1:8095"',
+                                        'listen: "127.0.0.1:%d"' % app_coord_port)
+        _ext_patched = _ext_patched.replace('cmd: ["plugin/serve-sidecar.exe"]',
+                                            'cmd: ["%s"]' % _sidecar_abs.replace(os.sep, "/"))
+        ext_app = os.path.join(tmp, "extensions_app.yaml")
+        with open(ext_app, "w", encoding="utf-8") as f:
+            f.write(_ext_patched)
+        app_env = dict(env)
+        app_env["GEAR_EXT_CONFIG"] = ext_app
+
+        # 自包含 bundle：anchor（once 排序锚点）+ 常驻 App Flow。
+        # 为什么必须有 anchor：service step **不能被依赖**（引擎显式拒绝），没有它 site 会与
+        # serve 落在**同一层并发**，/start 打在侧车完成 coord 注册之前 → connection refused。
+        # anchor 把 site 推到下一层，等 serve 注册成功再跑。
+        # 站点目录写**绝对路径**：派生出去的后台进程 cwd 与本进程无关，相对路径必然找不到。
+        anchor_yaml = """id: app_demo.anchor
+name: 排序锚点（不做事，只把后续 once 步推到下一层）
+runtime: lua
+input_schema:
+  type: object
+output_schema:
+  type: object
+versions:
+  - version: 1.0.0
+    state: stable
+entry: |
+  return {ok = true}
+"""
+        flow_yaml = """id: app_demo.up
+name: 验证用常驻应用（ext.serve 托管静态站）
+steps:
+  - id: serve
+    call: ext.serve
+    mode: service
+    input: {}
+  - id: anchor
+    call: app_demo.anchor
+    input: {}
+  - id: site
+    call: static_site.serve
+    depends_on: [anchor]
+    input:
+      port: %d
+      dir: "%s"
+      host: 127.0.0.1
+""" % (app_port, app_site.replace("\\", "/"))
+        ap_anchor = os.path.join(tmp, "app_anchor.yaml")
+        ap_flow = os.path.join(tmp, "app_flow.yaml")
+        with open(ap_anchor, "w", encoding="utf-8") as f:
+            f.write(anchor_yaml)
+        with open(ap_flow, "w", encoding="utf-8") as f:
+            f.write(flow_yaml)
+
+        rc_a, _ = run_gear(["tool", "register", "--registry", app_reg,
+                            os.path.join(ROOT, "plugin", "static_site_demo.yaml")], env=env)
+        rc_b, _ = run_gear(["tool", "register", "--registry", app_reg, ap_anchor], env=env)
+        rc_c, _ = run_gear(["flow", "register", "--registry", app_reg, ap_flow], env=env)
+        app_reg_ok = (rc_a == 0 and rc_b == 0 and rc_c == 0)
+
+        rc, out = run_gear(["app", "start", "app_demo.up", "--registry", app_reg,
+                            "--apps-dir", app_apps, "--port", str(app_port),
+                            "--wait", "12", "--restart", "never"], env=app_env)
+        _t1 = (out.strip().splitlines() or [""])[0].split()
+        app_state = _t1[0] if _t1 else ""
+        app_id = _t1[1] if len(_t1) > 1 else ""
+        if app_id:
+            started_apps.append(app_id)
+        # 关键断言：这次 fetch 发生在 `app start` 子进程**已经退出之后**——
+        # 端口仍在服务即证明应用是自持的独立进程（没有被 start 命令带走）。
+        app_served = False
+        if app_id:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/index.html" % app_port, timeout=5) as r:
+                    app_served = (r.read().decode("utf-8", "ignore") == "<h1>hello gear app</h1>")
+            except Exception:
+                pass
+        check("P4 app start 派生后台进程→立即返回→父命令退出后端口仍服务（应用真自持）",
+              app_reg_ok and rc == 0 and app_state == "running" and app_served,
+              "register=%s rc=%d state=%s app_id=%s served=%s" % (app_reg_ok, rc, app_state, app_id, app_served))
+
+        rc2, out2 = run_gear(["app", "start", "app_demo.up", "--registry", app_reg,
+                              "--apps-dir", app_apps, "--port", str(app_port),
+                              "--wait", "3", "--restart", "never"], env=env)
+        _t2 = (out2.strip().splitlines() or [""])[0].split()
+        check("P4 同 flow 二次 start 幂等（already_running，同一 app_id，不重复派生）",
+              bool(_t2) and _t2[0] == "already_running" and len(_t2) > 1 and _t2[1] == app_id,
+              "state=%s app_id=%s（期望 already_running / %s）"
+              % (_t2[0] if _t2 else "?", _t2[1] if len(_t2) > 1 else "?", app_id))
+
+        rc_st, out_st = run_gear(["app", "status", app_id, "--registry", app_reg,
+                                  "--apps-dir", app_apps], env=env)
+        rc_ls, out_ls = run_gear(["app", "list", "--registry", app_reg,
+                                  "--apps-dir", app_apps], env=env)
+        st_ok = (rc_st == 0 and "running" in out_st and "listening=true" in out_st)
+        ls_ok = (rc_ls == 0 and app_id in out_ls)
+        check("P4 app status/list 如实反映（pid + 端口双判据）", st_ok and ls_ok,
+              "status_ok=%s list_ok=%s status=%r" % (st_ok, ls_ok, out_st.strip().splitlines()[:1]))
+
+        # stop 的语义：app **自己**持有 ext.serve 侧车与站点端口（见本段的 extensions 副本），
+        # 所以 stop 必须把进程树（app run + 它拉起的 serve-sidecar）一起收干净 ——
+        # stopped + 端口**真释放**，而不是留在那被别人的进程占着。
+        # 「收不干净绝不谎报成功」的另一半（端口被外部持有 → ORPHAN_APP + 非 0 退出）由单测
+        # TestStopReportsOrphanWhenPortHeld 覆盖，两者合起来才是完整语义。
+        rc_sp, out_sp = run_gear(["app", "stop", app_id, "--registry", app_reg,
+                                  "--apps-dir", app_apps], env=env)
+        released = False
+        for _ in range(15):
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/index.html" % app_port, timeout=2) as r:
+                    r.read()
+            except Exception:
+                released = True
+                break
+            time.sleep(0.3)
+        check("P4 app stop 终止应用并真释放站点端口（stopped + listening=false）",
+              rc_sp == 0 and released and "stopped" in out_sp and "listening=false" in out_sp,
+              "rc=%d released=%s out=%r" % (rc_sp, released, out_sp.strip().splitlines()[:1]))
+
         # ---- 9) 红线：methods/schemas 不一致的 ext 必须启动 fail-closed ----
         bad = os.path.join(tmp, "bad.yaml")
         with open(bad, "w", encoding="utf-8") as f:
@@ -545,6 +713,14 @@ def main():
         six = {"ext.email", "ext.webhook", "ext.wecom", "ext.rabbitmq", "ext.kafka", "ext.sms", "ext.serve"}
         check("统一注册表含 6 个 ext", six.issubset(caps), "发现: %s" % sorted(caps))
     finally:
+        # 后台应用先收：它派生的进程**不在 procs 里**（是 app run 自持的独立进程树），
+        # 漏收会留下占着端口的残留进程，下一轮 verify 的端口前置检查就会直接 FATAL。
+        for _aid in started_apps:
+            try:
+                run_gear(["app", "stop", _aid, "--registry", app_reg, "--apps-dir", app_apps],
+                         env=env, cwd=ROOT)
+            except Exception:
+                pass
         for p in procs:
             try:
                 p.terminate()

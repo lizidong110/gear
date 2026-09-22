@@ -550,6 +550,7 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 > **实现状态（S6a+S5；AI 改 `ext.ai` 扩展，2026-09-14）**：**均已实现**（含 `GET /api/executions/{id}/logs` #71；晋升经 CLI `tool promote` 与 REST promote 端点均可触发），端到端可用（`gear serve --addr`）。另见 §11 末尾「第四种执行面：MCP」。**注意**：AI 已去内置化——不再是引擎内建原语，而是 `ext.ai` 扩展（sidecar 载体，`examples/gear-ai-sidecar`，结构化多阶段 agent）；REST 端点 `/api/ai/infer` 仍不存在（AI 不经独立端点），改由 `gear ai gen` 薄壳命令或 Flow 内 `ctx.ext.ai.*` 调用（见 §9）。`internal/ai` 旧包已删除。
 > - **执行是异步的**：`POST /api/executions` 立即返回 `202 {id, status}`，结果经 `GET /api/executions/{id}` 查询（三态：running / succeeded / failed，失败带 `error`）。
 > - **执行记录已持久化（#70，REQ-EXEC-PERSIST）**：`ExecStore` 改为 SQLite 持久化（`GEAR_EXEC_DB`，缺省 `build/gear.db`），重启可恢复全部执行历史与日志；`Server.Shutdown` 关闭 SQLite 句柄释放 WAL 侧车。app 句柄（运行中进程）仍存活在服务进程内、重启即丢失（属进程态，非执行记录）。
+>   - **2026-09-21 注记（落点变更）**：上句里的缺省 `build/gear.db` **已作废**，现缺省 `<GEAR_HOME>/exec.db`（`GEAR_HOME` 未设时 `<HOME>/.gear/exec.db`，见 `internal/gearhome/gearhome.go`）。起因是相对 cwd 的默认落点会让同一份二进制在不同工作目录下写到不同的库——宿主派生的 gear 常带不可控 cwd，执行历史看上去像「无故丢失」。历史原文保留不改写。
 > - **统一错误体**：`{"error": "..."}`；状态码语义 400 参数/校验、404 不存在、409 仍被引用。
 > - 实现用标准库 `net/http`（Go 1.22+ 方法路由），未引入 web 框架——保持单二进制与最小依赖。
 

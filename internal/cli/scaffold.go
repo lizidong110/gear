@@ -132,14 +132,15 @@ Step 字段：
   depends_on   []string 选填  上游 step id（input 里出现 ${steps.x.*} 也会隐式依赖）
   when         string   选填  条件执行（表达式，不是 ${} 模板），如 "steps.s1.output.n > 1"
   parallel     bool     选填  显式并行（无依赖 step 默认就并行）
-  mode         string   选填  once(默认) | service(长驻，仅 Tool 载体；须 gear app run)
+  mode         string   选填  once(默认) | service(长驻，仅 Tool 载体；须 gear app run/start)
 
 模板引用（input 值里）：
   ${vars.x}                 Flow 变量（x 须是 vars 顶层键）
   ${steps.id.output.field}  上游 step 出参（id 须存在）
   ${secrets.name}           密钥（运行期从 GEAR_SECRET_<NAME> 或 /api/secrets 取，不落明文）
 
-注意：service 模式（mode: service）的 Flow 必须 gear app run，flow run 会显式拒绝。
+注意：service 模式（mode: service）的 Flow 必须 gear app run（前台监管，人/CI 持有）或
+      gear app start（派生独立后台进程，立即返回、跨会话存活），flow run 会显式拒绝。
 
 示例：
   gear scaffold flow my-flow -o my-flow.yaml

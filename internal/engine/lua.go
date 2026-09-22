@@ -108,7 +108,7 @@ func luaScopeArg(L *lua.LState, idx int) cap.Scope {
 // luaDBArgs 从 Lua 第 1 个参数读取 db 调用的 {driver?, dsn?, sql, params?} 表。
 // 调用方已先行 host.DB() 探过实现可用性，故此处只负责参数塑形；缺 sql 即报错（不做静默 no-op）。
 func luaDBArgs(L *lua.LState) (driver, dsn, sql string, params []interface{}, err error) {
-	m, ok := fromLuaValue(L.Get(1)).(map[string]interface{})
+	m, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{})
 	if !ok {
 		return "", "", "", nil, fmt.Errorf("db 调用需传入 table：{driver?, dsn?, sql, params?}")
 	}
@@ -244,7 +244,7 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 				}
 				headers := map[string]string{}
 				if L.GetTop() >= 4 && L.Get(4) != lua.LNil {
-					if m, ok := fromLuaValue(L.Get(4)).(map[string]interface{}); ok {
+					if m, ok := fromLuaValue(L, L.Get(4)).(map[string]interface{}); ok {
 						for k, v := range m {
 							headers[k] = fmt.Sprint(v)
 						}
@@ -287,7 +287,7 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 			return 1
 		}))
 		t.RawSetString("encode", L.NewFunction(func(L *lua.LState) int {
-			v := fromLuaValue(L.Get(1))
+			v := fromLuaValue(L, L.Get(1))
 			b, err := json.Marshal(v)
 			if err != nil {
 				L.Push(lua.LString(""))
@@ -318,7 +318,7 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 			t.RawSetString(m, L.NewFunction(func(L *lua.LState) int {
 				args := map[string]interface{}{}
 				if L.GetTop() >= 1 && L.Get(1) != lua.LNil {
-					mt, ok := fromLuaValue(L.Get(1)).(map[string]interface{})
+					mt, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{})
 					if !ok {
 						L.RaiseError("%s.%s 的参数必须是 table：{ %s }", p, m, sig)
 						return 0
@@ -344,7 +344,7 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 			ctxTable.RawSetString("call", L.NewFunction(func(L *lua.LState) int {
 				target := L.CheckString(1)
 				var input map[string]interface{}
-				if m, ok := fromLuaValue(L.Get(2)).(map[string]interface{}); ok {
+				if m, ok := fromLuaValue(L, L.Get(2)).(map[string]interface{}); ok {
 					input = m
 				}
 				out, err := caller.Call(target, input)
@@ -367,7 +367,7 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 				name := L.CheckString(1)
 				var payload interface{}
 				if L.GetTop() >= 2 && L.Get(2) != lua.LNil {
-					payload = fromLuaValue(L.Get(2))
+					payload = fromLuaValue(L, L.Get(2))
 				}
 				e.Notify(name, payload)
 				return 0
@@ -408,7 +408,7 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 			ss := sub
 			t := L.NewTable()
 			t.RawSetString("start", L.NewFunction(func(L *lua.LState) int {
-				m, ok := fromLuaValue(L.Get(1)).(map[string]interface{})
+				m, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{})
 				if !ok {
 					L.RaiseError("subscribe.start 需传入 table：{source, config, callback}")
 					return 0
@@ -573,7 +573,7 @@ func (l *luaRuntime) Run(ctx context.Context, entry string, input map[string]int
 	if outVal == lua.LNil || outVal == nil {
 		outVal = ret
 	}
-	out, ok := fromLuaValue(outVal).(map[string]interface{})
+	out, ok := fromLuaValue(L, outVal).(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("lua 脚本未产出 object 输出（请写 ctx.output 或 return 一个 table）")
 	}
@@ -610,7 +610,7 @@ func toLuaValue(L *lua.LState, v interface{}) lua.LValue {
 	case int64:
 		return lua.LNumber(float64(x))
 	case []interface{}:
-		t := L.NewTable()
+		t := newLuaArrayTable(L)
 		for i, e := range x {
 			t.RawSetInt(i+1, toLuaValue(L, e))
 		}
@@ -627,7 +627,7 @@ func toLuaValue(L *lua.LState, v interface{}) lua.LValue {
 		rv := reflect.ValueOf(v)
 		switch rv.Kind() {
 		case reflect.Slice, reflect.Array:
-			t := L.NewTable()
+			t := newLuaArrayTable(L)
 			for i := 0; i < rv.Len(); i++ {
 				t.RawSetInt(i+1, toLuaValue(L, rv.Index(i).Interface()))
 			}
@@ -648,10 +648,10 @@ func toLuaValue(L *lua.LState, v interface{}) lua.LValue {
 
 // fromLuaValue 把 Lua 值转回 JSON 兼容的 Go 值。
 // 整数值的 number 转 int64（让 JSON Schema 的 number 与 integer 都能通过校验）。
-func fromLuaValue(v lua.LValue) interface{} {
+func fromLuaValue(L *lua.LState, v lua.LValue) interface{} {
 	switch x := v.(type) {
 	case *lua.LTable:
-		return luaTableToGo(x)
+		return luaTableToGo(L, x)
 	case lua.LString:
 		return string(x)
 	case lua.LNumber:
@@ -669,11 +669,55 @@ func fromLuaValue(v lua.LValue) interface{} {
 	}
 }
 
+// luaArrayMarker 是挂在 metatable 上的标记键：表示「这个 table 由 Go 的 slice/array 转来」。
+//
+// 存在的理由（2026-09-22 实测缺陷）：Lua 的 table 没有数组/对象之分，**空表尤其无法自证**——
+// luaTableToGo 只能按「非空且全数字键」判数组，于是 `db.query` 查到 0 行时回程变成 `{}`
+// 而不是 `[]`，调用方无法区分「查到 0 行」与「出错」（同一个 `{}` 两种含义）。
+//
+// 做法：Go→Lua 时给数组 table 挂一个只含标记的 metatable，回程据此定夺。
+// 标记放在 metatable 而非表内容里，所以 `pairs` / `ipairs` / `#` 都看不到它，不污染数据；
+// 也不设 `__index`，不影响取值语义。
+//
+// 已知边界：Lua 侧若把数组 table **复制**成新表（如 `{table.unpack(rows)}`），标记不会跟着走，
+// 空数组仍会退化成 `{}`；而 `ctx.json.encode` 是 Lua 侧序列化，同样看不到本标记。
+// 本标记只保证「Go 产出 → Lua 原样带回」这条最常见路径上类型不丢。
+const luaArrayMarker = "__gear_array"
+
+// newLuaArrayTable 建一个带数组标记的 Lua table。
+func newLuaArrayTable(L *lua.LState) *lua.LTable {
+	t := L.NewTable()
+	mt := L.NewTable()
+	mt.RawSetString(luaArrayMarker, lua.LTrue)
+	L.SetMetatable(t, mt)
+	return t
+}
+
+// markedAsArray 判定 table 是否带数组标记（来自 Go 的 slice/array）。
+//
+// 必须经 **L.GetMetatable** 取元表：gopher-lua 的 *LTable 不导出 metatable 字段，
+// 也没有 Metatable() getter（2026-09-22 实测踩到：`t.Metatable()` 编译不过）。
+func markedAsArray(L *lua.LState, t *lua.LTable) bool {
+	mt := L.GetMetatable(t)
+	if mt == nil || mt == lua.LNil {
+		return false
+	}
+	mtb, ok := mt.(*lua.LTable)
+	if !ok {
+		return false
+	}
+	return lua.LVAsBool(mtb.RawGetString(luaArrayMarker))
+}
+
 // luaTableToGo 把 Lua table 转成 []interface{}（连续数字键 1..n）或 map[string]interface{}。
-func luaTableToGo(t *lua.LTable) interface{} {
+//
+// 判定顺序：**显式标记优先**（来自 Go 的数组，含空数组），其次按「非空且全数字键」推断。
+// 前者是本次修复新增的：没有它，空数组只能落进 map 分支变成 `{}`。
+func luaTableToGo(L *lua.LState, t *lua.LTable) interface{} {
 	n := t.Len()
-	isArray := n > 0
-	if isArray {
+	marked := markedAsArray(L, t)
+	isArray := marked || n > 0
+	if isArray && !marked {
 		t.ForEach(func(k, _ lua.LValue) {
 			if _, ok := k.(lua.LNumber); !ok {
 				isArray = false
@@ -683,14 +727,14 @@ func luaTableToGo(t *lua.LTable) interface{} {
 	if isArray {
 		arr := make([]interface{}, 0, n)
 		for i := 1; i <= n; i++ {
-			arr = append(arr, fromLuaValue(t.RawGetInt(i)))
+			arr = append(arr, fromLuaValue(L, t.RawGetInt(i)))
 		}
 		return arr
 	}
 	m := map[string]interface{}{}
 	t.ForEach(func(k, v lua.LValue) {
 		// 键统一字符串化（数字键也算），避免类型断言 panic。
-		m[fmt.Sprint(fromLuaValue(k))] = fromLuaValue(v)
+		m[fmt.Sprint(fromLuaValue(L, k))] = fromLuaValue(L, v)
 	})
 	return m
 }

@@ -29,20 +29,36 @@ import (
 // mcpHTTPAddr 是 `--http` 的目标地址（host:port）。留空 = 用 stdio transport。
 var mcpHTTPAddr string
 
+// mcpExposeFlows 控制是否把已注册 Flow 反向暴露为 flow__{id} 工具。
+//
+// 默认关闭（MCP_AGENT_DESIGN.md §6.1）：该暴露面是**启动时快照**（新建 Flow 本次不可用）、
+// 与 gear_run 语义重复、且让工具数不可预测——三者都损害工具选择准确率。
+var mcpExposeFlows bool
+
+// mcpAppsDir 是应用台账目录（gear_app / gear app 共用）；留空 = <registry 同目录>/apps。
+var mcpAppsDir string
+
 // mcpCmd 构造 `gear mcp` 子命令。
 func mcpCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "mcp",
 		Short: "以 MCP (Model Context Protocol) 执行面暴露 Gear",
-		Long: "启动 Gear 的 MCP Server，把 Tool/Flow/Hook 的目录管理、静态校验与执行能力暴露给任何 MCP 客户端（智能体）。\n" +
+		Long: "启动 Gear 的 MCP Server，把 Tool/Flow/Hook 的目录管理、静态校验、执行与**应用生命周期**" +
+			"暴露给任何 MCP 客户端（智能体）。\n" +
 			"默认 stdio transport（客户端配置：{\"mcpServers\": {\"gear\": {\"command\": \"gear\", \"args\": [\"mcp\"]}}}）。\n" +
-			"加 --http :port 则改走 streamable HTTP transport（供远程智能体或 WorkBuddy 的 MCP 连接器接入）。\n" +
-			"已注册的 Flow 会被反向暴露为 flow__{id} 工具，外部智能体可直接调用你的编排。",
+			"加 --http :port 则改走 streamable HTTP transport（只应绑 127.0.0.1：当前无鉴权）。\n" +
+			"工具面共 12 个 gear_ 前缀工具，另通过 ServerOptions.Instructions 常驻下发心智模型。\n" +
+			"执行进度与全部诊断一律走 stderr（stdio 下 stdout 只承载协议帧）。\n" +
+			"gear_app(action=start) 会**派生独立后台进程**监管应用（跨会话存活），用 gear_app(action=stop) 停止。",
 		Args: cobra.NoArgs,
 		RunE: runMCP,
 	}
 	cmd.Flags().StringVar(&mcpHTTPAddr, "http", "",
 		"以 streamable HTTP transport 暴露（格式 host:port，如 :8788）；留空则用 stdio")
+	cmd.Flags().BoolVar(&mcpExposeFlows, "expose-flows", false,
+		"把已注册 Flow 反向暴露为 flow__{id} 工具（默认关闭：启动时快照、工具数不可预测）")
+	cmd.Flags().StringVar(&mcpAppsDir, "apps-dir", "",
+		"应用台账目录（默认 <registry 同目录>/apps）")
 	return cmd
 }
 
@@ -59,7 +75,16 @@ func runMCP(_ *cobra.Command, _ []string) error {
 		return err
 	}
 
-	srv, err := gearmcp.New(reg, eng)
+	// 注意：执行进度改道（stdout → stderr）**不在这里做**，而在 gearmcp.New 内部。
+	// 「stdio 下 stdout 只承载协议帧」是 MCP 面的协议约束，须由 MCP 面自己保证
+	// （这样任何 embedding 都成立），而不是依赖每个调用方都记得补一行。见 REQ-MCP-STDIO-PURE。
+
+	// 显式把 registry 路径交给 MCP Server：gear_app 派生子进程时**必须**继承它，
+	// 否则子进程读默认 ~/.gear/registry.db，可能启动另一个库里的同名 Flow（最难排查的一类错）。
+	srv, err := gearmcp.New(reg, eng,
+		gearmcp.WithRegistryPath(registryPath),
+		gearmcp.WithAppsDir(mcpAppsDir),
+		gearmcp.WithExposeFlows(mcpExposeFlows))
 	if err != nil {
 		return err
 	}
@@ -71,7 +96,7 @@ func runMCP(_ *cobra.Command, _ []string) error {
 	if mcpHTTPAddr != "" {
 		// 提示走 stderr：HTTP 模式下 stdout 也没有协议帧，但保持「诊断一律 stderr」的口径，
 		// 免得将来有人在 stdio 模式下照抄这行把协议打脏。
-		fmt.Fprintf(os.Stderr, "gear mcp: streamable HTTP transport 监听 %s（端点 /mcp）\n", mcpHTTPAddr)
+		fmt.Fprintf(os.Stderr, "gear mcp: streamable HTTP transport 监听 %s（端点 /mcp；当前无鉴权，只应绑 127.0.0.1）\n", mcpHTTPAddr)
 		return srv.ServeHTTP(ctx, mcpHTTPAddr)
 	}
 	fmt.Fprintln(os.Stderr, "gear mcp: stdio transport 就绪（stdout 只承载协议帧，日志一律走 stderr）")

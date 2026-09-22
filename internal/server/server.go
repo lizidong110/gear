@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -52,6 +54,15 @@ type Server struct {
 	appSeq []string
 	appWG  sync.WaitGroup // 受管 app 的 goroutine 计数（Shutdown 需等其收敛）
 
+	// registryPath / appsDir 是**落盘台账**（`gear app start` 那套）的定位依据，
+	// 供 POST /api/apps/prune 使用。构造期由 CLI 经 WithRegistryPath 注入。
+	//
+	// 为什么要显式注入而不是各自取默认值：默认值（gearhome）只是「没配时的兜底」，
+	// 而 `gear serve --registry /x` 起服时真正在用的是 /x——若 prune 内部再取一次默认值，
+	// 就会去清**另一个库的**台账（清错对象比清不掉更难排查）。同一教训见 mcp.Server.registryPath。
+	registryPath string
+	appsDir      string
+
 	// gate 是执行入口的全局并发闸门（REQ-CONCURRENCY-CROSS / #73）：
 	// 固定 worker 池 = 最大并发执行数，超额排队、再超额在入口拒绝（回 429，背压）。
 	// 区别于 S4 step 级 maxParallel（限单个 Flow 内 step 并发）与 S2 app run --max（限 Flow 数）。
@@ -70,6 +81,16 @@ func WithMaxConcurrent(n int) ServerOption { return func(s *Server) { s.maxConcu
 // WithExecQueueSize 设执行入口的有界排队队列长度：worker 全忙时进入排队，
 // 队列满再提交即被拒绝（回 429）。0 表示不排队、满即拒。
 func WithExecQueueSize(n int) ServerOption { return func(s *Server) { s.execQueueSize = n } }
+
+// WithRegistryPath 告诉 Server「本进程实际在用的 registry 路径」。
+//
+// 只有需要触碰**落盘台账**的端点（POST /api/apps/prune）才用得到它；
+// 不传则回退到 gearhome 默认值。CLI 起服必须显式传——否则 `gear serve --registry /x`
+// 下的 prune 会去清默认库的台账。
+func WithRegistryPath(p string) ServerOption { return func(s *Server) { s.registryPath = p } }
+
+// WithAppsDir 显式指定应用台账目录（覆盖 <registry 同目录>/apps 的推导）。
+func WithAppsDir(d string) ServerOption { return func(s *Server) { s.appsDir = d } }
 
 // New 构造 Server（不启动监听）。支持构造期选项（如 WithMaxConcurrent /
 // WithExecQueueSize 调并发闸门，REQ-CONCURRENCY-CROSS / #73）。
@@ -205,6 +226,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/tools/{id}", s.handleGetTool)
 	s.mux.HandleFunc("POST /api/tools", s.handleCreateTool)
 	s.mux.HandleFunc("DELETE /api/tools/{id}", s.handleDeleteTool)
+	s.mux.HandleFunc("POST /api/tools/{id}/run", s.handleRunTool)
 	s.mux.HandleFunc("POST /api/tools/{id}/versions/{v}/promote", s.handlePromoteVersion)
 
 	s.mux.HandleFunc("GET /api/flows", s.handleListFlows)
@@ -225,6 +247,7 @@ func (s *Server) routes() {
 
 	s.mux.HandleFunc("POST /api/apps", s.handleCreateApp)
 	s.mux.HandleFunc("GET /api/apps", s.handleListApps)
+	s.mux.HandleFunc("POST /api/apps/prune", s.handlePruneApps)
 	s.mux.HandleFunc("DELETE /api/apps/{id}", s.handleDeleteApp)
 }
 
@@ -313,7 +336,17 @@ type invokeCapabilityReq struct {
 // handleInvokeCapability 直接执行一个原子能力的方法（「能力目录」页调用测试用）。
 // 与 react 同权限（全量宿主授权 + Lua 沙箱）：db/kv 为内存态、secret 需内核已注入密钥源、
 // http 可访问任意 URL。未知能力名 / 方法在引擎侧 fail-closed 报错，不静默执行。
+//
+// ⚠ 收紧（2026-09-22）：本端点威力等价于「以宿主机身份执行任意能力」，此前无任何校验，
+// 而做带界面的应用必然经 ext.serve 反代把它暴露给浏览器。现在只接受本机来源、且禁调
+// secret.*（见 originAllowed / blockedInvokeCapability 的论证）。
 func (s *Server) handleInvokeCapability(w http.ResponseWriter, r *http.Request) {
+	if !originAllowed(r) {
+		writeErr(w, http.StatusForbidden, fmt.Errorf(
+			"拒绝跨站调用：Origin %q 不是本机来源——本端点可直达 secret/db 等宿主能力，只接受本机页面与无 Origin 的命令行客户端",
+			r.Header.Get("Origin")))
+		return
+	}
 	var req invokeCapabilityReq
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -323,12 +356,99 @@ func (s *Server) handleInvokeCapability(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("name 与 method 均不能为空"))
 		return
 	}
+	if blockedInvokeCapability(req.Name) {
+		writeErr(w, http.StatusForbidden, fmt.Errorf(
+			"能力 %s 不允许经 REST 直调：它是唯一「读到即不可挽回」的能力（密钥明文），"+
+				"正当用法全在 Flow 内部（${secrets.NAME} / ctx.secret.get），没有从浏览器手调的场景。"+
+				"密钥请用 `gear secret` 管理面或 GEAR_SECRET_* 播种", req.Name))
+		return
+	}
 	res, err := s.engine.InvokeCapability(req.Name, req.Method, req.Args)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"result": res})
+}
+
+// handleRunTool 同步执行单个 Tool 并直接返回输出：`POST /api/tools/{id}/run`。
+//
+// 存在的理由（2026-09-22 实测缺陷）：MCP 面有 `gear_run(kind=tool)` 同步跑 Tool，而 REST
+// 面此前只有**异步**的 `POST /api/executions`（跑 Flow，202 + 轮询）。于是做带界面的应用时，
+// 前端要么把 Tool 包成 Flow 再轮询，要么绕过 Tool 直接调 `/api/capabilities/invoke` ——
+// 后者把 prompt 工程从 Tool 里漏进前端 JS，等于放弃 Tool 这一层的复用价值。
+// 补上这个端点，REST 与 MCP 的执行能力才是对齐的。
+//
+// 请求体是 Tool 的入参 map（可留空 = 无入参执行，空 body 不算错误：零入参 Tool 很常见）。
+// 响应 `{id, output}`。与 MCP 侧同一套分流：先查 registry 判存在性——engine.RunTool 对
+// 「不存在」给的是无 sentinel 的纯文本错误，不先分流会把「id 写错」与「Tool 跑挂了」
+// 混成同一个 400，而两者修法相反（一个是改 id，一个要看日志）。
+func (s *Server) handleRunTool(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("tool id 不能为空"))
+		return
+	}
+	found, err := s.reg.GetTool(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if found == nil {
+		writeErr(w, http.StatusNotFound, fmt.Errorf(
+			"Tool 不存在: %s（用 GET /api/tools 确认 id，注意应用前缀）", id))
+		return
+	}
+	input := map[string]interface{}{}
+	if derr := json.NewDecoder(r.Body).Decode(&input); derr != nil && !errors.Is(derr, io.EOF) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("入参不是合法 JSON 对象: %w", derr))
+		return
+	}
+	out, err := s.engine.RunTool(id, input)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if out == nil {
+		out = map[string]interface{}{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"id": id, "output": out})
+}
+
+// originAllowed 判定请求是否来自「本机来源」。
+//
+// 背景：本 REST 面默认只绑 127.0.0.1，但**绑回环 ≠ 安全**——浏览器里的任意网页都能向
+// 127.0.0.1 发跨站请求（简单请求不预检，side effect 照常发生），而本面又有
+// /api/capabilities/invoke、/api/secrets 这类威力极大的端点。
+//
+// 策略：带 Origin 头且来源不是本机 → 拒绝；**不带 Origin 一律放行**（curl / CLI /
+// 服务端调用都不带，它们是本机使用者的正常入口）。这样零配置就能挡住跨站，又不给
+// 本机命令行使用增加任何门槛。
+func originAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	}
+	return false
+}
+
+// blockedInvokeCapability 判定某能力是否禁止经 REST 直调。
+//
+// 只禁 `secret`：它是唯一「读到即不可挽回」的能力（密钥明文），而它的正当用法全在 Flow
+// 内部（`${secrets.NAME}` / `ctx.secret.get`）——没有「从浏览器手调读明文」的合理场景。
+// db / http 同样威力大，但它们有真实的联调用途且不直接吐密钥，故不在此禁（收紧边界见
+// GEAR_工程方法：能用一个精确规则解决的，不要用一个宽泛规则去误伤）。
+func blockedInvokeCapability(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	return n == "secret" || strings.HasPrefix(n, "secret.")
 }
 
 // handleNews 经引擎同步运行 news.top10 Flow（抓取并整理百度热搜榜 Top10），
@@ -727,4 +847,50 @@ func (s *Server) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 	}
 	a.cancel() // 取消 ctx ⇒ Supervisor 停止并杀掉所有 service 子进程
 	writeJSON(w, http.StatusOK, map[string]string{"stopped": id})
+}
+
+type pruneAppsReq struct {
+	FlowID string `json:"flow_id,omitempty"`
+	DryRun bool   `json:"dry_run,omitempty"`
+}
+
+// handlePruneApps 清理**落盘台账**里确定已终止的应用记录（body 空 = 全量、非 dry-run）。
+//
+// ⚠ 与同前缀的 GET/POST/DELETE /api/apps **不是同一个模型**：那三个管的是**本进程内存里**的
+// AppInstance（等价 `gear app run`，进程一退即消失，既没有台账也没有孤儿）；本端点动的是
+// `gear app start` 落下的**持久台账**（等价 MCP `gear_app(action=prune)`）。
+// 沿用同一前缀是因为「应用」归这里管；而「批量清理」这件事只有台账侧存在——内存侧无物可清。
+//
+// 边界（保守优先，宁可少删）：只清 exited / stopped / startup_failed；running / starting / unknown
+// 一律保留，且**只删记录、不杀进程、不碰端口**（要停进程走 DELETE /api/apps/{id}）。
+func (s *Server) handlePruneApps(w http.ResponseWriter, r *http.Request) {
+	var req pruneAppsReq
+	if derr := json.NewDecoder(r.Body).Decode(&req); derr != nil && !errors.Is(derr, io.EOF) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("请求体不是合法 JSON 对象: %w", derr))
+		return
+	}
+	dir, err := app.ResolveAppsDir(s.registryPath, s.appsDir)
+	if err != nil {
+		// 定位不到台账就拒绝，而不是退回默认值去清另一个库（清错对象比清不掉更难排查）。
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf(
+			"无法定位应用台账（本进程未配置 registry 路径）: %w", err))
+		return
+	}
+	res, err := app.Prune(app.PruneOptions{
+		AppsDir: dir, FlowID: strings.TrimSpace(req.FlowID), DryRun: req.DryRun,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("清理台账失败: %w", err))
+		return
+	}
+	out := map[string]interface{}{
+		"dry_run": res.DryRun, "apps_dir": dir,
+		"pruned": res.Pruned, "skipped": res.Skipped,
+		"pruned_count": len(res.Pruned), "skipped_count": len(res.Skipped),
+	}
+	if len(res.Skipped) > 0 {
+		out["hint"] = "skipped 里的项实时判据未能确定已终止（running/unknown 一律保留，" +
+			"删了可能变成无人可查的孤儿）；要停它们走 DELETE /api/apps/{id}"
+	}
+	writeJSON(w, http.StatusOK, out)
 }
