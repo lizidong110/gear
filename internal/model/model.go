@@ -66,12 +66,42 @@ type Tool struct {
 	OutputSchema map[string]interface{} `yaml:"output_schema" json:"output_schema"`
 	Versions     []ToolVersion          `yaml:"versions" json:"versions"`
 	// Capabilities 声明该 Tool 被允许使用的宿主能力原语（PRD §6，最小权限）。
-	// 对应 ctx.* 的 http/call/db/kv/secret/event；运行期未声明的原语调用一律拒绝。
+	// 对应 ctx.* 的 http/call/db/secret/event；运行期未声明的原语调用一律拒绝。
 	Capabilities []string `yaml:"capabilities" json:"capabilities"`
 	// HealthProbe 是 service 模式 Tool 的健康检查探针（REQ-APP-HEALTH / #75）。
 	// 仅当该 Tool 被 service step 调用时生效：进程「活着」≠「健康」，探针按阈值
 	// 连续失败后由 Supervisor 杀掉并重启（与崩溃重启共用退避）。once 工具忽略。
 	HealthProbe *HealthProbe `yaml:"health_probe,omitempty" json:"health_probe,omitempty"`
+	// Timeout 声明该 Tool **单次执行**的超时（Go duration 字符串，如 "5m"、"300s"）。
+	//
+	// 缺省（空）→ 用引擎默认（defaultExecTimeout，30s），保持「防止挂死工具占住执行线程」的
+	// 默认语义；AI 补全、长任务等天然长耗时的 Tool 必须显式声明，否则会被默认值误杀——
+	// 典型症状：lua 里调用阻塞的 ctx.ext.ai.complete，AI 尚未返回就撞上默认闸门，
+	// 报 `lua 执行被中断: context deadline exceeded`（且时长常远超默认值，
+	// 因为阻塞的宿主调用无法被 ctx 打断，只有回到 lua 解释循环才检查取消）。
+	//
+	// 该值在**注册期**即解析校验（非法即拒绝注册），不留到运行期。
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+}
+
+// ExecTimeout 解析 Tool 声明的执行超时。
+// 返回 (0, nil) 表示「未声明，调用方应回退引擎默认值」；声明非法则返回错误。
+//
+// 只在 model 层解析、engine 层消费：注册期（Tool.Validate）与执行期共用本方法，
+// 避免「注册期判合法、运行期又解析一次」的双口径漂移。
+func (t Tool) ExecTimeout() (time.Duration, error) {
+	s := strings.TrimSpace(t.Timeout)
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("timeout=%q 非法（应为 Go duration，如 \"5m\"/\"300s\"）: %w", s, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("timeout=%q 必须为正时长", s)
+	}
+	return d, nil
 }
 
 // HealthProbe 探针类型。
@@ -196,7 +226,7 @@ type ToolVersion struct {
 //
 // Call 支持两种写法（解析规则见 engine.resolveStepCall，已注册 Tool 优先）：
 //   - 已注册 Tool 的 id（如 "translate_zh_en"）；
-//   - 原子能力直调「能力.方法」（如 "kv.put" / "http.Request" / "ext.ai.complete"）——
+//   - 原子能力直调「能力.方法」（如 "http.Request" / "db.query" / "ext.ai.complete"）——
 //     免去为用一次原语先注册一层 Tool 包装；此时 Input 即该方法的参数表，
 //     输出统一为 {result: <返回值>}。
 type Step struct {

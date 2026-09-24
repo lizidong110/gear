@@ -20,14 +20,16 @@ func (s *Server) registerRunTools(ms *mcp.Server) {
 		Name: "gear_run",
 		Description: "跑一次编排。kind=flow：**异步**启动并返回 execution_id（`wait_seconds` 短等结果，再用 gear_execution 取详情）；" +
 			"kind=tool：同步执行单个 Tool 并直接返回输出。**长驻应用请用 gear_app(start)**——service Flow 在这里一定被拒。",
-		Annotations: idempotent("执行编排"),
+		Annotations:  idempotent("执行编排"),
+		OutputSchema: outRun,
 	}, s.handleRun)
 
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_execution",
 		Description: "查看执行记录：给 id 看单次执行（可带日志），不给 id 则列出最近执行。" +
 			"排障时先用它定位到具体 step，改完 YAML 再重跑。",
-		Annotations: readOnly("执行记录"),
+		Annotations:  readOnly("执行记录"),
+		OutputSchema: outExecution,
 	}, s.handleExecution)
 }
 
@@ -36,7 +38,7 @@ func (s *Server) registerRunTools(ms *mcp.Server) {
 // kind=flow 为什么默认异步：MCP 调用受客户端超时约束，而一条要 build / 抓数据 / 计算的 Flow
 // 很容易顶到超时。REST 面早已是「202 + execution id」，这里对齐同一语义（§6.2④）。
 // kind=tool 保持同步：Tool 是原子动作（毫秒级），异步反而给智能体增加一次往返。
-func (s *Server) handleRun(_ context.Context, _ *mcp.CallToolRequest, in RunArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) handleRun(ctx context.Context, _ *mcp.CallToolRequest, in RunArgs) (*mcp.CallToolResult, any, error) {
 	kind := strings.ToLower(strings.TrimSpace(in.Kind))
 	if kind == "" {
 		kind = "flow"
@@ -71,7 +73,7 @@ func (s *Server) handleRun(_ context.Context, _ *mcp.CallToolRequest, in RunArgs
 		if err != nil {
 			return toolErrorFrom("FLOW_RUN_FAILED", err), nil, nil
 		}
-		snap := s.executionSnapshot(id, in.WaitSeconds)
+		snap := s.executionSnapshot(ctx, id, in.WaitSeconds)
 		snap["hint"] = "执行是异步的：用 gear_execution(id) 取最终结果与日志"
 		return nil, snap, nil
 	default:
@@ -80,7 +82,7 @@ func (s *Server) handleRun(_ context.Context, _ *mcp.CallToolRequest, in RunArgs
 }
 
 // handleExecution 返回单次执行记录或执行列表。
-func (s *Server) handleExecution(_ context.Context, _ *mcp.CallToolRequest, in ExecutionArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) handleExecution(ctx context.Context, _ *mcp.CallToolRequest, in ExecutionArgs) (*mcp.CallToolResult, any, error) {
 	if strings.TrimSpace(in.ID) == "" {
 		list := s.execs.List()
 		items := make([]map[string]any, 0, len(list))

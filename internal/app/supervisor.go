@@ -231,7 +231,11 @@ func reportServiceExit(h *engine.ServiceHandle) {
 	}
 }
 
-// waitAny 等待任意一个 service 进程退出；ctx 取消时返回 nil。
+// waitAny 等待任意一个 service 需要重启；ctx 取消时返回 nil。
+//
+// 注意「需要重启」不等于「有进程退出」：service ext 退让为 client 共享他人 sidecar 时
+// 手上没有本地进程，此时不算退出（见 engine.ServiceHandle.WaitExit）——否则会把共享成功
+// 误判成崩溃、进而无限重启。
 func (s *Supervisor) waitAny(ctx context.Context, handles []*engine.ServiceHandle) *engine.ServiceHandle {
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -241,7 +245,7 @@ func (s *Supervisor) waitAny(ctx context.Context, handles []*engine.ServiceHandl
 		go func(h *engine.ServiceHandle) {
 			select {
 			case <-wctx.Done():
-			case <-h.ProcWaitDone():
+			case <-h.WaitExit(wctx):
 				select {
 				case ch <- h:
 				case <-wctx.Done():

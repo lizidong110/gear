@@ -19,7 +19,7 @@ import (
 //   - entry = **Lua 源码**（inline；YAML 块标量天然支持多行）
 //   - 输入：全局 `ctx.input`（table）
 //   - 输出：写 `ctx.output`（table）或脚本 `return` 一个 table（`ctx.output` 优先）
-//   - 宿主能力：全局 `ctx.http / ctx.call / ctx.db / ctx.kv / ctx.secret / ctx.event`
+//   - 宿主能力：全局 `ctx.http / ctx.call / ctx.db / ctx.secret / ctx.event`
 //     （M5，按 Tool.Capabilities 白名单开放；未声明的访问返回 lua 错误，而非静默成功）
 //
 // 沙箱：只开 base/string/table/math；不加载 os/io/package/debug/coroutine，
@@ -89,20 +89,6 @@ func newSandboxState(policy string) (*lua.LState, error) {
 		L.SetGlobal(name, lua.LNil)
 	}
 	return L, nil
-}
-
-// luaScopeArg 从 Lua 第 idx 个参数读取 KV Scope；非字符串或非法值（含缺省 nil）一律退回
-// ScopeGlobal，保证旧调用（不传 scope）仍走全局命名空间（向后兼容）。
-func luaScopeArg(L *lua.LState, idx int) cap.Scope {
-	if v := L.Get(idx); v != lua.LNil {
-		if s, ok := v.(lua.LString); ok {
-			switch cap.Scope(s) {
-			case cap.ScopeSession, cap.ScopeGlobal:
-				return cap.Scope(s)
-			}
-		}
-	}
-	return cap.ScopeGlobal
 }
 
 // luaDBArgs 从 Lua 第 1 个参数读取 db 调用的 {driver?, dsn?, sql, params?} 表。
@@ -183,33 +169,6 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 	declared := map[string]bool{}
 	for _, c := range host.Capabilities() {
 		declared[c] = true
-	}
-
-	// ctx.kv: get(k[, scope]) -> string|nil；put(k,v[, scope])；delete(k[, scope])。
-	// scope 缺省 "global"（向后兼容旧调用）；传 "session" 则落到本次 flow 执行的会话命名空间，
-	// 跨 step 共享、run 结束回收（M-KV-LIFECYCLE）。
-	if declared["kv"] {
-		if kv, err := host.KV(); err == nil {
-			t := L.NewTable()
-			t.RawSetString("get", L.NewFunction(func(L *lua.LState) int {
-				v, ok := kv.Get(L.CheckString(1), luaScopeArg(L, 2))
-				if !ok {
-					L.Push(lua.LNil)
-					return 1
-				}
-				L.Push(lua.LString(v))
-				return 1
-			}))
-			t.RawSetString("put", L.NewFunction(func(L *lua.LState) int {
-				kv.Put(L.CheckString(1), L.CheckString(2), luaScopeArg(L, 3))
-				return 0
-			}))
-			t.RawSetString("delete", L.NewFunction(func(L *lua.LState) int {
-				kv.Delete(L.CheckString(1), luaScopeArg(L, 2))
-				return 0
-			}))
-			ctxTable.RawSetString("kv", t)
-		}
 	}
 
 	// ctx.secret: get(name) -> string（只读，看不到存储位置）

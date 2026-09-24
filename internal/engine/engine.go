@@ -198,7 +198,7 @@ func (e *Engine) InvokeCapability(name, method string, args map[string]interface
 // （cache=shared 的命名内存库是按 DSN 共享的，独立 DSN 即独立库）。
 var capDBSeq int64
 
-// defaultProviders 构造引擎默认宿主能力集（#69）：KV 内存表、HTTP 客户端、Event 总线、
+// defaultProviders 构造引擎默认宿主能力集（#69）：HTTP 客户端、Event 总线、
 // DB 内存 SQLite（每引擎唯一 DSN，进程级共享、重启即丢，M5 scratch 语义）。
 // Secret 默认 nil（无密钥源时声明 secret 的 Tool 收到 ErrCapabilityUnavailable，fail-closed）。
 func defaultProviders() *cap.Providers {
@@ -208,11 +208,9 @@ func defaultProviders() *cap.Providers {
 	// NewMultiDB 永不返回 nil，故 Providers.DB 用接口承载时不会出现 typed-nil。
 	dbCap := cap.NewMultiDB(dsn)
 	return &cap.Providers{
-		KV:       cap.NewMemKV(),
-		HTTP:     &http.Client{Timeout: 30 * time.Second},
-		Event:    cap.NewMemEvent(),
-		DB:       dbCap,
-		Sessions: cap.NewMemSessionRegistry(), // session 作用域 KV 命名空间（M-KV-LIFECYCLE）
+		HTTP:  &http.Client{Timeout: 30 * time.Second},
+		Event: cap.NewMemEvent(),
+		DB:    dbCap,
 	}
 }
 
@@ -226,7 +224,7 @@ func WithMaxParallel(n int) func(*Engine) {
 	}
 }
 
-// WithHost 注入宿主能力原语实现（PRD §6 的 http/call/db/kv/secret/event）。
+// WithHost 注入宿主能力原语实现（PRD §6 的 http/call/db/secret/event）。
 // 不调用时 Engine 无宿主能力，Tool 声明的 capability 运行期会返回 ErrCapabilityUnavailable。
 func WithHost(p *cap.Providers) func(*Engine) {
 	return func(e *Engine) {
@@ -324,13 +322,10 @@ func callChainOf(rc *runContext) []string {
 }
 
 // withCallChain 把调用链写入宿主视图：
-//   - ctx.call 的循环守卫依据（复用 #72 祖先链语义）；
-//   - 会话命名空间 id = 调用链末元素（最内层 flow id）：同一次 flow run 的所有 step
-//     共享同一份 session 作用域 KV（ScopeSession），run 结束经 SessionRegistry 回收。
+//   - ctx.call 的循环守卫依据（复用 #72 祖先链语义）。
 func withCallChain(c *cap.Context, via []string) *cap.Context {
 	if len(via) > 0 {
 		c.SetCallChain(via)
-		c.SetSession(via[len(via)-1])
 	}
 	return c
 }
@@ -533,7 +528,7 @@ func mergeVars(base, override map[string]interface{}) map[string]interface{} {
 // RunTool 一次性执行单个 Tool（供 `gear tool run` 与「单跑一个原子能力」的调用方）。
 //
 // 语义与「在 Flow 里执行一个 step」**完全一致**：input_schema 校验 → capability 门禁 →
-// runtime 执行（受 defaultExecTimeout 限制）→ step 级 Hook（before_step / after_step，按 tool id 匹配）
+// runtime 执行（受「Tool 声明的 timeout，缺省 defaultExecTimeout」限制）→ step 级 Hook（before_step / after_step，按 tool id 匹配）
 // → output_schema 校验。返回该 Tool 的 output。
 //
 // 会触发按 tool id 匹配的 **step 级** Hook；**不**触发 Flow 级 Hook（before_flow / on_success
@@ -557,12 +552,6 @@ func (e *Engine) RunToolExec(toolID string, input map[string]interface{}, execID
 		input = map[string]interface{}{}
 	}
 
-	// session 作用域 KV 以 tool id 命名空间隔离；结束回收（同 runWithVars 对 flow.ID 的处置）。
-	if e.host != nil && e.host.Sessions != nil {
-		e.host.Sessions.Acquire(toolID)
-		defer e.host.Sessions.Release(toolID)
-	}
-
 	hooks, err := e.loadHooks()
 	if err != nil {
 		return nil, err
@@ -573,7 +562,7 @@ func (e *Engine) RunToolExec(toolID string, input map[string]interface{}, execID
 		secretGet: e.secretResolver(),
 		execID:    execID,
 		logSink:   e.logSinkFor(execID),
-		flowID:    toolID, // 供 hostFor 拼调用链 + 定 session 命名空间
+		flowID:    toolID, // 供 hostFor 拼调用链
 	}
 	// step.ID 用 tool id：出错时「step <id> 执行失败」能直接指出是哪个 Tool。
 	step := model.Step{ID: toolID, Call: toolID, Input: input}
@@ -626,13 +615,7 @@ func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string, ance
 // 合并后作为初始 vars（覆盖优先）——用于「运行时给 Flow 传参」，不改动 registry 里的 Flow 快照；
 // 合并结果随后仍会被 before_flow Hook 改写。
 func (e *Engine) runWithVars(flow *model.Flow, observe ToolObserver, execID string, ancestors []string, varsOverride map[string]interface{}) (*RunResult, error) {
-	// session 作用域 KV 按 flow.ID 命名空间隔离；run 开始 Acquire、结束 Release（引用计数，
-	// 并发同 flow 互不干扰，最后一个结束才回收）。内存态、重启即失（方法论 §0 第14条）。
-	if e.host != nil && e.host.Sessions != nil && flow.ID != "" {
-		e.host.Sessions.Acquire(flow.ID)
-		defer e.host.Sessions.Release(flow.ID)
-	}
-	// 订阅所属按 Flow/Exec 回收（运行结束 defer，与 session 引用计数同源思路）：
+	// 订阅所属按 Flow/Exec 回收（运行结束 defer）：
 	// 本次运行中经 ctx.subscribe.start 建立的订阅在此一并 StopByOwner。
 	if e.subscriber != nil && flow.ID != "" {
 		defer e.subscriber.StopByOwner(cap.SubscriptionOwner{FlowID: flow.ID, ExecID: execID})

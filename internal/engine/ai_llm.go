@@ -50,8 +50,13 @@ type LLMRequest struct {
 
 // LLM 是模型层接口（稳定层契约）。complete/catalog/domains/validate 不需要它；generate 的
 // assemble 节点需要它。生产用 HTTPLLM，离线测试用 MockLLM。
+//
+// CompleteStream 是 Complete 的增量版：底层本就走 SSE 流式读取，只是把增量折叠成完整字符串返回；
+// CompleteStream 把每个 content/reasoning 增量通过 onDelta 回调出去（reasoning 在推理模型下非空，
+// 普通模型为空）。onDelta 返回非 nil 即中断流。复用同一套空闲超时 / 重复检测保护。
 type LLM interface {
 	Complete(ctx context.Context, req LLMRequest) (string, error)
+	CompleteStream(ctx context.Context, req LLMRequest, onDelta func(content, reasoning string) error) error
 }
 
 // llmConfig 是解析后的最终配置（已合并 per-call 覆盖 + 环境变量 + 默认）。
@@ -84,6 +89,20 @@ func (HTTPLLM) Complete(ctx context.Context, req LLMRequest) (string, error) {
 	return postChat(ctx, cfg, req.System, req.Prompt)
 }
 
+// CompleteStream 是 Complete 的增量版：把 SSE 增量逐条经 onDelta 回调出去，复用 readStream
+// 的空闲超时 / 重复检测。onDelta 为 nil 时退化为「拼完整串后回调一次」（无害）。
+func (HTTPLLM) CompleteStream(ctx context.Context, req LLMRequest, onDelta func(content, reasoning string) error) error {
+	if onDelta == nil {
+		onDelta = func(string, string) error { return nil }
+	}
+	if req.Provider == "mock" || os.Getenv("GEAR_AI_PROVIDER") == "mock" {
+		return onDelta(mockChatText(req), "")
+	}
+	cfg := resolveLLMConfig(req)
+	_, err := postChatWith(ctx, cfg, req.System, req.Prompt, onDelta)
+	return err
+}
+
 // MockLLM 是测试/离线用的确定性 LLM：按 system 内容返回结构化 JSON 文本（不联网）。
 // Respond 允许覆盖默认行为（按 system 关键词返回自定义文本）。
 type MockLLM struct {
@@ -96,6 +115,20 @@ func (m *MockLLM) Complete(_ context.Context, req LLMRequest) (string, error) {
 		return m.Respond(req), nil
 	}
 	return mockChatText(req), nil
+}
+
+// CompleteStream 是 MockLLM 的增量版：一次性拿到完整文本后回调一次（离线 mock 无真实流式）。
+func (m *MockLLM) CompleteStream(_ context.Context, req LLMRequest, onDelta func(content, reasoning string) error) error {
+	if onDelta == nil {
+		onDelta = func(string, string) error { return nil }
+	}
+	var text string
+	if m.Respond != nil {
+		text = m.Respond(req)
+	} else {
+		text = mockChatText(req)
+	}
+	return onDelta(text, "")
 }
 
 // resolveLLMConfig 合并优先级：per-call 参数 > 环境变量 > 内置默认。
@@ -186,17 +219,23 @@ func durFromEnvSec(name string, def time.Duration) time.Duration {
 	return def
 }
 
-// postChat 按 provider 选择协议（Ollama 原生 vs OpenAI 兼容）发流式请求。
+// postChat 是 postChatWith 的同步版：onDelta 为 nil（供 Complete 使用），签名保持稳定，既有测试无需改动。
 func postChat(ctx context.Context, cfg llmConfig, system, user string) (string, error) {
+	return postChatWith(ctx, cfg, system, user, nil)
+}
+
+// postChatWith 按 provider 选择协议（Ollama 原生 vs OpenAI 兼容）发流式请求，
+// 并把每个 SSE 增量经 onDelta 回调出去（增量版 CompleteStream 用；nil 时仅拼完整串）。
+func postChatWith(ctx context.Context, cfg llmConfig, system, user string, onDelta func(content, reasoning string) error) (string, error) {
 	msgs := []map[string]string{}
 	if system != "" {
 		msgs = append(msgs, map[string]string{"role": "system", "content": system})
 	}
 	msgs = append(msgs, map[string]string{"role": "user", "content": user})
 	if cfg.Provider == "ollama" {
-		return postOllama(ctx, cfg, msgs)
+		return postOllama(ctx, cfg, msgs, onDelta)
 	}
-	return postOpenAI(ctx, cfg, msgs)
+	return postOpenAI(ctx, cfg, msgs, onDelta)
 }
 
 // newStreamClient 构造「无总超时」的客户端：可靠性交给 readStream 的空闲/总时长保护，
@@ -216,7 +255,7 @@ func newStreamClient(idle time.Duration) *http.Client {
 	}
 }
 
-func postOpenAI(ctx context.Context, cfg llmConfig, msgs []map[string]string) (string, error) {
+func postOpenAI(ctx context.Context, cfg llmConfig, msgs []map[string]string, onDelta func(content, reasoning string) error) (string, error) {
 	url := strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions"
 	body := map[string]interface{}{
 		"model":       cfg.Model,
@@ -251,7 +290,7 @@ func postOpenAI(ctx context.Context, cfg llmConfig, msgs []map[string]string) (s
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return "", fmt.Errorf("LLM HTTP %d: %s", resp.StatusCode, string(data))
 	}
-	out, err := readStream(ctx, resp.Body, cfg.Idle, cfg.Total, parseOpenAILine)
+	out, err := readStreamWith(ctx, resp.Body, cfg.Idle, cfg.Total, parseOpenAILine, onDelta)
 	if err != nil {
 		return "", err
 	}
@@ -261,7 +300,7 @@ func postOpenAI(ctx context.Context, cfg llmConfig, msgs []map[string]string) (s
 	return out, nil
 }
 
-func postOllama(ctx context.Context, cfg llmConfig, msgs []map[string]string) (string, error) {
+func postOllama(ctx context.Context, cfg llmConfig, msgs []map[string]string, onDelta func(content, reasoning string) error) (string, error) {
 	url := strings.TrimRight(cfg.BaseURL, "/") + "/api/chat"
 	body := map[string]interface{}{
 		"model":    cfg.Model,
@@ -286,7 +325,7 @@ func postOllama(ctx context.Context, cfg llmConfig, msgs []map[string]string) (s
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return "", fmt.Errorf("Ollama HTTP %d: %s", resp.StatusCode, string(data))
 	}
-	out, err := readStream(ctx, resp.Body, cfg.Idle, cfg.Total, parseOllamaLine)
+	out, err := readStreamWith(ctx, resp.Body, cfg.Idle, cfg.Total, parseOllamaLine, onDelta)
 	if err != nil {
 		return "", err
 	}
@@ -303,9 +342,16 @@ type streamDelta struct {
 	reasoning string
 }
 
-// readStream 逐行读取流式响应，落地两种保护（空闲超时 + 重复输出检测）。
-// parse 把一行原始数据解析为增量，返回 (delta, done, recognized)：recognized=false 表示该行与本流无关（忽略）。
+// readStream 是 readStreamWith 的同步版：onDelta 为 nil，把增量折叠成完整字符串返回（供 Complete 使用）。
+// 原函数签名保持稳定，既有测试无需改动。
 func readStream(ctx context.Context, body io.Reader, idle, total time.Duration, parse func(line []byte) (streamDelta, bool, bool)) (string, error) {
+	return readStreamWith(ctx, body, idle, total, parse, nil)
+}
+
+// readStreamWith 逐行读取流式响应，落地两种保护（空闲超时 + 重复输出检测）。
+// parse 把一行原始数据解析为增量，返回 (delta, done, recognized)：recognized=false 表示该行与本流无关（忽略）。
+// onDelta 非 nil 时，每个增量会经它回调出去（增量版 CompleteStream 用）；nil 时仅拼完整串。
+func readStreamWith(ctx context.Context, body io.Reader, idle, total time.Duration, parse func(line []byte) (streamDelta, bool, bool), onDelta func(content, reasoning string) error) (string, error) {
 	type chunk struct {
 		d   streamDelta
 		err error
@@ -367,6 +413,13 @@ func readStream(ctx context.Context, body io.Reader, idle, total time.Duration, 
 			}
 			idleT.Reset(idle)
 
+			if c.d.content != "" || c.d.reasoning != "" {
+				if onDelta != nil {
+					if err := onDelta(c.d.content, c.d.reasoning); err != nil {
+						return "", err
+					}
+				}
+			}
 			if c.d.reasoning != "" {
 				reason.WriteString(c.d.reasoning)
 			}

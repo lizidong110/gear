@@ -1,0 +1,85 @@
+# mindstorm：Finder 三栏思维导图（头脑风暴 App v2）
+#
+# 注册说明：本文件含 App + Tool + Flow 混合文档，而 CLI 的 `gear flow register` /
+#   `gear tool register` 各自只接受纯文档（混合会被拒），且当前 CLI 不直接注册
+#   App kind（App 元数据由 app 系统消费）。因此实际 CLI 注册请用同目录拆分文件：
+#     gear tool register apps/mindstorm/mindstorm_tools.yaml
+#     gear flow register apps/mindstorm/mindstorm_flow.yaml
+#   本文件保留为「完整应用定义」存档（含 App 元数据 / 起服 Flow / 后端 Tool）。
+# 运行（仓库根；起服进程需能找到 sh）：
+#   build/gear.exe app start mindstorm.up --port 8090 --wait 10
+#
+# 结构：anchor(once) → ext.serve(service) → mindstorm__api(service, process 起 gear serve)
+#       → static_site.serve(depends_on anchor, 把 www 托管到 8090, /api 反代到 8790)。
+# 所有路径用绝对路径（正斜杠），避免 cwd 漂移导致的静默失败。
+kind: App
+id: mindstorm
+name: 头脑风暴（Finder 三栏思维导图）
+description: 树状思维导图，三栏 Finder 布局，AI 续写，本地 SQLite 持久化。
+entry_flow: mindstorm.up
+layout:
+  workdir: apps/mindstorm
+  files:
+    - {path: apps/mindstorm/www/index.html, required: true}
+start:
+  restart: always
+  ports: [8090]
+requires:
+  sidecars: [serve]
+  capabilities: [ext.serve]
+---
+kind: Tool
+id: mindstorm__config
+name: mindstorm 配置锚点
+description: 排序锚点（service step 不能作为依赖目标，用它把 site 推到下一层）
+runtime: lua
+entry: |
+  return {}
+input_schema:
+  type: object
+output_schema:
+  type: object
+versions:
+  - version: "1.0.0"
+    state: stable
+---
+kind: Tool
+id: mindstorm__api
+name: mindstorm REST 后端
+description: 用 process 长驻起 gear REST 执行面，作为 mindstorm 的后台（默认 127.0.0.1:8790）。
+runtime: process
+entry: "D:/gadern/gear/build/gear.exe serve --addr 127.0.0.1:8790"
+input_schema:
+  type: object
+output_schema:
+  type: object
+versions:
+  - version: "1.0.0"
+    state: stable
+---
+kind: Flow
+id: mindstorm.up
+name: mindstorm 起服
+description: 持有 serve 侧车，把 www 托管到 127.0.0.1:8090，并把 /api 反代到 8790 的 REST 后端
+steps:
+  - id: anchor
+    call: mindstorm__config
+    input: {}
+  - id: serve
+    call: ext.serve
+    mode: service
+    input: {}
+  - id: api
+    call: mindstorm__api
+    mode: service
+    input: {}
+  - id: site
+    call: static_site.serve
+    depends_on: [anchor]
+    input:
+      port: 8090
+      dir: D:/gadern/gear/apps/mindstorm/www
+      host: 127.0.0.1
+      proxy:
+        - path: /api
+          target: http://127.0.0.1:8790

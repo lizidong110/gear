@@ -518,15 +518,21 @@ func (s *Session) watchdog() {
 	}
 }
 
-// rehandshake 在心跳连续失败后重走 §12.4 握手（可能成为新 owner）。
+// Rehandshake 重走 §12.4 握手（可能成为新 owner），并更新本会话持有的进程句柄。
+//
+// 两个调用方：
+//   - 看门狗 watchdog：心跳连续失败后自愈（返回 error 只表示本次没收敛，下一轮继续）；
+//   - 引擎 Relaunch：service ext 的「重启」必须走这里，不能拿 Entry 直接 rt.Start ——
+//     Entry 带着 COORD_ADDR=<listen>，当端口已被他人 sidecar 占用时会拿到
+//     ExitAddrInUse(2) 速退，把「共享复用」变成崩溃循环（2026-09-23 实测）。
 //
 // 关键防误伤：若本 gear 本是 owner、且**本地 sidecar 进程仍然存活**，则说明刚才的
 // 心跳失败只是瞬时故障——握手返回的 client 角色不能采纳，否则会把一个健康的共享实例
 // 降级并杀掉，影响其它已注册的 gear。只有确认本地 sidecar 已死才降级为 client。
-func (s *Session) rehandshake() {
+func (s *Session) Rehandshake() error {
 	owner, proc, err := s.cli.handshake(s.start)
 	if err != nil {
-		return // 下一轮心跳继续尝试；不放弃也不 panic
+		return err // 下一轮心跳继续尝试；不放弃也不 panic
 	}
 
 	s.mu.Lock()
@@ -539,7 +545,7 @@ func (s *Session) rehandshake() {
 			_ = proc.Kill()
 			_ = proc.Wait()
 		}
-		return
+		return nil
 	}
 	s.owner, s.proc = owner, proc
 	if s.proc == nil {
@@ -552,6 +558,12 @@ func (s *Session) rehandshake() {
 		_ = old.Kill()
 		_ = old.Wait()
 	}
+	return nil
+}
+
+// rehandshake 是看门狗用的包装：重握手失败不留错误（下一轮心跳继续尝试）。
+func (s *Session) rehandshake() {
+	_ = s.Rehandshake()
 }
 
 // Proc 返回该 session 对应的 service 进程句柄：
@@ -560,6 +572,16 @@ func (s *Session) Proc() Process {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.proc
+}
+
+// IsOwner 报告本 gear 是否持有本地 sidecar 进程（owner）。
+//
+// client（退让复用他人实例）返回 false —— 此时手上没有本地进程，
+// 监管器不得把「无本地进程」当成「service 已退出」（见 engine.ServiceHandle.WaitExit）。
+func (s *Session) IsOwner() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.owner
 }
 
 // Close 退订并清理：停看门狗 → /deregister（占用列表空则侧车自动退出）→

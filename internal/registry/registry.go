@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,8 +43,19 @@ type Registry struct {
 }
 
 // Open 打开（必要时创建）registry 数据库并完成建表。
+//
+// DSN 必须带 busy_timeout + WAL：多个 gear 进程（CLI / serve / app run）可能同时打开
+// 同一个 registry.db。没有 busy_timeout 时任何并发写都会立即报 SQLITE_BUSY（database
+// is locked）；没有 WAL 时读写互斥更严重。与 internal/server/execstore.go 的 ExecStore
+// 同一姿势（2026-09-24 修复：第二个 `gear app run` 初始化扩展时撞锁直接退出）。
 func Open(path string) (*Registry, error) {
-	db, err := sql.Open("sqlite", path)
+	// path 可能本身已带 query（如 ai.go 传 "file:...?mode=memory&cache=shared"），
+	// 追加 pragma 时按有无 "?" 选分隔符，不能无脑拼 "?"。
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	db, err := sql.Open("sqlite", path+sep+"_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		return nil, fmt.Errorf("打开 registry 失败: %w", err)
 	}

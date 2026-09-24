@@ -50,6 +50,7 @@
 | `ORPHAN_APP` | `stop` 后端口仍未释放，或 pid 与端口判据不一致 | 如实上报 pid；`gear_doctor` 看谁占着；**不要把它当成功** |
 | `APP_PLATFORM_UNAVAILABLE` | `--apps` 转发模式下 REST 不可达 | 先起 `gear serve`，或去掉 `--apps` 用本地派生 |
 | `APP_PRUNE_FAILED` | `gear_app(action=prune)` 清理台账失败（读目录 / 删文件） | 看返回的 `apps_dir` 是否可写；prune **只删已终止的台账记录**，不杀进程 |
+| `EXECUTION_BUSY` | MCP 面在途执行已达并发上限（默认 8），`gear_run` / `flow__` 被背压拒绝 | 稍后重试，或先用 `gear_execution` 看现有执行进展。**这不是 YAML 问题**，别去改定义 |
 | `PRIMITIVE_MISSING` | 所需能力在目录与 extensions.yaml 中都不存在 | **不许绕过**；按 `gear_guide("primitive-gap")` 给出原语建议 |
 | `UNCLASSIFIED` | 未能归类（只能靠读 message） | 按 message 的内容人工判断；这通常说明该错误路径还没做结构化 |
 

@@ -14,12 +14,12 @@ import (
 // 一个 step 的 `call` 有两种互斥载体：
 //
 //  1. **Tool 载体**：`call` 是已注册 Tool 的 id —— 用 Tool 自身的 runtime/entry/schema。
-//  2. **原子能力直调**：`call` 写「能力.方法」（如 `db.query`、`kv.put`、`ext.ai.complete`）——
+//  2. **原子能力直调**：`call` 写「能力.方法」（如 `db.query`、`db.exec`、`ext.ai.complete`）——
 //     引擎把它编成一段 Lua entry 在沙箱里执行，宿主视图**只放行该能力**（书写即授权）。
 //     能力名可以是**两级**的 `ext.<name>`（扩展命名空间），故 `ext.ai.complete` 应切成
 //     能力 `ext.ai` + 方法 `complete`——切分只认 `splitToolMethod`（见其注释），
 //     别在别处用一刀 `strings.Cut(call, ".")`（会把能力名切错成 `ext`）。
-//     可直调的目标有三类：内核原语（http/call/db/kv/secret/event/subscribe）、
+//     可直调的目标有三类：内核原语（http/call/db/secret/event/subscribe）、
 //     **纯函数核心原子**（time/template/crypto——始终可用，无需声明 capabilities，见 purefunc.go）、
 //     以及 `ext.*` 扩展。三类都按方法级 schema 做静态校验（validatePrimitiveArgs）。
 //

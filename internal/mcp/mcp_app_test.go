@@ -99,6 +99,12 @@ func TestMCPAppLifecycleEndToEnd(t *testing.T) {
 	if _, ok := started["error"]; !ok {
 		t.Fatalf("startup_failed 时应给出 error 说明: %v", started)
 	}
+	// escaped_job 必须**恒在**（未探测时为 null）——它是「这次启动到底能不能跨会话存活」
+	// 的唯一凭据。曾经漏报，导致接口无条件承诺「跨会话存活」而智能体无从自检（评审 B-1）。
+	// 缺这个键就是回归，故在此硬断言。
+	if _, ok := started["escaped_job"]; !ok {
+		t.Fatalf("start 必须返回 escaped_job 键（true/false/null 三选一，不得缺省）: %v", started)
+	}
 
 	// ② status：如实报 startup_failed（结案原因被保留），而不是笼统的 stopped / running。
 	//    这条信息是排障关键——「它压根没起来过」和「它跑了一阵被停了」要分得开。

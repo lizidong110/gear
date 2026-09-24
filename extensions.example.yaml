@@ -20,7 +20,7 @@
 # 然后 Tool 声明 capabilities: [ext.tls]，Lua 里即可 local c = ctx.ext.tls.issue({ domain = "x.com" })。
 # 注意：ext.registry 是 gear 内建进程内扩展（读引擎 registry，供 agent 自我锚定），无需在此声明。
 #
-# 同理无需在此声明的是**内核原语**：受门禁的 7 个（http/call/db/kv/secret/event/subscribe，
+# 同理无需在此声明的是**内核原语**：受门禁的 6 个（http/call/db/secret/event/subscribe，
 # 由 Tool 的 capabilities 声明后使用）与始终可用的 3 个纯函数原子（time/template/crypto，
 # 无需任何声明即可用，如 Flow 直调 call: crypto.hash、Lua 里 ctx.time.now({})）。
 # 它们不是 ext.*，不进本文件；能力目录见 `gear ai capabilities`。
@@ -32,8 +32,9 @@
 #   ext.registry.capabilities() 自我锚定，堵住「tool entry 幻觉 ctx.* 参数」缺口；
 #   缺 schemas 或 methods 与 schemas 不一致时 gear 启动即报错）。
 #
-# 生成配方（ai.gen-flow/tool/hook 的可编辑制品）在 examples/ai/recipes/*.yaml；
-# 改那里的提示词/约束即可调生成细节，无需重编 gear（GEAR_AI_RECIPES 可指向自定义目录）。
+# 生成配方（ai.gen-flow/tool/hook）**默认内嵌**在 internal/engine/recipes/*.yaml；
+# 如需自定义，在 examples/ai/recipes/ 放同名 YAML 即可覆盖（该目录**默认不存在、可选**），
+# 或用 GEAR_AI_RECIPES 指向任意目录（其下需有 flow.yaml/tool.yaml/hook.yaml）。均无需重编 gear。
 
 # ext.ai（进程内 Eino agent）由 gear **始终注册**，方法清单与参数 schema 全部内置
 # （defaultAISchemas：complete / catalog / domains / validate / generate / capabilities / react），

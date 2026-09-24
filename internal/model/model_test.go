@@ -325,7 +325,7 @@ func TestToolValidateCapability(t *testing.T) {
 			Capabilities: caps}
 	}
 	t.Run("合法原语", func(t *testing.T) {
-		if err := base([]string{"kv", "secret", "http"}).Validate(); err != nil {
+		if err := base([]string{"db", "secret", "http"}).Validate(); err != nil {
 			t.Fatalf("合法 capability 应过: %v", err)
 		}
 	})
@@ -335,7 +335,7 @@ func TestToolValidateCapability(t *testing.T) {
 		}
 	})
 	t.Run("未知原语拒绝", func(t *testing.T) {
-		if err := base([]string{"kv", "bogus"}).Validate(); err == nil {
+		if err := base([]string{"db", "bogus"}).Validate(); err == nil {
 			t.Fatal("未知 capability 应拒绝")
 		}
 	})

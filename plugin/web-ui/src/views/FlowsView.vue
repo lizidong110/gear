@@ -453,7 +453,7 @@ onMounted(async () => {
     </p>
     <p class="page-desc">
       step 的 <code>call</code> 有两种写法：<b>已注册 Tool 的 id</b>（优先），或<b>直调原子能力</b>
-      「<code>能力.方法</code>」（如 <code>kv.put</code> / <code>http.Request</code> /
+      「<code>能力.方法</code>」（如 <code>db.exec</code> / <code>http.Request</code> /
       <code>ext.ai.complete</code>）——后者免去为用一次原语先写一层 Tool。直调时 input 即该方法参数，
       输出统一为 <code>{ result: … }</code>；方法名与参数见「能力目录」页。仅放行该 step 写出的那一个能力，
       且不支持 use_version / mode=service（注册期即拒）。
@@ -551,7 +551,7 @@ onMounted(async () => {
                     :options="toolOptions"
                     filterable
                     tag
-                    placeholder="选 Tool，或直调 kv.put 这类原子能力"
+                    placeholder="选 Tool，或直调 db.exec 这类原子能力"
                   />
                 </NFormItem>
                 <NFormItem label="use_version" style="width: 190px">

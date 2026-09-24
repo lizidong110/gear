@@ -104,7 +104,7 @@ func TestCapabilitiesEndpoint(t *testing.T) {
 			byName[n] = c
 		}
 	}
-	for _, want := range []string{"http", "call", "db", "kv", "secret", "event"} {
+	for _, want := range []string{"http", "call", "db", "secret", "event", "subscribe"} {
 		c, ok := byName[want]
 		if !ok || c["kind"] != "builtin" {
 			t.Fatalf("缺内置能力 %s: %v", want, caps)
@@ -163,23 +163,37 @@ func TestCapabilitiesEndpointIncludesCustomExt(t *testing.T) {
 }
 
 // A-1d：POST /api/capabilities/invoke 直接执行原子能力（内置走位置参数、ext.* 走单 table）。
-// 覆盖：内置 kv.put→kv.get 状态共享、ext.* 单 table 通道、未知方法 fail-closed、缺参 fail-closed。
+// 覆盖：内置 db.exec→db.query 状态共享、ext.* 单 table 通道、未知方法 fail-closed、缺参 fail-closed。
 func TestInvokeCapabilityEndpoint(t *testing.T) {
 	s, _ := newTestServer(t)
 	h := s.Handler()
 
-	// 1) 内置原语 kv.put → kv.get 取回同一值（内存 KV 跨调用共享）。
+	// 1) 内置原语 db.exec → db.query 取回同一行（默认宿主 sqlite scratch 跨调用共享）。
 	rec, _ := do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{
-		"name": "kv", "method": "put", "args": map[string]interface{}{"key": "k", "value": "v", "scope": "global"},
+		"name": "db", "method": "exec", "args": map[string]interface{}{"sql": "CREATE TABLE IF NOT EXISTS kv_demo(k TEXT PRIMARY KEY, v TEXT)"},
 	})
 	if rec.Code != http.StatusOK {
-		t.Fatalf("kv.put 应 200，实际 %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("db.exec(建表) 应 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	rec, _ = do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{
+		"name": "db", "method": "exec", "args": map[string]interface{}{"sql": "INSERT INTO kv_demo(k,v) VALUES('k','v')"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("db.exec(插入) 应 200，实际 %d: %s", rec.Code, rec.Body.String())
 	}
 	rec, out := do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{
-		"name": "kv", "method": "get", "args": map[string]interface{}{"key": "k", "scope": "global"},
+		"name": "db", "method": "query", "args": map[string]interface{}{"sql": "SELECT v FROM kv_demo WHERE k='k'"},
 	})
-	if rec.Code != http.StatusOK || out["result"] != "v" {
-		t.Fatalf("kv.get 应返回 v，实际 code=%d body=%v", rec.Code, out)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("db.query 应 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	rows, ok := out["result"].([]interface{})
+	if !ok || len(rows) != 1 {
+		t.Fatalf("db.query 应返回 1 行，实际: %v", out)
+	}
+	row, ok := rows[0].(map[string]interface{})
+	if !ok || row["v"] != "v" {
+		t.Fatalf("db.query 应返回 v，实际: %v", out)
 	}
 
 	// 2) ext.* 单 table 通道：ext.ai.capabilities 返回能力数组。
@@ -202,7 +216,7 @@ func TestInvokeCapabilityEndpoint(t *testing.T) {
 	}
 
 	// 4) 缺 name/method → 400。
-	rec, _ = do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{"name": "kv"})
+	rec, _ = do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{"name": "db"})
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("缺 method 应 400，实际 %d", rec.Code)
 	}
@@ -401,7 +415,7 @@ func TestFlowsAndValidate(t *testing.T) {
 }
 
 // TestFlowsAcceptPrimitiveCalls：REST 注册面必须与运行期「同样的『call 判定』」——
-// step.call 可以是「能力.方法」（kv.put / call.Call / ext.ai.capabilities），无需先包一层 Tool。
+// step.call 可以是「能力.方法」（db.exec / call.Call / ext.ai.capabilities），无需先包一层 Tool。
 //
 // 回归点（真实 bug）：handleCreateFlow/handleValidateFlow 曾用 engine.New(s.reg)（一次性、
 // 丢弃 capReg/agent）做静态校验，导致 ext.* 这类需要 capReg 才能识别的方法在 POST 阶段被
@@ -417,8 +431,8 @@ func TestFlowsAcceptPrimitiveCalls(t *testing.T) {
 		call string
 		in   map[string]interface{}
 	}{
-		{"内建原语 kv.put", "kv.put", map[string]interface{}{"key": "k1", "value": "v1"}},
-		{"内建原语 kv.get", "kv.get", map[string]interface{}{"key": "k1"}},
+		{"内建原语 db.exec", "db.exec", map[string]interface{}{"sql": "SELECT 1"}},
+		{"内建原语 db.query", "db.query", map[string]interface{}{"sql": "SELECT 1"}},
 		{"内建原语 call.Call（调 Tool）", "call.Call", map[string]interface{}{"target": "echo"}},
 		// 关键回归：ext.* 需要 capReg 才能识别；修复前此处 400。
 		{"扩展原语 ext.ai.capabilities", "ext.ai.capabilities", map[string]interface{}{}},
@@ -447,9 +461,9 @@ func TestFlowsAcceptPrimitiveCalls(t *testing.T) {
 		in   map[string]interface{}
 	}{
 		{"未知能力", "nope.put", map[string]interface{}{"key": "k"}},
-		{"已知能力但未知方法", "kv.nope", map[string]interface{}{"key": "k"}},
-		{"缺必填参数", "kv.put", map[string]interface{}{"key": "k"}}, // 缺 value
-		{"多余未知参数", "kv.get", map[string]interface{}{"key": "k", "oops": "x"}},
+		{"已知能力但未知方法", "db.nope", map[string]interface{}{"sql": "SELECT 1"}},
+		{"缺必填参数", "db.exec", map[string]interface{}{}}, // 缺 sql
+		{"多余未知参数", "db.query", map[string]interface{}{"sql": "SELECT 1", "oops": "x"}},
 	}
 	for i, tc := range bad {
 		flow := map[string]interface{}{

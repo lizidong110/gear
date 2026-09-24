@@ -15,14 +15,14 @@ gear 只提供**机制**，不提供**策略**：
 
 ```
 能力原语（底座）              →  执行单元            →  编排      →  切面
-http/call/db/kv/secret/event/subscribe    Tool（可复用）        Flow         Hook
+http/call/db/secret/event/subscribe    Tool（可复用）        Flow         Hook
 time/template/crypto（免门禁纯函数）       ↳ 或 step 直调「能力.方法」
 ext.*（须注册 + 须声明）
 ```
 
 - **能力原语**是宿主提供的能力，Tool 通过 `capabilities` 声明「我有权用哪些」，然后在 Lua / process 里经 `ctx.*` 调用。
 - **Tool** 是「能力 + 业务逻辑」的封装，注册后可被多个 Flow 复用。
-- **关键取舍**：Flow 的 step **可以直接写「能力.方法」**（`kv.put` / `http.Request` / `ext.ai.complete`），不必先建 Tool。
+- **关键取舍**：Flow 的 step **可以直接写「能力.方法」**（`db.query` / `http.Request` / `ext.ai.complete`），不必先建 Tool。
   → **可复用的才建 Tool；一次性的直接直调。** 这条决定了你该不该产出一个 Tool。
 - **Flow** 编排执行单元形成业务。
 - **Hook** 在生命周期节点插入执行与门禁（`before_flow` / `before_step` / `after_step` / `on_error` / `on_success` / `before_promote`）。

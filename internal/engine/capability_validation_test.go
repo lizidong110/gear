@@ -365,7 +365,7 @@ func TestCapabilityCatalogListsPureAtoms(t *testing.T) {
 // 这两份表是 buildActionEntry 拼 Lua 入口的两个输入：schema 决定「什么算合法方法/参数」，
 // 顺序表决定「怎么把 args 摆成位置调用」。任一处漏改都会**静默**出错：
 //   - schema 有方法、顺序表没有 → buildActionEntry 落到 ext.* 单 table 分支，编出
-//     `ctx.kv.nope({...})`：注册期放行，运行期才炸成「尝试调用 nil」；
+//     `ctx.db.nope({...})`：注册期放行，运行期才炸成「尝试调用 nil」；
 //   - 顺序表有参数、schema 没有 → validatePrimitiveArgs 放行未知参数；
 //   - schema 有参数、顺序表没有 → 该参数被**静默丢弃**（调用方传了值，却像没传）。
 //

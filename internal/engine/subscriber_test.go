@@ -5,7 +5,6 @@ import (
 	"sync"
 	"testing"
 
-	"gear/internal/cap"
 	"gear/internal/model"
 )
 
@@ -82,10 +81,9 @@ func TestSubscribeDeliverRunsTarget(t *testing.T) {
 	st, factory := newFakeSourceFactory()
 	eng.Subscriber().RegisterSource("fake", factory)
 
-	// 投递目标：sink 写 KV（观察副作用的可靠通道）。
-	putTool(t, reg, luaToolWithCaps("sink", []string{"kv"}, `
-		ctx.kv.put("seen_payload", ctx.input.payload)
-		ctx.kv.put("seen_extra", ctx.input.extra)
+	// 投递目标：sink 经 event 总线广播观察到的输入（观察副作用的可靠通道）。
+	putTool(t, reg, luaToolWithCaps("sink", []string{"event"}, `
+		ctx.event.notify("sink_payload", { payload = ctx.input.payload, extra = ctx.input.extra })
 		ctx.output = { ok = true }
 	`))
 	// 发起订阅的 Tool：声明 subscribe 能力，返回 handle。
@@ -117,11 +115,13 @@ func TestSubscribeDeliverRunsTarget(t *testing.T) {
 
 	// 事件到达 → Deliver → deliverTo(run) → 重调度 sink。
 	st.fire(SubscriptionEvent{Source: "fake", Handle: handle, Payload: "hello"})
-	if v, ok := eng.host.KV.Get("seen_payload", cap.ScopeGlobal); !ok || v != "hello" {
-		t.Fatalf("投递后 seen_payload = %q(ok=%v)，期望 hello", v, ok)
+	p, err := eng.host.Event.Wait("sink_payload")
+	if err != nil {
+		t.Fatalf("投递后未收到 sink_payload 事件: %v", err)
 	}
-	if v, ok := eng.host.KV.Get("seen_extra", cap.ScopeGlobal); !ok || v != "x" {
-		t.Fatalf("投递后 seen_extra = %q(ok=%v)，期望 x（callback.input 模板与 payload 合并）", v, ok)
+	m, ok := p.(map[string]interface{})
+	if !ok || m["payload"] != "hello" || m["extra"] != "x" {
+		t.Fatalf("投递后 payload/extra 异常（callback.input 模板与 payload 合并），实际 %#v", p)
 	}
 
 	// stop 取消订阅；再次投递应报「不存在」。

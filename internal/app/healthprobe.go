@@ -56,6 +56,15 @@ func (s *Supervisor) probeLoop(ctx context.Context, h *engine.ServiceHandle) {
 		fails++
 		if fails >= rp.Threshold {
 			fmt.Printf("⚠ step %s 健康检查连续 %d 次失败，重启 service\n", h.StepID, fails)
+			// 共享 sidecar（client 退让，本 gear 手上没有本地进程）：kill 是 no-op，
+			// 杀不掉、也不该杀——那个 sidecar 属于别人。交给 coord 看门狗（心跳连续
+			// 失败会 rehandshake，必要时本 gear 接管为 owner）；探针继续观察，
+			// 一旦接管为 owner 就走下面正常的「kill → waitAny 收到退出 → 重启」路径。
+			// 若在此 return，该句柄会彻底失去探活，sidecar 真挂了也没人管。
+			if !h.HasLocalProc() {
+				fails = 0
+				continue
+			}
 			// 杀掉后 waitAny 收到退出，superviseOne 走重启路径（共用退避）。
 			_ = h.ProcKill()
 			return

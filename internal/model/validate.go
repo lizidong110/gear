@@ -103,6 +103,10 @@ func (t Tool) Validate() error {
 			return fmt.Errorf("tool %s 的 health_probe: %w", t.ID, err)
 		}
 	}
+	// 执行超时：同样注册期解析，非法时长立刻拒绝（红线：能静态校验的不留到运行期）。
+	if _, err := t.ExecTimeout(); err != nil {
+		return fmt.Errorf("tool %s 的 timeout: %w", t.ID, err)
+	}
 	return nil
 }
 
@@ -170,7 +174,7 @@ func (f Flow) Validate() error {
 			return fmt.Errorf("flow %s 第 %d 个 step 缺少 id", f.ID, i)
 		}
 		if s.Call == "" {
-			return fmt.Errorf("step %s 的 call 不能为空（需指向已注册的 Tool，或写成「能力.方法」直调原子能力，如 kv.put）", s.ID)
+			return fmt.Errorf("step %s 的 call 不能为空（需指向已注册的 Tool，或写成「能力.方法」直调原子能力，如 http.Request）", s.ID)
 		}
 		if s.Mode != "" && StepMode(s.Mode) != ModeOnce && StepMode(s.Mode) != ModeService {
 			return fmt.Errorf("step %s 的 mode=%q 非法（应为 once 或 service）", s.ID, s.Mode)

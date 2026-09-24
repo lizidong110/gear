@@ -37,7 +37,7 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 | **Flow** | 编排多个 Tool 的声明式 DSL |
 | **Hook** | 在指定生命周期节点插入执行逻辑的「切面」 |
 | **Runtime** | Tool 的执行环境（process / lua / go-host / wasm） |
-| **Context** | 一次执行的共享数据空间（宿主原语：受门禁的 http/call/db/kv/secret/event/subscribe + 始终可用的纯函数原子 time/template/crypto） |
+| **Context** | 一次执行的共享数据空间（宿主原语：受门禁的 http/call/db/secret/event/subscribe + 始终可用的纯函数原子 time/template/crypto） |
 
 ---
 
@@ -58,8 +58,8 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 │                       runtime 分发 / 模板 / when 表达式 /    │
 │                       版本灰度 / AI 扩展装配 / 健康检查       │
 ├──────────────────────────────────────────────────────────┤
-│  internal/cap      —— 宿主能力：受门禁 7 个原语              │
-│                       http/call/db/kv/secret/event/subscribe   │
+│  internal/cap      —— 宿主能力：受门禁 6 个原语              │
+│                       http/call/db/secret/event/subscribe      │
 │                       另有纯函数原子：time/template/crypto     │
 │                       始终可用、无需声明 capabilities          │
 ├──────────────────────────────────────────────────────────┤
@@ -78,7 +78,7 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 | `model` | 核心数据模型唯一真相源 + 校验规则 |
 | `registry` | SQLite 持久化 tool/flow/hook，含删除守卫与示例 YAML 多文档加载 |
 | `engine` | 编排内核：Flow 拓扑执行、Hook 装配、runtime 分发、表达式、版本灰度 |
-| `cap` | 宿主能力层：**7 个受 capability 门禁的原语**（http/call/db/kv/secret/event/subscribe）的接口与内存实现（最小权限门禁、KV 会话作用域、事件总线、订阅生命周期）。纯函数原子（time/template/crypto）刻意不进此门禁，见 `internal/engine/purefunc.go` |
+| `cap` | 宿主能力层：**6 个受 capability 门禁的原语**（http/call/db/secret/event/subscribe）的接口与内存实现（最小权限门禁、事件总线、订阅生命周期）。纯函数原子（time/template/crypto）刻意不进此门禁，见 `internal/engine/purefunc.go` |
 | `server` | REST 执行面：路由、并发闸门、执行记录持久化、受管 app 托管 |
 | `app` | `app run` 监管器：把一个 / 多个 Flow 变成受管进程 |
 | `cli` | CLI 管理面：cobra 命令树、`gear`/`exec`/`ai`/`mcp` 客户端、extensions 装配 |
@@ -106,6 +106,7 @@ type Tool struct {
     Versions     []ToolVersion          `yaml:"versions" json:"versions"`
     Capabilities []string               `yaml:"capabilities" json:"capabilities"` // 声明宿主原语（最小权限）
     HealthProbe  *HealthProbe           `yaml:"health_probe,omitempty" json:"health_probe,omitempty"`
+    Timeout      string                 `yaml:"timeout,omitempty" json:"timeout,omitempty"` // 单次执行超时（缺省 30s）
 }
 ```
 
@@ -113,6 +114,7 @@ type Tool struct {
 - **ToolVersion 状态机**：`draft → testing → stable → deprecated → rejected`，非法迁移被 `CanPromote` 拒绝。
 - **统一参数协议（Tool）**：`stdin JSON → stdout 末行 JSON`。
 - **HealthProbe**：`kind`(http|tcp|cmd) + `addr`/`path`/`cmd` + `interval`(5s)/`timeout`(2s)/`threshold`(3)，用于 service 模式探针。
+- **Timeout**（单次执行超时）：Go duration 字符串（如 `5m`/`300s`）。缺省 = 引擎默认 `defaultExecTimeout`(30s)，保留「防止挂死工具占住执行线程」的默认语义。**AI 补全、长任务等天然长耗时的 Tool 必须显式声明**，否则会被默认值误杀——典型症状是 lua 里调用阻塞的 `ctx.ext.ai.complete`，AI 还没返回就撞上默认闸门，报 `lua 执行被中断: context deadline exceeded`。注册期即解析校验，非法时长拒绝注册。
 
 ### 3.2 Flow（通用运行单元 / 服务）
 
@@ -204,6 +206,7 @@ type Hook struct {
 **`gear app`**
 - `app run <flow-id>...`：`--restart always|never`（默认 always）、`--max <n>`（并发闸门）。把 Flow 变成受管进程（service 长驻 + 重启策略 + 退避）。
   service 退出时打印**退出码 + 输出尾部**（`✗ step <id> service 退出 (exit=N)` 后的 `│ <行>`），用于定位「拉起即秒退」类故障（端口被占、命令写错、依赖缺失）——不再只报「重启 第 N 次」。
+- **共享侧车不算崩溃**：多个 app 引用同一个 service ext（如 `ext.serve`）时，后起的那个会**退让复用**已经存在的侧车（日志显示 `service 长驻启动 (pid=0)`），本进程手上没有本地进程——这是共享的正常态，不会被判成 service 退出、也不会去抢已被占用的 coord 端口。侧车挂了由 coord 看门狗重握手自愈（必要时本进程接管为 owner）。详见 `EXT_SERVICE_DESIGN.md` §12.10。
 - **registry 沿进程树继承**：`openRegistry()` 会把本次生效的 registry **绝对化**后写进 `GEAR_REGISTRY`，派生的进程（`app start` 的监管进程、`app run` 里 engine 拉起的长驻 Tool 进程）自动读同一个库。所以应用内步骤**不该**写死 `--registry`——写了也仍以显式值为准，但会因「换个 cwd 就静默指向另一个库」在注册/校验期收到 warning。传**相对路径**的 `--registry` 会在 stderr 提示（相对值按调用时 cwd 解析，cwd 是调用方的属性、不是 gear 的属性）。
 - `app start | stop | status | list`：**后台**启动器 + 台账（见下方 `gear mcp` 一节的说明）。
 - `app prune`：`--dry-run`（只汇报，不动磁盘）、`--flow <id>`（只清该 Flow）、`--apps-dir`（台账目录）。清理台账里**确定已终止**的记录——只清 `exited` / `stopped` / `startup_failed` 三种终态，`running` 与 `unknown` **一律保留**（unknown 的双判据自相矛盾，删掉可能把「还在跑却再无人可查」的进程变成真孤儿）。**只删记录，不杀进程、不碰端口**（要停进程用 `app stop`）。`start` 失败一次就落一条台账，调试一轮下来很容易堆十几条，prune 就是为「按应用批量清干净」准备的。与 MCP `gear_app(action=prune)`、REST `POST /api/apps/prune` 共用 `internal/app` 同一份实现。
@@ -224,11 +227,13 @@ type Hook struct {
 
 **`gear ai`**（内置 `ext.ai` 进程内 agent）
 - `ai gen flow` / `ai gen tool`：`--intent` / 位置参数、`--register`（自动落库）
-- `ai capabilities`：打印当前能力目录（内核原语 + 已注册 `ext.*`）。内核原语分两类：**受门禁的 builtin 7 个**（http/call/db/kv/secret/event/subscribe，需在 Tool 里声明 `capabilities`）+ **始终可用的 pure 3 个**（time/template/crypto，无需声明）。目录由代码单一来源渲染（`allBuiltinPrimitives` + `capabilityCatalog`），不再各写一份字面量清单
+- `ai capabilities`：打印当前能力目录（内核原语 + 已注册 `ext.*`）。内核原语分两类：**受门禁的 builtin 6 个**（http/call/db/secret/event/subscribe，需在 Tool 里声明 `capabilities`）+ **始终可用的 pure 3 个**（time/template/crypto，无需声明）。目录由代码单一来源渲染（`allBuiltinPrimitives` + `capabilityCatalog`），不再各写一份字面量清单
 
 **`gear mcp`**（MCP 执行面，stdio / `--http`）
 - `gear mcp`：默认以 stdio transport 启动 MCP Server（客户端配置 `command: gear, args: [mcp]`）。
-- `gear mcp --http :8788`：改走 streamable HTTP transport，供远程智能体或 WorkBuddy 的 MCP 连接器接入。
+- `gear mcp --http 127.0.0.1:8788`：改走 streamable HTTP transport，供远程智能体或 WorkBuddy 的 MCP 连接器接入。
+  **非回环地址默认拒绝**（MCP 面当前无鉴权，绑全网卡会把「写 registry / 删对象 / 执行编排」暴露给局域网），
+  确有远程需求时显式加 `--allow-remote`；带 Origin 的跨站请求一律按同源判定拒绝（与 REST 面同一判据）。
 - `gear mcp --registry <path> --apps-dir <dir>`：显式交给 MCP 面 registry 路径与台账目录。**`gear_app(start)` 依赖它**——派生出去的子进程要继承 `--registry`，否则会读默认库、可能启动另一个库里的同名 Flow（未配置时 start 直接拒绝执行，不「尽力而为」）。
 - `gear mcp --expose-flows`：把已注册 Flow 额外反向暴露为 `flow__{id}` 工具（**默认关闭**：工具数必须可预测；且是启动时快照，之后新建的 Flow 本次进程内不会出现；service 长驻 Flow 永不暴露）。
 - 暴露 12 个意图级工具（手册 / 目录 / 校验 / 落库 / 删除 / 晋升 / 执行 / 执行记录 / 应用生命周期 / 环境自检），工具名统一 `gear_` 前缀；心智模型（四层模型、七条铁律、工具选路）只写在 `ServerOptions.Instructions` 里**一次**，工具描述只留「做什么 + 何时用 + 歧义消解」（单条 ≤240 字符、合计 ≤1,800 字符，有机械守卫）。
@@ -305,6 +310,7 @@ gear scaffold hook --help
 | DELETE | `/api/apps/{id}` | `handleDeleteApp` | 停止受管 app（404） |
 | GET | `/api/capabilities` | `handleCapabilities` | 实时原子能力目录（内核 builtin+pure + 已注册 `ext.*`，与 `gear ai capabilities` 同源） |
 | POST | `/api/capabilities/invoke` | `handleInvokeCapability` | 直接执行一次原子能力调用（body `{name, method, args}`，与 step 直调**共用**同一套校验）。**已收紧**：只接受本机 Origin，且 `secret.*` 一律 403（密钥明文不提供 HTTP 直读口） |
+| POST | `/api/capabilities/invoke/stream` | `handleInvokeCapabilityStream` | `invoke` 的 **SSE 流式版**：目前仅支持 `ext.ai.complete_stream`，以 `text/event-stream` 逐增量推送 `{delta, reasoning}`（结束 `data: {"done":true}`、出错 `event:error`）。同源与禁 secret 约束同上 |
 | DELETE | `/api/hooks/{id}` | `handleDeleteHook` | 注销 Hook（不存在 404） |
 | POST | `/api/events/{handle}` | `handleSubscriptionEvent` | 长驻订阅的事件**回推入口**：侧车/外部源把订阅到的消息 POST 到此处，引擎投递给对应 handle（404=handle 不存在），见 EXT_SERVICE_DESIGN |
 | GET | `/api/news` | `handleNews` | demo 端点（聚合示例数据源），仅 `--seed examples/news-top10.yaml` 时有意义 |
@@ -326,7 +332,7 @@ Gear 以「**能力原语**」为单位扩展：内核原语分两类（受门�
 
 | 类型 | kind / 标识 | 载体 | 调用协议 |
 |---|---|---|---|
-| 受门禁内核原语（builtin） | `http`/`call`/`db`/`kv`/`secret`/`event`/`subscribe` | 硬编码 Go 闭包 | `http`/`call` 位置参数；`db`/`subscribe` 单 table `ctx.db.query({driver,dsn,sql,params})` / `ctx.subscribe.start({source,config,callback})`（多后端 sqlite/mysql/postgres）；`kv`/`secret`/`event` 子表方法。**须声明 `capabilities` 才能用** |
+| 受门禁内核原语（builtin） | `http`/`call`/`db`/`secret`/`event`/`subscribe` | 硬编码 Go 闭包 | `http`/`call` 位置参数；`db`/`subscribe` 单 table `ctx.db.query({driver,dsn,sql,params})` / `ctx.subscribe.start({source,config,callback})`（多后端 sqlite/mysql/postgres）；`secret`/`event` 子表方法。**须声明 `capabilities` 才能用** |
 | 纯函数内核原语（pure） | `time`/`template`/`crypto` | 硬编码 Go 闭包（`internal/engine/purefunc.go`） | 单具名 table，如 `ctx.time.now({format,tz})` / `ctx.crypto.hash({algo,data})` / `ctx.template.render({text,vars})`。**始终可用、无需声明 capabilities**；也可作 Flow step 直调目标（`call: crypto.hash`） |
 | sidecar 子进程 | `kind=sidecar`（默认 `""`） | `CommandTransport` 起子进程 | stdin `{method,args}` → stdout 末行 `{result}`/`{error}` |
 | 进程内 Go agent | `kind=agent`（目前仅 `ext.ai`） | `InProcessExtension` 闭包 | 直接 Go 函数调用 |
@@ -388,6 +394,7 @@ stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error
 | `versions` | `[]ToolVersion` | 是 | 版本列表（`version`/`state`/`digest`/`note`） |
 | `capabilities` | `[]string` | 否 | 允许使用的宿主原语，最小权限 |
 | `health_probe` | object | 否 | service 模式健康检查（`kind` http/tcp/cmd） |
+| `timeout` | string | 否 | 单次执行超时（Go duration，如 `5m`），缺省引擎默认 30s；长耗时（AI/长任务）Tool 需显式声明 |
 
 > **`runtime` 补充说明**：`process`=外部命令（stdin 进 JSON、stdout 末行出 JSON）；`lua`=嵌入式 Lua 脚本（`entry` 即脚本本体，沙箱，不支持 service）；`go-host`=进程内 Go 函数（`entry` 为函数名，须在 Go 代码 `engine.RegisterHostFunc("myFunc", ...)` 登记，否则注册期即拒；不支持 service）；`wasm` 已知未实现，注册期即拒。`capabilities` 合法值见上「通用写法」一节：受门禁 7 原语须声明才可用、纯函数 3 原子无需声明、`ext.*` 须 `extensions.yaml` 登记。
 
@@ -422,10 +429,10 @@ stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error
 
 **step.call 两种写法**（解析规则见 `engine.resolveStepCall`，已注册 Tool 优先）：
 1. 已注册 Tool 的 id（如 `my-tool`）；
-2. 原子能力直调「能力.方法」（如 `crypto.hash` / `http.Request` / `kv.put` / `db.query` / `ext.ai.complete` / `call.Call`）——免去为用一次原语先注册一层 Tool 包装；此时 `input` 即该方法的参数表，输出统一为 `{result: <返回值>}`。
+2. 原子能力直调「能力.方法」（如 `crypto.hash` / `http.Request` / `db.exec` / `db.query` / `ext.ai.complete` / `call.Call`）——免去为用一次原语先注册一层 Tool 包装；此时 `input` 即该方法的参数表，输出统一为 `{result: <返回值>}`。
 
    直调原子分三类（与方法级 schema 共用同一份静态校验，见 `builtinCapabilitySchemas`）：
-   - 受门禁内核原语（http/call/db/kv/secret/event/subscribe）：须 Tool 声明 `capabilities` 才可用；
+   - 受门禁内核原语（http/call/db/secret/event/subscribe）：须 Tool 声明 `capabilities` 才可用；
    - 纯函数原子（time/template/crypto）：始终可用、无需声明；
    - 扩展原语 `ext.*`：须 `extensions.yaml` 登记，方法名/参数写错**注册期即拒**（不拖到运行期）。
 
@@ -445,7 +452,7 @@ stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error
 | `GEAR_HOME` | `<HOME>/.gear`（取不到 HOME 时退化到 `<exeDir>/.gear`） | gear 自身落盘根目录，决定 registry.db 与 exec.db 的默认位置（见 `internal/gearhome/gearhome.go`） |
 | `GEAR_ADDR` | `127.0.0.1:8787` | REST 执行面地址 |
 | `GEAR_EXT_CONFIG` | 未显式设置时按 **exe 锚优先**自动定位：`<exeDir>/extensions.yaml` → `<exeDir>/plugin/extensions.yaml` → `<repo>/plugin/extensions.yaml` → `<repo>/extensions.yaml` → `<cwd>/…`（详见 `internal/engine/extensionpath.go`） | 扩展配置文件路径。**显式指定却读不到会报错**（fail-closed），不静默退回「无扩展」 |
-| `GEAR_AI_RECIPES` | `examples/ai/recipes` | AI 可编辑配方目录 |
+| `GEAR_AI_RECIPES` | `examples/ai/recipes` | AI 配方**覆盖目录**（可选）：存在同名 `flow/tool/hook.yaml` 时优先于内嵌默认 `internal/engine/recipes/`；目录不存在则自动回退内嵌 |
 | `GEAR_EXEC_DB` | `<GEAR_HOME>/exec.db` | 执行记录 SQLite 库。**不随 cwd 变化**（2026-09-21 前为相对 cwd 的 `build/gear.db`，已废） |
 | `GEAR_DB_DRIVER` / `GEAR_DB_DSN` | 空 | `ext.db` 驱动 / 连接串回退 |
 | `GEAR_API` | `http://127.0.0.1:8787` | web-ui 开发期 Vite 反代目标 |
@@ -536,7 +543,7 @@ gear serve --seed examples/news-top10.yaml
 
 # 8) 让智能体接管配置：启动 MCP 执行面（stdio），在 Claude Desktop / WorkBuddy 的
 #    mcpServers 里配 {"command":"gear","args":["mcp"]}，即可用自然语言
-#    「读目录 → 写配置 → 校验 → 跑一把 → 看结果」；远程接入用 `gear mcp --http :8788`
+#    「读目录 → 写配置 → 校验 → 跑一把 → 看结果」；远程接入用 `gear mcp --http 127.0.0.1:8788`
 gear mcp
 
 ### 踩坑提醒
@@ -568,7 +575,7 @@ gear mcp
 | `REQUIREMENTS.md` | 需求可追溯矩阵（可执行规格契约），为每条 PRD 行为打需求 ID + 状态 + 断言测试 |
 | `GEAR_工程方法_v1.md` | 交付宪法：17 条红线与质量闸门，贡献代码前必读 |
 | `extensions.example.yaml` | 扩展原语配置模板（复制为 `extensions.yaml` 启用自定义扩展） |
-| `examples/` | 示例 YAML（hello / sleeper / service / news-top10）、AI 配方（`examples/ai/recipes/*.yaml`）；旧 Go 示例（slack-sidecar / news-demo / gear-ai-sidecar）**已移除** |
+| `examples/` | 面向用户的演示 / 种子 YAML（`hello_tool` / `hello_flow` / `sleeper_tool` / `service_flow` / `news-top10` / `ai-create-flow`），可 `gear serve --seed examples/<file>.yaml` 灌入；旧 Go 示例（slack-sidecar / news-demo / gear-ai-sidecar）**已移除**。AI 配方**默认内嵌**在 `internal/engine/recipes/`，`examples/ai/recipes/` 只是可选覆盖目录（默认不存在） |
 
 ---
 
@@ -593,7 +600,7 @@ gear mcp
 **streamable HTTP（远程 / 连接器）**：
 
 ```bash
-gear mcp --http :8788
+gear mcp --http 127.0.0.1:8788
 ```
 
 之后在支持 MCP 的客户端里填 `http://127.0.0.1:8788`（或 WorkBuddy 的 MCP 连接器填该地址）。

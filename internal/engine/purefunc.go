@@ -54,7 +54,7 @@ var pureFuncPrimitives = map[string]bool{
 
 // gatedPrimitiveOrder 是**受 capability 门禁**的内核原语（内容与 cap.KnownPrimitives 一一对应，
 // 由 TestGatedPrimitiveOrderMatchesCapEnums 守着不漂移），顺序即能力目录/提示词里的展示顺序。
-var gatedPrimitiveOrder = []string{"http", "call", "db", "kv", "secret", "event", "subscribe"}
+var gatedPrimitiveOrder = []string{"http", "call", "db", "secret", "event", "subscribe"}
 
 // purePrimitiveOrder 是纯函数核心原子的展示顺序（不受门禁）。
 var purePrimitiveOrder = []string{"time", "template", "crypto"}

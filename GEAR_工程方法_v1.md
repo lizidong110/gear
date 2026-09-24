@@ -90,9 +90,9 @@ gear/
 | §5.2 | 生命周期 + weight 升序（同重注册序） | engine | 单测 | T-eng-06 | 🟢 已落地（Target 过滤 + Order 升序装配；REQ-HOOK-SELECT/ORDER / `hook_test.go`: TestHookTargetFilter/Order） |
 | §5.3 | 插件无感知 / action 是 Tool 或 Flow / fail-closed / 禁止隐式依赖 | engine | 集成 | T-eng-07 | 🟢 已落地（action=已注册 Tool id 或 Flow id；#72 起 Flow 载体=同步内联子 Flow，同 execID、结构性无递归、递归守卫拦截循环；fail-closed；REQ-HOOK-FAILCLOSED/NORECUR/ACTION-FLOW）；Flow 级 stage（before_flow/on_success）#72 落地 |
 | §5.4 | 改写 input/output + 重校验；best-effort；on_error 不恢复；Hook 嵌套防重入 | engine | 集成 | T-eng-08..11 | 🟢 已落地（改写后按 schema 重校验、best-effort 仅告警、on_error 不恢复、无递归；REQ-HOOK-REWRITE/REVALIDATE/ONERROR/NORECUR） |
-| §6 | 宿主 7 原语 http/call/db/kv/secret/event/subscribe（另有纯函数原子 time/template/crypto，始终可用、不受门禁） | host | 集成 | T-host-01..07 | 🟢 M5 已落地（`internal/cap` + `engine.luaRuntime`/`processRuntime` 注入 `ctx.*`；#69 收口：db 原语实现 SQLite、引擎默认宿主装配 KV/HTTP/Event/DB + `call` 解析器 Tool/Flow + 循环守卫，声明即生产可用） |
+| §6 | 宿主 7 原语 http/call/db/kv/secret/event/subscribe（另有纯函数原子 time/template/crypto，始终可用、不受门禁） | host | 集成 | T-host-01..07 | 🟢 M5 已落地（`internal/cap` + `engine.luaRuntime`/`processRuntime` 注入 `ctx.*`；#69 收口：db 原语实现 SQLite、引擎默认宿主装配 KV/HTTP/Event/DB + `call` 解析器 Tool/Flow + 循环守卫，声明即生产可用）　⚠ **2026-09-24 注**：kv 原语已按方案 A 移除，§6 现为 6 原语（http/call/db/secret/event/subscribe）；本行原文保留作历史。 |
 | §6.2 | call 与 event 边界 | host | 集成 | T-host-07 | 🟢 M5：call 经 Resolver 唯一通道、event notify/wait 同步往返，均已测 |
-| §6 / §0#14 | KV 生命周期维度（ScopeGlobal 进程级持久 / ScopeSession 绑定 flow 执行、跨 step 共享 + 引用计数回收） | host/engine | 单元+集成 | T-kv-01..05, E-kvl-01..02 | 🟢 M-KV-LIFECYCLE 已落地（`internal/cap` Scope/SessionRegistry/MemSessionRegistry/scopedKV；`engine.run` 对 flow.ID 做 Acquire/defer Release；`lua` ctx.kv 增可选 scope 参数；全部内存态、重启即失，显式满足 §0 第14条） |
+| §6 / §0#14 | KV 生命周期维度（ScopeGlobal 进程级持久 / ScopeSession 绑定 flow 执行、跨 step 共享 + 引用计数回收） | host/engine | 单元+集成 | T-kv-01..05, E-kvl-01..02 | 🟢 M-KV-LIFECYCLE 已落地（`internal/cap` Scope/SessionRegistry/MemSessionRegistry/scopedKV；`engine.run` 对 flow.ID 做 Acquire/defer Release；`lua` ctx.kv 增可选 scope 参数；全部内存态、重启即失，显式满足 §0 第14条）　⚠ **2026-09-24 注**：随 kv 原语移除，M-KV-LIFECYCLE 已整体删除（Scope/SessionRegistry/scopedKV 及 T-kv-01..05 / E-kvl-01..02 均不存在）；本行原文保留作历史。 |
 | §7.1 | 状态机 draft→testing→stable→deprecated/rejected | engine/registry | 单测 | T-ver-01 | 🟢 已落地（VersionTransitions 白名单 + CanPromote；`model/version_test.go` / `engine/version_test.go`） |
 | §7.2 | 晋升显式 + operator 审计 | server/registry | 集成 | T-ver-02 | 🟢 已落地（晋升经 CLI `gear tool promote` 与 REST `POST /api/tools/{id}/versions/{v}/promote` 均可触发，均走 `engine.PromoteTool` + `before_promote` 门禁 fail-closed；见 REQ-API-PROMOTE） |
 | §7.3 | 幂等 + 并发安全（写锁/CAS/版本不可变） | registry | 并发测试 | T-ver-03 | 🟢 已落地（Registry 写锁 + upsert 事务 + `TestConcurrentUpsert`；版本行不可变） |
@@ -113,7 +113,7 @@ gear/
 > 每切片 DoD = 该切片矩阵条目全 🟢 + 覆盖率达标 + 评审过关。
 >
 > **⚠️ 2026-09-13 更正**：下面原定顺序在实施中已被调整，实际执行如下（本表随切片回填，避免方法论漂移）：
-> S0 骨架 ✅ / S1 最小引擎 ✅ / **S2 app run 进程监管 ✅** / **S3 Hook 切面 ✅** / **S4 并行+依赖推断+背压 ✅** / **S7a lua runtime ✅（提前）** / **`when` 条件执行 ✅** / **`ctx.*` 宿主能力层（M5）✅（http/call/kv/secret/event 实现 + 最小权限放行；db 原语已定义但宿主未提供实现，声明即可见、调用返回 ErrCapabilityUnavailable）** / **#69 ctx.* 宿主默认装配 ✅（2026-09-13：db 实现 SQLite + 引擎默认宿主 KV/HTTP/Event/DB + call 解析器 Tool/Flow + 循环守卫，声明即生产可用）**；**S5 版本灰度 ✅（2026-09-13）** / **S6c AI 闭环 ✅（2026-09-13）** / **#73 执行入口全局并发闸门 ✅（2026-09-13，ConcurrencyGate 背压闸门，REQ-CONCURRENCY-CROSS `implemented`）** / **#76 go-host runtime ✅（2026-09-13，进程内 Go 函数注册表 `engine.RegisterHostFunc` + `runtimeFor` 分发 + host 视图透传；wasm 仍 deferred V3）**。
+> S0 骨架 ✅ / S1 最小引擎 ✅ / **S2 app run 进程监管 ✅** / **S3 Hook 切面 ✅** / **S4 并行+依赖推断+背压 ✅** / **S7a lua runtime ✅（提前）** / **`when` 条件执行 ✅** / **`ctx.*` 宿主能力层（M5）✅（http/call/kv/secret/event 实现 + 最小权限放行；db 原语已定义但宿主未提供实现，声明即可见、调用返回 ErrCapabilityUnavailable）** / **#69 ctx.* 宿主默认装配 ✅（2026-09-13：db 实现 SQLite + 引擎默认宿主 KV/HTTP/Event/DB + call 解析器 Tool/Flow + 循环守卫，声明即生产可用）**；**S5 版本灰度 ✅（2026-09-13）** / **S6c AI 闭环 ✅（2026-09-13）** / **#73 执行入口全局并发闸门 ✅（2026-09-13，ConcurrencyGate 背压闸门，REQ-CONCURRENCY-CROSS `implemented`）** / **#76 go-host runtime ✅（2026-09-13，进程内 Go 函数注册表 `engine.RegisterHostFunc` + `runtimeFor` 分发 + host 视图透传；wasm 仍 deferred V3）**。　⚠ **2026-09-24 注**：本节提到的 kv 原语已按方案 A 移除（现为 6 原语），原文保留作历史。
 > 调整理由：lua 提前是因为 `ctx.*` 尚未落地时 lua 可作为**纯计算沙箱**独立成立；Hook 排在并行之前是因为 Hook 需要先抽「共享 step 执行路径」，而并行也要复用同一条路径——先建路径再改它的并发语义，风险更低。
 
 - **S0 基线**：model/registry/cli 骨架。DoD：修正 §9 的 6 处缺陷 + model 单测 + registry 集成测试 + CLI 与 §11 对齐清单。✅ **已完成 2026-09-12**。
@@ -129,7 +129,7 @@ gear/
   - **S6b CLI 补全** ✅（2026-09-13）：CLI 管理面单测全覆盖（成功 + 错误路径，含 §8.2 注销守卫），`cli` 包覆盖 **72.8%**；新增子命令 `exec start/status/list`（对齐 REST 执行面）、`tool promote`/`tool versions`（S5）、`ai gen`（S6c）均已落地。
   - **S6c AI 闭环（built-in）** ✅→**已撤回（2026-09-13）→ 已改 `ext.ai` 扩展（2026-09-14 ✅）**：用户决定 AI 不做进内核。原 built-in `internal/ai`（Inferrer / Ollama / SiliconFlow / GenerateFlow）、`server.inferrer` 字段、`POST /api/ai/infer` 端点已全部移除；AI 改以 **`ext.ai` 扩展原语（Sidecar）** 承载（参考 Flow + 薄 CLI 壳；结构化多阶段 agent，不自由 ReAct）。详见本文件 §11 第十一次/第十二次变更与 §9 矩阵行（状态 🟢 已实现）。
 
-- **M-KV-LIFECYCLE（KV 生命周期维度）** ✅（2026-09-13）：`kv` 原语增 `Scope`（`global` 进程级持久 / `session` 绑定 flow 执行跨 step 共享）+ `SessionRegistry`（引用计数回收，run 结束归零即删命名空间）；`engine.run` 按 flow.ID 做 `Acquire`/`defer Release`，`hostForChain` 把 sessionID 设为 flow.ID；`lua` ctx.kv 增可选 scope 参数（缺省 global，向后兼容）；全部内存态、重启即失（显式满足 §0 第14条）。覆盖 T-kv-01..05（`cap_test.go`）、E-kvl-01..02（`kv_session_test.go`）。
+- **M-KV-LIFECYCLE（KV 生命周期维度）** ✅（2026-09-13）：`kv` 原语增 `Scope`（`global` 进程级持久 / `session` 绑定 flow 执行跨 step 共享）+ `SessionRegistry`（引用计数回收，run 结束归零即删命名空间）；`engine.run` 按 flow.ID 做 `Acquire`/`defer Release`，`hostForChain` 把 sessionID 设为 flow.ID；`lua` ctx.kv 增可选 scope 参数（缺省 global，向后兼容）；全部内存态、重启即失（显式满足 §0 第14条）。覆盖 T-kv-01..05（`cap_test.go`）、E-kvl-01..02（`kv_session_test.go`）。　⚠ **2026-09-24 注**：M-KV-LIFECYCLE 已随 kv 原语移除整体删除，上述测试与设计均不存在；原文保留作历史。
 - **M-EXT-AI（AI 去内置化 → ext.ai 扩展）** ✅（2026-09-14）：移除 built-in `internal/ai`（包已删）；新增 `examples/gear-ai-sidecar`（Go 实现，SiliconFlow 默认 + Ollama 兜底，key 走 sidecar 环境变量）承载**稳定原语**：`complete`（参数化 LLM，provider/model/base_url/api_key/temperature/format 任意模型、`mock` 离线）、`catalog`（BM25 域内检索）、`domains`（按 namespace 归类）、`validate`（复用 `ValidateFlowStatic`）；**多阶段 agent 编排（能力域概览 → LLM 拆解 → 域内检索 → 组装 Flow/Tool → 校验 → ≤N 次重来 → 人工确认/注册）于 2026-09-14 第十三次重构全部移入 Lua（`examples/ai-create-flow.yaml` 的 `ai-gen` 入口），改 agent 行为不重编 Go**；引擎侧 `ext.ai` 经 `SidecarExtension` 接线（`engine.AIExtension` + `ctx.ext.ai.complete/catalog/domains/validate`，未声明即 `ErrCapabilityDenied`）+ 静态校验；server/cli 默认装配 `ext.ai`（sidecar 二进制缺失时 fail-closed 返回 `ErrCapabilityUnavailable`）；参考 Flow `examples/ai-create-flow.yaml`（注入 `tool_id+desc+schema`）+ 薄 CLI 壳 `gear ai gen flow|tool [--register]`；PRD §9 翻 `implemented (as ext.ai)`、REQ-API-AI 翻 `ext`；`ext.ai` 单测（`TestExtAIReachable`/`TestExtAINotDeclaredDenied`）+ sidecar 内部测试（mock LLM，覆盖成功/重试/全失败/校验拒未知工具/域概览检索/normalize）。复用 M-KV-LIFECYCLE 的 session 作用域做 agent 中间态跨 step 缓存。
 
 - **（注，2026-09-15 整体删除）**：`examples/gear-ai-sidecar` 示例与 `gear-ai-sidecar.exe` 已于本日整体删除；ext.ai 改为**进程内扩展**（无独立 sidecar 二进制，二进制缺失时 fail-closed 回 `ErrCapabilityUnavailable`）。本文件 M-EXT-AI / M-EXT-AI-LAYER / 第十六次真机验证等小节中出现的 `examples/gear-ai-sidecar/*` 与 `gear-ai-sidecar.exe` 均为当时记录，非现状；agent 编排现活在 Lua `examples/ai-create-flow.yaml` 的 `ai-gen` 入口。
@@ -319,14 +319,14 @@ gear/
 ### 2026-09-13（第四次）· 实现 M5：`ctx.*` 宿主能力层
 
 **M5 的设计原则（来自 PRD §6，已落进 `internal/cap`）**
-- **规则**：宿主只向 Tool 暴露 7 个跨边界原语（http/call/db/kv/secret/event/subscribe；另有 time/template/crypto 三个**纯函数原子**，始终可用、无需声明——见 ATOM_ROADMAP §0）；**capability 精确放行**——未声明的调用一律拒绝，权限遵循最小权限；secret 只读；原语只提供「通道」不提供「业务」（发邮件/接钉钉都是普通 Tool，内部用 http 实现）。
+- **规则**：宿主只向 Tool 暴露 7 个跨边界原语（http/call/db/kv/secret/event/subscribe；另有 time/template/crypto 三个**纯函数原子**，始终可用、无需声明——见 ATOM_ROADMAP §0）；**capability 精确放行**——未声明的调用一律拒绝，权限遵循最小权限；secret 只读；原语只提供「通道」不提供「业务」（发邮件/接钉钉都是普通 Tool，内部用 http 实现）。　⚠ **2026-09-24 注**：其中 kv 已按方案 A 移除，现为 6 个原语；本段为 M5 时的历史记录。
 - **为什么**：这是之前反复强调的「枚举式声明必须逐项登记（红线 15）」+「注册期拒绝未知值」在能力面上的延伸。能力枚举若两处维护必漂移，故 `cap.KnownPrimitives` 是**单一来源**，`cap.GrantsFromStrings` 在解析点拒绝未知值（与 `model.Runtime` / `model.HookStage` 同一套路）。
 - **落地**：
   - `internal/cap`：Primitive 枚举单一来源；`Context` 每个访问器先查 `Grants` 再取实现——未授权 `ErrCapabilityDenied`，已授权但宿主未提供 `ErrCapabilityUnavailable`（把「文档说有、代码无」变成可见错误）。
   - `Runtime` 接口加 `host *cap.Context` 参数；引擎 `Engine.hostFor(tool)` 按 `tool.Capabilities` 逐次执行构建视图并沿 `runOnceStep`/`startServiceStep`/`applyHooks`/`Relaunch` 透传。
   - **lua**：`setupLuaCapabilities` 仅注入**已声明**的原语（未声明的连字段都不出现在 `ctx` 上——比「存在但报错」更严格的防御纵深），闭包捕获授权后的实现，脚本无法绕过沙箱。
   - **process**：`withHostCapabilities` 把 `ctx.capabilities` / `ctx.sandbox` 注入 step input 的 JSON，进程侧可做最小权限自检（进程内实时强制留待后续切片）。
-  - **db**：原语已实现（`internal/cap/sqldb.go`，modernc.org/sqlite，文件或内存 DSN）；引擎 `New` 未显式 `WithHost` 时注入默认宿主（KV/HTTP/Event/DB），声明 `db` 的 Tool 在 `gear serve` 下即可读写 SQLite，不再返回 `ErrCapabilityUnavailable`（#69 收口）。
+  - **db**：原语已实现（`internal/cap/sqldb.go`，modernc.org/sqlite，文件或内存 DSN）；引擎 `New` 未显式 `WithHost` 时注入默认宿主（HTTP/Event/DB；⚠ 2026-09-24：kv 已移除），声明 `db` 的 Tool 在 `gear serve` 下即可读写 SQLite，不再返回 `ErrCapabilityUnavailable`（#69 收口）。
 
 **M5 顺手修的真实坑（值得记一笔）**
 - `cap.Context.HTTP()` 原先在 `Providers` 为 nil 时直接 `c.prov.HTTP` → **nil 解引用 panic**。其他访问器都有 `c.prov == nil` 守卫，唯独 HTTP 漏了。修复为：无宿主即 `ErrCapabilityUnavailable`（绝不静默回退到 `http.DefaultClient` 去访问公网——最小权限的「安全默认」）。新增 `TestHTTPUnavailableWhenNoProvider` 锁死。
@@ -410,7 +410,7 @@ gear/
 - 审计用「代码 + 文档 + 覆盖率逐函数」三查，而非凭记忆：真缺口只有 `GET /api/flows`（已实现挂路由却从没被测）；0% 函数全是入口/OS/胶水（main/Execute/ListenAndServe/ContextWithSignals/configureProcessTree/Relaunch/IsService），符合项目覆盖策略；cli/server 的 <80% 是错误分支未全。
 - **文档漂移比代码缺口更隐蔽**：方法论 §11 大量 🔴 实为已实现，会让人误判「未测试」。矩阵必须随切片回查——这正是 §0 第 12 条「方法论自身可追溯」的本意。
 
-**未实现（deferred，REQUIREMENTS 权威，本次未动）**：go-host/wasm runtime；lua service + 沙箱策略可配置；非 process runtime 的 service step；service 健康探针；跨进程队列/进程池；`${secrets.x}`；`GET /api/executions/{id}/logs`；执行记录持久化（有意内存态）；Hook action 指向 Flow；Hook stage `before_flow`/`on_success` + target 通配；ctx.* 宿主 db/kv/secret/event/call（仅声明，返回 ErrCapabilityUnavailable）；promote REST 端点（CLI 已做）。见 REQUIREMENTS.md 与各 REQ-ID。
+**未实现（deferred，REQUIREMENTS 权威，本次未动）**：go-host/wasm runtime；lua service + 沙箱策略可配置；非 process runtime 的 service step；service 健康探针；跨进程队列/进程池；`${secrets.x}`；`GET /api/executions/{id}/logs`；执行记录持久化（有意内存态）；Hook action 指向 Flow；Hook stage `before_flow`/`on_success` + target 通配；ctx.* 宿主 db/secret/event/call（仅声明，返回 ErrCapabilityUnavailable；⚠ 2026-09-24：kv 已移除，本项为历史文本）；promote REST 端点（CLI 已做）。见 REQUIREMENTS.md 与各 REQ-ID。
 
 ### 2026-09-13（第九次）· AI 闭环改走线上 SiliconFlow（默认），强化生成 prompt
 
@@ -533,6 +533,8 @@ gear/
 
 ### 2026-09-13（第十一次）· M-KV-LIFECYCLE：KV 增生命周期维度 + §9 AI 决策修正
 
+> ⚠ **2026-09-24 注**：kv 原语已按方案 A 整体移除，本节描述的 M-KV-LIFECYCLE（Scope/SessionRegistry/scopedKV 等）已不存在；原文保留作历史记录（依「工程方法历史记录加注记不改原文」约定）。
+
 **M-KV-LIFECYCLE（KV 生命周期维度）**
 - **触发**：用户要求「考虑一个生命周期为 flow 的会话级 env，允许 tool 缓存信息，考虑改造现有 kv 接口、增加生命周期机制」——直接对应 §0 第 14 条（状态持久性必须显式声明）。原来 `kv` 只有进程级全局命名空间，跨 step / 跨 flow 都共享同一份，无法支撑「一次 flow 执行内工具间缓存、执行完即清」的语义。
 - **改了什么**：
@@ -622,6 +624,7 @@ gear/
   2. **`tool register` 未初始化扩展名**（`internal/cli/tool.go`）：该命令直接 `reg.UpsertTool`，从不建引擎 → 全局扩展名表为空 → 用户配好 `ext.tls` 后注册 `capabilities:[ext.tls]` 的 Tool 必被拒。新增 `initExtensionNames(reg)`（`cli/engine.go`，借 `SetupExtensions` 的副作用并入全局名集合），在 `toolRegisterCmd` 校验前调用。（`flow register` 本就先 `cliEngine` 再校验，无此问题。）
   3. **agent 层 schema 容错**（`examples/ai-create-flow.yaml` + `internal/cli/ai.go` 嵌入副本）：真实 LLM 会把 `steps[].depends_on` 写成对象（如 `{"s1":true}`），Go 侧 `json.Unmarshal` 进 `model.Flow`（`[]string`）即失败。**容错放在易变层（Lua）**：新增 `norm_flow`（对象取键 / 标量包数组 → 字符串数组），并在组装 prompt 明写「`depends_on` 必须是字符串数组或省略，绝不能是对象」；**稳定层（Go 反序列化/静态校验）保持严格**——这正是「易变/稳定分层」的教科书用例。
   4. **（记录，未改）step 超时硬编码 30s**：`internal/engine/process.go` 的 `defaultExecTimeout = 30 * time.Second` 无 flag/env 可调。多轮调用远端 LLM 的 agent 贴近该边界（首轮空 registry 触发重试时会超时）。属「调优缺口」，建议后续开一个 per-step `timeout` 字段或 CLI flag，本轮不改。
+     > **2026-09-23 补记：已实现（#77）**——`model.Tool.Timeout`（Go duration 字符串）+ `Tool.ExecTimeout()` 解析 + `engine.execTimeoutFor(tool)`，三处执行点（`runOnceStep` / `applyHooks` / `applyFlowScopedToolHook`）统一「声明优先、缺省回退默认 30s」，注册期静态校验。原始记录保留不改（历史日志不回溯改写）。真实触发案例：mindstorm `mindstorm__expand` 同步调 `ctx.ext.ai.complete` 100% 撞 30s 闸门必失败。
 - **文档**：`extensions.example.yaml` 补警告——配置存在时「以配置为准」，须把用到的扩展（含 `ext.ai`）列全，否则能力静默消失。
 - **验证**：`go build ./...` 通过；`go test ./internal/engine/ ./internal/cli/ -count=1` 全绿；gofmt 已应用。真机 demo 产物在 `.postpublish-demo/`（用户侧文件，非 gear 源码）。
 
@@ -660,7 +663,7 @@ gear/
      - `internal/cli/flow.go`：新增 `--var` 标志 + `parseKVFlags(flagName, pairs)`（值先按 JSON 解析 → 数字/布尔/数组/对象，失败则原样作字符串；缺 `=` 或空 key 即报错）。
      - 语义：覆盖**只作用于本次运行、不写回 registry**；合并结果仍会被 `before_flow` Hook 进一步改写。
   2. **`gear tool run <id>`（新增子命令，Tool 也有执行入口）**：
-     - `internal/engine/engine.go`：新增 `RunTool(toolID, input)` / `RunToolExec(toolID, input, execID)`——**复用 `runOnceStep`**，故语义与「Flow 里跑一个 step」逐项一致：input_schema 校验 → capability 门禁 → runtime 执行（`defaultExecTimeout` 限时）→ step 级 Hook（before_step/after_step，按 tool id 匹配）→ output_schema 校验。session 命名空间用 tool id（等价「只含一步的 Flow」），结束回收；会触发 step 级 Hook，**不**触发 Flow 级 Hook（无 Flow）。
+     - `internal/engine/engine.go`：新增 `RunTool(toolID, input)` / `RunToolExec(toolID, input, execID)`——**复用 `runOnceStep`**，故语义与「Flow 里跑一个 step」逐项一致：input_schema 校验 → capability 门禁 → runtime 执行（`defaultExecTimeout` 限时；2026-09-23 起 Tool 声明的 `timeout` 优先，见 #77）→ step 级 Hook（before_step/after_step，按 tool id 匹配）→ output_schema 校验。session 命名空间用 tool id（等价「只含一步的 Flow」），结束回收；会触发 step 级 Hook，**不**触发 Flow 级 Hook（无 Flow）。
      - `internal/cli/tool.go`：`toolRunCmd` + `buildToolInput`——输入三选一（**互斥，混用即报错**）：`--input '<json>'` / `--input-file <path>` / `--arg k=v`（可重复，复用 `parseKVFlags`）。执行成功打印 `✓ Tool <id> 执行成功` + 输出 YAML。
 - **验证（真机，`.postpublish-demo`）**
   - `gear tool run tls.issue --arg domain=x.com` → 真跑用户自写的 **Python** `ext.tls` sidecar，返回 PEM。

@@ -121,7 +121,7 @@ output_schema:
 >
 > **lua 专项（S7a）**：
 > - `entry` = **inline Lua 源码**（非文件路径）；沙箱只开 base/string/table/math，不加载 os/io/package/debug，并移除 dofile/loadfile/require/module —— **脚本无法接触宿主**（实测 `os.system` 报错）。
-> - 超时/取消：`L.SetContext(ctx)`，死循环会被打断（与 process 的 `defaultExecTimeout` 对称）。
+> - 超时/取消：`L.SetContext(ctx)`，死循环会被打断（与 process 的 `defaultExecTimeout` 对称）。**注意其边界**：`SetContext` 只在 Lua 解释循环检查取消，**阻塞中的宿主调用（`ctx.ext.ai.complete`、`ctx.time.sleep`）无法被打断**——必须等它返回才判定超时，故需长耗时的调用方应给 Tool 声明 `timeout`（#77）。
 > - **不支持 service**（`Start` 显式报错，REQ-LUA-SERVICE deferred，V3 前不做）：长驻请用 process。
 
 ### 3.3 参数交互统一协议
@@ -277,8 +277,7 @@ hooks:
 |---------|---------|------|
 | http | `ctx.http.Request(method, url, body?, headers?)` | 任意 HTTP 请求（传输层，钉钉/微信等均基于此） |
 | call | `ctx.call(target, input)` | 调用另一个 Tool / Flow（唯一插件间通信通道） |
-| db | `ctx.db.query / exec` | 结构化数据读写 |
-| kv | `ctx.kv.get / put / delete` | 简单键值存储（配置 / 状态 / 缓存） |
+| db | `ctx.db.query / exec` | 结构化数据读写（配置 / 状态 / 缓存也走 db） |
 | secret | `ctx.secret.get(name)` | 密钥读取（只读，框架负责解密与审计） |
 | event | `ctx.event.notify / wait` | 异步事件通知 / 等待 |
 | subscribe | `ctx.subscribe.start(req) / stop(handle)` | 通用订阅（事件源回调 → 重调度 Tool/Flow），长驻订阅可按归属回收 |
@@ -291,9 +290,9 @@ hooks:
 - **capability 精确放行**：未声明的调用一律拒绝，权限遵循最小权限原则。
 - **secret 只读**：插件看不到明文存储位置，只能通过 `ctx.secret.get` 获取。
 - **未声明的原语不出现在 `ctx` 上**（lua）/ 不被注入 `ctx.capabilities`（process）：防御纵深——脚本连该字段都读不到，无法探测宿主能力边界；已声明但宿主未提供实现的调用时返回明确错误，而非静默成功。
-- **调用形态（M5 落地）**：lua 侧 `ctx.{http,call,db,kv,secret,event,subscribe}`（http/db 为对象方法 `ctx.http.Request` / `ctx.db.query`；kv/secret/event/subscribe 为子表方法 `ctx.kv.get` / `ctx.secret.get` / `ctx.event.notify` / `ctx.subscribe.start`；call 是**裸函数** `ctx.call(target, input)`）；process 侧运行期以 `input.ctx.capabilities`（字符串数组）与 `input.ctx.sandbox`（bool）透传声明，供进程自检。
+- **调用形态（M5 落地）**：lua 侧 `ctx.{http,call,db,secret,event,subscribe}`（http/db 为对象方法 `ctx.http.Request` / `ctx.db.query`；secret/event/subscribe 为子表方法 `ctx.secret.get` / `ctx.event.notify` / `ctx.subscribe.start`；call 是**裸函数** `ctx.call(target, input)`）；process 侧运行期以 `input.ctx.capabilities`（字符串数组）与 `input.ctx.sandbox`（bool）透传声明，供进程自检。
 
-- **引擎默认宿主装配（#69）**：`engine.New` 未显式 `WithHost` 时自动注入 KV/HTTP/Event/DB 原语实现与 `call` 解析器；声明了对应 capability 的 Tool 在生产环境直接可用（不再恒 `ErrCapabilityUnavailable`）。secret 默认仍无密钥源（fail-closed）；Server 经 `WithSecret` 注入 `SecretStore`（REQ-API-SECRETS）。
+- **引擎默认宿主装配（#69）**：`engine.New` 未显式 `WithHost` 时自动注入 HTTP/Event/DB 原语实现与 `call` 解析器；声明了对应 capability 的 Tool 在生产环境直接可用（不再恒 `ErrCapabilityUnavailable`）。secret 默认仍无密钥源（fail-closed）；Server 经 `WithSecret` 注入 `SecretStore`（REQ-API-SECRETS）。
 
 ### 6.2 call 与 event 的边界
 
@@ -308,7 +307,7 @@ hooks:
 
 - 调外部 API → `http`
 - 调内部能力 → `call`
-- 存结构化数据 → `db`；存配置/状态 → `kv`
+- 存结构化数据 / 配置 / 状态 → `db`
 - 读密码 / token → `secret`
 - 触发告警 / 审批 / Webhook → `event`
 - 写日志 → 不在此列，由 Hook 决定（见 5.3）
@@ -494,7 +493,7 @@ local r = ctx.ext.db.query({ driver = "postgres", dsn = ctx.input.dsn,
 
 **红线（`email_test.go:TestExtAtomsMustNotReadEnv` 机械守护）**：扩展原子的凭据（user/pass/key/apikey/sign）与连接配置一律从调用参数（args）传，**禁止读 `os.Getenv`**——原子契约与环境解耦，凭据由调用方负责。（`COORD_ADDR` 是侧车自身的运行位置、由引擎按 `listen` 注入，不属此列。）
 
-**已知调优边界**：单 step 执行超时硬编码 30s（`internal/engine/process.go` 的 `defaultExecTimeout`），多轮调用远端 LLM 的 agent 贴近该边界；后续宜开 per-step `timeout` 字段 / CLI flag。agent 侧的 LLM 输出容错（如 `depends_on` 归一化）属**易变层（Lua）职责**，稳定层（Go 反序列化 / 静态校验）保持严格。
+**已知调优边界（2026-09-23 已解决 → #77）**：单 step 执行超时默认 30s（`internal/engine/process.go` 的 `defaultExecTimeout`），**现已支持 Tool 级声明覆盖**：Tool 写 `timeout: "5m"`（Go duration）即用声明值，未声明仍回退 30s 防挂死。起因是多轮调用远端 LLM 的 agent 贴近该边界（首轮空 registry 触发重试时会超时）；实测更硬的反例是 mindstorm 的 `mindstorm__expand` 在 lua 里同步调 `ctx.ext.ai.complete`——AI 单次 17–20s，带 JSON 的长 prompt 必然超 30s，**100% 必失败**，且因「阻塞的宿主调用无法被 ctx 打断」（gopher-lua 只在回到解释循环时检查取消）报错时长常远超 30s，症状像 key/网络故障。agent 侧的 LLM 输出容错（如 `depends_on` 归一化）属**易变层（Lua）职责**，稳定层（Go 反序列化 / 静态校验）保持严格。
 
 ---
 
@@ -511,8 +510,8 @@ local r = ctx.ext.db.query({ driver = "postgres", dsn = ctx.input.dsn,
 │  Tool Registry                    │
 │  Schema / 版本 / 依赖图 / Lock    │
 ├─────────────────────────────────┤
-│  宿主能力层（7 个原语）            │
-│  http / call / db / kv / secret / event / subscribe
+│  宿主能力层（6 个原语）            │
+│  http / call / db / secret / event / subscribe
 │  （另有纯函数原子 time / template / crypto，始终可用）
 ├─────────────────────────────────┤
 │  Runtime 层                       │
@@ -664,7 +663,7 @@ CLI 是 V1 永久原生管理面（不同用户对 UI 需求不同，UI 以可�
 | `gear exec <flow>` | 触发 REST 执行面执行（`--addr` 指定执行面） |
 | `gear serve [--seed <yaml>] [--addr]` | 启动 REST 执行面（管理契约供 UI/程序调用，见 §11）。`--seed` 可灌入**含 Tool 与 Flow 混合**的多文档文件（按 Tool → Flow 顺序落库，因 Flow 静态校验需其 call 目标已存在）；任一对象失败则**回滚**本次全部写入 |
 | `gear ai gen flow\|tool --intent "..." [--register]` | AI 生成 Flow/Tool 草稿（`ext.ai`，见 §9）；同 `ai` 命令另含 `react`（见下）与 `capabilities` |
-| `gear ai react "<task>" [--max-steps N] [--allow http,kv] [--model/--provider/--base-url/--api-key]` | 跑 ReAct 智能体（LLM 逐步调内置/已注册工具完成任务，需联网 LLM；等价于 Tool entry 里 `ctx.ext.ai.react`） |
+| `gear ai react "<task>" [--max-steps N] [--allow http,secret] [--model/--provider/--base-url/--api-key]` | 跑 ReAct 智能体（LLM 逐步调内置/已注册工具完成任务，需联网 LLM；等价于 Tool entry 里 `ctx.ext.ai.react`） |
 | `gear ai capabilities` | 打印当前装配的原子能力目录（内核 builtin + pure 原语 + 已注册 ext.*，与 agent 提示词同源，随 extensions 配置动态变化） |
 | `gear ext <name>` | 运行内置扩展原语的 once 载体（email / sms / wecom / webhook / rabbitmq / kafka；`echo '{"method":"...","args":{...}}' \| gear ext email` 可调试）。service ext（webhook/rabbitmq/kafka/serve）的常规形态是常驻侧车 + 本地 HTTP，见 §9⑥ |
 | `gear mcp [--http :port]` | 以 MCP 执行面暴露 Gear（stdio 默认；`--http` 改 streamable HTTP，端点 `/mcp`），见 §11 第四种执行面 |

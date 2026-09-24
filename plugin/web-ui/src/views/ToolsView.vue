@@ -397,7 +397,7 @@ onMounted(async () => {
             （<code>echo '{"v":"1"}'</code>），否则 <code>sh</code> 会吃掉引号导致解析失败。
           </div>
           <div v-else-if="draft.runtime === 'lua'" class="hint-line">
-            Lua 是内联源码：通过 <code>ctx.http</code> / <code>ctx.call</code> / <code>ctx.kv</code> /
+            Lua 是内联源码：通过 <code>ctx.http</code> / <code>ctx.call</code> / <code>ctx.db</code> /
             <code>ctx.secret</code> 等原语访问外部能力，且必须与上面 capabilities 里声明的**一致** ——
             未声明的原语在运行期直接拒绝。
           </div>

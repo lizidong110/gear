@@ -49,7 +49,7 @@ func TestAIReactRunsWithMockProvider(t *testing.T) {
 	}
 	// 显式给模型参数也应跑通（flag → opts 的接线）
 	if err := runCLI(t, "ai", "react", "--max-steps", "1", "--provider", "mock",
-		"--model", "m", "--base-url", "http://127.0.0.1:1", "--api-key", "k", "--allow", "kv", "任务2"); err != nil {
+		"--model", "m", "--base-url", "http://127.0.0.1:1", "--api-key", "k", "--allow", "db", "任务2"); err != nil {
 		t.Fatalf("带模型参数的 react 失败: %v", err)
 	}
 }
@@ -81,13 +81,13 @@ func TestRenderHelpers(t *testing.T) {
 	// renderReactResult：map 形态 → 分段渲染（answer / used_tools / steps）
 	out := renderReactResult(map[string]interface{}{
 		"answer":     "最终答案",
-		"used_tools": []string{"kv.put", "http.Request"},
+		"used_tools": []string{"db.exec", "http.Request"},
 		"steps": []map[string]interface{}{
-			{"action": "kv.put", "observation": strings.Repeat("很长", 400)},
+			{"action": "db.exec", "observation": strings.Repeat("很长", 400)},
 			{"action": "", "observation": "收尾"},
 		},
 	})
-	if !strings.Contains(out, "最终答案") || !strings.Contains(out, "kv.put") {
+	if !strings.Contains(out, "最终答案") || !strings.Contains(out, "db.exec") {
 		t.Fatalf("渲染应含答案与使用过的工具，实际:\n%s", out)
 	}
 	if !strings.Contains(out, "(Final Answer)") {
@@ -108,7 +108,7 @@ func TestRenderHelpers(t *testing.T) {
 		t.Fatalf("非列表形态应退化为 YAML，实际 %q", got)
 	}
 	if got := renderCapabilities([]map[string]interface{}{
-		{"name": "kv", "kind": "builtin", "methods": map[string]interface{}{"put": nil}},
+		{"name": "db", "kind": "builtin", "methods": map[string]interface{}{"exec": nil}},
 		{"name": "crypto", "kind": "pure", "methods": map[string]interface{}{"hash": nil}},
 		{"name": "ext.ai", "kind": "ext", "methods": map[string]interface{}{"complete": nil}},
 	}); !strings.Contains(got, "1 个门禁原语") || !strings.Contains(got, "1 个纯函数原子") || !strings.Contains(got, "1 个扩展原语") {

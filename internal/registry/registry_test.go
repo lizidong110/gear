@@ -471,3 +471,34 @@ func TestDeleteFlowRunningGuard(t *testing.T) {
 		t.Fatalf("拒绝原因应指出是哪个执行在用，实际: %v", err)
 	}
 }
+
+// T-reg-multiproc：两个独立连接（模拟两个 gear 进程）并发写同一个 registry.db，
+// 不得报 SQLITE_BUSY（2026-09-24：Open 曾是裸 DSN，第二进程初始化扩展时撞锁直接退出）。
+func TestMultiProcessConcurrentWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.db")
+	reg1, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open reg1: %v", err)
+	}
+	defer reg1.Close()
+	reg2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open reg2: %v", err)
+	}
+	defer reg2.Close()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 40)
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func(i int) { defer wg.Done(); errs <- reg1.UpsertTool(validTool(fmt.Sprintf("t1-%d", i))) }(i)
+		go func(i int) { defer wg.Done(); errs <- reg2.UpsertTool(validTool(fmt.Sprintf("t2-%d", i))) }(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("并发写入失败（旧代码在此报 SQLITE_BUSY）: %v", err)
+		}
+	}
+}

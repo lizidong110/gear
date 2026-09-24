@@ -423,16 +423,14 @@ steps:
   - id: s2
     call: bogus.method
   - id: s3
-    call: kv.put
+    call: db.exec
     when: "${vars.flag}"
     input:
-      key: k
-      value: v
+      sql: "SELECT 1"
   - id: s4
-    call: kv.put
+    call: db.exec
     input:
-      key: "${bogus.x}"
-      value: v
+      sql: "${bogus.x}"
 `
 	var out map[string]any
 	callTool(t, session, "gear_validate", map[string]any{"yaml": brokenBundle}, &out)
@@ -669,7 +667,7 @@ func TestMCPCapabilitiesTool(t *testing.T) {
 		names[n] = true
 		kinds[n] = k
 	}
-	for _, want := range []string{"http", "call", "db", "kv", "secret", "event", "subscribe"} {
+	for _, want := range []string{"http", "call", "db", "secret", "event", "subscribe"} {
 		if !names[want] {
 			t.Fatalf("能力目录应含内核门禁原语 %s: %v", want, names)
 		}

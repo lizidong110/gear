@@ -6,7 +6,7 @@ Gear 是「机制内核」：只给 能力原语 + Tool（执行单元）+ Flow�
 并附 warning——该进程会随**发起启动的那次会话**结束被回收。它是 running，但活不到会话之后。
 
 ## 四层模型
-- **能力原语（宿主提供）**：受门禁 7 个 `http/call/db/kv/secret/event/subscribe`（须声明才可用）；
+- **能力原语（宿主提供）**：受门禁 6 个 `http/call/db/secret/event/subscribe`（须声明才可用）；
   免门禁纯函数 3 个 `time/template/crypto`（始终可用，**声明了反而被拒**）；`ext.*`（须注册且须声明）。
   `json` **不是能力**（只是 Lua 的 `ctx.json` 绑定，Flow 不能直调）。
 - **Tool** = 能力 + 业务逻辑，可复用。**可复用的才建 Tool；一次性的直接在 `step.call` 写「能力.方法」**。

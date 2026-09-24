@@ -144,31 +144,3 @@ func TestInvokeCapabilityBlocksSecret(t *testing.T) {
 		}
 	}
 }
-
-// TestOriginAllowed 表驱动覆盖判定本身（含畸形 Origin）。
-func TestOriginAllowed(t *testing.T) {
-	cases := []struct {
-		origin string
-		want   bool
-	}{
-		{"", true},
-		{"http://127.0.0.1:8787", true},
-		{"http://127.0.0.1", true},
-		{"http://localhost:5173", true},
-		{"http://LOCALHOST:5173", true},
-		{"http://[::1]:8080", true},
-		{"https://evil.example", false},
-		{"null", false},                      // 沙箱 iframe / 本地文件的 Origin
-		{"http://127.0.0.1.evil.com", false}, // 前缀伪装
-		{"://bad", false},                    // 解析失败
-	}
-	for _, c := range cases {
-		req := httptest.NewRequest("POST", "/api/capabilities/invoke", nil)
-		if c.origin != "" {
-			req.Header.Set("Origin", c.origin)
-		}
-		if got := originAllowed(req); got != c.want {
-			t.Fatalf("originAllowed(%q) = %v，期望 %v", c.origin, got, c.want)
-		}
-	}
-}

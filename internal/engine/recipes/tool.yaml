@@ -1,7 +1,7 @@
 # 生成「Tool」的可编辑配方（ai.gen-tool 制品）。
 # 这是选项2（capabilities 能力目录）直接发挥作用的场景：entry 是 Lua 实现，
 # 可调用 ctx.* 宿主能力，agent 必须基于「生成时动态注入的 capabilities 列表」来写，避免幻觉。
-# 注意：本配方不写死任何具体能力；可用能力由引擎在生成时按「当前已注册 ext.* + 内核原语（受门禁 7 + 纯函数 3）」
+# 注意：本配方不写死任何具体能力；可用能力由引擎在生成时按「当前已注册 ext.* + 内核原语（受门禁 6 + 纯函数 3）」
 # 实时注入到提示词的「可用能力与参数」一节，新增扩展会自动出现，无需改此文件。
 kind: tool
 max_retries: 3
@@ -19,11 +19,11 @@ output_hints: |
   - 出输出：`return { ... }` 或 `ctx.output = { ... }`，必须产出一个 table；
   - 宿主能力在「可用能力与参数」一节动态注入（每次生成按当前已注册 ext.* + 内核原语实时列出），
     只可使用其中列出的方法与参数；未列出的 ctx.* 视为不存在，不得臆造：
-    - 内置原语（http/call/db/kv/secret/event）用「位置参数」：ctx.http.Request(method, url, ...)；
+    - 内置原语（http/call/db/secret/event）用「位置参数」：ctx.http.Request(method, url, ...)；
     - 扩展原语（ext.*）用「单 table 具名调用」：ctx.ext.<name>.<method>({ 字段 = 值 })；
   - 不要调用 ctx.secret 去取 LLM key：若需调用 LLM，使用 capabilities 中列出的 ctx.ext.<x>.complete，
     它会自动读取环境变量中的 key。
   只输出 JSON，不要解释。
 capabilities_hint: |
-  可用能力由「可用能力与参数」一节给出（实时，非写死）：内核原语（受门禁 7 + 纯函数 3）+ 当前所有已注册 ext.*，
+  可用能力由「可用能力与参数」一节给出（实时，非写死）：内核原语（受门禁 6 + 纯函数 3）+ 当前所有已注册 ext.*，
   每条带方法名与参数 schema。entry 只能调用其中列出的方法；ext 方法一律「单 table 具名调用」。

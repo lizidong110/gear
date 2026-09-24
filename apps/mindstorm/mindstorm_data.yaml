@@ -1,0 +1,598 @@
+# mindstorm 数据层 Tool（注册：gear tool register apps/mindstorm/mindstorm_data.yaml）
+#
+# 持久化硬约束：db 原子的 dsn 缺省回退「引擎内存 scratch 库，重启即丢且无报错」。
+# 故本文件所有 db 调用都显式传 dsn —— 指向 build/mindstorm.db（gitignored 产物区，文件库）。
+# 列名用 `ord`（不用 `order`，SQL 保留字）；nodes.path 物化祖先链，免递归 CTE。
+#
+# dsn 硬编码为绝对路径（与 v1 brainstorm__api 硬编码 gear.exe 绝对路径同一务实风格）；
+# 生产应改为可配 / 相对 GEAR_HOME，此处 MVP 先求「落地可验证」。
+#
+# 注意：Lua 数组中间塞 nil 会被 gear 的 Lua→Go 转换在第一个 nil 处截断（t.Len() 长度运算符语义），
+# 故 node_create 用「有无 parent 两条分支」构造 params，绝不把 nil 放进占位符数组。
+---
+kind: Tool
+id: mindstorm__init
+name: mindstorm 建表（幂等）
+description: 首次运行建 SQLite 表（trees/nodes/node_tags/ai_calls），幂等。前端启动调一次。
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties: {}
+output_schema:
+  type: object
+  properties:
+    ok: {type: boolean}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local SCHEMA = [[
+    CREATE TABLE IF NOT EXISTS trees(
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT DEFAULT '',
+      created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS nodes(
+      id TEXT PRIMARY KEY, tree_id TEXT NOT NULL, parent_id TEXT,
+      path TEXT NOT NULL, ord INTEGER NOT NULL, depth INTEGER NOT NULL,
+      title TEXT NOT NULL, body TEXT DEFAULT '', summary TEXT DEFAULT '',
+      ai_generated INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));
+    CREATE INDEX IF NOT EXISTS idx_nodes_tree_path ON nodes(tree_id, path);
+    CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(tree_id, parent_id);
+    CREATE TABLE IF NOT EXISTS node_tags(
+      node_id TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(node_id, tag));
+    CREATE TABLE IF NOT EXISTS ai_calls(
+      id TEXT PRIMARY KEY, tree_id TEXT, node_id TEXT, prompt_hash TEXT,
+      model TEXT, created_at TEXT DEFAULT (datetime('now')));
+    CREATE INDEX IF NOT EXISTS idx_aicalls_hash ON ai_calls(prompt_hash);
+  ]]
+  ctx.db.exec({driver="sqlite", dsn=DSN, sql=SCHEMA})
+  return {ok = true}
+---
+kind: Tool
+id: mindstorm__tree_create
+name: 创建树
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    id: {type: string}
+    title: {type: string}
+    category: {type: string}
+  required: [id, title]
+output_schema:
+  type: object
+  properties:
+    id: {type: string}
+    title: {type: string}
+    category: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local id = ctx.input.id
+  local title = ctx.input.title
+  local cat = ctx.input.category or ""
+  ctx.db.exec({driver="sqlite", dsn=DSN,
+    sql="INSERT OR REPLACE INTO trees(id,title,category,updated_at) VALUES(?,?,?,datetime('now'))",
+    params={id, title, cat}})
+  return {id=id, title=title, category=cat}
+---
+kind: Tool
+id: mindstorm__tree_list
+name: 列树（可按 category 过滤）
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    category: {type: string}
+output_schema:
+  type: object
+  properties:
+    trees:
+      type: array
+      items:
+        type: object
+        properties:
+          id: {type: string}
+          title: {type: string}
+          category: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local cat = ctx.input.category
+  local sql, params
+  if cat and cat ~= "" then
+    sql = "SELECT id,title,category FROM trees WHERE category=? ORDER BY updated_at DESC"
+    params = {cat}
+  else
+    sql = "SELECT id,title,category FROM trees ORDER BY updated_at DESC"
+    params = {}
+  end
+  local rows = ctx.db.query({driver="sqlite", dsn=DSN, sql=sql, params=params}) or {}
+  return {trees = rows}
+---
+kind: Tool
+id: mindstorm__tree_delete
+name: 删除树（级联节点）
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    id: {type: string}
+  required: [id]
+output_schema:
+  type: object
+  properties:
+    deleted: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local id = ctx.input.id
+  ctx.db.exec({driver="sqlite", dsn=DSN, sql="DELETE FROM nodes WHERE tree_id=?", params={id}})
+  ctx.db.exec({driver="sqlite", dsn=DSN, sql="DELETE FROM trees WHERE id=?", params={id}})
+  return {deleted=id}
+---
+kind: Tool
+id: mindstorm__tree_update
+name: 改树标题 / 分类
+description: 给定 tree id，更新 title 和/或 category（缺省字段不改动）。前端左栏重命名/改分类用。
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    id: {type: string}
+    title: {type: string}
+    category: {type: string}
+  required: [id]
+output_schema:
+  type: object
+  properties:
+    id: {type: string}
+    title: {type: string}
+    category: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local id = ctx.input.id
+  local title = ctx.input.title
+  local cat = ctx.input.category
+  if title and title ~= "" then
+    ctx.db.exec({driver="sqlite", dsn=DSN, sql="UPDATE trees SET title=?,updated_at=datetime('now') WHERE id=?", params={title, id}})
+  end
+  if cat then
+    ctx.db.exec({driver="sqlite", dsn=DSN, sql="UPDATE trees SET category=?,updated_at=datetime('now') WHERE id=?", params={cat, id}})
+  end
+  local r = ctx.db.query({driver="sqlite", dsn=DSN, sql="SELECT id,title,category FROM trees WHERE id=?", params={id}})
+  if not r or #r == 0 then error("tree 不存在: " .. id) end
+  return r[1]
+---
+kind: Tool
+id: mindstorm__node_create
+name: 创建节点（子/同级）
+description: 给定 tree_id 与可选 parent_id（空=根）；算 path/ord/depth 并落库。id 由调用方生成。
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    id: {type: string}
+    tree_id: {type: string}
+    parent_id: {type: string}
+    title: {type: string}
+    body: {type: string}
+    summary: {type: string}
+    ai_generated: {type: integer}
+  required: [id, tree_id, title]
+output_schema:
+  type: object
+  properties:
+    id: {type: string}
+    tree_id: {type: string}
+    parent_id: {type: string}
+    path: {type: string}
+    ord: {type: integer}
+    depth: {type: integer}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local id = ctx.input.id
+  local tree_id = ctx.input.tree_id
+  local pid = ctx.input.parent_id or ""
+  local title = ctx.input.title
+  local body = ctx.input.body or ""
+  local summary = ctx.input.summary or ""
+  local ai = ctx.input.ai_generated or 0
+  local path, depth, ord
+  if pid ~= "" then
+    local pr = ctx.db.query({driver="sqlite", dsn=DSN, sql="SELECT path,depth FROM nodes WHERE id=?", params={pid}})
+    if not pr or #pr == 0 then error("parent_id 不存在: " .. pid) end
+    path = pr[1].path .. "/" .. id
+    depth = pr[1].depth + 1
+    local oq = ctx.db.query({driver="sqlite", dsn=DSN,
+      sql="SELECT COALESCE(MAX(ord),0)+1000 AS o FROM nodes WHERE tree_id=? AND parent_id=?", params={tree_id, pid}})
+    ord = oq[1].o
+    ctx.db.exec({driver="sqlite", dsn=DSN,
+      sql="INSERT INTO nodes(id,tree_id,parent_id,path,ord,depth,title,body,summary,ai_generated,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+      params={id, tree_id, pid, path, ord, depth, title, body, summary, ai}})
+  else
+    path = "/" .. id
+    depth = 0
+    local oq = ctx.db.query({driver="sqlite", dsn=DSN,
+      sql="SELECT COALESCE(MAX(ord),0)+1000 AS o FROM nodes WHERE tree_id=? AND parent_id IS NULL", params={tree_id}})
+    ord = oq[1].o
+    ctx.db.exec({driver="sqlite", dsn=DSN,
+      sql="INSERT INTO nodes(id,tree_id,path,ord,depth,title,body,summary,ai_generated,updated_at) VALUES(?,?,?,?,?,?,?,?,?,datetime('now'))",
+      params={id, tree_id, path, ord, depth, title, body, summary, ai}})
+  end
+  return {id=id, tree_id=tree_id, parent_id=pid, path=path, ord=ord, depth=depth}
+---
+kind: Tool
+id: mindstorm__node_children
+name: 列子节点（按 ord），含 child_count
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    tree_id: {type: string}
+    parent_id: {type: string}
+  required: [tree_id]
+output_schema:
+  type: object
+  properties:
+    nodes:
+      type: array
+      items:
+        type: object
+        properties:
+          id: {type: string}
+          title: {type: string}
+          depth: {type: integer}
+          ai_generated: {type: integer}
+          summary: {type: string}
+          child_count: {type: integer}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local tree_id = ctx.input.tree_id
+  local pid = ctx.input.parent_id or ""
+  local sql, params
+  if pid ~= "" then
+    sql = "SELECT n.id,n.title,n.depth,n.ai_generated,n.summary,"
+       .. "(SELECT COUNT(*) FROM nodes c WHERE c.parent_id=n.id) AS child_count "
+       .. "FROM nodes n WHERE n.tree_id=? AND n.parent_id=? ORDER BY n.ord"
+    params = {tree_id, pid}
+  else
+    sql = "SELECT n.id,n.title,n.depth,n.ai_generated,n.summary,"
+       .. "(SELECT COUNT(*) FROM nodes c WHERE c.parent_id=n.id) AS child_count "
+       .. "FROM nodes n WHERE n.tree_id=? AND n.parent_id IS NULL ORDER BY n.ord"
+    params = {tree_id}
+  end
+  local rows = ctx.db.query({driver="sqlite", dsn=DSN, sql=sql, params=params}) or {}
+  return {nodes = rows}
+---
+kind: Tool
+id: mindstorm__node_get
+name: 取单节点（含 path/child_count）
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    id: {type: string}
+  required: [id]
+output_schema:
+  type: object
+  properties:
+    id: {type: string}
+    tree_id: {type: string}
+    parent_id: {type: string}
+    path: {type: string}
+    ord: {type: integer}
+    depth: {type: integer}
+    title: {type: string}
+    body: {type: string}
+    summary: {type: string}
+    ai_generated: {type: integer}
+    child_count: {type: integer}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local id = ctx.input.id
+  local rows = ctx.db.query({driver="sqlite", dsn=DSN,
+    sql="SELECT n.id,n.tree_id,n.parent_id,n.path,n.ord,n.depth,n.title,n.body,n.summary,n.ai_generated,"
+       .."(SELECT COUNT(*) FROM nodes c WHERE c.parent_id=n.id) AS child_count FROM nodes n WHERE n.id=?",
+    params={id}})
+  if not rows or #rows == 0 then error("node 不存在: " .. id) end
+  return rows[1]
+---
+kind: Tool
+id: mindstorm__node_update
+name: 改节点标题/详情/摘要
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    id: {type: string}
+    title: {type: string}
+    body: {type: string}
+    summary: {type: string}
+  required: [id]
+output_schema:
+  type: object
+  properties:
+    id: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local id = ctx.input.id
+  local title = ctx.input.title
+  local body = ctx.input.body
+  local summary = ctx.input.summary
+  if title and title ~= "" then
+    ctx.db.exec({driver="sqlite", dsn=DSN, sql="UPDATE nodes SET title=?,updated_at=datetime('now') WHERE id=?", params={title, id}})
+  end
+  if body then
+    ctx.db.exec({driver="sqlite", dsn=DSN, sql="UPDATE nodes SET body=?,updated_at=datetime('now') WHERE id=?", params={body, id}})
+  end
+  if summary then
+    ctx.db.exec({driver="sqlite", dsn=DSN, sql="UPDATE nodes SET summary=?,updated_at=datetime('now') WHERE id=?", params={summary, id}})
+  end
+  return {id=id}
+---
+kind: Tool
+id: mindstorm__node_delete
+name: 删除节点（级联子孙，硬删）
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    id: {type: string}
+  required: [id]
+output_schema:
+  type: object
+  properties:
+    deleted: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local id = ctx.input.id
+  local r = ctx.db.query({driver="sqlite", dsn=DSN, sql="SELECT path FROM nodes WHERE id=?", params={id}})
+  if not r or #r == 0 then error("node 不存在: " .. id) end
+  local path = r[1].path
+  -- 级联：path 以该节点 path 为前缀的（含自身）全部删除
+  ctx.db.exec({driver="sqlite", dsn=DSN, sql="DELETE FROM nodes WHERE path LIKE ?", params={path .. "/%"}})
+  ctx.db.exec({driver="sqlite", dsn=DSN, sql="DELETE FROM nodes WHERE id=?", params={id}})
+  return {deleted=id}
+---
+kind: Tool
+id: mindstorm__search
+name: 搜索节点（标题/摘要/正文）
+description: 按关键词全文搜索节点，返回命中节点（含所属树、面包屑、命中片段）。可选 tree_id 限定在单棵树内。
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    q: {type: string}
+    tree_id: {type: string}
+    limit: {type: integer}
+  required: [q]
+output_schema:
+  type: object
+  properties:
+    nodes:
+      type: array
+      items:
+        type: object
+        properties:
+          id: {type: string}
+          tree_id: {type: string}
+          tree_title: {type: string}
+          title: {type: string}
+          depth: {type: integer}
+          breadcrumb: {type: string}
+          snippet: {type: string}
+    count: {type: integer}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local q = ctx.input.q
+  if not q or q == "" then
+    return {nodes = ctx.json.decode("[]"), count = 0}
+  end
+  local limit = ctx.input.limit or 50
+  if limit < 1 then limit = 1 end
+  if limit > 200 then limit = 200 end
+  local tree_id = ctx.input.tree_id
+  local like = "%" .. q .. "%"
+  local sql, params
+  if tree_id and tree_id ~= "" then
+    sql = "SELECT id,tree_id,path,depth,title,summary,body FROM nodes WHERE tree_id=? AND (title LIKE ? OR summary LIKE ? OR body LIKE ?) ORDER BY updated_at DESC LIMIT ?"
+    params = {tree_id, like, like, like, limit}
+  else
+    sql = "SELECT id,tree_id,path,depth,title,summary,body FROM nodes WHERE (title LIKE ? OR summary LIKE ? OR body LIKE ?) ORDER BY updated_at DESC LIMIT ?"
+    params = {like, like, like, limit}
+  end
+  local rows = ctx.db.query({driver="sqlite", dsn=DSN, sql=sql, params=params}) or {}
+
+  local ql = q:lower()
+  local cache = {}
+  local function titleOf(id)
+    if cache[id] then return cache[id] end
+    local r = ctx.db.query({driver="sqlite", dsn=DSN, sql="SELECT title FROM nodes WHERE id=?", params={id}})
+    local t = (r and #r > 0) and r[1].title or "?"
+    cache[id] = t
+    return t
+  end
+  local tcache = {}
+  local function treeTitle(id)
+    if tcache[id] then return tcache[id] end
+    local r = ctx.db.query({driver="sqlite", dsn=DSN, sql="SELECT title FROM trees WHERE id=?", params={id}})
+    local t = (r and #r > 0) and r[1].title or "?"
+    tcache[id] = t
+    return t
+  end
+  local function snippetOf(src)
+    if not src or src == "" then return "" end
+    local i = string.find(src:lower(), ql, 1, true)
+    if not i then return string.sub(src, 1, 80) end
+    local s = math.max(1, i - 24)
+    local e = math.min(#src, i + #q + 40)
+    return (s > 1 and "…" or "") .. string.sub(src, s, e) .. (e < #src and "…" or "")
+  end
+  local function pickSnippet(r)
+    if r.summary and string.find(r.summary:lower(), ql, 1, true) then return snippetOf(r.summary) end
+    if r.body and string.find(r.body:lower(), ql, 1, true) then return snippetOf(r.body) end
+    if r.summary and r.summary ~= "" then return string.sub(r.summary, 1, 80) end
+    if r.body and r.body ~= "" then return string.sub(r.body, 1, 80) end
+    return ""
+  end
+
+  local out = {}
+  for _, r in ipairs(rows) do
+    local parts = {}
+    for seg in string.gmatch(r.path, "[^/]+") do
+      if seg ~= r.id then table.insert(parts, titleOf(seg)) end
+    end
+    table.insert(out, {id = r.id, tree_id = r.tree_id, tree_title = treeTitle(r.tree_id),
+      title = r.title, depth = r.depth, breadcrumb = table.concat(parts, " › "),
+      snippet = pickSnippet(r)})
+  end
+  local j = ctx.json.encode(out)
+  if #out == 0 then j = "[]" end
+  return {nodes = ctx.json.decode(j), count = #out}
+---
+kind: Tool
+id: mindstorm__tag_add
+name: 给节点加标签
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    node_id: {type: string}
+    tag: {type: string}
+  required: [node_id, tag]
+output_schema:
+  type: object
+  properties:
+    node_id: {type: string}
+    tag: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local node_id = ctx.input.node_id
+  local tag = (ctx.input.tag or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if tag == "" then error("tag 不能为空") end
+  ctx.db.exec({driver="sqlite", dsn=DSN, sql="INSERT OR IGNORE INTO node_tags(node_id,tag) VALUES(?,?)", params={node_id, tag}})
+  return {node_id=node_id, tag=tag}
+---
+kind: Tool
+id: mindstorm__tag_remove
+name: 移除节点标签
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    node_id: {type: string}
+    tag: {type: string}
+  required: [node_id, tag]
+output_schema:
+  type: object
+  properties:
+    node_id: {type: string}
+    tag: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local node_id = ctx.input.node_id
+  local tag = ctx.input.tag
+  ctx.db.exec({driver="sqlite", dsn=DSN, sql="DELETE FROM node_tags WHERE node_id=? AND tag=?", params={node_id, tag}})
+  return {node_id=node_id, tag=tag}
+---
+kind: Tool
+id: mindstorm__tag_list
+name: 列某节点的标签
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties:
+    node_id: {type: string}
+  required: [node_id]
+output_schema:
+  type: object
+  properties:
+    tags:
+      type: array
+      items: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local rows = ctx.db.query({driver="sqlite", dsn=DSN, sql="SELECT tag FROM node_tags WHERE node_id=? ORDER BY tag", params={ctx.input.node_id}}) or {}
+  local tags = {}
+  for _, r in ipairs(rows) do table.insert(tags, r.tag) end
+  local j = ctx.json.encode(tags)
+  if #tags == 0 then j = "[]" end
+  return {tags = ctx.json.decode(j)}
+---
+kind: Tool
+id: mindstorm__tags_all
+name: 列全部标签（去重）
+runtime: lua
+capabilities: [db]
+input_schema:
+  type: object
+  properties: {}
+output_schema:
+  type: object
+  properties:
+    tags:
+      type: array
+      items: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local rows = ctx.db.query({driver="sqlite", dsn=DSN, sql="SELECT DISTINCT tag FROM node_tags ORDER BY tag", params={}}) or {}
+  local tags = {}
+  for _, r in ipairs(rows) do table.insert(tags, r.tag) end
+  local j = ctx.json.encode(tags)
+  if #tags == 0 then j = "[]" end
+  return {tags = ctx.json.decode(j)}

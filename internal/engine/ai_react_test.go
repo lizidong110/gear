@@ -43,6 +43,22 @@ func (s *scriptedLLM) Complete(_ context.Context, req LLMRequest) (string, error
 	return t, nil
 }
 
+func (s *scriptedLLM) CompleteStream(_ context.Context, req LLMRequest, onDelta func(content, reasoning string) error) error {
+	s.got = append(s.got, req)
+	if s.err != nil {
+		return s.err
+	}
+	if s.i >= len(s.texts) {
+		return fmt.Errorf("脚本已耗尽（第 %d 次调用）", s.i+1)
+	}
+	t := s.texts[s.i]
+	s.i++
+	if onDelta != nil {
+		return onDelta(t, "")
+	}
+	return nil
+}
+
 func seedTool(t *testing.T, reg *registry.Registry) {
 	t.Helper()
 	if err := reg.UpsertTool(&model.Tool{
@@ -101,7 +117,7 @@ func TestReactFailsClosedWithoutExecutorOrTask(t *testing.T) {
 
 func TestReactHappyPathExecutesToolThenAnswers(t *testing.T) {
 	llm := &scriptedLLM{texts: []string{
-		actionJSON("kv.put", `{"key":"k","value":"v"}`),
+		actionJSON("db.exec", `{"sql":"SELECT 1"}`),
 		"Thought: 已经拿到结果\nFinal Answer: 答案是 42",
 	}}
 	a, entries := newReactAgent(t, llm)
@@ -115,14 +131,14 @@ func TestReactHappyPathExecutesToolThenAnswers(t *testing.T) {
 		t.Fatalf("answer 应为 Final Answer 的内容，实际 %q", m["answer"])
 	}
 	used, _ := m["used_tools"].([]string)
-	if len(used) != 1 || used[0] != "kv.put" {
+	if len(used) != 1 || used[0] != "db.exec" {
 		t.Fatalf("used_tools 应记录实际调用过的工具，实际 %v", used)
 	}
 	steps, _ := m["steps"].([]map[string]interface{})
 	if len(steps) != 2 {
 		t.Fatalf("应记录 2 步（工具步 + 收尾步），实际 %d", len(steps))
 	}
-	if len(*entries) != 1 || !strings.Contains((*entries)[0], "ctx.kv.put") {
+	if len(*entries) != 1 || !strings.Contains((*entries)[0], "ctx.db.exec") {
 		t.Fatalf("工具调用必须经宿主能力通道执行，实际 entry=%v", *entries)
 	}
 	// 缺省值：未给温度/步数时按约定值，不能退化成 0（否则一次都不跑）
@@ -133,7 +149,7 @@ func TestReactHappyPathExecutesToolThenAnswers(t *testing.T) {
 
 func TestReactAllowListBlocksUnlistedTool(t *testing.T) {
 	llm := &scriptedLLM{texts: []string{
-		actionJSON("kv.put", `{"key":"k","value":"v"}`),
+		actionJSON("db.exec", `{"sql":"SELECT 1"}`),
 		"Final Answer: 放弃",
 	}}
 	a, entries := newReactAgent(t, llm)
@@ -154,8 +170,8 @@ func TestReactAllowListBlocksUnlistedTool(t *testing.T) {
 func TestReactDuplicateCallIsStopped(t *testing.T) {
 	// 同一工具 + 同一参数连续两次：第二次必须被拦（防模型陷入同一动作的死循环）。
 	llm := &scriptedLLM{texts: []string{
-		actionJSON("kv.put", `{"key":"k","value":"v"}`),
-		actionJSON("kv.put", `{"key":"k","value":"v"}`),
+		actionJSON("db.exec", `{"sql":"SELECT 1"}`),
+		actionJSON("db.exec", `{"sql":"SELECT 1"}`),
 	}}
 	a, entries := newReactAgent(t, llm)
 
@@ -187,7 +203,7 @@ func TestReactMalformedOutputAndMaxSteps(t *testing.T) {
 }
 
 func TestReactPropagatesExecutorErrorAsObservation(t *testing.T) {
-	llm := &scriptedLLM{texts: []string{actionJSON("kv.put", `{"key":"k","value":"v"}`)}}
+	llm := &scriptedLLM{texts: []string{actionJSON("db.exec", `{"sql":"SELECT 1"}`)}}
 	a, _ := newReactAgent(t, llm)
 	a.exec = func(context.Context, string, map[string]interface{}) (map[string]interface{}, error) {
 		return nil, errors.New("插件崩了")
@@ -201,7 +217,7 @@ func TestReactPropagatesExecutorErrorAsObservation(t *testing.T) {
 
 func TestReactBuildActionEntryFailureIsSurfaced(t *testing.T) {
 	// 编不出 Lua 入口（例如内置原语没有该方法）→ 作为 observation 回灌，不能 panic。
-	llm := &scriptedLLM{texts: []string{actionJSON("kv.nope", `{}`)}}
+	llm := &scriptedLLM{texts: []string{actionJSON("db.nope", `{}`)}}
 	a, entries := newReactAgent(t, llm)
 	res, _ := a.React(context.Background(), "任务", ReactOpts{MaxSteps: 1})
 	if len(*entries) != 0 {
@@ -228,7 +244,7 @@ func TestReactMethodPassesOptsThrough(t *testing.T) {
 	if _, err := a.ReactMethod(map[string]interface{}{
 		"task":        "任务",
 		"max_steps":   float64(3),
-		"allow":       []interface{}{"kv"},
+		"allow":       []interface{}{"db"},
 		"provider":    "p",
 		"model":       "m",
 		"base_url":    "http://x",
@@ -257,11 +273,11 @@ func TestReactPromptAndToolsText(t *testing.T) {
 	if !strings.Contains(all, "ctx.ext.demo.run") {
 		t.Fatal("已注册的 ext.* 应出现在可用工具清单里")
 	}
-	only := a.reactToolsText([]string{"kv"})
+	only := a.reactToolsText([]string{"db"})
 	if strings.Contains(only, "ctx.http") {
 		t.Fatal("allow 过滤后不得列出未授权的原语")
 	}
-	if !strings.Contains(only, "ctx.kv.put") {
+	if !strings.Contains(only, "ctx.db.exec") {
 		t.Fatal("allow 内的原语应列出")
 	}
 }
@@ -535,11 +551,11 @@ func TestCheckCallTargetsAcceptsCapabilityDirectCall(t *testing.T) {
 	seedTool(t, reg)
 	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, nil)
 
-	f := model.Flow{ID: "f", Name: "n", Description: "d", Steps: []model.Step{{ID: "s1", Call: "kv.put"}}}
+	f := model.Flow{ID: "f", Name: "n", Description: "d", Steps: []model.Step{{ID: "s1", Call: "db.exec"}}}
 	if err := a.checkCallTargets(f, nil); err != nil {
 		t.Fatalf("「能力.方法」直调应合法: %v", err)
 	}
-	f.Steps[0].Call = "kv.nope"
+	f.Steps[0].Call = "db.nope"
 	if err := a.checkCallTargets(f, nil); err == nil {
 		t.Fatal("内置原语不存在的方法必须被拒")
 	}
@@ -598,8 +614,8 @@ func TestRecipeLoaderDirOverrideAndEmbeddedFallback(t *testing.T) {
 // ---- 小工具 ----
 
 func TestParseReactAction(t *testing.T) {
-	tool, method, args, ok := parseReactAction(actionJSON("kv.put", `{"key":"k"}`))
-	if !ok || tool != "kv" || method != "put" || args["key"] != "k" {
+	tool, method, args, ok := parseReactAction(actionJSON("db.exec", `{"sql":"SELECT 1"}`))
+	if !ok || tool != "db" || method != "exec" || args["sql"] != "SELECT 1" {
 		t.Fatalf("解析不符: %q/%q/%v/%v", tool, method, args, ok)
 	}
 	tool, method, _, ok = parseReactAction(actionJSON("ext.ai.complete", `{}`))
@@ -619,7 +635,7 @@ func TestParseReactAction(t *testing.T) {
 	if _, _, _, ok := parseReactAction("```json\n{\"method\":\"x\"}\n```"); ok {
 		t.Fatal("缺 tool 字段应解析失败")
 	}
-	if _, _, args, ok := parseReactAction("```json\n{\"tool\":\"kv.get\"}\n```"); !ok || args == nil {
+	if _, _, args, ok := parseReactAction("```json\n{\"tool\":\"db.query\"}\n```"); !ok || args == nil {
 		t.Fatal("缺 args 时应补成空 map（而不是 nil 让后续 panic）")
 	}
 }
@@ -652,7 +668,7 @@ func TestReactTextHelpers(t *testing.T) {
 	if got := trimThought("  纯思考  "); got != "纯思考" {
 		t.Fatalf("无 Action 时应取全文并去空白，实际 %q", got)
 	}
-	if !allowContains([]string{"http", "kv"}, "kv") {
+	if !allowContains([]string{"http", "db"}, "db") {
 		t.Fatal("allowContains 应命中显式名单")
 	}
 	if !allowContains([]string{"ext.*"}, "ext.anything") {
@@ -661,7 +677,7 @@ func TestReactTextHelpers(t *testing.T) {
 	if allowContains([]string{"ext.*"}, "http") {
 		t.Fatal("ext.* 不得放行内核原语")
 	}
-	if allowContains([]string{"http"}, "kv") {
+	if allowContains([]string{"http"}, "db") {
 		t.Fatal("名单外的工具必须拒绝")
 	}
 	if got := stableJSON(map[string]interface{}{"b": 1, "a": 2}); got != `{"a":2,"b":1}` {
@@ -712,8 +728,8 @@ func TestParseToolSummariesAndMisc(t *testing.T) {
 }
 
 func TestBuildActionEntryShapes(t *testing.T) {
-	entry, err := buildActionEntry("kv", "put", map[string]interface{}{"key": "k", "value": "v"})
-	if err != nil || !strings.Contains(entry, "ctx.kv.put(") || !strings.Contains(entry, `"k"`) {
+	entry, err := buildActionEntry("db", "exec", map[string]interface{}{"sql": "SELECT 1"})
+	if err != nil || !strings.Contains(entry, "ctx.db.exec(") || !strings.Contains(entry, `"SELECT 1"`) {
 		t.Fatalf("内置原语应编成位置参数调用: (%s, %v)", entry, err)
 	}
 	entry, err = buildActionEntry("crypto", "hash", map[string]interface{}{"alg": "sha256"})
@@ -723,7 +739,7 @@ func TestBuildActionEntryShapes(t *testing.T) {
 	if _, err := buildActionEntry("crypto", "nope", nil); err == nil {
 		t.Fatal("纯函数原子不存在的方法必须被拒（解析点拒绝未知值）")
 	}
-	if _, err := buildActionEntry("kv", "nope", nil); err == nil {
+	if _, err := buildActionEntry("db", "nope", nil); err == nil {
 		t.Fatal("内置原语不存在的方法必须被拒")
 	}
 	entry, err = buildActionEntry("ext.ai", "complete", map[string]interface{}{"prompt": "hi"})

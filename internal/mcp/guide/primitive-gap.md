@@ -29,7 +29,7 @@
 | 形态 | 判据 | 落点 | 是否进门禁 |
 |---|---|---|---|
 | 纯函数原语 | 无 IO、无凭据、确定性（`hash`/`base64`/`parse`） | `internal/cap`，单具名 table 入参 | 否（声明了反而被拒） |
-| 受门禁原语 | 有外发 IO 或副作用（网络/DB/KV/事件/密钥） | `internal/cap` 的 `KnownPrimitives` | **是** |
+| 受门禁原语 | 有外发 IO 或副作用（网络/DB/事件/密钥） | `internal/cap` 的 `KnownPrimitives` | **是** |
 | 扩展原子 `ext.*` | 需握手/配置/第三方 SDK/侧车，或需长驻 | `plugin/extensions.yaml` 注册，可选 `service: true` | **是** |
 | **不申请原语** | 只在某一个应用里复用 | **直接建 Tool**（Lua/process），或 step 直调已有能力 | —（**这才是大多数情况的答案**） |
 

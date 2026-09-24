@@ -15,7 +15,7 @@ import (
 //   - Start：长驻执行（service 模式），拉起进程**不等待**，返回可监管句柄。
 //
 // host 是一次执行的宿主能力视图（M5）：由各 Tool 的 Capabilities 精确授权，运行时原语
-// （http/call/db/kv/secret/event）经它放行。未声明的原语调用一律被原语自身拒绝（最小权限）。
+// （http/call/db/secret/event）经它放行。未声明的原语调用一律被原语自身拒绝（最小权限）。
 type Runtime interface {
 	// Run 执行一个 Tool：input 为已解析并校验的 JSON 对象，返回 Tool 的 output JSON 对象。
 	Run(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context) (map[string]interface{}, error)

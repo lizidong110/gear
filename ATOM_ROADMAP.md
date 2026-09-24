@@ -10,7 +10,7 @@
 
 | 类别 | 定义 | 是否进 capability 门禁 | 示例 |
 |---|---|---|---|
-| **核心原子** | 内核内建、协议/产品无关、无业务语义的通用计算/IO 原语 | 是（`KnownPrimitives`） | `http` `call` `db` `kv` `secret` `event` `subscribe` |
+| **核心原子** | 内核内建、协议/产品无关、无业务语义的通用计算/IO 原语 | 是（`KnownPrimitives`） | `http` `call` `db` `secret` `event` `subscribe` |
 | **纯函数核心原子** | 内核内建、始终可用、无外部依赖的纯计算工具（不应进门禁，否则违背纯函数直觉） | 否（文档化口径） | `time` `template` `crypto`（2026-09-19 落地，一等调用目标）；`json`（Lua 绑定，见下方说明） |
 | **可扩展原子** | 桥接某具体外部系统/协议的单操作连接器，以 `ext.*` 插拔 | 是（`ext.` 前缀 + 显式声明） | `ext.email` `ext.wecom` `ext.rabbitmq` … |
 
@@ -144,7 +144,7 @@
 
 **仍暂缓**：
 
-- **方法命名统一**（`http.Request` PascalCase vs `kv.put` snake_case）：已接受但**暂缓**——
+- **方法命名统一**（`http.Request` PascalCase vs `db.exec` snake_case）：已接受但**暂缓**——
   改名跨 `cap` 接口 + 多 runtime + 会破坏 `news-top10`/`news-demo` 示例，属破坏性变更，
   需单独迁移方案（建议：保留 `http.Request` 别名、新写法统一 snake_case，文档化而非强改）。
 

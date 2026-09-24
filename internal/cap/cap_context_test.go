@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-// 本文件覆盖 Context 的「视图注入」面：扩展原语注入、调用链透传、订阅归属绑定、
-// 以及 scopedKV 的 Delete 路由。这些 setter 单独调用没有可观测后果，故一律断言
+// 本文件覆盖 Context 的「视图注入」面：扩展原语注入、调用链透传、订阅归属绑定。
+// 这些 setter 单独调用没有可观测后果，故一律断言
 // **下游拿到的值**（Resolver 收到的 via、Subscribe.Start 收到的 Owner），
 // 而不是「调过就算覆盖」。
 
@@ -32,7 +32,7 @@ func (f *fakeSub) Stop(handle string) error {
 }
 
 func TestContextExtensionInjection(t *testing.T) {
-	c := New(Grants{PrimKV: true}, &Providers{})
+	c := New(Grants{PrimSecret: true}, &Providers{})
 	// 未声明该扩展名 → 拒绝（最小权限）
 	if _, err := c.Extension("ext.db"); err != ErrCapabilityDenied {
 		t.Fatalf("未声明的扩展名应 ErrCapabilityDenied，实际 %v", err)
@@ -115,51 +115,5 @@ func TestContextSubscribePropagatesStartError(t *testing.T) {
 	sub.stopErr = boom
 	if err := s.Stop("h"); !errors.Is(err, boom) {
 		t.Fatalf("Stop 的错误必须原样上抛，实际 %v", err)
-	}
-}
-
-func TestScopedKVDeleteRoutesByScope(t *testing.T) {
-	sessions := NewMemSessionRegistry()
-	global := NewMemKV()
-	c := New(Grants{PrimKV: true}, &Providers{KV: global, Sessions: sessions})
-	c.SetSession("flow-1")
-	kv, err := c.KV()
-	if err != nil {
-		t.Fatalf("KV 不该报错：%v", err)
-	}
-
-	kv.Put("g", "gv", ScopeGlobal)
-	kv.Put("s", "sv", ScopeSession)
-	// 两个命名空间隔离
-	if v, ok := sessions.Session("flow-1").Get("s", ScopeSession); !ok || v != "sv" {
-		t.Fatalf("session 键应落在 session 命名空间，实际 (%q,%v)", v, ok)
-	}
-	if _, ok := global.Get("s", ScopeGlobal); ok {
-		t.Fatal("session 键不得污染 global 命名空间")
-	}
-
-	kv.Delete("s", ScopeSession)
-	if _, ok := sessions.Session("flow-1").Get("s", ScopeSession); ok {
-		t.Fatal("scopedKV.Delete(ScopeSession) 应删掉会话键")
-	}
-	kv.Delete("g", ScopeGlobal)
-	if _, ok := global.Get("g", ScopeGlobal); ok {
-		t.Fatal("scopedKV.Delete(ScopeGlobal) 应删掉全局键")
-	}
-}
-
-func TestSessionRegistryRefCountRecycles(t *testing.T) {
-	// 引用计数归零才回收：同一 flow 的并发运行互不干扰。
-	r := NewMemSessionRegistry()
-	r.Acquire("f1")
-	r.Acquire("f1")
-	r.Session("f1").Put("k", "v", ScopeSession)
-	r.Release("f1")
-	if _, ok := r.Session("f1").Get("k", ScopeSession); !ok {
-		t.Fatal("引用计数未归零时不得回收命名空间")
-	}
-	r.Release("f1")
-	if _, ok := r.Session("f1").Get("k", ScopeSession); ok {
-		t.Fatal("引用计数归零后应回收该命名空间（内存态，重启即失）")
 	}
 }

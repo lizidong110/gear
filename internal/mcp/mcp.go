@@ -18,10 +18,13 @@
 //	gear_app          长驻应用生命周期（start/stop/status/list）
 //	gear_doctor       环境自检（侧车/端口/台账/遗留）
 //
+// 工具实现分文件：tools_read.go（只读 5 个）/ tools_write.go（写 4 个）/ tools_run.go（执行 2 个）/
+// tools_app.go（应用 1 个）；公共部件（结构化错误、入参类型、输出 schema）在 common.go。
+//
 // 设计取舍：
 //   - MCP 只做**协议翻译**：删除守卫（PRD §8.2）、schema 校验、版本状态机、静态校验全部在
 //     registry/engine/app 层，本包不重复实现（守卫必须只有一份，否则各执行面会漂移）。
-//   - **能力原语的边界**（§9.2 四类）：受门禁 7（http/call/db/kv/secret/event/subscribe）、
+//   - **能力原语的边界**（§9.2 四类）：受门禁 6（http/call/db/secret/event/subscribe）、
 //     免门禁纯函数 3（time/template/crypto，声明了反而被拒）、`json` 只是 Lua 绑定不是能力、
 //     `ext.*` 须注册且须声明。这四条最容易写错，`gear_guide("atoms")` 有完整表。
 //   - **长驻子进程不得出现在本进程树内**（§9.1 第 5 条）：`gear_app(start)` 派生 detach 的
@@ -42,9 +45,12 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -54,6 +60,7 @@ import (
 	"gear/internal/cap"
 	"gear/internal/engine"
 	"gear/internal/execstore"
+	"gear/internal/httpsafe"
 	"gear/internal/mcp/guide"
 	"gear/internal/model"
 	"gear/internal/registry"
@@ -80,7 +87,22 @@ type Server struct {
 	// 关闭理由：启动时快照（新建 Flow 本次不可用）、与 gear_run 语义重复、工具数不可预测，
 	// 三者都损害工具选择准确率（§1「负资产」）。
 	exposeFlows bool
+	// allowRemote 允许监听非回环地址（默认 false = 只许 127.0.0.1）。
+	// MCP 面当前无鉴权，绑全网卡等于把「写 registry / 删对象 / 执行编排」的能力暴露给局域网，
+	// 故默认 fail-closed，需要远程接入必须显式打开（评审 B-2）。
+	allowRemote bool
+
+	// execSem 是**执行的有界并发闸门**（评审 I-1）：每条 gear_run / flow__ 执行占一个槽，
+	// 满了直接拒绝（背压）而不是排无限长的队——否则一个客户端能瞬间打满 goroutine。
+	execSem chan struct{}
+	// execWG 追踪在途执行，Close 时等待收敛：否则进程退出会强杀在途 Flow，执行记录永久
+	// 停在 running（gear_execution 里出现永不结束的僵尸记录）。
+	execWG sync.WaitGroup
 }
+
+// maxConcurrentExecs 是 MCP 面同时在跑的 Flow 执行上限（对齐 REST 面 ConcurrencyGate 的思路：
+// 有界并发 + 满了背压）。取值与 REST 的默认闸门同量级即可，MCP 不是吞吐主战场。
+const maxConcurrentExecs = 8
 
 // Option 定制 MCP Server（保持 New 的向后兼容：既有调用方 New(reg, eng) 不变）。
 type Option func(*Server)
@@ -93,6 +115,12 @@ func WithAppsDir(d string) Option { return func(s *Server) { s.appsDir = d } }
 
 // WithExposeFlows 开启 Flow 反向暴露（flow__{id}）。
 func WithExposeFlows(b bool) Option { return func(s *Server) { s.exposeFlows = b } }
+
+// WithAllowRemote 允许 MCP 的 streamable HTTP transport 监听非回环地址。
+//
+// 默认 false：无鉴权地把写/删/执行能力绑到 0.0.0.0 是不负责任的默认项，
+// 需要远程接入时必须由使用者显式打开这层开关（并自行承担暴露面）。
+func WithAllowRemote(b bool) Option { return func(s *Server) { s.allowRemote = b } }
 
 // New 构造 MCP Server。registry 与引擎由调用方装配（CLI 用 cliEngine，
 // 与 REST 面同一套扩展加载），这里补上执行记录存储与运行期注销守卫。
@@ -112,7 +140,7 @@ func New(reg *registry.Registry, eng *engine.Engine, opts ...Option) (*Server, e
 	if guide.Summary() == "" {
 		return nil, fmt.Errorf("MCP Server 装配失败：guide/summary.md 未嵌入（instructions 为空）")
 	}
-	s := &Server{reg: reg, engine: eng, execs: execstore.NewExecStore()}
+	s := &Server{reg: reg, engine: eng, execs: execstore.NewExecStore(), execSem: make(chan struct{}, maxConcurrentExecs)}
 	for _, o := range opts {
 		o(s)
 	}
@@ -145,7 +173,13 @@ func extNamesReady() error {
 }
 
 // Close 释放执行记录库句柄。
-func (s *Server) Close() error { return s.execs.Close() }
+//
+// ★ 先等在途执行收敛再关库（评审 I-1）：否则在途 Flow 的 Finish 会写到一个已关闭的库上，
+// 且执行记录会永久停在 running。等待上界由各 step 的执行超时（默认 30s）自然给出。
+func (s *Server) Close() error {
+	s.execWG.Wait()
+	return s.execs.Close()
+}
 
 // newMCPServer 构造底层 SDK server（stdio 与 HTTP 两个 transport 共用同一套工具面与
 // instructions——否则「本地 stdio 能用、HTTP 接进来的智能体看不到手册」）。
@@ -169,24 +203,86 @@ func (s *Server) Run(ctx context.Context, transport mcp.Transport) error {
 }
 
 // httpHandler 构造 streamable HTTP transport 的 http.Handler（与 stdio 共用同一套工具面）。
+//
+// ★ Origin 校验（2026-09-24 补，评审 B-2）：与 REST 面**共用** httpsafe.OriginAllowed。
+//
+//	此前这里裸挂 handler、没有任何来源校验，而 MCP 工具面含 gear_apply（写 registry）、
+//	gear_delete（删对象）、gear_run（执行编排）——同一个进程暴露的两个面**安全水位不一致**。
+//	关键认知：「只绑 127.0.0.1」挡不住浏览器——任意网页都能向回环地址发请求，且浏览器
+//	会自动带上 Origin 头。没有这条判定，回环绑定在浏览器面前形同虚设。
 func (s *Server) httpHandler() (http.Handler, error) {
 	ms, err := s.newMCPServer()
 	if err != nil {
 		return nil, err
 	}
-	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return ms }, nil), nil
+	inner := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return ms }, nil)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !httpsafe.OriginAllowed(r) {
+			http.Error(w, "cross-origin request denied: MCP 面只接受本机来源", http.StatusForbidden)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}), nil
+}
+
+// checkBindAddr 校验 MCP 的监听地址：非回环地址必须显式开 allowRemote。
+//
+// 为什么 fail-closed：MCP 面无鉴权，绑到 0.0.0.0 等于把「写 registry / 删对象 / 执行编排」
+// 的能力暴露给局域网。此前代码注释写着「只应绑 127.0.0.1」、文档给的示例却是 `--http :8788`
+// （绑全网卡），而 ServeHTTP 从不校验——安全建议形同虚设（评审 B-2）。
+func checkBindAddr(addr string, allowRemote bool) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("MCP 监听地址 %q 非法（应为 host:port）: %w", addr, err)
+	}
+	if isLoopbackHost(host) {
+		return nil
+	}
+	if allowRemote {
+		// 放行，但把代价说清楚——静默放行等于替使用者做了一个他们不知情的决定。
+		fmt.Fprintf(os.Stderr,
+			"gear mcp: ⚠ 监听非回环地址 %s（当前无鉴权：任何能访问该地址的人都可调用 gear_apply / gear_delete / gear_run）\n", addr)
+		return nil
+	}
+	return fmt.Errorf("拒绝监听非回环地址 %q：MCP 面当前无鉴权，绑全网卡会把「写 registry / 删对象 / 执行编排」"+
+		"暴露给局域网；请改用 127.0.0.1:<port>（确有远程需求时显式加 --allow-remote）", addr)
+}
+
+// isLoopbackHost 判定 host 是否回环。空 host（`:8788`）视为**全网卡**，不算回环。
+func isLoopbackHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	switch h {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // ServeHTTP 在 addr（host:port）以 streamable HTTP transport 暴露 MCP Server，
 // 阻塞直到退出信号（SIGINT/SIGTERM）或 ctx 取消。
 //
-// ⚠ 当前无鉴权：只应绑 127.0.0.1（§9.3）。
+// ⚠ 当前无鉴权：默认只接受回环地址（非回环需 WithAllowRemote 显式打开），
+// 并对带 Origin 的跨站请求做同源判定（见 httpHandler 的论证）。
 func (s *Server) ServeHTTP(ctx context.Context, addr string) error {
+	// 先挡住「绑全网卡」——这一步必须在 ListenAndServe 之前，否则等它监听上了再说就晚了。
+	if err := checkBindAddr(addr, s.allowRemote); err != nil {
+		return err
+	}
 	h, err := s.httpHandler()
 	if err != nil {
 		return err
 	}
-	srv := &http.Server{Addr: addr, Handler: h}
+	// 超时只设「读」方向：**不设 WriteTimeout**，否则会截断 streamable HTTP 的长连接与
+	// 流式响应（SSE 一条流可能要跑几十秒）；IdleTimeout 同理从宽。
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+	}
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	go func() {
@@ -265,7 +361,7 @@ func (s *Server) register(ms *mcp.Server) error {
 			if err != nil {
 				return toolErrorFrom("FLOW_RUN_FAILED", err), nil, nil
 			}
-			return nil, s.executionSnapshot(id, in.WaitSeconds), nil
+			return nil, s.executionSnapshot(ctx, id, in.WaitSeconds), nil
 		})
 	}
 	return nil
@@ -318,12 +414,25 @@ func (s *Server) lockFlowForRun(flowID string) (*model.Flow, error) {
 // 为什么异步：MCP 工具调用受客户端超时约束，而一条要 build / 抓数据 / 计算的 Flow 很容易顶到
 // 超时；REST 面早已是「202 + execution id」（POST /api/executions），这里对齐同一语义（§6.2④）。
 // 调用方用 gear_execution(id) 轮询结果，或先给 wait_seconds 短等。
+//
+// 治理（评审 I-1）：执行**有界并发**（execSem，满了返回 EXECUTION_BUSY 背压），并被 execWG
+// 追踪，Close 时等待收敛——此前每条执行都裸起 goroutine，既无上限也无收敛。
 func (s *Server) startFlowExec(flowID string, vars map[string]any) (string, error) {
 	if _, err := s.lockFlowForRun(flowID); err != nil {
 		return "", err
 	}
+	select {
+	case s.execSem <- struct{}{}:
+	default:
+		return "", diagError("EXECUTION_BUSY", "",
+			"稍后重试；或先 gear_execution 看现有执行的进展",
+			"并发执行已达上限（%d），请稍后重试", maxConcurrentExecs)
+	}
 	rec := s.execs.Create(flowID)
+	s.execWG.Add(1)
 	go func() {
+		defer s.execWG.Done()
+		defer func() { <-s.execSem }()
 		res, runErr := s.engine.RunFlowExecWithVars(flowID, rec.ID, func(toolIDs []string) {
 			s.execs.SetTools(rec.ID, toolIDs)
 		}, vars)
@@ -336,7 +445,10 @@ func (s *Server) startFlowExec(flowID string, vars map[string]any) (string, erro
 //
 // waitSeconds>0 时先短等：避免了「刚起就查、必然 running」的空转（§13 R5）；
 // 等不到也不报错——如实返回 running，让调用方决定继续等还是先干别的。
-func (s *Server) executionSnapshot(id string, waitSeconds int) map[string]any {
+//
+// ★ ctx 取消（评审 I-1）：客户端断开/超时就**立刻停止忙等**——此前不看 ctx.Done()，
+// 客户端早走了这里还会白等满 N 秒。停止忙碌时如实返回**当前**快照（不报错）。
+func (s *Server) executionSnapshot(ctx context.Context, id string, waitSeconds int) map[string]any {
 	if waitSeconds > 0 {
 		deadline := time.Now().Add(time.Duration(waitSeconds) * time.Second)
 		for time.Now().Before(deadline) {
@@ -344,9 +456,18 @@ func (s *Server) executionSnapshot(id string, waitSeconds int) map[string]any {
 			if !ok || e.FinishedAt != nil {
 				break
 			}
-			time.Sleep(200 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return s.executionSnapshotNow(id)
+			case <-time.After(200 * time.Millisecond):
+			}
 		}
 	}
+	return s.executionSnapshotNow(id)
+}
+
+// executionSnapshotNow 取一次当前执行快照（不等待）。
+func (s *Server) executionSnapshotNow(id string) map[string]any {
 	e, ok := s.execs.Get(id)
 	if !ok {
 		return map[string]any{"execution_id": id, "status": "unknown"}

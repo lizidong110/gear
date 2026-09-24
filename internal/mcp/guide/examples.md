@@ -6,20 +6,24 @@
 kind: Flow
 id: demo.hello
 name: 最小一次性编排
-description: 写一个键再读回来（演示直调能力与隐式依赖）
+description: 写一条记录再读回来（演示直调能力与隐式依赖）
 vars:
   who: world
 steps:
-  - id: put
-    call: kv.put            # 直调：能力.方法（先 gear_capabilities 确认参数）
+  - id: set
+    call: db.exec            # 直调：能力.方法（先 gear_capabilities 确认参数）
     input:
-      key: greeting
-      value: "hello ${vars.who}"
+      sql: "CREATE TABLE IF NOT EXISTS greetings(k TEXT PRIMARY KEY, v TEXT)"
+  - id: put
+    call: db.exec
+    depends_on: [set]
+    input:
+      sql: "INSERT INTO greetings(k,v) VALUES('greeting', 'hello ${vars.who}')"
   - id: get
-    call: kv.get
+    call: db.query
     depends_on: [put]       # 也可省略：这里没有 ${steps.*} 引用，故显式声明
     input:
-      key: greeting
+      sql: "SELECT v FROM greetings WHERE k = 'greeting'"
 ```
 
 运行：`gear_run(kind=flow, id="demo.hello")` → 看 `gear_execution` 的 `result.steps.get.output`。

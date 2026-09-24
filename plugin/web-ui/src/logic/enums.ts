@@ -70,16 +70,16 @@ export const STEP_MODE_LABEL: Record<string, string> = {
 
 /**
  * 宿主能力原语（PRD §6，最小权限）。
- * 前 6 个是内核内置（由 cap.KnownPrimitives 生成）；`ext.*` 是启动期由 extensions.yaml
+ * 以下 6 个是内核内置（由 cap.KnownPrimitives 生成）；`ext.*` 是启动期由 extensions.yaml
  * 注册的扩展原语（如 ext.ai / ext.db），名字不固定，故 UI 用可输入标签而非固定下拉。
  */
 export const CAPABILITY_LABEL: Record<string, string> = {
   http: 'http · HTTP 请求',
   call: 'call · 调用其它 Tool / Flow',
   db: 'db · 数据库原语',
-  kv: 'kv · 键值存储',
   secret: 'secret · 密钥读取（只读）',
   event: 'event · 事件收发',
+  subscribe: 'subscribe · 订阅事件源',
 }
 
 /** 执行状态（server/execstore.go）。rejected = 入口繁忙被背压拒绝，未真正运行。 */

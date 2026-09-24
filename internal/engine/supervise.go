@@ -40,19 +40,50 @@ func (h *ServiceHandle) ProcKill() error {
 	return h.Proc.Kill()
 }
 
-// ProcWaitDone 返回在当前 Proc 退出时关闭的 channel（读 Proc 加锁，避免与 Relaunch 竞争）。
-func (h *ServiceHandle) ProcWaitDone() <-chan struct{} {
-	h.procMu.Lock()
-	p := h.Proc
-	h.procMu.Unlock()
+// waitExitPoll 是「本 gear 未持有本地 sidecar（client 共享他人实例）」时，
+// 复查是否已接管为 owner 的间隔。
+const waitExitPoll = 500 * time.Millisecond
+
+// WaitExit 返回在该 service 需要重启时关闭的 channel；ctx 取消则直接返回（不关 channel）。
+//
+// 为什么不能只等「当前进程退出」：service ext 走 coord 握手，同主机多个 gear **共享同一个**
+// sidecar（§12.4 注册优先 / 竞态退让）。退让为 client 的一方手上没有本地进程 —— 它的 Proc
+// 是 noopProcess，Wait() 立即返回。若据此判定「service 已退出」，监管器就会去 Relaunch，
+// 而 Relaunch 若拿 Entry 直接 rt.Start，就会硬抢已被占用的 coord 端口、拿到
+// ExitAddrInUse(2) 速退 ——「共享成功」被误判成崩溃循环（2026-09-23 实测：两个 flow 各跑
+// 一个 gear app run，第二个无限重启，日志里先是无退出信息、后是 exit=2）。
+//
+// 因此共享状态下本 gear 没有进程可等：sidecar 的存活由 coord 看门狗负责（心跳连续失败即
+// rehandshake，必要时本 gear 接管为新 owner）。这里轮询「是否已持有本地进程」：一旦接管为
+// owner（Proc 变成真实子进程）就转为等待该进程退出。
+func (h *ServiceHandle) WaitExit(ctx context.Context) <-chan struct{} {
 	ch := make(chan struct{})
 	go func() {
-		if p != nil {
-			_ = p.Wait()
+		for {
+			if p := h.CurrentProc(); h.HasLocalProc() && p != nil {
+				_ = p.Wait()
+				close(ch)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return // 不关 channel：由等待方走 ctx 分支，避免被误读成「进程退出」
+			case <-time.After(waitExitPoll):
+			}
 		}
-		close(ch)
 	}()
 	return ch
+}
+
+// HasLocalProc 报告本 gear 手上是否有一个**自己持有**的本地进程可监管。
+//
+// service ext（Coord != nil）只有 owner 才有：client 共享他人实例时 Proc 是 noopProcess，
+// 既不可 kill 也不可 wait，不能拿它判存活（详见 WaitExit 的注释）。
+func (h *ServiceHandle) HasLocalProc() bool {
+	if h.Coord != nil {
+		return h.Coord.IsOwner()
+	}
+	return h.CurrentProc() != nil
 }
 
 // CurrentProc 在锁内返回当前 Proc（探针据此判断进程是否已被重启，重置失败计数）。
@@ -225,14 +256,28 @@ func (e *Engine) stopStartedServices(res *SuperviseResult) {
 
 // Relaunch 重启一个已退出的 service step（restart=always 时由 Supervisor 调用）。
 // 按原 runtime 重新分发，复用 Entry 与已校验的 input，Restarts 计数 +1。
+//
+// service ext（Coord != nil）**不走** runtime：它的 Entry 形如
+// `COORD_ADDR=<listen> <sidecar>`，直接 rt.Start 会在端口已被他人 sidecar 占用时
+// 拿到 ExitAddrInUse(2) 速退 —— 而握手本来的设计就是「抢不到就退让复用」，
+// 所以重启必须重走 coord 握手：端口无人听则本 gear 接管为 owner 拉起 sidecar，
+// 否则继续退让为 client 复用同一实例（见 coord.Session.Rehandshake）。
 func (e *Engine) Relaunch(h *ServiceHandle) error {
-	rt, err := runtimeForCaps(h.Runtime, e.sandboxPolicy, e.capReg)
-	if err != nil {
-		return fmt.Errorf("restart step %s: %w", h.StepID, err)
-	}
-	proc, err := rt.Start(context.Background(), h.Entry, h.Input, h.Host)
-	if err != nil {
-		return fmt.Errorf("restart step %s 失败: %w", h.StepID, err)
+	var proc Process
+	if h.Coord != nil {
+		if err := h.Coord.Rehandshake(); err != nil {
+			return fmt.Errorf("restart step %s: coord 重握手失败: %w", h.StepID, err)
+		}
+		proc = h.Coord.Proc()
+	} else {
+		rt, err := runtimeForCaps(h.Runtime, e.sandboxPolicy, e.capReg)
+		if err != nil {
+			return fmt.Errorf("restart step %s: %w", h.StepID, err)
+		}
+		proc, err = rt.Start(context.Background(), h.Entry, h.Input, h.Host)
+		if err != nil {
+			return fmt.Errorf("restart step %s 失败: %w", h.StepID, err)
+		}
 	}
 	h.procMu.Lock()
 	h.Proc = proc

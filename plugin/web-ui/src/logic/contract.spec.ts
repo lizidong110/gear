@@ -93,7 +93,7 @@ describe('生成枚举的结构不变量（防漂移，对应内核 TestRuntimeK
     ])
     expect([...PROBE_KINDS]).toEqual(['http', 'tcp', 'cmd'])
     expect([...STEP_MODES]).toEqual(['once', 'service'])
-    expect([...BUILTIN_CAPABILITIES]).toEqual(['http', 'call', 'db', 'kv', 'secret', 'event'])
+    expect([...BUILTIN_CAPABILITIES]).toEqual(['http', 'call', 'db', 'secret', 'event', 'subscribe'])
   })
 
   it('版本状态机：rejected 仅可重开为 draft（终态语义）', () => {

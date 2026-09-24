@@ -4,7 +4,7 @@
 
 | 类别 | 成员 | 受 capability 门禁 | Flow 能直调 | 说明 |
 |---|---|---|---|---|
-| **受门禁原语** | `http` `call` `db` `kv` `secret` `event` `subscribe`（7） | **是**（Tool 必须声明） | 能（如 `http.Request`） | 单一真相源 `internal/cap/cap.go` |
+| **受门禁原语** | `http` `call` `db` `secret` `event` `subscribe`（6） | **是**（Tool 必须声明） | 能（如 `http.Request`） | 单一真相源 `internal/cap/cap.go` |
 | **纯函数原子** | `time` `template` `crypto`（3） | **否**（始终可用，**声明了反而被拒**） | 能（如 `crypto.hash`） | 无 IO、确定性、单具名 table 入参 |
 | **Lua 便利绑定** | `json`（`ctx.json.encode/decode`） | — | **不能** | **不是能力**，不在能力目录 |
 | **扩展原子** | `ext.email` `ext.serve` `ext.kafka` … | **是**（还须在 `extensions.yaml` 注册） | 能（如 `ext.serve.start`） | 分 once 与 `service: true` 两种 |
@@ -20,7 +20,6 @@
 | `db.query` | sql*, driver, dsn, params | 行集合 `[]map` |
 | `db.exec` | sql*, driver, dsn, params | nil（失败经 err 表达） |
 | `db.ping` | driver, dsn | 连通性 |
-| `kv.get` / `kv.put` / `kv.delete` | key*（+value*）, scope | `(value, ok)` / nil |
 | `secret.get` | name* | 明文（**只读取**，看不到存储位置） |
 | `event.notify` | name*, payload | 广播（尽力通知） |
 | `event.wait` | name* | 下次通知的 payload |

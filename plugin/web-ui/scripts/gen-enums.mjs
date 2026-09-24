@@ -117,7 +117,7 @@ export function generate() {
   const probeKinds = resolveNames(boolMapKeys(model, 'var KnownProbeKinds = map[string]bool'), mc, 'KnownProbeKinds')
   const stepModes = resolveNames(['ModeOnce', 'ModeService'], mc, 'StepMode')
   const capabilities = resolveNames(
-    ['PrimHTTP', 'PrimCall', 'PrimDB', 'PrimKV', 'PrimSecret', 'PrimEvent'],
+    ['PrimHTTP', 'PrimCall', 'PrimDB', 'PrimSecret', 'PrimEvent', 'PrimSubscribe'],
     cc,
     'cap.Primitive',
   )

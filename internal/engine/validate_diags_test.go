@@ -36,9 +36,9 @@ func brokenFlowWithFiveStepErrors() *model.Flow {
 		Steps: []model.Step{
 			{ID: "s1", Call: "no_such_tool"},
 			{ID: "s2", Call: "bogus.method"},
-			{ID: "s3", Call: "kv.put", When: "${vars.flag}", Input: map[string]interface{}{"key": "k", "value": "v"}},
-			{ID: "s4", Call: "kv.put", Input: map[string]interface{}{"key": "${bogus.x}", "value": "v"}},
-			{ID: "s5", Call: "kv.put", Input: map[string]interface{}{"key": "k"}}, // 缺必填 value
+			{ID: "s3", Call: "db.exec", When: "${vars.flag}", Input: map[string]interface{}{"sql": "SELECT 1"}},
+			{ID: "s4", Call: "db.exec", Input: map[string]interface{}{"sql": "${bogus.x}"}},
+			{ID: "s5", Call: "db.exec", Input: map[string]interface{}{}}, // 缺必填 sql
 		},
 	}
 }
@@ -93,12 +93,12 @@ func TestValidatePrimitiveArgsCatchesUnknownAndMissing(t *testing.T) {
 		name  string
 		input map[string]interface{}
 	}{
-		{"未知参数名", map[string]interface{}{"kay": "k", "value": "v"}},
-		{"缺必填参数", map[string]interface{}{"key": "k"}},
+		{"未知参数名", map[string]interface{}{"sql": "SELECT 1", "kay": "k"}},
+		{"缺必填参数", map[string]interface{}{}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			f := &model.Flow{ID: "f", Steps: []model.Step{{ID: "s1", Call: "kv.put", Input: c.input}}}
+			f := &model.Flow{ID: "f", Steps: []model.Step{{ID: "s1", Call: "db.exec", Input: c.input}}}
 			diags := e.ValidateFlowStaticDiags(f)
 			if len(diags) != 1 || diags[0].Code != CodeBadPrimitiveArgs {
 				t.Fatalf("%s 应报恰好一条 %s，实际 %+v", c.name, CodeBadPrimitiveArgs, diags)
@@ -153,7 +153,7 @@ func TestValidateFlowStaticDiagsCleanFlowIsSilent(t *testing.T) {
 	}
 	f := &model.Flow{ID: "f", Steps: []model.Step{
 		{ID: "s1", Call: "hello"},
-		{ID: "s2", Call: "kv.put", Input: map[string]interface{}{"key": "k", "value": "${steps.s1.output.x}"}},
+		{ID: "s2", Call: "db.exec", Input: map[string]interface{}{"sql": "SELECT 1"}},
 	}}
 	if diags := New(reg).ValidateFlowStaticDiags(f); len(diags) != 0 {
 		t.Fatalf("合法 Flow 不应有诊断，实际: %+v", diags)

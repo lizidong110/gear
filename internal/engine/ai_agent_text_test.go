@@ -23,7 +23,7 @@ func TestCapabilitiesTextListsAllPrimitives(t *testing.T) {
 	txt := a.capabilitiesText()
 
 	// 受门禁原语：位置参数形态
-	if !strings.Contains(txt, "ctx.kv.put(") || strings.Contains(txt, "ctx.kv.put({") {
+	if !strings.Contains(txt, "ctx.http.Request(") || strings.Contains(txt, "ctx.http.Request({") {
 		t.Fatal("内置受门禁原语应按位置参数渲染")
 	}
 	// 纯函数原子：单具名 table 形态（与 ctx.ext.* 同款），否则模型会写成位置参数
@@ -50,7 +50,7 @@ func TestFlowCapabilitiesTextUsesBareCallForm(t *testing.T) {
 	if strings.Contains(txt, "ctx.") {
 		t.Fatalf("flow 的能力清单不得带 ctx. 前缀，实际:\n%s", txt)
 	}
-	if !strings.Contains(txt, "- kv.put") {
+	if !strings.Contains(txt, "- http.Request") {
 		t.Fatalf("应列出「能力.方法」直调形态，实际:\n%s", txt)
 	}
 	if a.flowCapabilitiesText() != txt {
@@ -108,10 +108,10 @@ func TestNormalizeDefFillsWhatLLMForgets(t *testing.T) {
 func TestDeriveCapabilitiesMergesDeclared(t *testing.T) {
 	got := deriveCapabilities(
 		"ctx.http.Request('GET','u'); ctx.ext.ai.complete({})",
-		[]string{"kv", "  ", "http"},
+		[]string{"db", "  ", "http"},
 	)
 	joined := strings.Join(got, ",")
-	for _, want := range []string{"http", "kv", "ext.ai"} {
+	for _, want := range []string{"http", "db", "ext.ai"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("应与已声明的取并集并去空白，实际 %v", got)
 		}

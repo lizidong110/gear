@@ -205,6 +205,11 @@ func Start(opts StartOptions) (*StartResult, error) {
 	// 的端口才能证明「是我们的进程把服务起起来了」。启动前就被人占着的端口不能用于判定就绪
 	// ——同端口已有常驻实例时引擎会复用其监听，于是 app 的 service 步立即完成、进程退出，
 	// 而端口照样在服务；拿它判就绪就会把这种情况误报成 running。
+	//
+	// 注（2026-09-23）：上面「service 步立即完成、进程退出」是修复前的现象——当时监管层把
+	// 「client 退让、本 gear 手上没有本地进程」误判成 service 退出并无限重启。现在共享实例
+	// 不再触发重启（见 EXT_SERVICE_DESIGN.md §12.10），但**探活归因**这条理由依然成立：
+	// 端口在听不能证明是本次派生的进程把它拉起来的，preBusy 的排除逻辑照旧。
 	preBusy := make(map[int]bool, len(opts.Ports))
 	for _, p := range opts.Ports {
 		if PortListening(p) {

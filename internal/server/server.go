@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -24,6 +23,7 @@ import (
 	"gear/internal/app"
 	"gear/internal/cap"
 	"gear/internal/engine"
+	"gear/internal/httpsafe"
 	"gear/internal/model"
 	"gear/internal/registry"
 )
@@ -217,6 +217,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/news", s.handleNews)
 	s.mux.HandleFunc("GET /api/capabilities", s.handleCapabilities)
 	s.mux.HandleFunc("POST /api/capabilities/invoke", s.handleInvokeCapability)
+	s.mux.HandleFunc("POST /api/capabilities/invoke/stream", s.handleInvokeCapabilityStream)
 
 	s.mux.HandleFunc("GET /api/secrets", s.handleListSecrets)
 	s.mux.HandleFunc("PUT /api/secrets/{name}", s.handleSetSecret)
@@ -334,14 +335,14 @@ type invokeCapabilityReq struct {
 }
 
 // handleInvokeCapability 直接执行一个原子能力的方法（「能力目录」页调用测试用）。
-// 与 react 同权限（全量宿主授权 + Lua 沙箱）：db/kv 为内存态、secret 需内核已注入密钥源、
+// 与 react 同权限（全量宿主授权 + Lua 沙箱）：db 为内存态、secret 需内核已注入密钥源、
 // http 可访问任意 URL。未知能力名 / 方法在引擎侧 fail-closed 报错，不静默执行。
 //
 // ⚠ 收紧（2026-09-22）：本端点威力等价于「以宿主机身份执行任意能力」，此前无任何校验，
 // 而做带界面的应用必然经 ext.serve 反代把它暴露给浏览器。现在只接受本机来源、且禁调
-// secret.*（见 originAllowed / blockedInvokeCapability 的论证）。
+// secret.*（见 httpsafe.OriginAllowed / blockedInvokeCapability 的论证）。
 func (s *Server) handleInvokeCapability(w http.ResponseWriter, r *http.Request) {
-	if !originAllowed(r) {
+	if !httpsafe.OriginAllowed(r) {
 		writeErr(w, http.StatusForbidden, fmt.Errorf(
 			"拒绝跨站调用：Origin %q 不是本机来源——本端点可直达 secret/db 等宿主能力，只接受本机页面与无 Origin 的命令行客户端",
 			r.Header.Get("Origin")))
@@ -369,6 +370,68 @@ func (s *Server) handleInvokeCapability(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"result": res})
+}
+
+// handleInvokeCapabilityStream 是 /invoke 的流式版本：目前仅支持 ext.ai.complete_stream，
+// 以 SSE 逐增量推送。沿用 /invoke 的同源与禁 secret 约束（httpsafe.OriginAllowed / blockedInvokeCapability）。
+func (s *Server) handleInvokeCapabilityStream(w http.ResponseWriter, r *http.Request) {
+	if !httpsafe.OriginAllowed(r) {
+		writeErr(w, http.StatusForbidden, fmt.Errorf(
+			"拒绝跨站调用：Origin %q 不是本机来源——流式端点同样可直达宿主能力，只接受本机来源",
+			r.Header.Get("Origin")))
+		return
+	}
+	var req invokeCapabilityReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Name == "" || req.Method == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("name 与 method 均不能为空"))
+		return
+	}
+	if req.Name != "ext.ai" || req.Method != "complete_stream" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf(
+			"流式调用目前仅支持 ext.ai.complete_stream（其他方法请走 POST /api/capabilities/invoke）"))
+		return
+	}
+	if blockedInvokeCapability(req.Name) {
+		writeErr(w, http.StatusForbidden, fmt.Errorf("能力 %s 不允许经 REST 直调", req.Name))
+		return
+	}
+	agent := s.engine.AIAgent()
+	if agent == nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("扩展未初始化"))
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("当前传输层不支持流式响应"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	send := func(event string, payload interface{}) {
+		if event != "" {
+			fmt.Fprintf(w, "event: %s\n", event)
+		}
+		b, _ := json.Marshal(payload)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		flusher.Flush()
+	}
+
+	if err := agent.CompleteStream(req.Args, func(content, reasoning string) error {
+		send("", map[string]interface{}{"delta": content, "reasoning": reasoning})
+		return nil
+	}); err != nil {
+		send("error", map[string]string{"error": err.Error()})
+		return
+	}
+	send("", map[string]interface{}{"done": true})
 }
 
 // handleRunTool 同步执行单个 Tool 并直接返回输出：`POST /api/tools/{id}/run`。
@@ -413,31 +476,6 @@ func (s *Server) handleRunTool(w http.ResponseWriter, r *http.Request) {
 		out = map[string]interface{}{}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"id": id, "output": out})
-}
-
-// originAllowed 判定请求是否来自「本机来源」。
-//
-// 背景：本 REST 面默认只绑 127.0.0.1，但**绑回环 ≠ 安全**——浏览器里的任意网页都能向
-// 127.0.0.1 发跨站请求（简单请求不预检，side effect 照常发生），而本面又有
-// /api/capabilities/invoke、/api/secrets 这类威力极大的端点。
-//
-// 策略：带 Origin 头且来源不是本机 → 拒绝；**不带 Origin 一律放行**（curl / CLI /
-// 服务端调用都不带，它们是本机使用者的正常入口）。这样零配置就能挡住跨站，又不给
-// 本机命令行使用增加任何门槛。
-func originAllowed(r *http.Request) bool {
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
-		return true
-	}
-	u, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-	switch strings.ToLower(u.Hostname()) {
-	case "127.0.0.1", "localhost", "::1":
-		return true
-	}
-	return false
 }
 
 // blockedInvokeCapability 判定某能力是否禁止经 REST 直调。

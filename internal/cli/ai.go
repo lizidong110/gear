@@ -20,7 +20,7 @@ func aiCmd() *cobra.Command {
 	c.AddCommand(&cobra.Command{
 		Use:   "capabilities",
 		Short: "列出当前所有原子能力（内核 builtin + pure 原语 + 已注册 ext.*）及其方法参数 schema",
-		Long: "打印引擎当前装配的宿主能力目录：内核门禁原语（http/call/db/kv/secret/event/subscribe）+ " +
+		Long: "打印引擎当前装配的宿主能力目录：内核门禁原语（http/call/db/secret/event/subscribe）+ " +
 			"纯函数原子（time/template/crypto，始终可用、无需声明）+ 所有已注册 " +
 			"ext.* 扩展，每条带方法名、参数类型与必填标记。\n" +
 			"这是 agent 生成 Tool 时锚定的同一份目录（ext.registry.capabilities() / ext.ai.capabilities()），" +
@@ -30,17 +30,31 @@ func aiCmd() *cobra.Command {
 	reactC := &cobra.Command{
 		Use:   "react [任务描述]",
 		Short: "跑 ReAct 智能体（LLM 逐步调用内置工具完成任务）",
-		Long: "用自然语言任务驱动一个 ReAct 循环：LLM 每步思考并调用一个内置工具（http/call/db/kv/secret/event" +
+		Long: "用自然语言任务驱动一个 ReAct 循环：LLM 每步思考并调用一个内置工具（http/call/db/secret/event" +
 			"或已注册 ext.*），观察结果后继续，直到给出 Final Answer。\n" +
 			"等价于在 Tool 的 entry 里调 ctx.ext.ai.react({ task = \"...\" })。需要联网 LLM（key/provider 经参数传入，dev CLI 可用 GEAR_AI_* 注入）。",
 		RunE: func(cmd *cobra.Command, args []string) error { return runAIReact(cmd, args) },
 	}
 	reactC.Flags().Int("max-steps", 6, "最大步数")
-	reactC.Flags().StringSlice("allow", nil, "限制可用工具（如 http,kv）；默认全部")
+	reactC.Flags().StringSlice("allow", nil, "限制可用工具（如 http,secret）；默认全部")
 	reactC.Flags().String("model", "", "模型名（可选，缺省读 GEAR_AI_MODEL）")
 	reactC.Flags().String("provider", "", "模型厂商（可选，缺省读 GEAR_AI_PROVIDER）")
 	reactC.Flags().String("base-url", "", "API base（可选，缺省读 GEAR_AI_BASE_URL）")
 	reactC.Flags().String("api-key", "", "API key（可选，缺省读 GEAR_AI_API_KEY）")
+	completeC := &cobra.Command{
+		Use:   "complete [prompt]",
+		Short: "调用 ext.ai.complete（LLM 补全），可加 --stream 逐增量打印",
+		RunE:  func(cmd *cobra.Command, args []string) error { return runAIComplete(cmd, args) },
+	}
+	completeC.Flags().StringP("system", "s", "", "系统提示（可选）")
+	completeC.Flags().String("format", "text", "输出格式 text|json（可选，默认 text）")
+	completeC.Flags().Bool("stream", false, "流式输出：逐 token 打印增量（含推理增量）")
+	completeC.Flags().String("model", "", "模型名（可选，缺省读 GEAR_AI_MODEL）")
+	completeC.Flags().String("provider", "", "模型厂商（可选，缺省读 GEAR_AI_PROVIDER）")
+	completeC.Flags().String("base-url", "", "API base（可选，缺省读 GEAR_AI_BASE_URL）")
+	completeC.Flags().String("api-key", "", "API key（可选，缺省读 GEAR_AI_API_KEY）")
+	c.AddCommand(completeC)
+
 	c.AddCommand(reactC)
 	return c
 }
@@ -206,7 +220,7 @@ func renderCapabilities(sums interface{}) string {
 }
 
 // genCmd 是 `ai gen` 的父命令，承载公共选项（--intent / --register）。
-// 参考配方来自内嵌默认（examples/ai/recipes/*.yaml），可用 GEAR_AI_RECIPES 覆盖目录。
+// 参考配方默认内嵌（internal/engine/recipes/*.yaml）；examples/ai/recipes/ 或 GEAR_AI_RECIPES 可覆盖（可选）。
 func genCmd() *cobra.Command {
 	c := &cobra.Command{Use: "gen", Short: "生成 Flow 或 Tool"}
 	c.PersistentFlags().StringP("intent", "i", "", "自然语言意图（也可用位置参数）")
@@ -325,4 +339,88 @@ func seedRefRegistry(refReg, reg *registry.Registry) error {
 		}
 	}
 	return nil
+}
+
+// runAIComplete 实现 `ai complete "prompt"`：构造进程内 ext.ai agent，调 Complete（或 CompleteStream）。
+// 这是 CLI 侧对流式原子能力的最小消费示例——REST SSE、Lua 回调式走同一 AIAgent.CompleteStream 通道。
+func runAIComplete(cmd *cobra.Command, args []string) error {
+	prompt := strings.Join(args, " ")
+	if strings.TrimSpace(prompt) == "" {
+		return fmt.Errorf("请提供 prompt：gear ai complete \"...\"")
+	}
+	reg, err := registry.Open(fmt.Sprintf("file:gear_ai_cli_%d?mode=memory&cache=shared", os.Getpid()))
+	if err != nil {
+		return fmt.Errorf("打开内存 registry 失败: %w", err)
+	}
+	defer reg.Close()
+	eng, err := cliEngine(reg)
+	if err != nil {
+		return err
+	}
+	agent := eng.AIAgent()
+	if agent == nil {
+		return fmt.Errorf("ext.ai 未装配（SetupExtensions 失败？）")
+	}
+
+	system, _ := cmd.Flags().GetString("system")
+	format, _ := cmd.Flags().GetString("format")
+	model, _ := cmd.Flags().GetString("model")
+	provider, _ := cmd.Flags().GetString("provider")
+	baseURL, _ := cmd.Flags().GetString("base-url")
+	apiKey, _ := cmd.Flags().GetString("api-key")
+	stream, _ := cmd.Flags().GetBool("stream")
+
+	// 开发便利：flag 未给时回退到 GEAR_AI_* 环境变量（原子能力本身只读调用参数，不读 env）。
+	if provider == "" {
+		provider = os.Getenv("GEAR_AI_PROVIDER")
+	}
+	if model == "" {
+		model = os.Getenv("GEAR_AI_MODEL")
+	}
+	if baseURL == "" {
+		baseURL = os.Getenv("GEAR_AI_BASE_URL")
+	}
+	if apiKey == "" {
+		apiKey = os.Getenv("GEAR_AI_API_KEY")
+	}
+
+	reqArgs := map[string]interface{}{"prompt": prompt}
+	if system != "" {
+		reqArgs["system"] = system
+	}
+	if format != "" {
+		reqArgs["format"] = format
+	}
+	if model != "" {
+		reqArgs["model"] = model
+	}
+	if provider != "" {
+		reqArgs["provider"] = provider
+	}
+	if baseURL != "" {
+		reqArgs["base_url"] = baseURL
+	}
+	if apiKey != "" {
+		reqArgs["api_key"] = apiKey
+	}
+
+	if !stream {
+		res, err := agent.Complete(reqArgs)
+		if err != nil {
+			return fmt.Errorf("complete 失败: %w", err)
+		}
+		b, _ := yaml.Marshal(res)
+		cmd.Println(string(b))
+		return nil
+	}
+	// 流式：每个增量直接打印（reasoning 与 content 分开，便于区分推理过程）。
+	return agent.CompleteStream(reqArgs, func(content, reasoning string) error {
+		if reasoning != "" {
+			cmd.Print(reasoning)
+		}
+		if content != "" {
+			cmd.Print(content)
+		}
+		return nil
+	})
 }

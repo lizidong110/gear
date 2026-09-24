@@ -43,7 +43,7 @@ id: web_ui.api
 name: Gear REST 后端（web-ui 的后台）
 description: 以 process 长驻方式启动 gear REST 执行面（/api/**），作为 web-ui 的后台。默认监听 127.0.0.1:8787。
 runtime: process
-entry: "build/gear.exe serve --addr 127.0.0.1:8787"
+entry: "./gear.exe serve --addr 127.0.0.1:8787"
 input_schema:
   type: object
   properties: {}

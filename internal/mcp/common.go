@@ -91,6 +91,85 @@ func diagError(code, field, hint, format string, args ...any) error {
 	return engine.Diagf(code, field, hint, format, args...)
 }
 
+// ---- 工具输出 schema（评审 I-6）----
+//
+// 此前所有工具都走 `Out = any` ⇒ **完全没有 outputSchema**：客户端（尤其第三方/严格客户端）
+// 无法静态知道返回形状，只能靠 gear_guide 或试调用——与 input 侧「jsonschema tag 自动生成 +
+// 有守卫」的严谨度严重不对等（见 MCP_接口与协议评审_v1.md I-6）。
+//
+// ⚠ 两条硬约束（先读 SDK 源码才敢写）：
+//  1. **不设 `required`、不设 `additionalProperties: false`**：`AddTool` 会对**每次**返回做
+//     schema 校验（`server.go` 的 `toolForErr` → `applySchema(outJSON, outputResolved, true)`），
+//     合法返回里缺失/多余的键都会把整次调用判失败。这里只声明「有这些键、类型如此」。
+//  2. 类型不确定 / 可为 null 的字段一律用 `sAny()`（空 schema = 任意）：宁可少声明类型，
+//     也不要因写错类型把正常返回拒掉（尤其 `escaped_job` 可为 null、`result` 形状随业务变）。
+//
+// 键名与类型以「该工具所有返回路径的并集」为准（一个工具可能分多个 action/kind 返回不同键）。
+func sStr() map[string]any  { return map[string]any{"type": "string"} }
+func sNum() map[string]any  { return map[string]any{"type": "number"} }
+func sBool() map[string]any { return map[string]any{"type": "boolean"} }
+func sArr() map[string]any  { return map[string]any{"type": "array"} }
+func sObj() map[string]any  { return map[string]any{"type": "object"} }
+
+// sAny 是「任意类型」片段（空对象 = 不加约束）。
+func sAny() map[string]any { return map[string]any{} }
+
+// outSchema 组装输出 schema：`{"type":"object","properties":{...}}`。
+func outSchema(props map[string]any) map[string]any {
+	return map[string]any{"type": "object", "properties": props}
+}
+
+// 各工具的输出 schema（单一处集中定义，便于与返回体逐键对照）。
+var (
+	outGuide = outSchema(map[string]any{
+		"topic": sStr(), "content": sStr(), "topics": sArr(),
+	})
+	outCatalog = outSchema(map[string]any{
+		"items": sArr(), "total": sNum(), "truncated": sBool(), "counts": sObj(),
+	})
+	outDescribe = outSchema(map[string]any{
+		"kind": sStr(), "object": sObj(), "long_running": sBool(),
+	})
+	outCapabilities = outSchema(map[string]any{
+		"capabilities": sArr(),
+	})
+	outDoctor = outSchema(map[string]any{
+		"registry": sObj(), "extensions": sObj(), "ai": sObj(), "ports": sObj(),
+		"apps": sArr(), "orphan": sArr(), "apps_dir": sStr(), "warnings": sArr(),
+	})
+	outValidate = outSchema(map[string]any{
+		"valid": sBool(), "diagnostics": sArr(), "warnings": sArr(), "summary": sObj(),
+	})
+	outApply = outSchema(map[string]any{
+		"valid": sBool(), "dry_run": sBool(), "diagnostics": sArr(), "warnings": sArr(),
+		"applied": sObj(), "would_apply": sObj(),
+	})
+	outDelete = outSchema(map[string]any{
+		"deleted": sStr(),
+	})
+	outPromote = outSchema(map[string]any{
+		"tool_id": sStr(), "version": sStr(), "state": sStr(),
+	})
+	outRun = outSchema(map[string]any{
+		"kind": sStr(), "id": sStr(), "output": sObj(),
+		"execution_id": sStr(), "flow_id": sStr(), "status": sStr(), "started_at": sAny(),
+		"error": sStr(), "result": sAny(), "finished_at": sAny(), "hint": sStr(),
+	})
+	outExecution = outSchema(map[string]any{
+		"id": sStr(), "flow_id": sStr(), "status": sStr(), "started_at": sAny(),
+		"error": sStr(), "result": sAny(), "tool_ids": sArr(), "finished_at": sAny(),
+		"logs": sArr(), "executions": sArr(), "total": sNum(),
+	})
+	outApp = outSchema(map[string]any{
+		"app_id": sStr(), "flow_id": sStr(), "pid": sNum(), "state": sStr(), "log_path": sStr(),
+		"ports": sArr(), "escaped_job": sAny(), "warning": sStr(), "last_logs": sArr(),
+		"error": sStr(), "hint": sStr(), "ports_released": sBool(), "started_at": sAny(),
+		"uptime_s": sNum(), "items": sArr(), "orphan": sArr(), "total": sNum(),
+		"dry_run": sBool(), "pruned": sArr(), "skipped": sArr(),
+		"pruned_count": sNum(), "skipped_count": sNum(), "apps_dir": sStr(),
+	})
+)
+
 // ---- 工具入参类型（SDK 据此自动生成 input schema）----
 
 // IDArgs 是「按 id 操作」类工具的公共入参。

@@ -8,6 +8,7 @@ package coord
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -398,4 +399,108 @@ func isOwner(s *Session) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.owner
+}
+
+// ---- 共享 sidecar 下的角色判定 / 重握手（2026-09-23：多 app 共享单侧车不再被误判为崩溃）----
+
+// IsOwner 必须如实反映角色：client 退让时 false（本 gear 手上没有本地进程），owner 时 true。
+// 监管器据此决定「等不等这个进程」——判错就会把共享成功当成 service 退出并无限重启。
+func TestSessionIsOwnerMatchesRole(t *testing.T) {
+	empty, _ := oneShotEmpty()
+	addr, _ := serveCoord(t, empty)
+
+	cli, err := NewClient(addr, time.Second)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	sess, err := cli.RegisterOrStart(func() (Process, error) { return &fakeProc{pid: os.Getpid()}, nil })
+	if err != nil {
+		t.Fatalf("RegisterOrStart: %v", err)
+	}
+	defer sess.Close()
+	if sess.IsOwner() {
+		t.Fatal("已有实例时应退让为 client（IsOwner=false）")
+	}
+	if isOwner(sess) != sess.IsOwner() {
+		t.Fatal("IsOwner 与内部 owner 字段不一致")
+	}
+
+	// 对照：无监听 → 本 gear 成为 owner。
+	addr2 := freeAddr(t)
+	cli2, err := NewClient(addr2, time.Second)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	var srv *Coordinator
+	sess2, err := cli2.RegisterOrStart(func() (Process, error) {
+		srv = New(Options{CheckInterval: 50 * time.Millisecond, TTL: 2 * time.Second, OnEmpty: func() {}})
+		go func() { _ = srv.Serve(addr2, nil) }()
+		return &fakeProc{pid: os.Getpid()}, nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterOrStart: %v", err)
+	}
+	defer sess2.Close()
+	if !sess2.IsOwner() {
+		t.Fatal("无人监听时应成为 owner（IsOwner=true）")
+	}
+}
+
+// 本地 sidecar 仍存活时，重握手不得降级为 client、更不得误杀它——
+// 否则会把一个健康的共享实例打掉，影响其它已注册的 gear。
+func TestSessionRehandshakeKeepsOwnerWhenLocalSidecarAlive(t *testing.T) {
+	addr := freeAddr(t)
+	cli, err := NewClient(addr, time.Second)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	proc := &fakeProc{pid: os.Getpid()} // 本进程必然存活 → processAlive 为真
+	var srv *Coordinator
+	sess, err := cli.RegisterOrStart(func() (Process, error) {
+		srv = New(Options{CheckInterval: 50 * time.Millisecond, TTL: 2 * time.Second, OnEmpty: func() {}})
+		go func() { _ = srv.Serve(addr, nil) }()
+		return proc, nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterOrStart: %v", err)
+	}
+	defer sess.Close()
+	_ = srv
+
+	if err := sess.Rehandshake(); err != nil {
+		t.Fatalf("本地进程存活时重握手不应报错: %v", err)
+	}
+	if !sess.IsOwner() {
+		t.Fatal("本地 sidecar 仍存活，重握手后必须保留 owner 角色")
+	}
+	if sess.Proc().Pid() != proc.Pid() {
+		t.Fatalf("不应换掉存活的本地进程句柄: 期望 pid=%d，实际 %d", proc.Pid(), sess.Proc().Pid())
+	}
+	if proc.killed.Load() != 0 {
+		t.Fatal("不得误杀存活的本地 sidecar")
+	}
+}
+
+// 重握手失败（无人监听且拉不起 sidecar）必须把错误交回调用方，
+// 由监管层决定退避重试——不能静默当成「重启成功」。
+func TestSessionRehandshakePropagatesError(t *testing.T) {
+	cli, err := NewClient(freeAddr(t), time.Second) // 无人监听
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	// 直接构造会话（不起看门狗）：start 恒失败，模拟 sidecar 拉不起来（二进制缺失等）。
+	sess := &Session{
+		cli:   cli,
+		pid:   os.Getpid(),
+		owner: false,
+		proc:  noopProcess{},
+		stop:  make(chan struct{}),
+		start: func() (Process, error) { return nil, errors.New("sidecar 启动失败") },
+	}
+	if err := sess.Rehandshake(); err == nil {
+		t.Fatal("重握手失败必须返回 error（监管层据此退避重试，不能当成重启成功）")
+	}
+	if sess.IsOwner() {
+		t.Fatal("拉不起 sidecar 却成了 owner：状态与事实不符")
+	}
 }

@@ -1,0 +1,30 @@
+# mindstorm 起服用的 Tool（配套 mindstorm_flow.yaml）。
+# 注册（cwd = 仓库根）：gear tool register apps/mindstorm/mindstorm_tools.yaml
+kind: Tool
+id: mindstorm__config
+name: mindstorm 配置锚点
+description: 排序锚点（service step 不能作为依赖目标，用它把 site 推到下一层）
+runtime: lua
+entry: |
+  return {}
+input_schema:
+  type: object
+output_schema:
+  type: object
+versions:
+  - version: "1.0.0"
+    state: stable
+---
+kind: Tool
+id: mindstorm__api
+name: mindstorm REST 后端
+description: 用 process 长驻起 gear REST 执行面，作为 mindstorm 的后台（默认 127.0.0.1:8790）。
+runtime: process
+entry: "D:/gadern/gear/build/gear.exe serve --addr 127.0.0.1:8790"
+input_schema:
+  type: object
+output_schema:
+  type: object
+versions:
+  - version: "1.0.0"
+    state: stable

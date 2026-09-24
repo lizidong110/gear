@@ -6,8 +6,8 @@ import (
 )
 
 // 本文件覆盖「扩展原语名」注册面（cap.RegisterExtensionName / IsBuiltin / Known）。
-// 红线 15「未知枚举即拒」在此保持原样：只是合法枚举从写死 7 个变为
-// 「7 个内核原语 ∪ 启动期注册的 ext.* 名」。两条必须拒的情况刻意各测一次：
+// 红线 15「未知枚举即拒」在此保持原样：只是合法枚举从写死 6 个变为
+// 「6 个内核原语 ∪ 启动期注册的 ext.* 名」。两条必须拒的情况刻意各测一次：
 //  1. 注册名撞内置原语（内置集是受信核心，不得被扩展名遮蔽）；
 //  2. 注册名不带 ext. 前缀（与内置名空间冲突）。
 func TestRegisterExtensionNameAcceptsExtPrefix(t *testing.T) {
@@ -32,7 +32,7 @@ func TestRegisterExtensionNameRejectsBuiltinAndUnprefixed(t *testing.T) {
 	if err := RegisterExtensionName(PrimHTTP); err == nil {
 		t.Fatal("不得覆盖内置原语 http")
 	}
-	if err := RegisterExtensionName(PrimKV); !strings.Contains(err.Error(), "内置") {
+	if err := RegisterExtensionName(PrimDB); !strings.Contains(err.Error(), "内置") {
 		t.Fatalf("拒绝内置名时应说明原因，实际 %v", err)
 	}
 	if err := RegisterExtensionName(Primitive("nosep")); err == nil {

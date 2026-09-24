@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>mindstorm · 思维导图</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="banner"></div>
+
+  <!-- 左栏：搜索 / 分类 / 思维树列表 -->
+  <aside id="left" class="pane">
+    <div class="pane-head">
+      <span>思维树</span>
+      <button class="tiny primary" id="newTree">＋</button>
+    </div>
+    <div class="left-top">
+      <input id="searchBox" class="search-box" type="search" placeholder="搜索节点（标题/摘要/正文）…" />
+      <div class="cat-chips" id="catChips"></div>
+    </div>
+    <div class="tree-list" id="treeList"></div>
+  </aside>
+
+  <!-- 中栏：节点树 -->
+  <section id="mid" class="pane">
+    <div class="pane-head">
+      <span id="midTitle">节点</span>
+      <span class="mid-tools">
+        <span class="nav-group">
+          <button class="tiny nav-btn" id="navUp" title="上一级 (←)" disabled>↑</button>
+          <button class="tiny nav-btn" id="navDown" title="下一级 (→)：钻入选中节点" disabled>↓</button>
+          <button class="tiny nav-btn" id="navHome" title="回到整棵树根 (Home)" disabled>⌂</button>
+        </span>
+        <button class="tiny" id="addBtn" style="display:none" title="给选中节点加子节点（未选中则加根节点）">＋ 子节点</button>
+        <span id="midHint" class="mid-hint">视图 · 3 级</span>
+      </span>
+    </div>
+    <div class="node-tree" id="nodeTree" tabindex="0"></div>
+  </section>
+
+  <!-- 右栏：详情 + AI 续写 -->
+  <aside id="right" class="pane">
+    <div class="pane-head">
+      <span>详情</span>
+      <button class="tiny" id="modeToggle" title="在阅读 / 编辑间切换">✏️ 编辑</button>
+    </div>
+    <div class="detail" id="detail">
+      <div class="empty">从中间栏选择一个节点</div>
+    </div>
+  </aside>
+
+  <div id="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>

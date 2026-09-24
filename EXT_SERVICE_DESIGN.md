@@ -56,7 +56,7 @@
   让同主机的外部 service 成为**每主机单例**：首个需要的 gear 拉起 sidecar 并绑定端口，
   其余 gear 注册 PID 复用同一实例；占用列表空则 sidecar 自动退出。即 Gear 保证
   "单 gear 进程内一份"升级为"单主机一份"。
-- 不改现有内核原语（受门禁 7 个 http/call/db/kv/secret/event/subscribe + 纯函数 3 个 time/template/crypto）与 `lua` / `go-host` runtime（它们依旧不支持 service，与现状一致）。
+- 不改现有内核原语（受门禁 6 个 http/call/db/secret/event/subscribe + 纯函数 3 个 time/template/crypto）与 `lua` / `go-host` runtime（它们依旧不支持 service，与现状一致）。
 
 ---
 
@@ -102,7 +102,7 @@
 | **进程内**（Go builtin，编译进主二进制） | 直接函数调用：go-host `RegisterHostFunc`，同进程无子进程 | **长驻 goroutine**：直接持有 `ctx.*`，无任何 transport，goroutine 级监管 |
 
 **关键判断**：STDIO / RPC 都是"跨进程边界"才需要的传输层。进程内同地址空间，
-Gear 直接拿函数指针调方法、服务组件直接读 `ctx.*` 宿主能力（call/event/db/kv），
+Gear 直接拿函数指针调方法、服务组件直接读 `ctx.*` 宿主能力（call/event/db），
 不存在"传输"这件事。
 
 > 易混点提示：现有 `internal/ext/*.go`（rabbitmq/kafka/sms）代码虽**编译进主二进制**
@@ -129,7 +129,7 @@ registerService(ServiceSpec{
 生命周期（flow service step 引用时）：
 
 1. Gear 在主进程里 `go spec.Start(cancellableCtx)` 拉起一个 goroutine，
-   `ctx` 携带宿主能力（call/event/db/kv）—— 比进程外侧车**更强**，无需 IPC 注入；
+   `ctx` 携带宿主能力（call/event/db）—— 比进程外侧车**更强**，无需 IPC 注入；
 2. 监管复用同一套「重启策略 + 健康探针」逻辑，但作用在 **goroutine** 上（不是进程树）：
    - goroutine 异常退出 → `recover` 捕获 → 按 `RestartAlways/Never` + 指数退避重启；
    - `Health()` 连续失败 → 杀掉并重启；
@@ -247,7 +247,7 @@ stdin/stdout 换成 HTTP，便于连接复用与并发：
 | 文件 | 改动 |
 |---|---|
 | `internal/ext/ext.go` | 新增 `ServiceSpec` 结构 + `registerService(...)`；新增「goroutine supervisor」：`go spec.Start(ctx)` 拉起、`recover` 包裹异常、`Health()` 探针、按 `Restart` 策略 + 指数退避重启、`Stop()` 平滑退出（复用策略常量，作用在 goroutine 而非进程树） |
-| `internal/engine/engine.go` | service step 解析：当 `call` 命中**进程内** service ext 时走 `registerService` 拉起路径（带可取消 `ctx`），而非 `processRuntime.Start`；`ctx` 直接注入宿主能力（call/event/db/kv），无需 IPC |
+| `internal/engine/engine.go` | service step 解析：当 `call` 命中**进程内** service ext 时走 `registerService` 拉起路径（带可取消 `ctx`），而非 `processRuntime.Start`；`ctx` 直接注入宿主能力（call/event/db），无需 IPC |
 | `internal/app/supervisor.go` | （可选）把重启 / 探针逻辑抽成可复用于 goroutine 的通用函数，避免进程外 / 进程内两套重复实现 |
 | `examples/` | 一个**进程内 service 样例**（如 `ext.demo-inproc`：注册一个每秒打点的 goroutine，演示自运行 + 被调） |
 
@@ -423,6 +423,43 @@ if occupants.empty():
 - kill 其中一个 gear（模拟崩溃）→ sidecar 存活巡检移除非存活 PID，另一 gear 仍正常；
 - 两个 gear 都退出 → 占用列表空 → sidecar 自动退出（无孤儿进程、无端口占用）；
 - 竞态：同时起 2 gear → 至多一轮重试收敛为单 sidecar，无 `EADDRINUSE` 报错。
+- 两个 `gear app run` 各跑一个引用同一 service ext 的 flow → 第二个的 service step **不重启**
+  （日志为 `service 长驻启动 (pid=0)`，即 client 退让），全程只有 1 个 sidecar 进程。
+
+### 12.10 监管层：client 退让**不是** service 退出（2026-09-23 修复）
+
+现象：同主机跑两个 `gear app run`（不同 flow，都含 `ext.serve` service step），第二个反复重启：
+
+```
+✗ step serve service 退出（该 runtime 未提供退出信息）   ← 首行即误判
+↻ step serve service 重启 (第 1 次)
+✗ step serve service 退出 (exit=2)
+│ serve-sidecar 监听 127.0.0.1:8095（RPC/coord 端口）
+│ 端口 127.0.0.1:8095 已被占用，serve-sidecar 退让退出
+```
+
+**与 §12.4 的握手无关——握手其实是成功的**（第一个 gear 是 owner，第二个正常退让为 client）。
+根因是监管层把「没有本地进程」当成了故障，两处叠加：
+
+1. client 退让时手上**没有本地进程**：`Session.Proc()` 返回 `noopProcess`，其 `Wait()` 立即返回 nil。
+   `app.Supervisor.waitAny` 等的就是这个 Wait，于是「复用成功」被判成「service 已退出」。
+2. `engine.Relaunch` 接着直接 `rt.Start(h.Entry)`，而 Entry 形如 `COORD_ADDR=<listen> <sidecar>`；
+   端口已被他人 sidecar 占用 → 新 sidecar `net.Listen` 失败 → `os.Exit(ExitAddrInUse=2)` →
+   再次被判为退出 → 无限循环（退避 50ms→5s 封顶）。
+
+修法（判据集中在四处，语义只有一条：**没有本地进程是共享的正常态，不是故障**）：
+
+- `engine.ServiceHandle.HasLocalProc()`：service ext 只有在 **owner**（`Session.IsOwner()`）时才算
+  持有本地进程；client 手上那个 `noopProcess` 既不可 kill 也不可 wait，不能拿来判存活。
+- `engine.ServiceHandle.WaitExit(ctx)`：无本地进程时**不返回**，每 500ms 复查是否已接管为 owner
+  （由 §12.4.4 看门狗的 rehandshake 完成），接管后再转为等待该进程退出。
+- `engine.Relaunch`：`h.Coord != nil` 时走 `Session.Rehandshake()`——端口无人听则本 gear 接管为
+  owner 拉起 sidecar，否则继续退让复用；**不再** `rt.Start`，也就不会再撞 `ExitAddrInUse`。
+- 健康检查探针（#75）同理：共享实例杀不掉、也不该杀（那是别人的 sidecar）。达到阈值时
+  不 return（否则该句柄彻底失去探活），重置计数继续观察，交给看门狗自愈。
+
+锁：`internal/engine/service_coord_test.go`（3 例，含「丢掉 coord 分支即红」的负向验证）、
+`internal/sidecar/coord/coord_test.go` 的 `TestSession*` 三例。
 
 ---
 

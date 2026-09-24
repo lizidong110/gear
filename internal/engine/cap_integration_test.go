@@ -8,7 +8,7 @@ import (
 	"gear/internal/model"
 )
 
-// capTool 是一个声明了 kv + http 能力的 process Tool，entry 用 cat 把 stdin（含注入的 ctx）原样回显。
+// capTool 是一个声明了 db + http 能力的 process Tool，entry 用 cat 把 stdin（含注入的 ctx）原样回显。
 func capTool() *model.Tool {
 	return &model.Tool{
 		ID:           "cap-tool",
@@ -18,8 +18,8 @@ func capTool() *model.Tool {
 		InputSchema:  map[string]interface{}{"type": "object"},
 		OutputSchema: map[string]interface{}{"type": "object"},
 		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
-		// 声明两个 capability；运行期未声明的原语（如 secret/db）不应出现在 ctx 上。
-		Capabilities: []string{"kv", "http"},
+		// 声明两个 capability；运行期未声明的原语（如 secret/event）不应出现在 ctx 上。
+		Capabilities: []string{"db", "http"},
 	}
 }
 
@@ -41,8 +41,8 @@ func TestRunFlowInjectsCapabilities(t *testing.T) {
 		t.Fatalf("注册 Flow 失败: %v", err)
 	}
 
-	// 宿主提供 kv 实现（http 走默认 client），不提供 secret/db。
-	host := &cap.Providers{KV: cap.NewMemKV()}
+	// 宿主无需额外实现（capabilities 来自声明，与实现无关；实现是否可用由原语自身决定）。
+	host := &cap.Providers{}
 	res, err := New(reg, WithHost(host)).RunFlowResult("capflow")
 	if err != nil {
 		t.Fatalf("RunFlowResult 失败: %v", err)
@@ -65,10 +65,10 @@ func TestRunFlowInjectsCapabilities(t *testing.T) {
 	for _, c := range caps {
 		capSet[fmt.Sprint(c)] = true
 	}
-	if !capSet["kv"] || !capSet["http"] {
-		t.Fatalf("ctx.capabilities 应包含 kv/http，实际: %v", caps)
+	if !capSet["db"] || !capSet["http"] {
+		t.Fatalf("ctx.capabilities 应包含 db/http，实际: %v", caps)
 	}
-	if capSet["secret"] || capSet["db"] || capSet["event"] || capSet["call"] {
+	if capSet["secret"] || capSet["event"] || capSet["call"] {
 		t.Fatalf("未声明的 capability 不应透传: %v", caps)
 	}
 	if fmt.Sprint(ctxObj["sandbox"]) != "false" {
@@ -100,7 +100,7 @@ func TestRunFlowNoHostDeclaredCap(t *testing.T) {
 	ctxObj := res.Steps["s1"]["output"].(map[string]interface{})["ctx"].(map[string]interface{})
 	caps, ok := ctxObj["capabilities"].([]interface{})
 	if !ok || len(caps) != 2 {
-		t.Fatalf("未配置 Host 时声明仍应透传（kv/http），实际: %v", ctxObj["capabilities"])
+		t.Fatalf("未配置 Host 时声明仍应透传（db/http），实际: %v", ctxObj["capabilities"])
 	}
 	if fmt.Sprint(ctxObj["sandbox"]) != "false" {
 		t.Fatalf("ctx.sandbox 应为 false，实际: %v", ctxObj["sandbox"])

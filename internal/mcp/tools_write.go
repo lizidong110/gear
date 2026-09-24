@@ -458,33 +458,37 @@ func (s *Server) registerWriteTools(ms *mcp.Server) {
 		Name: "gear_validate",
 		Description: "校验 bundle YAML **但不落库**，返回字段级诊断（code/step/field/hint）。" +
 			"写配置后、apply 前用它；失败可无限次重试，直到 valid:true。",
-		Annotations: readOnly("校验 YAML"),
+		Annotations:  readOnly("校验 YAML"),
+		OutputSchema: outValidate,
 	}, s.handleValidate)
 
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_apply",
 		Description: "把 bundle 落库（**唯一写入口**）：原子、幂等。多文档按依赖顺序 Tool→Flow→Hook 写入，" +
 			"任一非法则整体不写。dry_run=true 等价于先用 validate 看一遍含冲突检测。",
-		Annotations: idempotent("落库定义"),
+		Annotations:  idempotent("落库定义"),
+		OutputSchema: outApply,
 	}, s.handleApply)
 
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_delete",
 		Description: "删除一个对象（tool/flow/hook）。被其它对象或运行中的执行引用时会被守卫拒绝，" +
 			"错误信息会说明被谁引用。**破坏性操作**：先想清楚影响面。",
-		Annotations: destructive("删除对象"),
+		Annotations:  destructive("删除对象"),
+		OutputSchema: outDelete,
 	}, s.handleDelete)
 
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_promote",
 		Description: "晋升 Tool 某个版本的状态（draft→testing→stable→deprecated，非法迁移会被状态机拒绝），" +
 			"触发 before_promote 门禁。stable 后才能被默认引用使用。",
-		Annotations: idempotent("晋升版本"),
+		Annotations:  idempotent("晋升版本"),
+		OutputSchema: outPromote,
 	}, s.handlePromote)
 }
 
 // handleValidate：收 YAML、返回诊断、**不落库**。
-func (s *Server) handleValidate(_ context.Context, _ *mcp.CallToolRequest, in ValidateArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) handleValidate(ctx context.Context, _ *mcp.CallToolRequest, in ValidateArgs) (*mcp.CallToolResult, any, error) {
 	if strings.TrimSpace(in.YAML) == "" {
 		return toolError("BAD_ARGUMENT", "yaml 不能为空",
 			"把 bundle 的多文档 YAML 传进来（第一份通常是 kind: App）"), nil, nil
@@ -502,7 +506,7 @@ func (s *Server) handleValidate(_ context.Context, _ *mcp.CallToolRequest, in Va
 }
 
 // handleApply：唯一的写入口（声明式、原子、幂等）。
-func (s *Server) handleApply(_ context.Context, _ *mcp.CallToolRequest, in ApplyArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) handleApply(ctx context.Context, _ *mcp.CallToolRequest, in ApplyArgs) (*mcp.CallToolResult, any, error) {
 	if strings.TrimSpace(in.Bundle) == "" {
 		return toolError("BAD_ARGUMENT", "bundle 不能为空", "先用 gear_guide(\"examples\") 拿一个骨架"), nil, nil
 	}
@@ -652,7 +656,7 @@ func (s *Server) diffExisting(b *bundle, wantExisting bool) []string {
 }
 
 // handleDelete 删对象（守卫语义与 REST/CLI 完全一致，本层只做协议翻译）。
-func (s *Server) handleDelete(_ context.Context, _ *mcp.CallToolRequest, in DeleteArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) handleDelete(ctx context.Context, _ *mcp.CallToolRequest, in DeleteArgs) (*mcp.CallToolResult, any, error) {
 	kind := strings.ToLower(strings.TrimSpace(in.Kind))
 	if in.ID == "" {
 		return toolError("BAD_ARGUMENT", "id 不能为空", "先用 gear_catalog 确认要删的对象"), nil, nil
@@ -689,7 +693,7 @@ func (s *Server) handleDelete(_ context.Context, _ *mcp.CallToolRequest, in Dele
 }
 
 // handlePromote 晋升 Tool 版本（状态机与 Hook 门禁都在 engine 层，本层不重复实现）。
-func (s *Server) handlePromote(_ context.Context, _ *mcp.CallToolRequest, in PromoteArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) handlePromote(ctx context.Context, _ *mcp.CallToolRequest, in PromoteArgs) (*mcp.CallToolResult, any, error) {
 	target := model.ToolVersionState(in.Target)
 	if !model.ValidStates[target] {
 		return toolError("BAD_ARGUMENT",

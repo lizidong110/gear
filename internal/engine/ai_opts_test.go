@@ -28,6 +28,14 @@ func (l *recordingLLM) Complete(_ context.Context, req LLMRequest) (string, erro
 	return "{}", nil
 }
 
+func (l *recordingLLM) CompleteStream(_ context.Context, req LLMRequest, onDelta func(content, reasoning string) error) error {
+	l.got = append(l.got, req)
+	if onDelta != nil {
+		return onDelta("{}", "")
+	}
+	return nil
+}
+
 // TestGenerateAppliesLLMOverridesFromOpts —— GenerateOpts 的模型覆盖必须真的生效。
 //
 // 曾踩的坑：CLI `gear ai gen` 把 GEAR_AI_MODEL / GEAR_AI_PROVIDER 填进 opts，

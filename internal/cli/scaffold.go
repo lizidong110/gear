@@ -73,7 +73,7 @@ func scaffoldToolCmd() *cobra.Command {
 
 versions[].state 取值：draft / testing / stable / deprecated / rejected
 capabilities 合法值（最小权限，未声明即不能用）：
-  - 受门禁内核原语（须声明才可用）：http / call / db / kv / secret / event / subscribe
+  - 受门禁内核原语（须声明才可用）：http / call / db / secret / event / subscribe
   - 纯函数原子（始终可用，无需声明）：time / template / crypto
   - 扩展原语 ext.*（须 extensions.yaml 登记，如 ext.ai / ext.email / ext.kafka）
 
@@ -127,7 +127,7 @@ Step 字段：
   call         string   必填  两种写法：
                          1) 已注册 Tool 的 id（如 my-tool）
                          2) 原子能力直调「能力.方法」（如 crypto.hash / http.Request /
-                            kv.put / db.query / ext.ai.complete）
+                            db.query / secret.get / ext.ai.complete）
   input        map      选填  入参；值里可写模板（见下）
   depends_on   []string 选填  上游 step id（input 里出现 ${steps.x.*} 也会隐式依赖）
   when         string   选填  条件执行（表达式，不是 ${} 模板），如 "steps.s1.output.n > 1"
@@ -267,7 +267,7 @@ name: %s
 description: "TODO: 用一句话描述这个原子能力做什么"
 runtime: %s
 %s
-capabilities: []            # 最小权限白名单：http/call/db/kv/secret/event/subscribe；ext.* 需 extensions.yaml 登记；time/template/crypto 无需声明
+capabilities: []            # 最小权限白名单：http/call/db/secret/event/subscribe；ext.* 需 extensions.yaml 登记；time/template/crypto 无需声明
 input_schema:
   type: object
   properties:
@@ -301,7 +301,7 @@ func scaffoldFlowYAML(name string) string {
 #
 # step.call 两种写法：
 #   1) 已注册 Tool 的 id（如 my-tool）
-#   2) 原子能力直调「能力.方法」（如 crypto.hash / http.Request / kv.put / ext.ai.complete）
+#   2) 原子能力直调「能力.方法」（如 crypto.hash / http.Request / db.query / ext.ai.complete）
 # 模板：${vars.x}（Flow 变量）/ ${steps.id.output.field}（上游出参）/ ${secrets.name}（密钥）
 # 条件执行：when: "steps.hash.output.result != ''"（表达式，不是 ${} 模板）
 id: %s

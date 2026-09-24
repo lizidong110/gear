@@ -27,8 +27,10 @@ import (
 	"strings"
 
 	"github.com/cloudwego/eino/compose"
+	"github.com/yuin/gopher-lua"
 	"gopkg.in/yaml.v3"
 
+	"gear/internal/cap"
 	"gear/internal/model"
 	"gear/internal/registry"
 )
@@ -46,16 +48,16 @@ type Recipe struct {
 	CapabilitiesHint string `yaml:"capabilities_hint"`
 }
 
-// RecipeLoader 加载某 kind 的配方。embeddedRecipeLoader 先试目录覆盖（examples/ai/recipes），
-// 再回退嵌入默认；用户改目录里的 YAML 即生效，无需重编。
+// RecipeLoader 加载某 kind 的配方。embeddedRecipeLoader 先试**可选**覆盖目录（examples/ai/recipes，
+// 默认不存在；存在则优先），再回退嵌入默认；用户改覆盖目录里的 YAML 即生效，无需重编。
 type RecipeLoader interface {
 	Load(kind string) (*Recipe, error)
 }
 
 // embeddedRecipes 是随二进制分发的默认配方（flow/tool/hook 三份必须齐全：Load 按 kind 直接
-// ReadFile，缺任何一份都等于「该 kind 生成不了」）。仓库里 examples/ai/recipes 是**用户可改的
-// 覆盖目录**（GEAR_AI_RECIPES 可换），两份内容初始相同；改默认措辞或约束时两边一起改，
-// 否则会出现「本地跑得好、装到别处生成变样」的漂移。
+// ReadFile，缺任何一份都等于「该 kind 生成不了」）。覆盖目录 examples/ai/recipes（或
+// GEAR_AI_RECIPES 指向的目录）**默认不存在、按需创建即可**，存在时优先于内嵌。
+// 改默认措辞/约束只需改 `internal/engine/recipes/*.yaml`（内嵌即权威），不必再造覆盖副本。
 //
 //go:embed recipes/*.yaml
 var embeddedRecipes embed.FS
@@ -145,6 +147,17 @@ func (a *AIAgent) Complete(args map[string]interface{}) (interface{}, error) {
 		return map[string]interface{}{"data": data}, nil
 	}
 	return map[string]interface{}{"text": text}, nil
+}
+
+// CompleteStream 是 Complete 的流式版：把 LLM 增量逐条经 onDelta 回调出去（content 为主文本，
+// reasoning 为推理增量，可能为空）。供 REST SSE 端点与 Lua 回调式 API 复用；旧的 Complete
+// 同步方法保持不变，所有现存同步调用方零破坏。
+func (a *AIAgent) CompleteStream(args map[string]interface{}, onDelta func(content, reasoning string) error) error {
+	var req LLMRequest
+	if b, err := json.Marshal(args); err == nil {
+		_ = json.Unmarshal(b, &req)
+	}
+	return a.llm.CompleteStream(context.Background(), req, onDelta)
 }
 
 // Catalog 在指定能力域内（或全域）按「查询词 + 域」做 BM25 检索，返回 Top-K 候选工具。
@@ -279,7 +292,7 @@ func (a *AIAgent) GenerateMethod(args map[string]interface{}) (interface{}, erro
 // ReactOpts 携带 react 的可选项。
 type ReactOpts struct {
 	MaxSteps    int      // 最大步数（默认 6）
-	Allow       []string // 限制可用工具（如 ["http","kv"]）；空 = 全部内置原语 + 已注册 ext.*
+	Allow       []string // 限制可用工具（如 ["http","secret"]）；空 = 全部内置原语 + 已注册 ext.*
 	Provider    string   // 模型厂商（可选，覆盖 env）
 	Model       string   // 模型名（可选）
 	BaseURL     string   // API base（可选）
@@ -291,7 +304,7 @@ type ReactOpts struct {
 // 编成一段 Lua 入口、经与真实 Tool 完全相同的宿主能力通道（host.* / ctx.ext.*）执行，观察结果再
 // 喂回 LLM，直到 LLM 给出 Final Answer 或达到最大步数。
 //
-// react「可以使用内置所有工具」即此意：每步 LLM 选中的工具（内核原语 http/call/db/kv/secret/event/subscribe
+// react「可以使用内置所有工具」即此意：每步 LLM 选中的工具（内核原语 http/call/db/secret/event/subscribe
 // 与纯函数原子 time/template/crypto，或已注册 ext.*）都经 exec 执行——复用引擎既有的最小权限 + Lua 沙箱，
 // react 不会越出宿主能力边界。
 //
@@ -441,7 +454,7 @@ func (a *AIAgent) reactSystemPrompt(allow []string, maxSteps int) string {
 	b.WriteString("Final Answer: <给用户的完整回答>\n\n")
 	b.WriteString("## 规则\n")
 	b.WriteString("- 每轮只能调用一个工具。Action 必须是合法 JSON（放在 ```json ... ``` 围栏内）。\n")
-	b.WriteString("- tool 字段为「<能力名>.<方法>」：内置原语如 http.Request / db.query / kv.get；扩展如 ext.ai.complete。\n")
+	b.WriteString("- tool 字段为「<能力名>.<方法>」：内置原语如 http.Request / db.query / secret.get；扩展如 ext.ai.complete。\n")
 	b.WriteString("- 内置原语按「位置参数」调用，args 的键对应上面列出的参数名（可选参数缺省传 null）。\n")
 	b.WriteString("- 扩展（ext.*）按「单个具名 table」调用，args 整体作为 { ... } 传入 ctx.ext.<name>.<method>({...})。\n")
 	b.WriteString("- Observation（工具返回）会由系统填回作为下一步输入；不要自己编造 Observation。\n")
@@ -459,7 +472,7 @@ func (a *AIAgent) reactToolsText(allow []string) string {
 		return len(allowed) == 0 || allowed[name]
 	}
 	var sb strings.Builder
-	for _, p := range []string{"http", "call", "db", "kv", "secret", "event"} {
+	for _, p := range []string{"http", "call", "db", "secret", "event"} {
 		if !filter(p) {
 			continue
 		}
@@ -498,7 +511,6 @@ var builtinParamOrder = map[string]map[string][]string{
 	"http":      {"Request": {"method", "url", "body", "headers"}},
 	"call":      {"Call": {"target", "input"}},
 	"db":        {"query": {"table"}, "exec": {"table"}, "ping": {"table"}},
-	"kv":        {"get": {"key", "scope"}, "put": {"key", "value", "scope"}, "delete": {"key", "scope"}},
 	"secret":    {"get": {"name"}},
 	"event":     {"notify": {"name", "payload"}, "wait": {"name"}},
 	"subscribe": {"start": {"table"}, "stop": {"handle"}},
@@ -1031,7 +1043,7 @@ func (a *AIAgent) normalizeDef(kind string, def map[string]interface{}) {
 // 而 GrantsFromStrings 只认 cap.KnownPrimitives ∪ 已注册 ext.* → 生成出来的 Tool 会在
 // 「未知的 capability "time"」上校验失败（一句话：自动推导只登记真需要授权的原语）。
 var builtinCapabilityNames = map[string]bool{
-	"http": true, "call": true, "db": true, "kv": true, "secret": true, "event": true, "subscribe": true,
+	"http": true, "call": true, "db": true, "secret": true, "event": true, "subscribe": true,
 }
 
 var (
@@ -1214,40 +1226,128 @@ func (o overrideLLM) Complete(ctx context.Context, req LLMRequest) (string, erro
 	return o.base.Complete(ctx, req)
 }
 
+// CompleteStream 与 Complete 同款：先填 opts 的空字段，再转发给底层 LLM 的流式实现。
+func (o overrideLLM) CompleteStream(ctx context.Context, req LLMRequest, onDelta func(content, reasoning string) error) error {
+	if req.Provider == "" {
+		req.Provider = o.opts.Provider
+	}
+	if req.Model == "" {
+		req.Model = o.opts.Model
+	}
+	if req.BaseURL == "" {
+		req.BaseURL = o.opts.BaseURL
+	}
+	if req.APIKey == "" {
+		req.APIKey = o.opts.APIKey
+	}
+	return o.base.CompleteStream(ctx, req, onDelta)
+}
+
 // GenResult 是 generate 的产物。
 type GenResult struct {
 	Kind string
 	Def  map[string]interface{}
 }
 
-// AIExtensionInProcess 把 AIAgent 暴露为进程内扩展原语 ctx.ext.ai.{complete,catalog,domains,validate,generate,capabilities}。
+// AIExtensionInProcess 把 AIAgent 暴露为进程内扩展原语 ctx.ext.ai。
 // 取代原 sidecar 子进程载体（用户决策：ext.ai 进程内）。
-// aiMethodNames 是 ext.ai 暴露的方法（AIAgent 的稳定层方法）。注册（AIAgent 的 InProcessExtension）
-// 与 schema（defaultAISchemas）共用这一份清单——两者不一致会让静态校验「拒掉真能跑的方法」
-// 或「放过会 500 的方法」，由 TestAIMethodNamesMatchDefaultSchemas 守着。
-var aiMethodNames = []string{"complete", "catalog", "domains", "validate", "generate", "capabilities", "react"}
+//
+// 方法分两类：
+//   - 同步方法（aiSyncMethods）：走 callAIMethod，与原 InProcessExtension 行为一致；
+//   - complete_stream：回调式，Lua 侧以 ctx.ext.ai.complete_stream(args, function(token, reasoning) ...)
+//     调用，每个 LLM 增量触发一次回调（REST SSE 端点走同一条 AIAgent.CompleteStream 通道）。
+//
+// aiMethodNames 是「注册方法清单」（用于 capabilities 目录与 schema 守卫），含 complete_stream；
+// aiSyncMethods 是「走同步分发的子集」。两者不一致会让静态校验出错，由
+// TestAIMethodNamesMatchDefaultSchemas 守着。
+var aiMethodNames = []string{"complete", "catalog", "domains", "validate", "generate", "capabilities", "react", "complete_stream"}
 
+// aiSyncMethods 是 ext.ai 里「同步分发」的方法（不含回调式的 complete_stream）。
+var aiSyncMethods = []string{"complete", "catalog", "domains", "validate", "generate", "capabilities", "react"}
+
+// callAIMethod 按方法名分发到 AIAgent 的稳定层方法（同步路径），供 Lua / go-host Provider 共用。
+func callAIMethod(a *AIAgent, method string, args map[string]interface{}) (interface{}, error) {
+	switch method {
+	case "complete":
+		return a.Complete(args)
+	case "catalog":
+		return a.Catalog(args)
+	case "domains":
+		return a.Domains(args)
+	case "validate":
+		return a.ValidateMethod(args)
+	case "capabilities":
+		return a.CapabilitiesMethod()
+	case "generate":
+		return a.GenerateMethod(args)
+	case "react":
+		return a.ReactMethod(args)
+	default:
+		return nil, fmt.Errorf("ext.ai 不支持的方法 %q（仅 complete/catalog/domains/validate/generate/capabilities/react/complete_stream）", method)
+	}
+}
+
+// aiInProcessProvider 是 ext.ai 的 go-host 原生实现（host.Extension("ext.ai") 取用）。
+// complete_stream 无法在同步 Provider 接口上表达流式回调，故显式报错引导到 Lua / REST 流式面。
+type aiInProcessProvider struct{ a *AIAgent }
+
+func (p *aiInProcessProvider) Call(method string, args map[string]interface{}) (interface{}, error) {
+	if method == "complete_stream" {
+		return nil, fmt.Errorf("ext.ai.complete_stream 仅支持 Lua 回调式调用（ctx.ext.ai.complete_stream(args, function)）或 REST SSE 端点，无法通过同步 Provider 调用")
+	}
+	return callAIMethod(p.a, method, args)
+}
+
+// AIExtensionInProcess 构造 ext.ai 的进程内扩展定义：同步方法 + complete_stream 回调式。
 func AIExtensionInProcess(a *AIAgent) *CapabilityExtension {
-	return InProcessExtension("ext.ai",
-		aiMethodNames,
-		func(method string, args map[string]interface{}) (interface{}, error) {
-			switch method {
-			case "complete":
-				return a.Complete(args)
-			case "catalog":
-				return a.Catalog(args)
-			case "domains":
-				return a.Domains(args)
-			case "validate":
-				return a.ValidateMethod(args)
-			case "capabilities":
-				return a.CapabilitiesMethod()
-			case "generate":
-				return a.GenerateMethod(args)
-			case "react":
-				return a.ReactMethod(args)
-			default:
-				return nil, fmt.Errorf("ext.ai 不支持的方法 %q（仅 complete/catalog/domains/validate/generate/capabilities/react）", method)
+	return &CapabilityExtension{
+		Provider: func(c *cap.Context) (interface{}, error) {
+			return &aiInProcessProvider{a: a}, nil
+		},
+		BuildLua: func(L *lua.LState, c *cap.Context) (lua.LValue, error) {
+			tbl := L.NewTable()
+			// 同步方法：与旧 InProcessExtension 同款（args table → 同步结果）。
+			for _, m := range aiSyncMethods {
+				method := m
+				tbl.RawSetString(m, L.NewFunction(func(L *lua.LState) int {
+					args := map[string]interface{}{}
+					if mt, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{}); ok {
+						args = mt
+					}
+					res, err := callAIMethod(a, method, args)
+					if err != nil {
+						L.RaiseError("%v", err)
+						return 0
+					}
+					L.Push(toLuaValue(L, res))
+					return 1
+				}))
 			}
-		})
+			// complete_stream：arg1 = args table，arg2 = callback function（每个增量触发一次）。
+			tbl.RawSetString("complete_stream", L.NewFunction(func(L *lua.LState) int {
+				var args map[string]interface{}
+				if mt, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{}); ok {
+					args = mt
+				}
+				cb := L.Get(2)
+				cbfn, ok := cb.(*lua.LFunction)
+				if !ok {
+					L.RaiseError("ext.ai.complete_stream 需要两个参数：args(table) 与 callback(function)")
+					return 0
+				}
+				err := a.CompleteStream(args, func(content, reasoning string) error {
+					if err := L.CallByParam(lua.P{Fn: cbfn, NRet: 0, Protect: true}, lua.LString(content), lua.LString(reasoning)); err != nil {
+						return err
+					}
+					return nil
+				})
+				if err != nil {
+					L.RaiseError("%v", err)
+					return 0
+				}
+				return 0
+			}))
+			return tbl, nil
+		},
+	}
 }

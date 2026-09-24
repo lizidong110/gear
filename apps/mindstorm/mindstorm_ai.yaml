@@ -1,0 +1,538 @@
+# mindstorm AI 续写 / 大纲生成 Tool（注册：gear tool register apps/mindstorm/mindstorm_ai.yaml）
+#
+# 路径：PRD §5.5.1 默认「同步 Tool 路径」——prompt 组装 + AI 生成 + 落库 + 去重都在 Tool 内完成，
+# 干净、落库原子。流式（SSE 直调 ext.ai）作为 UX 增强留给前端，两条路径共享本 Tool 的 prompt/解析口径。
+#
+# 两种用法（同一 Tool，靠 depth 区分）：
+#   - depth=1（默认）：给定节点，调 AI 生成至多 EXPAND_BATCH_MAX(12) 个不重复子节点（续写一层）。
+#   - depth>1：给定一个主体节点，调 AI 一次性生成「深度 depth 的分层大纲」并递归落库（建整棵轮廓树）。
+#
+# 用户自定义指令（instruction）：可选。传了就作为「额外要求」注入 prompt，
+#   用来回答「AI 到底该续写个啥」——例如「只从成本角度切入」「面向车载场景」「偏工程实现而非市场」。
+#   不传则只按节点标题/上下文自由发散（原来的行为）。
+#
+# ⚠️ timeout: "15m" 的取值口径（#77 + 2026-09-23 修正）：
+#   1) 必须**远大于**引擎默认闸门 defaultExecTimeout=30s：本 Tool 在 lua 里**同步阻塞**调用
+#      ctx.ext.ai.complete，实测 AI 单次 17–20s（最短负载）、长正文 60–160s，不声明则 100% 报
+#      `lua 执行被中断: context deadline exceeded`（且阻塞的宿主调用无法被 ctx 打断，报错时长
+#      常远超 30s，看起来像 key/网络故障，实为超时）。
+#   2) 必须**不小于** AI 层的总超时 GEAR_AI_TOTAL_TIMEOUT（默认 900s=15m）：否则 AI 还在正常输出
+#      就被这一层提前掐断。Tool.timeout 只是**兜底上限**，判死交给 AI 层：
+#        - Idle  = GEAR_AI_IDLE_TIMEOUT（默认 60s）——「多久没有新增输出即判死」，这才是
+#          「是不是卡住了」的正确判据（一直在出字 ⇒ 没死；长时间不出字 ⇒ 假死）；
+#        - Total = GEAR_AI_TOTAL_TIMEOUT（默认 900s）—— 单次调用总上限。
+#      即：**只要还在持续输出新内容就不该被杀**，与总耗时无关。
+#
+# 约束：
+#   - EXPAND_BATCH_MAX=12：单次「续写一层」最多 12 个子节点（成本∝N、质量随 N 断崖）。
+#   - 大纲模式：总节点硬上限 OUTLINE_MAX=200（防失控），每层每个节点最多 count 个分支，层数 ≤ MAX_DEPTH(4)。
+#   - 手工加子节点不受此限（由前端/其它 Tool 控制）。
+#   - demo 模式：无 AI key 时传 demo=true，返回样例子节点/样例大纲，便于离线验收全链路。
+#
+# 已知限制：gopher-lua 为 Lua 5.1，**无 goto**，去重/截断用普通 if 分支表达。
+---
+kind: Tool
+id: mindstorm__expand
+name: AI 续写 / 大纲生成（生成子节点并落库）
+description: 给定节点，调 ext.ai 生成子节点并落库；depth=1 续写一层（≤12 个），depth>1 一次性生成分层大纲（建整棵轮廓）。instruction 可传用户自定义要求。demo=true 无 key 也返回样例。
+runtime: lua
+capabilities: [db, ext.ai]
+timeout: "15m"
+input_schema:
+  type: object
+  properties:
+    node_id: {type: string}
+    count: {type: integer}
+    depth: {type: integer}
+    instruction: {type: string}
+    mode: {type: string}
+    demo: {type: boolean}
+    dry_run: {type: boolean}
+    items_json: {type: string}
+  required: [node_id]
+output_schema:
+  type: object
+  properties:
+    created:
+      type: array
+      items:
+        type: object
+        properties:
+          id: {type: string}
+          title: {type: string}
+          depth: {type: integer}
+          ai_generated: {type: integer}
+          parent_id: {type: string}
+    skipped: {type: integer}
+    requested: {type: integer}
+    depth: {type: integer}
+    truncated: {type: boolean}
+    mode: {type: string}
+    auto_count: {type: boolean}
+    system: {type: string}
+    prompt: {type: string}
+    kept: {type: integer}
+    prev_count: {type: integer}
+    extras:
+      type: array
+      items: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local EXPAND_BATCH_MAX = 12
+  local OUTLINE_MAX = 200
+  local MAX_DEPTH = 4
+  local MAX_CRUMB = 6  -- 祖先面包屑条数上限（AI_CTX_BUDGET 的近似裁剪：每条摘要 ~20 token）
+
+  local node_id = ctx.input.node_id
+  -- count：**可选**。0 / 缺省 = 让 AI 按内容自然决定分几支（东东 2026-09-23 反馈：
+  -- 「我也不知道到底分多少分支合适」——那就不该逼用户猜，交给 AI 判断粒度）。
+  -- 显式传正整数时才作为「目标条数」。
+  local count = ctx.input.count or 0
+  if type(count) ~= "number" then count = 0 end
+  if count < 0 then count = 0 end
+  local autoCount = (count == 0)
+  if not autoCount and count > EXPAND_BATCH_MAX then count = EXPAND_BATCH_MAX end
+  local depth = ctx.input.depth or 1
+  if depth < 1 then depth = 1 end
+  if depth > MAX_DEPTH then depth = MAX_DEPTH end
+  local demo = ctx.input.demo or false
+  -- dry_run：只组装 prompt 并返回（**不调 AI、不落库**），供前端走 REST SSE 流式路径。
+  local dry_run = ctx.input.dry_run or false
+  -- items_json：前端已通过 SSE 拿到 AI 的完整输出并解析成数组，回传后**跳过 AI 直接落库**。
+  -- 这是流式路径的第二段，与 dry_run 成对使用。
+  local items_json = ctx.input.items_json or ""
+  if type(items_json) ~= "string" then items_json = "" end
+  local from_items = (items_json ~= "")
+  -- mode：append（默认，补充新分支）/ regroup（**重新规划整体划分**）。
+  -- regroup 解决「重复点生成越点越差」：append 每轮只能去挑「还没被占的」，几轮下来是边角料拼凑；
+  -- regroup 则让 AI 看到已有全部子项后**重新给一份完整划分**，复用已有的、补齐缺失的。
+  -- 仅对「续写一层」有意义（分层大纲本就是一次性整体生成），故 depth>1 时强制回落为 append。
+  local mode = ctx.input.mode or "append"
+  if mode ~= "regroup" then mode = "append" end
+  if depth > 1 then mode = "append" end
+  -- 用户自定义指令：可选。空串/缺省都视为「无额外要求」。
+  local instruction = ctx.input.instruction or ""
+  if type(instruction) ~= "string" then instruction = "" end
+  instruction = instruction:gsub("^%s+", ""):gsub("%s+$", "")
+
+  -- 单次生成的总硬上限（**安全护栏**，不是目标值）：
+  --   - 分层大纲：OUTLINE_MAX（防一次生成上千节点）
+  --   - 自动决定条数：AUTO_HARD_CAP（防模型失控输出几十条）；prompt 里明确「通常 3~9 个」
+  --   - 显式指定条数：就是那个数
+  local AUTO_HARD_CAP = 16
+  local CAP
+  if depth > 1 then CAP = OUTLINE_MAX
+  elseif autoCount then CAP = AUTO_HARD_CAP
+  else CAP = count end
+
+  -- output_schema 要求 created/extras 是数组；Lua 原生空表会被判成 object，必须过一遍 json。
+  local function emptyArr() return ctx.json.decode("[]") end
+
+  -- 读目标节点
+  local nr = ctx.db.query({driver="sqlite", dsn=DSN,
+    sql="SELECT id,tree_id,parent_id,path,depth,title,body,summary FROM nodes WHERE id=?", params={node_id}})
+  if not nr or #nr == 0 then error("node 不存在: " .. node_id) end
+  local node = nr[1]
+
+  -- 已有子节点（顶层去重用；也是 regroup 的「现有划分」素材）。
+  -- 带上 summary 很重要：只给标题时 AI 看不出已有的覆盖深度，regroup 会误判「缺什么」。
+  local er = ctx.db.query({driver="sqlite", dsn=DSN,
+    sql="SELECT title,summary FROM nodes WHERE tree_id=? AND parent_id=? ORDER BY ord",
+    params={node.tree_id, node_id}})
+  local exlist = {}
+  if er then
+    for _, e in ipairs(er) do
+      local sm = (e.summary or "")
+      if #sm > 0 then
+        table.insert(exlist, "- " .. e.title .. "（" .. sm .. "）")
+      else
+        table.insert(exlist, "- " .. e.title)
+      end
+    end
+  end
+  local exstr = #exlist > 0 and table.concat(exlist, "\n") or "(无)"
+  local prevCount = er and #er or 0
+
+  -- 祖先面包屑（path 拆解，裁剪到 MAX_CRUMB 条）
+  local ancestors = {}
+  for seg in string.gmatch(node.path, "[^/]+") do
+    if seg ~= node_id then table.insert(ancestors, seg) end
+  end
+  local crumb = {}
+  local starti = math.max(1, #ancestors - MAX_CRUMB + 1)
+  for i = starti, #ancestors do
+    local ar = ctx.db.query({driver="sqlite", dsn=DSN, sql="SELECT title FROM nodes WHERE id=?", params={ancestors[i]}})
+    if ar and #ar > 0 then table.insert(crumb, ar[1].title) end
+  end
+  local context = table.concat(crumb, " > ")
+
+  local function newid(i)
+    local ts = ctx.time.now({format = "unix"})
+    return "c_" .. tostring(ts) .. "_" .. tostring(i) .. "_" .. tostring(math.random(99999))
+  end
+
+  -- 用户指令段：空则整段不出现，避免往 prompt 里塞「额外要求: (无)」这类噪音
+  local instr_line = ""
+  if instruction ~= "" then
+    instr_line = "\n额外要求（用户指定，优先级高于上面的泛化描述）: " .. instruction
+  end
+
+  -- 剥掉模型爱加的 markdown 代码围栏（```json ... ``` / ``` ... ```）。
+  -- 已在 system 里明确要求「不要 markdown 代码块」，但真实模型仍常加；不剥则 json.decode 必失败，
+  -- 表现为「AI 明明生成了却解析不出来」——属真实场景必踩，故此处显式容错。
+  local function stripFence(s)
+    if type(s) ~= "string" then return s end
+    local t = s:gsub("^%s+", ""):gsub("%s+$", "")
+    local body = t:match("^```[%w]*%s*\n(.*)\n```$")
+    if body then return body end
+    body = t:match("^```[%w]*%s*\n(.*)```$")
+    if body then return body end
+    return t
+  end
+
+  -- 调 AI 并解析成 Lua table。失败一律给出可操作错误（不静默返回空）。
+  local function askAI(system, prompt)
+    local res = ctx.ext.ai.complete({system = system, prompt = prompt, format = "json"})
+    local raw = res
+    if type(res) == "table" then
+      -- 有的通路会把结构化结果直接给回来；统一降到 JSON 串再解析，保证后续口径一致。
+      raw = ctx.json.encode(res)
+    end
+    raw = stripFence(raw)
+    local ok, v = pcall(function() return ctx.json.decode(raw) end)
+    if not ok or type(v) ~= "table" then
+      error("AI 返回无法解析为 JSON（可能被截断或格式不符）。前 200 字符: " .. tostring(raw):sub(1, 200))
+    end
+    -- 常见包装：{"nodes":[...]} / {"items":[...]} / {"children":[...]} → 取内层数组
+    if v.nodes then return v.nodes end
+    if v.items then return v.items end
+    if v.children then return v.children end
+    if v.data then return v.data end
+    return v
+  end
+
+  -- 返回 map[key] = 原标题（不只是 true）：regroup 要拿它算「AI 新方案里没提到的现有项」
+  local function existingTitles(tree_id, pid)
+    local r = ctx.db.query({driver="sqlite", dsn=DSN,
+      sql="SELECT title FROM nodes WHERE tree_id=? AND parent_id=?", params={tree_id, pid}})
+    local ex = {}
+    if r then for _, e in ipairs(r) do ex[(e.title or ""):lower()] = e.title end end
+    return ex
+  end
+
+  local created = {}
+  local skipped = 0
+  local truncated = false
+  local hitTitles = {}
+  local keptCount = 0
+
+  -- 递归落库：把 outline 列表插入到 (pid, parentPath, parentDepth) 之下，levelBudget 控制剩余层数
+  local function insertList(list, tree_id, pid, parentPath, parentDepth, levelBudget)
+    local ex = existingTitles(tree_id, pid)
+    for i, idea in ipairs(list) do
+      if #created >= CAP then truncated = true; break end
+      if type(idea) == "string" then idea = {title = idea} end
+      local key = (idea.title or ""):lower()
+      if key == "" or ex[key] then
+        skipped = skipped + 1
+        if ex[key] and pid == node_id then
+          -- 顶层命中已有项 = regroup 的「复用」。记下以便算出 AI 新方案里漏掉的现有项。
+          -- 注意只记录**原本就存在**的（新建项走 else 分支），否则会把新项也算成已有。
+          hitTitles[key] = true
+          keptCount = keptCount + 1
+        end
+      else
+        local id = newid(i)
+        local oq = ctx.db.query({driver="sqlite", dsn=DSN,
+          sql="SELECT COALESCE(MAX(ord),0)+1000 AS o FROM nodes WHERE tree_id=? AND parent_id=?", params={tree_id, pid}})
+        local ord = oq[1].o
+        local path = parentPath .. "/" .. id
+        local dp = parentDepth + 1
+        ctx.db.exec({driver="sqlite", dsn=DSN,
+          sql="INSERT INTO nodes(id,tree_id,parent_id,path,ord,depth,title,body,summary,ai_generated,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+          params={id, tree_id, pid, path, ord, dp, idea.title, idea.body or "", idea.summary or "", 1}})
+        table.insert(created, {id=id, title=idea.title, depth=dp, ai_generated=1, parent_id=pid})
+        ex[key] = true  -- 同层内也去重
+        if idea.children and levelBudget > 1 then
+          -- 归一化 children（可能含字符串）
+          local kids = {}
+          for _, k in ipairs(idea.children) do
+            if type(k) == "string" then table.insert(kids, {title = k}) else table.insert(kids, k) end
+          end
+          insertList(kids, tree_id, id, path, dp, levelBudget - 1)
+        end
+      end
+    end
+  end
+
+  -- 构造顶层大纲列表 topList（depth>1 时带嵌套 children）
+  local topList = {}
+  if from_items then
+    -- 流式路径第二段：前端解析好的数组直接落库（不再调 AI）。
+    -- 与 enrich 同款的结构容错：对象被包数组 / 多包一层 items|data，都退到内层。
+    local ok, v = pcall(function() return ctx.json.decode(items_json) end)
+    if not ok or type(v) ~= "table" then
+      error("items_json 无法解析为数组（前端解析结果异常）")
+    end
+    if type(v.items) == "table" then v = v.items end
+    if type(v.data) == "table" then v = v.data end
+    topList = v
+  elseif demo then
+    local function genDemo(lst, n, levels)
+      for i = 1, n do
+        local node0 = {title = string.format("样例分支 %d", i),
+          body = "（demo 模式生成的占位想法；配置 GEAR_AI_API_KEY 后即为真实 AI 大纲）", children = {}}
+        if levels > 1 then genDemo(node0.children, math.min(n, 4), levels - 1) end
+        table.insert(lst, node0)
+      end
+    end
+    genDemo(topList, autoCount and 5 or count, depth)
+  else
+    if depth > 1 then
+      local system = "你是思维导图大纲助手。给定一个节点及其上下文，生成一个分层大纲。"
+        .. "严格只输出 JSON 数组，每个元素为对象 {title:string, summary:string, body:string, children:array}，"
+        .. "children 是该节点的子节点列表（结构相同、可递归嵌套）。不要任何额外文字或 markdown 代码块。"
+      local prompt = string.format(
+        "上下文路径: %s\n根节点标题: %s\n根节点详情: %s\n已有子节点: %s\n"
+        .. "请生成深度 %d 的分层大纲：每层每个节点至多 %d 个子节点，第 1 层正好 %d 个；"
+        .. "子节点要有信息量、互不重复、层层细化；每项的 summary 是一句话（不超过 50 字）作上下文索引，"
+        .. "body 用 1~2 句说清该分支要解决什么。%s",
+        (context ~= "" and context or "(根)"), node.title, (node.body or ""), exstr, depth, count, count, instr_line)
+      if dry_run then
+        return {system = system, prompt = prompt, requested = count, depth = depth, mode = mode,
+                auto_count = autoCount, created = emptyArr(), extras = emptyArr(),
+                skipped = 0, kept = 0, prev_count = prevCount, truncated = false}
+      end
+      topList = askAI(system, prompt)
+    else
+      local system = "你是思维导图发散助手。给定一个节点及其上下文，生成若干不重复、有信息量、"
+        .. "彼此差异明显的子主题。严格只输出 JSON 数组，每个元素为对象 {title:string, summary:string, body:string}，"
+        .. "不要任何额外文字，不要 markdown 代码块。"
+      local ask_spec = "每项都要给全三样："
+        .. "title 不超过 20 字；"
+        .. "summary 是一句话概括（不超过 50 字，将作为上级与相邻节点的上下文索引，"
+        .. "不要写「本节点将介绍…」这类元话术）；"
+        .. "body 写 2~4 句把要点讲清楚，让读者即使不点开子节点也能明白这一项的范围与典型例子。"
+      local head = string.format(
+        "上下文路径: %s\n当前节点标题: %s\n当前节点详情: %s\n已有子节点:\n%s\n",
+        (context ~= "" and context or "(根)"), node.title, (node.body or ""), exstr)
+      local prompt
+      if mode == "regroup" then
+        prompt = head
+          .. "请**重新规划**当前的子项划分，输出一份**完整的**新方案（不是增量补充）：\n"
+          .. "- 逐条判断现有子项：值得保留的**沿用原有措辞**（标题相同的不会被重复创建、也不会覆盖已有内容）；\n"
+          .. "- 补齐缺失的大类；把过细、重复或同一维度的项合并；\n"
+          .. "- 目标：同级各项粒度相当、互不重叠、合起来能覆盖整个主题。\n"
+          .. "输出完整的 JSON 数组（含复用的与新补的）。" .. ask_spec .. instr_line
+      elseif autoCount then
+        prompt = head
+          .. "请判断这个主题自然应该分成几个子项（通常 3~9 个，视内容复杂度而定），"
+          .. "不要为了凑数硬凑，也不要遗漏显而易见的大类。"
+          .. ask_spec .. instr_line
+      else
+        prompt = head
+          .. string.format("请生成 %d 个新子主题（不要与已有重复）。", count)
+          .. ask_spec .. instr_line
+      end
+      if dry_run then
+        return {system = system, prompt = prompt, requested = count, depth = depth, mode = mode,
+                auto_count = autoCount, created = emptyArr(), extras = emptyArr(),
+                skipped = 0, kept = 0, prev_count = prevCount, truncated = false}
+      end
+      topList = askAI(system, prompt)
+    end
+  end
+
+  -- 归一化：字符串项 / 缺 title 的项都要处理掉，否则落库写出空标题节点
+  local norm = {}
+  for _, it in ipairs(topList) do
+    if type(it) == "string" then table.insert(norm, {title = it})
+    elseif type(it) == "table" and it.title then table.insert(norm, it) end
+  end
+  if #norm == 0 and not demo and not dry_run then
+    error("AI 未返回任何可用子主题（可能为空数组或被截断）。可减少「每层分支」或稍后重试。")
+  end
+
+  -- 落库
+  insertList(norm, node.tree_id, node_id, node.path, node.depth, depth)
+
+  -- regroup 专有：列出「现在有、但 AI 的新划分里没提到」的子项。
+  -- **只报不删** —— 删节点是破坏性操作（可能连带用户已写好的正文），必须由人确认后手动处理。
+  local extras = {}
+  if mode == "regroup" and depth == 1 and er then
+    for _, e in ipairs(er) do
+      local k = (e.title or ""):lower()
+      if k ~= "" and not hitTitles[k] then table.insert(extras, e.title) end
+    end
+  end
+
+  -- 真实调用才记 ai_calls。
+  -- dry_run 没调 AI；from_items 的 AI 调用发生在前端 SSE 那一段（由 REST 面记录），此处只落库。
+  if not demo and not dry_run and not from_items then
+    ctx.db.exec({driver="sqlite", dsn=DSN,
+      sql="INSERT INTO ai_calls(id,tree_id,node_id,model,created_at) VALUES(?,?,?,?,datetime('now'))",
+      params={newid(0), node.tree_id, node_id, "ext.ai.complete"}})
+  end
+
+  -- created 是 Lua 原生空表会被 luaTableToGo 退化成 {}（object），破坏 output_schema 的 array 约束。
+  -- 经 json encode→decode 走 Go→Lua 强制挂数组标记：非空序列变标记数组，空时直接给 "[]"。
+  local created_json = ctx.json.encode(created)
+  if #created == 0 then created_json = "[]" end
+  local created_arr = ctx.json.decode(created_json)
+  -- extras 同理：空表会退化成 {}，必须过一遍 json 以保证仍是数组
+  local extras_json = ctx.json.encode(extras)
+  if #extras == 0 then extras_json = "[]" end
+  local extras_arr = ctx.json.decode(extras_json)
+  return {created = created_arr, skipped = skipped, requested = count, depth = depth,
+          truncated = truncated, mode = mode, auto_count = autoCount,
+          kept = keptCount, prev_count = prevCount, extras = extras_arr}
+
+---
+kind: Tool
+id: mindstorm__enrich
+name: AI 展开本节点（写摘要 + 正文）
+description: 读取节点标题与上下文，调 ext.ai 为该节点写 summary（上下文索引用的一句话）与 body（Markdown 正文），并落库。用于「让 AI 把这一节讲清楚」；instruction 可指定受众与详略。demo=true 无 key 也返回样例。
+runtime: lua
+capabilities: [db, ext.ai]
+timeout: "15m"
+input_schema:
+  type: object
+  properties:
+    node_id: {type: string}
+    instruction: {type: string}
+    demo: {type: boolean}
+    dry_run: {type: boolean}
+    result_json: {type: string}
+  required: [node_id]
+output_schema:
+  type: object
+  properties:
+    id: {type: string}
+    summary: {type: string}
+    body: {type: string}
+    model: {type: string}
+    system: {type: string}
+    prompt: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  -- AI 展开本节点：把「一个节点的摘要与正文」写出来（与 expand 的「生成子节点」互补）。
+  -- 典型场景：AI 建完整棵轮廓后，用户挑一个节点说「把这一节给我讲清楚」。
+  --
+  -- 为什么单独一个 Tool 而不是塞进 expand：两者产物不同（本节点内容 vs 子节点列表），
+  -- 混在一起会让 prompt 两边都说不清（首版就是这么做的，结果是既没摘要、正文也只有一句话）。
+  --
+  -- timeout 同 expand：>= AI 层 GEAR_AI_TOTAL_TIMEOUT(900s)，只作兜底上限；
+  -- 「是否卡死」由 AI 层的 Idle（GEAR_AI_IDLE_TIMEOUT，默认 60s 无新增输出即判死）负责 ——
+  -- 只要还在持续出内容就不该被掐断（2026-09-23 修正，此前 5m 会误杀正在正常生成的调用）。
+  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local MAX_CRUMB = 6
+
+  local node_id = ctx.input.node_id
+  local instruction = ctx.input.instruction or ""
+  if type(instruction) ~= "string" then instruction = "" end
+  instruction = instruction:gsub("^%s+", ""):gsub("%s+$", "")
+  local demo = ctx.input.demo or false
+  -- dry_run：只组装 prompt 并返回（不调 AI、不写库），供前端走 REST SSE 流式路径
+  local dry_run = ctx.input.dry_run or false
+  -- result_json：前端已通过 SSE 拿到 AI 完整输出并解析成 {summary, body}，回传后跳过 AI 直接落库
+  local result_json = ctx.input.result_json or ""
+  if type(result_json) ~= "string" then result_json = "" end
+  local from_result = (result_json ~= "")
+
+  local nr = ctx.db.query({driver="sqlite", dsn=DSN,
+    sql="SELECT id,tree_id,path,depth,title,body,summary FROM nodes WHERE id=?", params={node_id}})
+  if not nr or #nr == 0 then error("node 不存在: " .. node_id) end
+  local node = nr[1]
+
+  -- 祖先面包屑（与 expand 同口径，供 AI 判断这一节在整棵树里的位置）
+  local ancestors = {}
+  for seg in string.gmatch(node.path, "[^/]+") do
+    if seg ~= node_id then table.insert(ancestors, seg) end
+  end
+  local crumb = {}
+  local starti = math.max(1, #ancestors - MAX_CRUMB + 1)
+  for i = starti, #ancestors do
+    local ar = ctx.db.query({driver="sqlite", dsn=DSN, sql="SELECT title FROM nodes WHERE id=?", params={ancestors[i]}})
+    if ar and #ar > 0 then table.insert(crumb, ar[1].title) end
+  end
+  local context = table.concat(crumb, " > ")
+
+  local summary, body
+  if from_result then
+    -- 流式路径第二段：前端解析好的结果直接落库（不再调 AI），结构容错与同步路径同款
+    local ok, v = pcall(function() return ctx.json.decode(result_json) end)
+    if not ok or type(v) ~= "table" then
+      error("result_json 无法解析为对象")
+    end
+    if type(v.data) == "table" then v = v.data end
+    if type(v[1]) == "table" then v = v[1] end
+    summary = v.summary or v.abstract or v.brief or ""
+    body = v.body or v.content or v.markdown or v.text or v.detail or ""
+    if summary == "" and body == "" then
+      error("result_json 里没有 summary/body")
+    end
+  elseif demo then
+    summary = "（demo）" .. node.title .. " 的一句话摘要"
+    body = "## " .. node.title .. "\n\n（demo 模式占位正文；配置 GEAR_AI_API_KEY 后即为真实 AI 讲解）\n\n- 要点一：范围与定义\n- 要点二：典型例子\n- 要点三：常见误区"
+  else
+    local system = "你是内容编辑助手。给定思维导图里的一个节点及其上下文，为它写摘要与正文。"
+      .. "summary 是一句话概括（不超过 60 字），将作为上级与相邻节点的上下文索引，"
+      .. "不要写「本节点将介绍…」这类元话术，直接说内容。"
+      .. "body 是 Markdown 正文，要把这一节真正讲清楚：用二级标题分成几个小块、用列表列要点、"
+      .. "必要时给例子（学科内容请给具体例题/例词）；不要复述标题，不要写「本节点」「此节点」这类指代自己的话。"
+      .. "受众与详略程度以「额外要求」为准；未指定时面向普通读者、中等详略。"
+      .. "严格只输出 JSON 对象 {\"summary\":\"...\",\"body\":\"...\"}，不要任何额外文字。"
+    local prompt = string.format(
+      "上下文路径: %s\n节点标题: %s\n节点现有摘要: %s\n节点现有正文: %s\n",
+      (context ~= "" and context or "(根)"), node.title, (node.summary or ""), (node.body or ""))
+      .. "额外要求（用户指定，优先级最高）: "
+      .. (instruction ~= "" and instruction or "(无，按默认：面向普通读者、中等详略)")
+      .. "\n请输出该节点的 summary 与 body。"
+    -- 流式路径第一段：只把 prompt 交回前端，由它去打 REST SSE（**不调 AI、不写库**）
+    if dry_run then
+      return {id = node_id, system = system, prompt = prompt, summary = "", body = "", model = ""}
+    end
+    local res = ctx.ext.ai.complete({system = system, prompt = prompt, format = "json"})
+    local raw = res
+    if type(res) == "table" then raw = ctx.json.encode(res) end
+    if type(raw) ~= "string" then raw = tostring(raw) end
+    -- 剥 markdown 代码围栏（真实模型常加，不剥则 json.decode 必失败）
+    local t = raw:gsub("^%s+", ""):gsub("%s+$", "")
+    local inner = t:match("^```[%w]*%s*\n(.*)\n```$") or t:match("^```[%w]*%s*\n(.*)```$")
+    if inner then t = inner end
+    local ok, v = pcall(function() return ctx.json.decode(t) end)
+    if not ok or type(v) ~= "table" then
+      error("AI 返回无法解析为 JSON（可能被截断）。前 300 字符: " .. tostring(raw):sub(1, 300))
+    end
+    -- 结构容错之一：网关/模型可能把对象包在数组里（[{...}]）
+    if v[1] ~= nil and type(v[1]) == "table" then v = v[1] end
+    -- 结构容错之二：可能多包一层 data / result / output（format=json 的常见包装）
+    for _, k in ipairs({"data", "result", "output", "json", "response"}) do
+      if type(v[k]) == "table" then v = v[k] break end
+    end
+    -- 结构容错之三：字段名（不同模型用 content / markdown / text 装正文）
+    summary = v.summary or v.abstract or v.brief or ""
+    body = v.body or v.content or v.markdown or v.text or v.detail or ""
+    if summary == "" and body == "" then
+      -- 带上原始返回，否则「取不到字段」无法定位到底是哪种包装
+      error("AI 未返回 summary/body。原始返回前 300 字符: " .. tostring(raw):sub(1, 300))
+    end
+  end
+
+  ctx.db.exec({driver="sqlite", dsn=DSN,
+    sql="UPDATE nodes SET summary=?, body=?, updated_at=datetime('now') WHERE id=?",
+    params={summary, body, node_id}})
+
+  if not demo and not dry_run and not from_result then
+    ctx.db.exec({driver="sqlite", dsn=DSN,
+      sql="INSERT INTO ai_calls(id,tree_id,node_id,model,created_at) VALUES(?,?,?,?,datetime('now'))",
+      params={"e_" .. tostring(ctx.time.now({format = "unix"})) .. "_" .. tostring(math.random(99999)),
+              node.tree_id, node_id, "ext.ai.complete(enrich)"}})
+  end
+
+  return {id = node_id, summary = summary, body = body, model = "ext.ai.complete"}

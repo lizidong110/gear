@@ -408,6 +408,16 @@ func defaultAISchemas() map[string]MethodSchema {
 			"api_key":     {Type: "string", Description: "API key（可选；缺省回退 env GEAR_AI_API_KEY。优先写 ${secrets.x} 引用密钥源，别把明文落在 Flow 定义里）"},
 			"temperature": {Type: "number", Description: "采样温度（可选）"},
 		}},
+		"complete_stream": {Description: "complete 的流式版：逐 token 增量输出。REST 经 POST /api/capabilities/invoke/stream 消费 SSE；Lua 经 ctx.ext.ai.complete_stream(args, function(token, reasoning) ...) 回调式消费", Parameters: map[string]ParamSchema{
+			"system":      {Type: "string", Description: "系统提示（可选）"},
+			"prompt":      {Type: "string", Description: "用户提示", Required: true},
+			"format":      {Type: "string", Description: "text|json（可选，默认 text；json 模式增量仍是原始文本，由调用方自行聚合）"},
+			"provider":    {Type: "string", Description: "模型厂商（可选）"},
+			"model":       {Type: "string", Description: "模型名（可选）"},
+			"base_url":    {Type: "string", Description: "API base（可选）"},
+			"api_key":     {Type: "string", Description: "API key（可选）"},
+			"temperature": {Type: "number", Description: "采样温度（可选）"},
+		}},
 		"catalog": {Description: "BM25 式能力域检索，返回候选工具列表", Parameters: map[string]ParamSchema{
 			"query":  {Type: "string", Description: "查询词", Required: true},
 			"domain": {Type: "string", Description: "限定能力域（可选）"},
@@ -488,7 +498,7 @@ type ExtSpec struct {
 
 // builtinCapabilitySchemas 是**内核原语**的「方法级参数 schema」硬编码单一来源。
 // 含两类（分类原则见 ATOM_ROADMAP.md §0）：
-//   - 受 capability 门禁的核心原语（http/call/db/kv/secret/event/subscribe，即 cap.KnownPrimitives）；
+//   - 受 capability 门禁的核心原语（http/call/db/secret/event/subscribe，即 cap.KnownPrimitives）；
 //   - 纯函数核心原子（time/template/crypto，见 purefunc.go，始终可用、不受门禁）。
 //
 // 它同时是「什么算合法的内核原语方法」的判定依据：checkCapabilityMethod / validatePrimitiveArgs
@@ -528,21 +538,6 @@ var builtinCapabilitySchemas = map[string]map[string]MethodSchema{
 		"ping": {Description: "探活（sqlite 文件可打开 / mysql/postgres 网络连得通即 ok）", Parameters: map[string]ParamSchema{
 			"driver": {Type: "string", Enum: []string{"sqlite", "mysql", "postgres"}, Description: "数据库驱动（缺省 sqlite）"},
 			"dsn":    {Type: "string", Description: "连接串（mysql/postgres 必填）"},
-		}},
-	},
-	"kv": {
-		"get": {Description: "读键值，返回 (value, ok)", Parameters: map[string]ParamSchema{
-			"key":   {Type: "string", Description: "键", Required: true},
-			"scope": {Type: "string", Description: "global|session（可选，默认 global）"},
-		}},
-		"put": {Description: "写键值", Parameters: map[string]ParamSchema{
-			"key":   {Type: "string", Description: "键", Required: true},
-			"value": {Type: "string", Description: "值", Required: true},
-			"scope": {Type: "string", Description: "global|session（可选，默认 global）"},
-		}},
-		"delete": {Description: "删键值", Parameters: map[string]ParamSchema{
-			"key":   {Type: "string", Description: "键", Required: true},
-			"scope": {Type: "string", Description: "global|session（可选，默认 global）"},
 		}},
 	},
 	"secret": {
@@ -593,7 +588,7 @@ func builtinCapabilitySummaries() []CapabilitySummary {
 // capabilityCatalog 渲染「内核原语 + 已注册 ext.*」的完整能力目录（JSON 友好形态），
 // 供 ext.registry.capabilities（Lua 侧自我锚定）与 ext.ai.capabilities（REST `GET /api/capabilities`
 // 与 MCP `capabilities` 工具）共用——两个入口的目录**永远同源**：此前各自维护一份
-// 「http/call/db/kv/secret/event」字面量列表，于是 subscribe 被漏在目录外、
+// 「http/call/db/secret/event」字面量列表，于是 subscribe 被漏在目录外、
 // 纯函数原子无处登记（两份副本必然漂移）。
 //
 // ext 名排序输出：能力目录会被拼进提示词，必须可复现（否则提示词与测试随 map 迭代顺序抖动）。
@@ -675,9 +670,10 @@ func LoadExtensionConfig(path string) (map[string]ExtSpec, error) {
 // 这样「发布后加 ext.tls」只需在 extensions.yaml 加一段，不必改 gear 源码——
 // 取代原先写死在 cli/engine.go 与 server/server.go 的 Register("ext.ai", ...)。
 // fail-closed：配置非法（YAML 错 / cmd 为空 / 扩展名非 ext. 开头）返回 error，调用方应中断启动。
-// defaultRecipeDir 是「可编辑配方」的磁盘覆盖目录：若存在同名 YAML 则优先于内嵌默认
-// （examples/ai/recipes/{flow,tool,hook}.yaml = ai.gen-* 制品，用户改这里即可调生成细节，
-// 无需重编 gear）。目录不存在时自动回退内嵌默认。
+// defaultRecipeDir 是「可编辑配方」的**可选**磁盘覆盖目录：存在同名 YAML 时优先于内嵌默认，
+// 不存在则自动回退内嵌默认（internal/engine/recipes/{flow,tool,hook}.yaml）。
+// 想调生成细节（提示词/约束）时，在 examples/ai/recipes/{flow,tool,hook}.yaml 放同名文件即可
+// （目录按需创建），或用 GEAR_AI_RECIPES 指向自定义目录——都无需重编 gear。
 const defaultRecipeDir = "examples/ai/recipes"
 
 // applyExtSchemas 把 extCaps（ext 名 → 方法级 schema）登记进能力目录，供

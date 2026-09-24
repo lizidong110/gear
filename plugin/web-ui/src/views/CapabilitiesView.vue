@@ -160,7 +160,7 @@ onUnmounted(() => caps.stopPolling())
               </p>
               <p>
                 每个方法可点「调用」直接执行（<code>POST /api/capabilities/invoke</code>，无需先写成 Tool）。
-                执行权限与 <code>react</code> 一致：全量宿主授权 + Lua 沙箱；<code>db</code>/<code>kv</code>
+                执行权限与 <code>react</code> 一致：全量宿主授权 + Lua 沙箱；<code>db</code>
                 为内存态（重启即失）、<code>secret</code> 需内核已注入密钥源、<code>http</code> 可访问任意
                 URL。未知能力 / 方法直接报错，不会静默执行。
               </p>

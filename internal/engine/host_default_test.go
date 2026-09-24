@@ -9,7 +9,7 @@ import (
 	"gear/internal/model"
 )
 
-// luaToolWithCaps 构造一个声明了指定 capability 的 lua Tool（db/kv/secret/event/call/http）。
+// luaToolWithCaps 构造一个声明了指定 capability 的 lua Tool（db/secret/event/call/http）。
 func luaToolWithCaps(id string, caps []string, entry string) *model.Tool {
 	return &model.Tool{
 		ID:           id,
@@ -54,26 +54,27 @@ func TestDefaultHostDBWorks(t *testing.T) {
 	}
 }
 
-// H9-2：默认宿主下 kv 原语可用（无需 WithHost）。
-func TestDefaultHostKVWorks(t *testing.T) {
+// H9-2：默认宿主下 event 原语可用（无需 WithHost）。
+func TestDefaultHostEventWorks(t *testing.T) {
 	reg := newTestRegistry(t)
 	defer reg.Close()
-	if err := reg.UpsertTool(luaToolWithCaps("kvtool", []string{"kv"}, `
-		ctx.kv.put("k", "v")
-		return { got = ctx.kv.get("k") }
+	if err := reg.UpsertTool(luaToolWithCaps("evttool", []string{"event"}, `
+		ctx.event.notify("e", { n = 1 })
+		local p = ctx.event.wait("e")
+		return { got = p.n }
 	`)); err != nil {
 		t.Fatalf("注册 Tool 失败: %v", err)
 	}
-	flow := &model.Flow{ID: "kvflow", Steps: []model.Step{{ID: "s1", Call: "kvtool"}}}
+	flow := &model.Flow{ID: "evtflow", Steps: []model.Step{{ID: "s1", Call: "evttool"}}}
 	if err := reg.UpsertFlow(flow); err != nil {
 		t.Fatalf("注册 Flow 失败: %v", err)
 	}
-	res, err := New(reg).RunFlowResult("kvflow")
+	res, err := New(reg).RunFlowResult("evtflow")
 	if err != nil {
 		t.Fatalf("RunFlowResult 失败: %v", err)
 	}
-	if fmt.Sprint(res.Steps["s1"]["output"].(map[string]interface{})["got"]) != "v" {
-		t.Fatalf("kv 读写异常")
+	if fmt.Sprint(res.Steps["s1"]["output"].(map[string]interface{})["got"]) != "1" {
+		t.Fatalf("event 读写异常")
 	}
 }
 
@@ -185,8 +186,8 @@ func TestCallTargetNotFound(t *testing.T) {
 func TestWithHostPreservedButResolverInjected(t *testing.T) {
 	reg := newTestRegistry(t)
 	defer reg.Close()
-	// 显式宿主只给 kv，不给 db（验证默认宿主未覆盖它 → db 仍 Unavailable）。
-	host := &cap.Providers{KV: cap.NewMemKV()}
+	// 显式宿主只给 secret，不给 db（验证默认宿主未覆盖它 → db 仍 Unavailable）。
+	host := &cap.Providers{Secret: cap.MapSecret{"TOKEN": "x"}}
 	eng := New(reg, WithHost(host))
 	if eng.host.DB != nil {
 		t.Fatalf("显式 WithHost 的 DB 不应被默认宿主覆盖（应保持 nil）")

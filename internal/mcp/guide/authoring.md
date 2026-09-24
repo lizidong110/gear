@@ -26,7 +26,7 @@ versions:                   # 必填且非空
 
 - **runtime 语义**：`lua` 走内嵌沙箱（`entry` 是脚本本体，用 `ctx.input` 读入参、`return {...}` 出参）；
   `process` 走外部命令（stdin 进 JSON、stdout 末行出 JSON）；`go-host` 走宿主注册的实现。
-- **capabilities 门禁**：用了 `ext.*` 或 7 个受门禁原语就**必须**声明；`crypto`/`time`/`template` 声明了反而被拒。
+- **capabilities 门禁**：用了 `ext.*` 或 6 个受门禁原语就**必须**声明；`crypto`/`time`/`template` 声明了反而被拒。
 - **`versions` 是必需的**——因为 Flow 的 `use_version` 只能钉已注册 Tool 的版本；原子能力直调没有版本概念。
 
 ## 2. Flow
@@ -84,8 +84,8 @@ order: 10                   # 可选：同 stage 内的执行顺序
 id: myapp.cacheit
 steps:
   - id: put
-    call: kv.put                 # 直调：能力.方法（先 gear_capabilities 确认方法名与参数）
-    input: {key: "greeting", value: "hi"}
+    call: db.query               # 直调：能力.方法（先 gear_capabilities 确认方法名与参数）
+    input: {sql: "SELECT 1"}
 ```
 
 **✅ 可复用逻辑：建 Tool**

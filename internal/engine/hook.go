@@ -103,7 +103,7 @@ func (e *Engine) applyHooks(ctx context.Context, all []model.Hook, stage, flowID
 			continue
 		}
 
-		hctx, cancel := context.WithTimeout(ctx, defaultExecTimeout)
+		hctx, cancel := context.WithTimeout(ctx, execTimeoutFor(tool))
 		host := e.hostFor(tool, nil)
 		out, err := rt.Run(hctx, tool.Entry, cur, host)
 		cancel()
@@ -202,7 +202,7 @@ func (e *Engine) applyFlowScopedToolHook(ctx context.Context, rc *runContext, h 
 		// on_success：payload 是 RunResult 的 map 表示（仅副作用，输出丢弃）。
 		payload = rc.lastResultMap()
 	}
-	hctx, cancel := context.WithTimeout(ctx, defaultExecTimeout)
+	hctx, cancel := context.WithTimeout(ctx, execTimeoutFor(tool))
 	host := e.hostFor(tool, rc)
 	out, err := rt.Run(hctx, tool.Entry, payload, host)
 	cancel()
@@ -342,7 +342,9 @@ func (e *Engine) runOnceStep(ctx context.Context, rc *runContext, hooks []model.
 		pr.execID, pr.stepID, pr.sink = rc.execID, step.ID, rc.logSink
 	}
 
-	stepCtx, cancel := context.WithTimeout(ctx, defaultExecTimeout)
+	// 生效超时：Tool 声明的 timeout 优先，未声明回退 defaultExecTimeout（见 execTimeoutFor）。
+	// 直调原子能力（call.tool == nil）恒用默认值。
+	stepCtx, cancel := context.WithTimeout(ctx, execTimeoutFor(call.tool))
 	output, err = rt.Run(stepCtx, entry, input, host)
 	cancel()
 	if err != nil {

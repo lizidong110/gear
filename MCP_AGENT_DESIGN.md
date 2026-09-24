@@ -174,14 +174,14 @@
 
    ```
    能力（原语）          →  执行单元            →  编排        →  切面
-   http/call/db/kv/…       Tool（可复用）          Flow          Hook
+   http/call/db/…          Tool（可复用）          Flow          Hook
    time/template/crypto    ↳ 或 step 直调「能力.方法」          （生命周期插入/门禁）
    ext.*（扩展原子）
    ```
 
    - **原语/能力是底座**：宿主提供的能力，Tool 靠 `capabilities` 声明「我有权用哪些」，在 Lua/process 里经 `ctx.*` 调用。
    - **Tool 是执行单元**：能力 + 业务逻辑（Lua / process / go-host），注册进 registry 后可被复用。
-   - **关键取舍**：**Flow 的 step 可以直接写「能力.方法」（如 `kv.put` / `http.Request` / `ext.ai.complete`），不必先建 Tool**——所以「可复用的才建 Tool，一次性的直接直调」。这条决定了智能体该不该产出一个 Tool。
+   - **关键取舍**：**Flow 的 step 可以直接写「能力.方法」（如 `db.exec` / `http.Request` / `ext.ai.complete`），不必先建 Tool**——所以「可复用的才建 Tool，一次性的直接直调」。这条决定了智能体该不该产出一个 Tool。
    - **Flow 编排执行单元形成业务**：「应用」= 含 `mode: service` 长驻 step 的 Flow。
    - **Hook 是切面**：在 `before_flow`/`before_step`/`after_step`/`on_error`/`on_success`/`before_promote` 插入执行与门禁。
 
@@ -469,7 +469,7 @@ steps:
 
 | 类别 | 成员 | 是否受 capability 门禁 | 能否被 Flow step 直调 | 说明 |
 |---|---|---|---|---|
-| 受门禁原语 | `http` `call` `db` `kv` `secret` `event` `subscribe`（7 个） | **是**（Tool 必须声明） | 能（如 `http.Request`） | 单一真相源 `internal/cap/cap.go` 的 `KnownPrimitives` |
+| 受门禁原语 | `http` `call` `db` `secret` `event` `subscribe`（6 个） | **是**（Tool 必须声明） | 能（如 `http.Request`） | 单一真相源 `internal/cap/cap.go` 的 `KnownPrimitives` |
 | 纯函数原子 | `time` `template` `crypto`（3 个） | **否**（始终可用，声明了反而被拒） | 能（如 `crypto.hash`） | 单具名 table 入参，`internal/engine/purefunc.go` |
 | Lua 便利绑定 | `json`（`ctx.json.encode/decode`） | — | **不能** | **不是能力**，不在能力目录；`ATOM_ROADMAP.md:21-27` 刻意如此 |
 | 可扩展原子 | `ext.email` `ext.serve` `ext.kafka` … | **是**（`ext.` 前缀 + 必须在 `extensions.yaml` 注册） | 能（如 `ext.ai.complete`） | 含 once 与 `service: true` 两种载体 |
@@ -548,7 +548,7 @@ steps:
 | 形态 | 判据 | 落点 | 是否进门禁 |
 |---|---|---|---|
 | 纯函数原语 | 无 IO、无凭据、确定性（`hash`/`base64`/`parse`） | `internal/cap`，单具名 table 入参 | 否（声明了反而被拒） |
-| 受门禁原语 | 有外发 IO 或副作用（网络/DB/KV/事件/密钥） | `internal/cap` 的 `KnownPrimitives` | **是** |
+| 受门禁原语 | 有外发 IO 或副作用（网络/DB/事件/密钥） | `internal/cap` 的 `KnownPrimitives` | **是** |
 | 扩展原子 `ext.*` | 需握手/配置/第三方 SDK/侧车，或需长驻 | `plugin/extensions.yaml` 注册，可选 `service: true` | **是** |
 | **不申请原语** | 只在某一个应用里复用 | 直接建 Tool（Lua/process），或 step 直调已有能力 | —（这才是大多数情况的答案） |
 
@@ -637,7 +637,7 @@ steps:
 **红线**：任何一次「未验证就宣称成功」直接记失败（对应 §9.5）；任何一次「绕过能力门禁」直接记失败（对应 §9.6）。
 
 > **注（文档漂移已修，2026-09-21）**：`README.md` §12.2/§12.3 与 `REQUIREMENTS.md`（`REQ-MCP-WIRE-OBJECT` / `REQ-MCP-STDIO-PURE`）引用的 `plugin/mcp_wire_probe.py`（MCP 线上帧取证，stdio + `--http` 双模式）**已恢复**：它用原始 JSON-RPC（不经 SDK 的宽松客户端）与 `gear mcp` 对话、把每帧落盘成 JSONL，再用**严格客户端同款判据**逐帧判（`structuredContent` 顶层必须是对象），并**自检判据**（合成的裸数组帧必须被判违规）。自带临时 registry/执行库/台账，探完即杀。退出码 `0`=全绿 / `1`=有 FAIL / `2`=环境失败，可直接进 CI。
-> 仍未修的一处：`README.md:550` 提到的 `examples/ai/recipes/*.yaml` 目录不存在（与本文档方案无关，属 AI 生成示例的文档漂移）。
+> 已于 2026-09-24 修正：上述配方**默认内嵌**在 `internal/engine/recipes/`，`examples/ai/recipes/` 是**可选**覆盖目录（默认不存在、存在时优先）；README / `extensions.example.yaml` / 代码注释的措辞已从「目录存在」改为「可选覆盖」，不再是虚假承诺。（同轮还恢复了被误删的 `examples/` 演示画廊。）
 
 ---
 
@@ -687,7 +687,7 @@ Gear 是一个「机制内核」：只提供能力原语 + Tool（执行单元�
 一个「应用」= 一个含 mode: service 长驻 step 的 Flow，用 gear_app(start) 以后台进程方式运行。
 
 四层模型
-· 能力原语（底座，宿主提供）：受门禁 7 个 http/call/db/kv/secret/event/subscribe（Tool 必须声明才可用）、
+· 能力原语（底座，宿主提供）：受门禁 6 个 http/call/db/secret/event/subscribe（Tool 必须声明才可用）、
   免门禁 3 个纯函数 time/template/crypto（始终可用，声明了反而被拒）、扩展原子 ext.*（须在 extensions.yaml 注册且必须声明）。
   json 不是能力（只是 Lua 里的 ctx.json 便利绑定，Flow 不能直调）。
 · Tool = 能力 + 业务逻辑，注册后可复用的执行单元。可复用的才建 Tool；一次性的直接在 step.call 写「能力.方法」。
@@ -816,6 +816,7 @@ steps:
 | `IN_USE` | 删除被引用对象 | 错误信息会指出被谁引用，先解引用 |
 | `ENTRY_EXE_UNRESOLVED` | process 型 Tool 的 entry 首 token 指向的可执行文件不存在（**校验期**即拦） | 改路径；Windows 下正/反斜杠都可（反斜杠不再被当转义符）。只有绝对路径报此码——相对路径与裸名字只给告警，因为运行时 cwd/PATH 可能与校验时不同 |
 | `APP_PRUNE_FAILED` | `gear_app(action=prune)` 清理台账失败 | 看返回的 `apps_dir` 是否可写；prune 只删**确定已终止**的记录（`running`/`unknown` 一律保留），不杀进程 |
+| `EXECUTION_BUSY` | MCP 面在途 Flow 执行数达并发上限（默认 8），`gear_run` / `flow__` 被背压拒绝（评审 I-1 新增的有界并发） | 稍后重试；先 `gear_execution` 看现有执行进展。**这不是 YAML 问题**，别去改定义 |
 
 ## 附录 E：智能体常见误解（写进 `gear_guide`，直接减少返工）
 

@@ -204,12 +204,12 @@ process entry: "D:\gadern\gear\build\gear.exe serve --addr 127.0.0.1:8788"
 
 当前是可用的单会话工具，若要长期使用还缺（按优先级）：
 
-1. **会话持久化**：想法存下来（用 `db` 或 `kv` 原子落 SQLite），刷新不丢、可回溯历史。
+1. **会话持久化**：想法存下来（用 `db` 原子落 SQLite），刷新不丢、可回溯历史。
 2. **服务端持有 Key**：把 `api_key` 从前端挪到 `${secrets.GEAR_AI_API_KEY}` 引用，页面不再接触明文。
 3. **走 Tool 而非裸调原子**：§6.3 的同步端点已补上，可把 prompt 工程收进 `brainstorm__ideate` 等 Tool，
    前端只传主题（`POST /api/tools/brainstorm__ideate/run`）。**本页尚未改造**。
 4. **流式输出**：现在是一次等完整响应；`ext.ai` 暂无流式接口，长生成体验偏"卡"。
-5. **多人/多会话**：`kv` 的 `scope: session` 已提供隔离基础，但缺会话列表 UI。
+5. **多人/多会话**：`kv` 原语（含 `scope: session`）已于 2026-09-24 移除，会话隔离需改由 `db` 的命名空间/前缀承载，且目前缺会话列表 UI。
 6. **完整鉴权**：§6.5 只做了 Origin 守卫 + `secret.*` 禁调。本机多用户 / 多进程场景下
    invoke 面仍需 token 或能力白名单。
 

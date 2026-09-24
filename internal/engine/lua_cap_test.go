@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"gear/internal/cap"
@@ -31,28 +32,32 @@ func luaRunHost(t *testing.T, entry string, input map[string]interface{}, host *
 	return rt.Run(context.Background(), entry, input, host)
 }
 
-// M5-lua-1：未声明 capability 时，ctx.kv 根本不存在，脚本访问即报错（最小权限 + 防御纵深）。
+// M5-lua-1：未声明 capability 时，ctx.db 根本不存在，脚本访问即报错（最小权限 + 防御纵深）。
 func TestLuaCapUngranted(t *testing.T) {
 	host := luaHost(t, nil, &cap.Providers{}) // 无任何 capability
-	_, err := luaRunHost(t, `return ctx.kv.get("x")`, nil, host)
+	_, err := luaRunHost(t, `return ctx.db.query({ driver = "sqlite", sql = "SELECT 1" })`, nil, host)
 	if err == nil {
-		t.Fatal("未声明 kv 时访问 ctx.kv 应报错")
+		t.Fatal("未声明 db 时访问 ctx.db 应报错")
 	}
 }
 
-// M5-lua-2：声明 kv 后，put/get 正常往返（宿主侧 MemKV 实现）。
-func TestLuaCapKV(t *testing.T) {
-	prov := &cap.Providers{KV: cap.NewMemKV()}
-	host := luaHost(t, []string{"kv"}, prov)
+// M5-lua-2：声明 db 后，exec/query 正常往返（宿主侧 MultiDB 实现）。
+func TestLuaCapDB(t *testing.T) {
+	db := cap.NewMultiDB(filepath.Join(t.TempDir(), "lua.db"))
+	t.Cleanup(func() { _ = db.Close() })
+	prov := &cap.Providers{DB: db}
+	host := luaHost(t, []string{"db"}, prov)
 	out, err := luaRunHost(t, `
-		ctx.kv.put("k", "v")
-		return { got = ctx.kv.get("k") }
+		ctx.db.exec({ driver = "sqlite", sql = "CREATE TABLE kv_demo(k TEXT PRIMARY KEY, v TEXT)" })
+		ctx.db.exec({ driver = "sqlite", sql = "INSERT INTO kv_demo VALUES('k','v')" })
+		local rows = ctx.db.query({ driver = "sqlite", sql = "SELECT v FROM kv_demo WHERE k='k'" })
+		return { got = rows[1].v }
 	`, nil, host)
 	if err != nil {
-		t.Fatalf("kv 读写失败: %v", err)
+		t.Fatalf("db 读写失败: %v", err)
 	}
 	if fmt.Sprint(out["got"]) != "v" {
-		t.Fatalf("kv 往返异常: %v", out)
+		t.Fatalf("db 往返异常: %v", out)
 	}
 }
 
@@ -144,12 +149,14 @@ func TestLuaCapDBUnavailable(t *testing.T) {
 	}
 }
 
-// M5-lua-8：声明隔离——仅声明 kv 时访问 ctx.http 报错（不暴露未声明原语）。
+// M5-lua-8：声明隔离——仅声明 db 时访问 ctx.http 报错（不暴露未声明原语）。
 func TestLuaCapIsolation(t *testing.T) {
-	prov := &cap.Providers{KV: cap.NewMemKV()}
-	host := luaHost(t, []string{"kv"}, prov) // 仅 kv
+	db := cap.NewMultiDB(filepath.Join(t.TempDir(), "iso.db"))
+	t.Cleanup(func() { _ = db.Close() })
+	prov := &cap.Providers{DB: db}
+	host := luaHost(t, []string{"db"}, prov) // 仅 db
 	_, err := luaRunHost(t, `return ctx.http.Request("GET", "http://x", nil, nil)`, nil, host)
 	if err == nil {
-		t.Fatal("仅声明 kv 时访问 ctx.http 应报错")
+		t.Fatal("仅声明 db 时访问 ctx.http 应报错")
 	}
 }

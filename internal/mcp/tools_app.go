@@ -5,8 +5,15 @@ package mcp
 // 这个工具是「通过 MCP 创建应用」的最后一环，也是最容易做错的一环：
 //   - **start 派生独立后台进程后立即返回**，本进程**从不持有**它——持有者是那个 `gear app run`
 //     自己（PRD §14.1）。判据一句话：**长驻子进程不得出现在 MCP 进程树内**（§9.1 第 5 条）。
-//   - 因此它会**跨会话存活**：WorkBuddy 关掉、MCP Server 退出，应用照跑。这既是它的价值，
+//   - 因此它**通常**跨会话存活：WorkBuddy 关掉、MCP Server 退出，应用照跑。这既是它的价值，
 //     也意味着**必须提供 stop**——「能活过会话却关不掉」才是真缺陷（§6.2⑤）。
+//
+// ⚠ 但「跨会话存活」**不是无条件的**（2026-09-24 修正，评审 B-1）：
+//   `CREATE_BREAKAWAY_FROM_JOB` 失败时会退化为普通派生，进程仍留在调用方的 Job Object 内，
+//   **调用方一退出就被连坐回收**。此时 `StartResult.EscapedJob = false` 并带 `Warning`。
+//   所以 start 的返回值**必须**如实透传 `escaped_job` / `warning`，文案也**不能**无条件承诺
+//   「跨会话存活」——否则智能体会把「现在能访问」说成「一直能访问」，正是 Instructions
+//   七条铁律点名的「智能体最贵的错误」。
 //   - 进程归属与台账的完整论证见 MCP_AGENT_DESIGN.md §0.2。
 
 import (
@@ -23,15 +30,16 @@ import (
 func (s *Server) registerAppTools(ms *mcp.Server) {
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_app",
-		Description: "长驻应用生命周期。start：派生**独立后台进程**后立即返回（跨会话存活）；status：pid + 端口双判据；" +
+		Description: "长驻应用生命周期。start：派生**独立后台进程**后立即返回（是否跨会话存活见返回的 escaped_job）；status：pid + 端口双判据；" +
 			"stop：终止并复检端口（**破坏性**，收不干净会报 ORPHAN_APP）；list：全部台账与遗留项；" +
 			"prune：清理**确定已终止**的台账项（running/unknown 一律保留，不会误删在跑的应用）。service Flow 只能用这里启动。",
-		Annotations: idempotent("应用生命周期"),
+		Annotations:  idempotent("应用生命周期"),
+		OutputSchema: outApp,
 	}, s.handleApp)
 }
 
 // handleApp 分发四个 action。
-func (s *Server) handleApp(_ context.Context, _ *mcp.CallToolRequest, in AppArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) handleApp(ctx context.Context, _ *mcp.CallToolRequest, in AppArgs) (*mcp.CallToolResult, any, error) {
 	regPath, appsDir := s.appEnv()
 	switch strings.ToLower(strings.TrimSpace(in.Action)) {
 	case "start":
@@ -47,6 +55,15 @@ func (s *Server) handleApp(_ context.Context, _ *mcp.CallToolRequest, in AppArgs
 			"app_id": res.AppID, "flow_id": res.FlowID, "pid": res.PID,
 			"state": res.State, "log_path": res.LogPath, "ports": res.Ports,
 		}
+		// ★ escaped_job / warning 必须透传：它们是「这次启动到底能不能跨会话存活」的**唯一凭据**。
+		//   漏报会让智能体把「现在能访问」说成「一直能访问」（评审 B-1），故此处不再是可选项。
+		//
+		//   键**恒输出**（未探测时为 null）：客户端总该看到这个字段，而不是要靠「键不存在」去猜。
+		//   三种取值：true=已脱离（真跨会话）；false=未脱离（随本进程退出）；null=未探测（同样不许承诺）。
+		out["escaped_job"] = res.EscapedJob
+		if res.Warning != "" {
+			out["warning"] = res.Warning
+		}
 		if res.LastLogs != nil {
 			out["last_logs"] = res.LastLogs
 		}
@@ -56,7 +73,16 @@ func (s *Server) handleApp(_ context.Context, _ *mcp.CallToolRequest, in AppArgs
 			out["hint"] = "常见原因：端口被占、侧车未构建、registry 路径不符；先用 gear_doctor 看环境"
 			return nil, out, nil
 		}
-		out["hint"] = "应用是独立后台进程、跨会话存活；停止用 gear_app(action=stop, app_id=…)"
+		// hint 按 escaped_job 分三种：已脱离才敢承诺，未脱离要说破，未探测也不能承诺。
+		const stopHint = "停止用 gear_app(action=stop, app_id=…)"
+		if res.EscapedJob != nil && !*res.EscapedJob {
+			out["hint"] = "⚠ escaped_job=false：派生未脱离调用方进程沙箱，应用会随本进程退出而终止——" +
+				"不要向用户承诺它长期可用；" + stopHint
+		} else if res.EscapedJob == nil {
+			out["hint"] = "未能确认应用是否脱离本进程沙箱（escaped_job 未上报）：不要向用户承诺长期可用；" + stopHint
+		} else {
+			out["hint"] = "应用已脱离本进程沙箱（escaped_job=true），跨会话存活；" + stopHint
+		}
 		return nil, out, nil
 
 	case "stop":

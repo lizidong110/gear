@@ -14,7 +14,7 @@ output_hints: |
   "steps":[{"id":"s1","call":"<tool_id 或 能力.方法>","input":{"<k>":"<占位>"},"depends_on":["s1"]}]}
   约束：
   1) call 只能是「候选工具 id」或「capabilities 里列出的原子能力（写成 能力.方法，
-     如 kv.put / http.Request / ext.ai.complete）」，二者都不在列表里的名字一律不准用；
+     如 db.exec / http.Request / ext.ai.complete）」，二者都不在列表里的名字一律不准用；
      直调原子能力时 input 就是该方法参数（键名照 capabilities 抄，不要多也不要少）；
   2) depends_on 必须是「step id 字符串数组」(如 ["s1"]) 或省略，绝不能是对象；
   3) 真实依赖才写 depends_on；

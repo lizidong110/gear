@@ -22,7 +22,7 @@ export const FLOW_LEVEL_STAGES = ["before_flow", "on_success"] as const
 export const PROBE_KINDS = ["http", "tcp", "cmd"] as const
 export const STEP_MODES = ["once", "service"] as const
 
-export const BUILTIN_CAPABILITIES = ["http", "call", "db", "kv", "secret", "event"] as const
+export const BUILTIN_CAPABILITIES = ["http", "call", "db", "secret", "event", "subscribe"] as const
 
 /** 生成时读到的源路径（排障用：产物与源不一致时先看这里）。 */
 export const GENERATED_FROM = "internal/model/model.go + internal/model/validate.go + internal/cap/cap.go"

@@ -43,27 +43,31 @@ func (s *Server) registerReadTools(ms *mcp.Server) {
 		Name: "gear_guide",
 		Description: "取 Gear 手册的某个主题。写 YAML 前看 authoring、做长驻应用看 service-app、报错后看 errors、" +
 			"发现能力不足看 primitive-gap。与常驻说明同源，比翻仓库文档更准。",
-		Annotations: readOnly("Gear 手册"),
+		Annotations:  readOnly("Gear 手册"),
+		OutputSchema: outGuide,
 	}, s.handleGuide)
 
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_catalog",
 		Description: "列出目录里现有的对象**摘要**（tool/flow/hook/execution/app）——「先看看有什么」用这个。" +
 			"要看某个对象的完整定义用 gear_describe。",
-		Annotations: readOnly("目录摘要"),
+		Annotations:  readOnly("目录摘要"),
+		OutputSchema: outCatalog,
 	}, s.handleCatalog)
 
 	mcp.AddTool(ms, &mcp.Tool{
-		Name:        "gear_describe",
-		Description: "查看某个对象的完整定义（tool/flow/hook/app）。从 gear_catalog 拿到 id 后用它看细节。",
-		Annotations: readOnly("对象详情"),
+		Name:         "gear_describe",
+		Description:  "查看某个对象的完整定义（tool/flow/hook/app）。从 gear_catalog 拿到 id 后用它看细节。",
+		Annotations:  readOnly("对象详情"),
+		OutputSchema: outDescribe,
 	}, s.handleDescribe)
 
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_capabilities",
 		Description: "列出可用的能力目录（内核原语 + ext.*），含方法级参数 schema。" +
 			"写 step.call 的「能力.方法」直调前先看它，不要凭记忆猜方法名与参数。",
-		Annotations: readOnly("能力目录"),
+		Annotations:  readOnly("能力目录"),
+		OutputSchema: outCapabilities,
 	}, s.handleCapabilities)
 
 	mcp.AddTool(ms, &mcp.Tool{
@@ -71,12 +75,13 @@ func (s *Server) registerReadTools(ms *mcp.Server) {
 		Description: "环境自检：registry 计数、扩展与侧车就绪情况、AI 凭据就绪（只看有没有、不回显明文）、" +
 			"台账/遗留应用、端口占用。应用起不来、侧车缺失、ext.ai 报 401 时先跑它，" +
 			"能一次区分「YAML 写错」与「环境没准备好」。",
-		Annotations: readOnly("环境自检"),
+		Annotations:  readOnly("环境自检"),
+		OutputSchema: outDoctor,
 	}, s.handleDoctor)
 }
 
 // handleGuide 返回手册某主题的全文。
-func (s *Server) handleGuide(_ context.Context, _ *mcp.CallToolRequest, in GuideArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) handleGuide(ctx context.Context, _ *mcp.CallToolRequest, in GuideArgs) (*mcp.CallToolResult, any, error) {
 	topic := strings.TrimSpace(in.Topic)
 	if topic == "" {
 		topic = "overview"
@@ -94,7 +99,7 @@ func (s *Server) handleGuide(_ context.Context, _ *mcp.CallToolRequest, in Guide
 // 这是 P3（token 爆炸）的根治：旧 list_tools 返回每个 Tool 的完整 input_schema/output_schema/
 // versions，一个成熟 registry 一次能吃掉数万 token，而 95% 当场无用。摘要 + 按需 describe
 // 把「看一眼」的成本压到常数级。
-func (s *Server) handleCatalog(_ context.Context, _ *mcp.CallToolRequest, in CatalogArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) handleCatalog(ctx context.Context, _ *mcp.CallToolRequest, in CatalogArgs) (*mcp.CallToolResult, any, error) {
 	kind := strings.ToLower(strings.TrimSpace(in.Kind))
 	if kind == "" {
 		kind = "all"
@@ -187,7 +192,7 @@ func (s *Server) handleCatalog(_ context.Context, _ *mcp.CallToolRequest, in Cat
 }
 
 // handleDescribe 返回单个对象的完整定义。
-func (s *Server) handleDescribe(_ context.Context, _ *mcp.CallToolRequest, in DescribeArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) handleDescribe(ctx context.Context, _ *mcp.CallToolRequest, in DescribeArgs) (*mcp.CallToolResult, any, error) {
 	kind := strings.ToLower(strings.TrimSpace(in.Kind))
 	id := strings.TrimSpace(in.ID)
 	if id == "" {
@@ -235,7 +240,7 @@ func (s *Server) handleDescribe(_ context.Context, _ *mcp.CallToolRequest, in De
 }
 
 // handleCapabilities 返回内核原语 + 已注册 ext.* 的能力目录（含方法级 schema）。
-func (s *Server) handleCapabilities(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+func (s *Server) handleCapabilities(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
 	agent := s.engine.AIAgent()
 	if agent == nil {
 		return toolError("CAPABILITIES_UNAVAILABLE", "扩展目录未初始化（引擎未装配 AIAgent）"), nil, nil
@@ -252,7 +257,7 @@ func (s *Server) handleCapabilities(_ context.Context, _ *mcp.CallToolRequest, _
 //
 // 它回答的是一个**智能体自己查不到**的问题：起不来到底是 YAML 写错了，还是环境没准备好
 // （侧车没 build、端口被占、应用台账里有遗留进程）。没有它，智能体只会反复重写 YAML。
-func (s *Server) handleDoctor(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+func (s *Server) handleDoctor(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
 	warnings := []string{}
 
 	tools, err := s.reg.ListTools()

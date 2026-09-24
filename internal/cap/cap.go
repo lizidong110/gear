@@ -1,7 +1,7 @@
 // Package cap 实现 Gear 的宿主能力层（PRD §6 宿主能力原语）。
 //
-// 宿主（Runtime）只向 Tool 暴露 7 个受 capability 门禁的跨边界通信原语：
-// http / call / db / kv / secret / event / subscribe。
+// 宿主（Runtime）只向 Tool 暴露 6 个受 capability 门禁的跨边界通信原语：
+// http / call / db / secret / event / subscribe。
 // 另有 time / template / crypto 三个**纯函数原子**（内核内建、始终可用、纯计算无外部依赖）——
 // 它们刻意**不进**本门禁（见 internal/engine/purefunc.go 与 ATOM_ROADMAP.md §0）。
 // 它们处于同一抽象层级——都是「插件与外界交换数据的通道」，不混杂业务。
@@ -36,7 +36,6 @@ const (
 	PrimHTTP      Primitive = "http"
 	PrimCall      Primitive = "call"
 	PrimDB        Primitive = "db"
-	PrimKV        Primitive = "kv"
 	PrimSecret    Primitive = "secret"
 	PrimEvent     Primitive = "event"
 	PrimSubscribe Primitive = "subscribe"
@@ -47,7 +46,6 @@ var KnownPrimitives = map[Primitive]bool{
 	PrimHTTP:      true,
 	PrimCall:      true,
 	PrimDB:        true,
-	PrimKV:        true,
 	PrimSecret:    true,
 	PrimEvent:     true,
 	PrimSubscribe: true,
@@ -103,7 +101,7 @@ func GrantsFromStrings(ss []string) (Grants, error) {
 	for _, s := range ss {
 		p := Primitive(s)
 		if !p.Known() {
-			return nil, fmt.Errorf("未知的 capability %q（合法值：内核受门禁原语 http/call/db/kv/secret/event/subscribe，或已注册的 ext.* 扩展名；time/template/crypto 是纯函数原子，始终可用、无需声明）", s)
+			return nil, fmt.Errorf("未知的 capability %q（合法值：内核受门禁原语 http/call/db/secret/event/subscribe，或已注册的 ext.* 扩展名；time/template/crypto 是纯函数原子，始终可用、无需声明）", s)
 		}
 		g[p] = true
 	}
@@ -114,39 +112,6 @@ func GrantsFromStrings(ss []string) (Grants, error) {
 func (g Grants) Has(p Primitive) bool { return g[p] }
 
 // Capability 接口：各原语对 Tool 暴露的最小 API。
-
-// Scope 是 KV 键的生命周期维度（PRD §6 + 方法论 §0 第14条：状态的持久性必须显式声明）。
-type Scope string
-
-const (
-	// ScopeGlobal 进程级持久（原有行为）：数据活在进程内存，重启即失，非落盘；
-	// 不同 flow 执行共享同一份全局命名空间。
-	ScopeGlobal Scope = "global"
-	// ScopeSession 绑定本次 flow 执行（命名空间 key = flow id）：跨 step 共享同一份会话态，
-	// flow run 结束经 SessionRegistry 回收（引用计数归零即删），内存态、重启即失。
-	ScopeSession Scope = "session"
-)
-
-// KV 键值存储（配置 / 状态 / 缓存）。每个键须显式声明所属 Scope（见 Scope 常量）：
-//   - ScopeGlobal：进程级持久（重启即失）；
-//   - ScopeSession：绑定本次 flow 执行，跨 step 共享、run 结束回收。
-type KV interface {
-	Get(key string, scope Scope) (string, bool)
-	Put(key, value string, scope Scope)
-	Delete(key string, scope Scope)
-}
-
-// SessionRegistry 管理 session 作用域 KV 的命名空间：按 flow 执行 id 隔离，引用计数回收。
-// 引擎在 flow run 开始 Acquire(flowID)、结束 Release(flowID)；计数归零才真正回收该命名空间，
-// 使同一 flow 的并发运行互不干扰（各自 Acquire/Release，最后一个结束才清）。
-type SessionRegistry interface {
-	// Session 返回该 id 的 session 作用域 KV 视图（命名空间不存在则新建空 map）。
-	Session(id string) KV
-	// Acquire 增加 id 的引用计数（flow run 开始调用）。
-	Acquire(id string)
-	// Release 减少 id 的引用计数；归零时回收命名空间（内存态，重启即失）。
-	Release(id string)
-}
 
 // Secret 只读密钥读取。
 type Secret interface {
@@ -172,7 +137,7 @@ type Event interface {
 }
 
 // SubscriptionOwner 标识发起订阅的执行单元（Flow / Exec / Step），供引擎在运行结束时
-// 按归属回收订阅（与 session 作用域 KV 按 flow id 回收、引用计数的思路同源）。
+// 按归属回收订阅（与订阅自身的生命周期管理思路同源）。
 type SubscriptionOwner struct {
 	FlowID string // 所属 Flow id
 	ExecID string // 所属 Exec id（serve 模式下每次执行唯一）
@@ -230,15 +195,11 @@ type Resolver func(target string, input map[string]interface{}, via []string) (m
 
 // Providers 汇集各原语的具体实现，由宿主（Engine）一次性注入。
 type Providers struct {
-	KV       KV
 	Secret   Secret
 	HTTP     *http.Client
 	Event    Event
 	Resolver Resolver
 	DB       DB // 内置多后端 DB 实现（cap.NewMultiDB）；nil 表示未提供（已授权时返回 ErrCapabilityUnavailable）
-	// Sessions 是 session 作用域 KV 的命名空间管理（引用计数 + 回收）。nil 表示未提供，
-	// 此时 ScopeSession 键降级为 global（见 Context.KV）。引擎默认宿主已注入。
-	Sessions SessionRegistry
 	// Subscribe 是通用订阅原语实现（引擎装配；与 Event 平级）。nil 表示未提供，
 	// 声明了 subscribe 的 Tool 运行期收到 ErrCapabilityUnavailable（fail-closed）。
 	Subscribe Subscribe
@@ -256,17 +217,10 @@ type Context struct {
 	// via 是本次执行的调用链（祖先 Flow id，含当前 Flow）。经 ctx.call 透传给 Resolver，
 	// 供引擎检测循环调用（A→B→A）。空表示非 Flow 内执行（如顶级 flow run / call 入口）。
 	via []string
-	// sessionID 是本次 flow 执行的会话命名空间 id（引擎取调用链末元素 = flow id 写入）。
-	// KV() 据此把 ScopeSession 键路由到 SessionRegistry.Session(sessionID)；空表示无会话作用域
-	// （如非 Flow 内执行），此时 session 键降级为 global（见 Context.KV）。
-	sessionID string
 	// owner 是发起本次执行的订阅归属（Flow/Exec/Step），引擎在构建宿主视图时写入。
 	// Subscribe() 据此把 owner 绑定进 Subscribe.Start 的请求，供引擎在运行结束时回收订阅。
 	owner SubscriptionOwner
 }
-
-// SetSession 写入本次执行的会话命名空间 id（引擎在构建宿主视图时调用）。
-func (c *Context) SetSession(id string) { c.sessionID = id }
 
 // SetCallChain 写入本次执行的调用链（引擎在构建宿主视图时调用）。
 func (c *Context) SetCallChain(via []string) { c.via = via }
@@ -315,26 +269,6 @@ func (c *Context) SetExtension(name string, v interface{}) {
 
 // Sandbox 报告是否处于沙箱模式（宿主可据此进一步收紧网络/fs 等）。
 func (c *Context) Sandbox() bool { return c.sandbox }
-
-// KV 返回键值存储原语；未授权则 ErrCapabilityDenied。
-// 若已声明会话命名空间（sessionID 非空）且宿主提供了 Sessions，则返回按 Scope 路由的
-// scopedKV：ScopeSession 键落到 SessionRegistry.Session(sessionID)，ScopeGlobal 落到全局 KV。
-// 否则（无会话或宿主未提供 Sessions）返回全局 KV，session 键降级为 global（不报错，仅降级）。
-func (c *Context) KV() (KV, error) {
-	if !c.grants.Has(PrimKV) {
-		return nil, ErrCapabilityDenied
-	}
-	if c.prov == nil || c.prov.KV == nil {
-		return nil, ErrCapabilityUnavailable
-	}
-	if c.sessionID != "" && c.prov.Sessions != nil {
-		return &scopedKV{
-			global:  c.prov.KV,
-			session: c.prov.Sessions.Session(c.sessionID),
-		}, nil
-	}
-	return c.prov.KV, nil
-}
 
 // Secret 返回只读密钥原语；未授权则 ErrCapabilityDenied。
 func (c *Context) Secret() (Secret, error) {
@@ -463,120 +397,6 @@ type resolverCall struct {
 
 func (r resolverCall) Call(target string, input map[string]interface{}) (map[string]interface{}, error) {
 	return r.fn(target, input, r.via)
-}
-
-// MemKV 是进程内的全局 KV 实现（ScopeGlobal，配置 / 状态 / 缓存）。scope 参数被忽略
-// （它只承载全局命名空间；session 命名空间由 SessionRegistry 管理）。
-type MemKV struct {
-	mu sync.Mutex
-	m  map[string]string
-}
-
-// NewMemKV 构造空的内存 KV。
-func NewMemKV() *MemKV { return &MemKV{m: make(map[string]string)} }
-
-func (k *MemKV) Get(key string, _ Scope) (string, bool) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	v, ok := k.m[key]
-	return v, ok
-}
-
-func (k *MemKV) Put(key, value string, _ Scope) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.m[key] = value
-}
-
-func (k *MemKV) Delete(key string, _ Scope) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	delete(k.m, key)
-}
-
-// sessionKV 是单个 session 命名空间的 KV 视图（只服务 ScopeSession）。其底层 map 由
-// MemSessionRegistry 持有，故多个 step 的 ctx.KV() 经同一 sessionID 取到的是同一份会话态。
-type sessionKV struct{ m map[string]string }
-
-func (k *sessionKV) Get(key string, _ Scope) (string, bool) {
-	v, ok := k.m[key]
-	return v, ok
-}
-
-func (k *sessionKV) Put(key, value string, _ Scope) { k.m[key] = value }
-
-func (k *sessionKV) Delete(key string, _ Scope) { delete(k.m, key) }
-
-// MemSessionRegistry 是 SessionRegistry 的进程内实现：按 id 隔离命名空间，引用计数回收。
-// 所有命名空间均为内存态，进程重启即失（显式满足方法论 §0 第14条的状态持久性声明）。
-type MemSessionRegistry struct {
-	mu  sync.Mutex
-	m   map[string]map[string]string
-	ref map[string]int
-}
-
-// NewMemSessionRegistry 构造空的会话命名空间管理器。
-func NewMemSessionRegistry() *MemSessionRegistry {
-	return &MemSessionRegistry{m: make(map[string]map[string]string), ref: make(map[string]int)}
-}
-
-// Session 返回 id 的 session 命名空间 KV 视图（不存在则新建空 map，仍受全局锁保护）。
-func (r *MemSessionRegistry) Session(id string) KV {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	s, ok := r.m[id]
-	if !ok {
-		s = make(map[string]string)
-		r.m[id] = s
-	}
-	return &sessionKV{m: s}
-}
-
-// Acquire 增加 id 的引用计数（flow run 开始调用）。
-func (r *MemSessionRegistry) Acquire(id string) {
-	r.mu.Lock()
-	r.ref[id]++
-	r.mu.Unlock()
-}
-
-// Release 减少 id 的引用计数；归零时回收该命名空间（内存态）。
-func (r *MemSessionRegistry) Release(id string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.ref[id]--
-	if r.ref[id] <= 0 {
-		delete(r.m, id)
-		delete(r.ref, id)
-	}
-}
-
-// scopedKV 把 global / session 两个命名空间按 Scope 路由到同一个 KV 视图。
-type scopedKV struct {
-	global  KV
-	session KV
-}
-
-func (s *scopedKV) Get(key string, scope Scope) (string, bool) {
-	if scope == ScopeSession {
-		return s.session.Get(key, scope)
-	}
-	return s.global.Get(key, scope)
-}
-
-func (s *scopedKV) Put(key, value string, scope Scope) {
-	if scope == ScopeSession {
-		s.session.Put(key, value, scope)
-		return
-	}
-	s.global.Put(key, value, scope)
-}
-
-func (s *scopedKV) Delete(key string, scope Scope) {
-	if scope == ScopeSession {
-		s.session.Delete(key, scope)
-		return
-	}
-	s.global.Delete(key, scope)
 }
 
 // MapSecret 是只读密钥源（来自宿主配置，如环境变量注入的 map）。

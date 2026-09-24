@@ -16,11 +16,28 @@ import (
 
 	"gear/internal/cap"
 	"gear/internal/cmdline"
+	"gear/internal/model"
 )
 
 // defaultExecTimeout 是单次 process 执行的默认超时（F4：防止挂死工具占住执行线程）。
 // 设为变量便于测试注入更短/更长时限。
+//
+// 可被 **Tool 级声明**覆盖：Tool 写了 timeout 就用它（见 model.Tool.ExecTimeout 与
+// execTimeoutFor）。默认值本身保持不变，因此「没声明的 Tool」依旧受 30s 防挂死保护。
 var defaultExecTimeout = 30 * time.Second
+
+// execTimeoutFor 返回某次 Tool 执行的生效超时：优先用 Tool 声明的 timeout，
+// 未声明（或声明非法，注册期已拦下，此处仅防御性回退）则用引擎默认。
+func execTimeoutFor(tool *model.Tool) time.Duration {
+	if tool == nil {
+		return defaultExecTimeout
+	}
+	d, err := tool.ExecTimeout()
+	if err != nil || d <= 0 {
+		return defaultExecTimeout
+	}
+	return d
+}
 
 // processRuntime 实现 Runtime 接口：外部进程，stdin 进 JSON，stdout 末行出 JSON（PRD §3.3）。
 type processRuntime struct {
