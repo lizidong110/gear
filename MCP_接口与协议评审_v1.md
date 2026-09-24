@@ -19,6 +19,8 @@ Gear 的 MCP 面整体水准高于多数同类实现：**三处同源的背景�
 | 重要 | 9 | ctx/超时、错误码一致性、破坏性标注、输出 schema、大 payload、能力缺口 |
 | 可选 | 8 | 能力协商、资源模板、并发治理、文档补齐 |
 
+> **修复状态（2026-09-24 收尾）**：阻塞 2 ✅、重要 9 ✅（I-1 的④孤儿识别本轮补齐）、可选 8 → **已处理 7**（O-7 合并进 I-1；「无 prompts/completions」按评审建议维持现状）。工具面由 12 增至 13（新增 `gear_invoke`，见 I-8）。
+
 ---
 
 # 一、阻塞（Blocking）
@@ -166,6 +168,8 @@ REST 面有 Origin 校验，MCP 面没有——同一个进程暴露的两个面
 
 **优先级：P1。**
 
+> ✅ **2026-09-24 已修 ①②③④**：① 新增机械守卫 `tools/doc_audit.py` 的「③ MCP 错误码双向核对」（`guide/errors.md` ⇄ 代码产生点，附录 D 亦须 ⊆ 产生点；已做负向验证：改坏一个码 → exit 1，还原 → exit 0）并**进闸门**；② 统一为 `BAD_DEPENDENCY`（附录 D 的 `DEP_CYCLE` 已改并注明旧名）；③ **删除三个从不产生的码**（`PRIMITIVE_MISSING`/`PORT_IN_USE`/`APP_PLATFORM_UNAVAILABLE`——留着只会让智能体查到不存在的条目），并把 **17 个实际在用却漏收的兜底码**全部补进手册（新增「MCP 工具调用层（通用码）」一节）；④ `toolErrorFrom` 现把多余诊断并入 hint，并在代码里写明「一条 error 至多带一条诊断（`diagWrap` 不叠加）」所以 `diags[0]` 不会丢信息。锁：`tools/doc_audit.py`。
+
 ---
 
 ## I-3 ★ 必填参数错误没有 `[CODE]` 前缀，与错误契约不一致
@@ -180,6 +184,8 @@ REST 面有 Origin 校验，MCP 面没有——同一个进程暴露的两个面
 
 **优先级：P1。**
 
+> ✅ **2026-09-24 已修（采纳「显式说明」方案）**：`guide/errors.md` 开头新增「例外：缺必填参数不带码」小节（形如 `missing properties: [...]`，读字段名即可定位），`guide/summary.md`（Instructions）也加了同一句提醒——比「额外包一层自定义校验」更小的改动，且不牺牲「客户端就地发现漏参」的好处。已有回归用例 `mcp_errorpaths_test.go: TestMCPSchemaRequiredArgsFailLoudly` 钉住该行为。
+
 ---
 
 ## I-4 ★ `gear_app` 含 `stop` / `prune` 破坏性动作，却只标 `IdempotentHint`
@@ -192,6 +198,8 @@ REST 面有 Origin 校验，MCP 面没有——同一个进程暴露的两个面
 **改进**：近期——改为 `destructive`（宁可过度提示）；中期——考虑把 `stop`/`prune` 拆成独立工具，或至少在返回值里对破坏性动作回显 `destructive: true` 供客户端识别。
 
 **优先级：P1。**
+
+> ✅ **2026-09-24 已修（近期方案）**：`gear_app` 的 annotations 由 `idempotent` 改为 **`destructive`**（宁可过度提示），并在 `stop` / `prune` 的**返回值**里回显 `destructive: true`（`prune(dry_run)` 不标——没实际改动）供只读结果的客户端识别。中期方案（拆工具）未做。锁：`mcp_review_test.go` 的 `TestMCPAppToolMarkedDestructive` / `TestMCPAppStopEchoesDestructive`。
 
 ---
 
@@ -209,6 +217,8 @@ REST 面有 Origin 校验，MCP 面没有——同一个进程暴露的两个面
 2. 加机械守卫：断言 `common.go` 的 topic 文案集合 == `guide.Topics()`（单一真相源应是磁盘，不是硬编码字符串）。更好：schema 描述里不枚举 topic，改为「见 `gear_guide` 返回的 `topics` 字段」。
 
 **优先级：P1。**
+
+> ✅ **2026-09-24 已修**：采纳「更好」的方案——`GuideArgs` 的 schema 文案**不再枚举 topic**（改为「见返回值里的 `topics` 字段，或 `resources/list` 的 `gear://guide/{topic}`」），单一真相源回到磁盘。守卫：`mcp_review_test.go` 的 `TestMCPGuideTopicsSingleSource`（断言 schema 文案里不出现任何 topic 名 + 每个磁盘 topic 都真能取到且返回集合与磁盘逐项一致），并保留 `rest-api` 存在的显式断言。
 
 ---
 
@@ -241,6 +251,8 @@ REST 面有 Origin 校验，MCP 面没有——同一个进程暴露的两个面
 
 **优先级：P1。**
 
+> ✅ **2026-09-24 已修**：三处都做了——`gear_catalog` 加 `offset`（并回 `next_offset` 续取位置）；`gear_execution` 加 `limit`（默认 20，`total` 仍为全量计数，被截断时给 `hint`）；`gear_capabilities` 支持 `name`/`kind` 过滤（无匹配时返回空数组 + 可用能力名 `hint`，不是错误）。锁：`mcp_review_test.go` 的 `TestMCPPaginationAndFilters`。
+
 ---
 
 ## I-8 ★ MCP 面缺少「能力直调」与「流式」工具（REST 两者都有）
@@ -257,6 +269,11 @@ REST 面有 Origin 校验，MCP 面没有——同一个进程暴露的两个面
 
 **优先级：P1（能力缺口 + 潜在安全口径不一致）。**
 
+> ✅ **2026-09-24 已修（直调部分；流式未做）**：新增第 13 个工具 **`gear_invoke`**（`internal/mcp/tools_invoke.go`），走与 REST 完全相同的引擎入口 `engine.InvokeCapability`。
+> 关键点：**禁则搬到了共享真相源** `cap.BlockedDirectInvoke`（REST 的 `blockedInvokeCapability` 与 MCP 的 `gear_invoke` 都调它），从根上消除「两个执行面安全水位不一致」。
+> 流式变体**未做**（MCP 的 tools/call 无 SSE 语义；`wait_seconds` + `gear_execution` 已够用，故不引入）。
+> 工具数预算随之上调 12→13（`tools_surface.go` 的 `toolBudget`），并同步 README / MCP_AGENT_DESIGN。锁：`mcp_review_test.go` 的 `TestMCPInvokeCapability`。
+
 ---
 
 ## I-9 权限边界不可枚举（不看 guide 无从得知禁止项）
@@ -272,6 +289,8 @@ REST 面有 Origin 校验，MCP 面没有——同一个进程暴露的两个面
 
 **优先级：P1。**
 
+> ✅ **2026-09-24 已修**：Instructions 由「七条铁律」扩为**八条**——第 8 条即「动手前先读 `gear_guide("security")`：破坏性清单与密钥规则都在那里」；`gear_apply` 的 Description 也写明「**不支持密钥写入**，见 `gear_guide("security")`」。`guide/summary.md` 与 `MCP_AGENT_DESIGN.md`（§4 / 附录 A 快照）同步。
+
 ---
 
 # 三、可选（Optional）
@@ -286,6 +305,16 @@ REST 面有 Origin 校验，MCP 面没有——同一个进程暴露的两个面
 | O-6 ★ | `summary` 被注册为资源，与设计意图矛盾 | `guide/guide.go:80` 注册了 `summary`，而 `guide.go:23-25` 说「summary 不进 Topics 列表」 | 工具侧刻意排除、资源侧又注册。建议统一 |
 | O-7 | Flow 执行 goroutine 无治理 | `mcp.go:326-331` 裸 `go func()` | 见 I-1，合并处理 |
 | O-8 | 新增工具需同步改 5 处，无生产侧清单 | `mcpToolRegistry` 只在 `mcp_test.go:1030-1049` | 好处是漏改会 CI 红；建议把这份登记表提升为生产侧常量，供 `gear_capabilities` 之类自描述接口复用 |
+
+> ✅ **2026-09-24 已处理的 7 条**（除 O-7 合并进 I-1、以及「补充观察」按建议维持现状外）：
+> - **O-1**：显式**不声明 `logging`**（`ServerOptions.Capabilities` 里不带 `Logging`）。理由：本包从不发日志通知，声明它就是骗客户端；该特性本身也已在 2026-07-28 版规范弃用（SEP-2577）。要日志请读 `gear_execution`。
+> - **O-2**：`ToolCapabilities{ListChanged:false}` / `ResourceCapabilities{ListChanged:false}`（非 nil 才不会被 SDK 的 augment 分支覆盖回 true）。工具面与资源面运行期确实从不变化。
+> - **O-3**：`SupportedProtocolVersions: ["2025-06-18"]`（`mcp.go` 的 `supportedProtocolVersion`）——只声明被那套「顶层必须是对象」红线验证过的版本；协商是优雅降级，不会造成旧客户端连不上。
+> - **O-4**：补 `AddResourceTemplate("gear://guide/{topic}")`，与文档口径一致；读取走同一份 embed。
+> - **O-5**：补 Go 单测 `mcp_review_test.go: TestMCPResourcesExposeGuideTopics`（列全 topic、不含 summary、静态资源可读、模板可读、模板已声明）。
+> - **O-6**：resources 只注册 `guide.Topics()`（**不含 summary**），与 `gear_guide` 工具口径统一；`guide.All()` 随之删除（唯一消费者是本处注册）。
+> - **O-8**：登记表提升为**生产侧常量** `toolSurface` + `toolBudget`（`internal/mcp/tools_surface.go`），测试改用它做双向核对。
+> 另：**补充观察**里的「README 工具表只列到 `gear_describe`」已补齐（现 13 行齐全，含 `gear_invoke`）。
 
 补充观察（不列条目）：**无 prompts、无 completions**——「创建应用」这类高频流程没有可复用提示模板，全靠 Instructions 文本，与设计文档把 resources 标为「加分项」的定位一致，可维持现状。`README.md:604-615` 的工具表只列到 `gear_describe`（后 9 个缺失），作为第三方第一入口应补齐。
 
@@ -310,11 +339,17 @@ REST 面有 Origin 校验，MCP 面没有——同一个进程暴露的两个面
 | 11 | `listChanged` 声明为 true 但运行期从不变化 | 可选 |
 | 12 | 协议版本未钉、resources 无 URI 模板、resources 无 Go 测试 | 可选 |
 
+> **2026-09-24 状态**：上表 12 项**已全部处理**（1/2 早前已修，3~9 本次修，10~12 本次修）；验收闭环见下方 `TestMCPAgentAcceptanceFlow`。
+
 **验证方法建议**：写一个「纯 MCP 接入者」脚本，在不读任何 Go 源码、只读 `tools/list` + `resources/list` + `gear_guide` 的前提下完成「创建并启动一个应用 → 确认它真的跨会话存活 → 读取执行日志」全流程；上面每一条都会在该流程中真实撞到。
+
+> ✅ **2026-09-24 已落地为 Go 验收用例** `internal/mcp/mcp_review_test.go: TestMCPAgentAcceptanceFlow`（走完「自描述 outputSchema → doctor → capabilities(过滤) → guide(security) → invoke → validate → apply → run → execution(含日志) → initialize 元信息」），**进闸门**（`go test`）。表中第 1/2 项另有 `mcp_app_test.go` 的 `escaped_job` 硬断言与 `TestServeHTTPListensAndShutsDownOnCtxCancel`。
 
 ---
 
 # 五、改进路线建议
+
+> ✅ **2026-09-24：三步的 9 条全部完成**（B-1/B-2 早前已修；I-1①②③ 与 I-6 早前已修；本次补齐 I-1④ / I-2 / I-3 / I-4 / I-5 / I-7 / I-8 / I-9 与可选级 7 条）。闸门 `bash scripts/gate.sh` PASS。
 
 **第一步（本周，消除接口层谎言与安全缺口）**
 1. B-1：`gear_app(start)` 补 `escaped_job` / `warning`，文案去承诺化，加守卫测试。
@@ -339,5 +374,5 @@ REST 面有 Origin 校验，MCP 面没有——同一个进程暴露的两个面
 - **顶层必须是对象**的红线（`mcp.go:227-232`）+ 帧级探针 `plugin/mcp_wire_probe.py` 的 33 条判据（含「合成的裸数组帧必须被判违规」的自检）。
 - **错误带 `field` + `hint` + `docs: gear://guide/errors#CODE`**（`common.go:65-87`），自愈回路闭环。
 - **失败 vs 错误的分界契约**（`common.go:5-10`）：执行失败是成功返回值里的 `status: failed`，前置条件不满足才 `IsError`。
-- **工具命名/体量/数量预算的机械守卫**（`mcp_test.go:1064-1161`）：`gear_` 前缀、单条 ≤240 rune、工具数 ≤12。
+- **工具命名/体量/数量预算的机械守卫**（`mcp_test.go` + `tools_surface.go`）：`gear_` 前缀、单条 ≤240 rune、工具数 ≤ `toolBudget`（13）。
 - **`jsonschema` tag 不能以 `WORD=` 开头**的踩坑记录 + 守卫（`common.go:144-147`、`mcp_test.go:1106`）。

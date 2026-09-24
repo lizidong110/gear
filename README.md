@@ -51,7 +51,7 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 │  (管理面 / 客户端)        │  (执行面: 并发闸门 + 执行记录)      │
 ├──────────────────────────────────────────────────────────┤
 │  internal/mcp  —— MCP 执行面：与 CLI/REST 同构的 registry+引擎装配， │
-│                  协议翻译层（12 个意图级 gear_* 工具 +               │
+│                  协议翻译层（13 个意图级 gear_* 工具 +               │
 │                  Instructions 心智模型 + 可选 flow__{id} 反向暴露）    │
 ├──────────────────────────────────────────────────────────┤
 │  internal/engine   —— 编排内核：拓扑执行 / Hook 装配 /        │
@@ -82,7 +82,7 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 | `server` | REST 执行面：路由、并发闸门、执行记录持久化、受管 app 托管 |
 | `app` | `app run` 监管器：把一个 / 多个 Flow 变成受管进程 |
 | `cli` | CLI 管理面：cobra 命令树、`gear`/`exec`/`ai`/`mcp` 客户端、extensions 装配 |
-| `mcp` | MCP 执行面：12 个**意图级** `gear_*` 工具（手册 / 目录 / 校验 / 落库 / 执行 / 应用生命周期 / 环境自检）+ 经 `ServerOptions.Instructions` 注入的心智模型；`--expose-flows` 才把已注册 Flow 反向暴露为 `flow__{id}` |
+| `mcp` | MCP 执行面：13 个**意图级** `gear_*` 工具（手册 / 目录 / 校验 / 落库 / 能力直调 / 执行 / 应用生命周期 / 环境自检）+ 经 `ServerOptions.Instructions` 注入的心智模型；`--expose-flows` 才把已注册 Flow 反向暴露为 `flow__{id}` |
 | `execstore` | 执行记录持久化（SQLite），REST 与 MCP 两执行面共用同一份执行历史与「运行中不可注销」判据 |
 | `gearhome` | **gear 自身落盘位置的单一真相源**：`GEAR_HOME` → `<HOME>/.gear` → `<exeDir>/.gear` 兜底，决定 registry.db / exec.db 路径与诊断时的产物搜索锚点（见 `internal/gearhome/gearhome.go`）。**默认路径一律不随 cwd 变化**——这是「同一份 gear 在不同工作目录下行为不一致」的根治点 |
 
@@ -236,7 +236,7 @@ type Hook struct {
   确有远程需求时显式加 `--allow-remote`；带 Origin 的跨站请求一律按同源判定拒绝（与 REST 面同一判据）。
 - `gear mcp --registry <path> --apps-dir <dir>`：显式交给 MCP 面 registry 路径与台账目录。**`gear_app(start)` 依赖它**——派生出去的子进程要继承 `--registry`，否则会读默认库、可能启动另一个库里的同名 Flow（未配置时 start 直接拒绝执行，不「尽力而为」）。
 - `gear mcp --expose-flows`：把已注册 Flow 额外反向暴露为 `flow__{id}` 工具（**默认关闭**：工具数必须可预测；且是启动时快照，之后新建的 Flow 本次进程内不会出现；service 长驻 Flow 永不暴露）。
-- 暴露 12 个意图级工具（手册 / 目录 / 校验 / 落库 / 删除 / 晋升 / 执行 / 执行记录 / 应用生命周期 / 环境自检），工具名统一 `gear_` 前缀；心智模型（四层模型、七条铁律、工具选路）只写在 `ServerOptions.Instructions` 里**一次**，工具描述只留「做什么 + 何时用 + 歧义消解」（单条 ≤240 字符、合计 ≤1,800 字符，有机械守卫）。
+- 暴露 13 个意图级工具（手册 / 目录 / 校验 / 落库 / 删除 / 晋升 / 能力直调 / 执行 / 执行记录 / 应用生命周期 / 环境自检），工具名统一 `gear_` 前缀；心智模型（四层模型、八条铁律、工具选路）只写在 `ServerOptions.Instructions` 里**一次**，工具描述只留「做什么 + 何时用 + 歧义消解」（单条 ≤240 字符、合计 ≤1,800 字符，有机械守卫）。
 - `gear app start/stop/status/list/prune`：**后台**应用生命周期（与 MCP 的 `gear_app` 共用 `internal/app` 同一份实现）。`start` 派生后台进程后立即返回；`stop` 收不干净会如实报 `ORPHAN_APP` 而非谎报成功；台账落在 `<registry 同目录>/apps/`。`prune` 清理台账里**确定已终止**的记录（`running`/`unknown` 一律保留，只删记录不杀进程；`--dry-run` 先预览、`--flow` 限定单个 Flow）。
 
 > **`start` 的「跨会话存活」是有条件的，不承诺无条件成立（2026-09-21 修正）**
@@ -373,6 +373,7 @@ stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error
 - **构建**：`npm run dev`（端口 5173，Vite 反代 `/api` → `GEAR_API` 或 `http://127.0.0.1:8787`）；`npm run build` → `dist/`。
 - **托管**：`dist/` 由任意静态服务器 / 反向代理托管，并把 `/api` 转发到内核——内核本身**不托管**其构建产物。
 - **用 Gear 自己的能力托管（静态 + 反代，推荐）**：`ext.serve`（类 nginx）既托管静态目录，也支持 `proxy` 规则把 `/api` 反代到内核——**静态与接口同源**，正是 dev 下 Vite 代理的生产等价物。仓库自带 Flow `web_ui.up`（`plugin/web_ui_tools.yaml` + `plugin/web_ui_flow.yaml`），用**一个 Flow 起两个长驻服务**（`ext.serve` 静态站 + `/api` 反代 + `process` 起 gear REST 后端）：`GEAR_EXT_CONFIG=plugin/extensions.yaml gear app run web_ui.up`（**在仓库根执行**；**不要**给应用自带的 REST 面写 `--registry`，见下）。详见 `plugin/web-ui/README.md`。
+- **多站点（2026-09-24）**：`ext.serve` 侧车可同时托管多个网站（不同 `port`），这是多 app 共享同一侧车的直接收益——`web_ui.up` 托管 8080 的同时 `mindstorm.up` 托管 8090，互不干扰。幂等按「port + dir + host + proxy 全同」判定，同端口换配置 `start` 会 **fail-closed 报错**（绝不静默吞参数——旧单站点代码曾把第二个应用的 `/start` 静默吞掉，页面「成功」却 404）。`stop` 带 `port` 只停该站，省略则停全部（旧语义）。end-to-end 判据：`plugin/verify.py` P3「多站点」项。
 
 > **应用自带的 REST 面为什么不写 `--registry`**（2026-09-22）：起服进程会把本次生效的 registry **绝对化**后写进环境变量 `GEAR_REGISTRY`，应用内步骤（含长驻 Tool 进程）直接继承——于是 UI 里的列表与你的 `gear flow list` **必然同源**。此前 `web_ui.api` 的 entry 写死了相对 `--registry ./ui-registry.db`，子进程按**自己的 cwd** 解析，读到另一次实验留下的空库：`http://127.0.0.1:8080/api/flows` 返回 `[]`、日志一个字都没有（同一个根因此前在 `gear app start` 的 launcher 上发作过一次）。两条配套护栏：`gear serve` 的 banner 现在带 **`flows=N, tools=N`**（指向空库一眼可见）；`--registry` 传相对路径会在 stderr 收到提示，entry 里的相对路径取值会在注册/校验期作为 warning 回报。显式 `--registry` **仍然优先**——机制只保证「没说的时候永远一致」，不替人翻案。
 
@@ -605,7 +606,7 @@ gear mcp --http 127.0.0.1:8788
 
 之后在支持 MCP 的客户端里填 `http://127.0.0.1:8788`（或 WorkBuddy 的 MCP 连接器填该地址）。
 
-### 12.2 工具面（12 个意图级工具 + 可选反向暴露）
+### 12.2 工具面（13 个意图级工具 + 可选反向暴露）
 
 工具面按**意图**划分而不是按资源划分：一个「校验后落库」的动作只有一个入口（`gear_apply`），
 不需要模型在 `create_tool` / `create_flow` / `create_hook` 之间做资源级选择。
@@ -613,18 +614,19 @@ gear mcp --http 127.0.0.1:8788
 
 | 阶段 | MCP tool | 映射到内核 | 关键语义 |
 |---|---|---|---|
-| 读 | `gear_guide` | `internal/mcp/guide`（embed） | 按主题取手册：`overview` / `authoring` / `service-app` / `atoms` / `errors` / `primitive-gap` / `examples` / `security`。与 `Instructions`、`gear://guide/{topic}` 资源**同源**，杜绝「三处说法不一致」 |
-| 读 | `gear_catalog` | `reg.List*` | **摘要**（id/name/description/runtime/版本状态/是否长驻），不返回 schema 与脚本源码——成熟目录一次能吃掉数万 token，其中 95% 当场无用 |
+| 读 | `gear_guide` | `internal/mcp/guide`（embed） | 按主题取手册。**可用主题以返回体里的 `topics` 字段为准**（单一真相源是磁盘上的 `guide/*.md`，schema 文案刻意不枚举，见评审 I-5）。与 `Instructions`、`gear://guide/{topic}` 资源**同源**，杜绝「三处说法不一致」 |
+| 读 | `gear_catalog` | `reg.List*` | **摘要**（id/name/description/runtime/版本状态/是否长驻），不返回 schema 与脚本源码——成熟目录一次能吃掉数万 token，其中 95% 当场无用。支持 `offset`/`limit` 翻页（`truncated` 为 true 时用 `next_offset` 续取） |
 | 读 | `gear_describe` | `reg.Get*`、`app.Status` | 单个对象的完整定义（按需取，替代旧 `list_*` 的批量吐全量） |
-| 读 | `gear_capabilities` | `agent.CapabilitiesMethod` | 能力目录（内核 7 个受门禁原语 + 3 个 pure 纯函数原子 + 已注册 `ext.*`），含方法级参数 schema |
+| 读 | `gear_capabilities` | `agent.CapabilitiesMethod` | 能力目录（内核 **6** 个受门禁原语 + 3 个 pure 纯函数原子 + 已注册 `ext.*`），含方法级参数 schema；支持 `name`/`kind` 过滤以减小返回 |
 | 读 | `gear_doctor` | `app.List` + 侧车/扩展探测 | 环境自检：registry 计数、扩展与侧车就绪、台账与遗留应用、端口占用。用于区分「YAML 写错」与「环境没准备好」 |
 | 写 | `gear_validate` | `parseBundle` + `ValidateFlowStaticDiagsWith` | **不落库**的编译器：收 bundle YAML、一次报出**全部**字段级诊断（`code`/`step`/`field`/`hint`/`docs`），可无限次重试 |
-| 写 | `gear_apply` | `reg.Upsert*`（Tool→Flow→Hook） | **唯一写入口**：原子（任一非法则一个字节都不写）、幂等（二次 apply 报 `updated`）、`dry_run`、`overwrite`（默认 false：已存在且内容不同即拒，防覆盖人工维护的定义） |
-| 写 | `gear_delete` | `reg.Delete*` | 守卫语义与 REST/CLI 完全一致；`NOT_FOUND` 与 `IN_USE` 分码，错误信息指出被谁引用 |
+| 写 | `gear_apply` | `reg.Upsert*`（Tool→Flow→Hook） | **唯一写入口**：原子（任一非法则一个字节都不写）、幂等（二次 apply 报 `updated`）、`dry_run`、`overwrite`（默认 false：已存在且内容不同即拒，防覆盖人工维护的定义）。**不支持密钥写入**（见 `gear_guide("security")`） |
+| 写 | `gear_delete` | `reg.Delete*` | 守卫语义与 REST/CLI 完全一致；`NOT_FOUND` 与 `IN_USE` 分码，错误信息指出被谁引用。**破坏性** |
 | 写 | `gear_promote` | `engine.PromoteTool` | 版本状态机（draft→testing→stable→deprecated），非法迁移被拒 |
+| 跑 | `gear_invoke` | `engine.InvokeCapability` | **能力直调**：试一个原子方法（如 `db.query` / `http.Request` / `ext.ai.complete`）不必先写 Flow。**禁 `secret.*`**（与 REST 面同一条禁则 `cap.BlockedDirectInvoke`）。破坏性（可发 HTTP / 写 db / 发事件） |
 | 跑 | `gear_run` | `engine.RunTool` / `RunFlowExecWithVars` | `kind=tool` 同步返回输出；`kind=flow` **异步**返回 `execution_id`（`wait_seconds` 短等）。service 长驻 Flow 一律拒（`SERVICE_FLOW_SYNC_RUN`），须走 `gear_app(start)` |
-| 跑 | `gear_execution` | `execstore` | 给 id 取单次执行（可带日志、`tail`）；不给 id 列出最近执行 |
-| 跑 | `gear_app` | `internal/app` | 长驻应用生命周期：`start`（派生**独立后台进程**后立即返回，跨会话存活）/ `stop`（终止 + 端口复检，收不干净报 `ORPHAN_APP`）/ `status`（pid + 端口双判据）/ `list`（台账 + 遗留项）/ `prune`（清台账里确定已终止的项，`running`/`unknown` 一律保留、只删记录不杀进程）。与 `gear app start|stop|status|list|prune` 同一份实现 |
+| 跑 | `gear_execution` | `execstore` | 给 id 取单次执行（可带日志、`tail`）；不给 id 列出最近执行（默认最近 20 条，`limit` 可调）。**标出孤儿记录**（状态 running 但发起它的进程已不存在，见评审 I-1④） |
+| 跑 | `gear_app` | `internal/app` | 长驻应用生命周期：`start`（派生**独立后台进程**后立即返回，**是否跨会话存活看返回的 `escaped_job`**：true/false/null 三选一，false 时随本进程退出）/ `stop`（终止 + 端口复检，收不干净报 `ORPHAN_APP`）/ `status`（pid + 端口双判据）/ `list`（台账 + 遗留项）/ `prune`（清台账里确定已终止的项，`running`/`unknown` 一律保留、只删记录不杀进程）。含破坏性动作，故标 `DestructiveHint`。与 `gear app start\|stop\|status\|list\|prune` 同一份实现 |
 | 反向暴露 | `flow__{id}`（`--expose-flows`，service 长驻 Flow 不暴露） | `startFlowExec(id, vars)` | 等价于 `gear_run(kind=flow, id=…)` 的便捷入口，少一次参数拼装 |
 
 > **返回形态是硬约束，不是风格问题**：MCP 规范（2025-06-18）规定 `tools/call` 的
@@ -633,8 +635,8 @@ gear mcp --http 127.0.0.1:8788
 > `{"expected":"record","path":["structuredContent"],"message":"Invalid input: expected record, received array"}`。
 > 故列表结果一律经 `internal/mcp.objectResult` 包一层具名键；红线由
 > `mcp_test.go: TestMCPAllToolsReturnObjectStructuredContent` 逐工具锁住——
-> 该用例的覆盖度反查由**显式登记表** `mcpToolRegistry` 驱动（不再靠 `list_` 命名约定猜），
-> 新增工具不登记即 FAIL。诊断线上真实帧用 `python plugin/mcp_wire_probe.py`（stdio）或
+> 该用例的覆盖度反查由**显式登记表** `toolSurface`（生产侧常量，`internal/mcp/tools_surface.go`）驱动
+> （不再靠 `list_` 命名约定猜），新增工具不登记即 FAIL，工具数预算 `toolBudget`（13）同处声明。诊断线上真实帧用 `python plugin/mcp_wire_probe.py`（stdio）或
 > `python plugin/mcp_wire_probe.py --http`（streamable HTTP，与 WorkBuddy 连接器同一条路）：
 > 它用**原始 JSON-RPC**（不经 SDK 的宽松客户端）抓帧并落盘 `build/mcp_wire_frames.<mode>.jsonl`，
 > 再用**严格客户端同款判据**逐帧判，最后**自检判据**（喂一个合成的裸数组帧，必须判违规——
@@ -650,13 +652,13 @@ gear mcp --http 127.0.0.1:8788
 ### 12.3 设计要点
 
 - **协议翻译零重复守卫**：删除守卫（§8.2）、schema 校验、版本状态机全在 registry/engine 层，MCP 面只做协议翻译，与 REST 面共用同一份守卫逻辑（不会漂移）。
-- **背景信息只写一次**：心智模型（四层模型、七条铁律、工具选路、常见误解）进 `ServerOptions.Instructions`，全字段语义进 `gear_guide` 的返回值；工具 `Description` 只留「做什么 + 何时用 + 歧义消解」。若把背景下沉到每个描述，`tools/list` 会随工具数**线性膨胀**且同一段话有 N 份副本（必然漂移）。上限（单条 ≤240 / 合计 ≤1,800 字符）由 `TestMCPToolDescriptionsStayLean` 机械守卫。
+- **背景信息只写一次**：心智模型（四层模型、八条铁律、工具选路、常见误解）进 `ServerOptions.Instructions`，全字段语义进 `gear_guide` 的返回值；工具 `Description` 只留「做什么 + 何时用 + 歧义消解」。若把背景下沉到每个描述，`tools/list` 会随工具数**线性膨胀**且同一段话有 N 份副本（必然漂移）。上限（单条 ≤240 / 合计 ≤1,800 字符）由 `TestMCPToolDescriptionsStayLean` 机械守卫。
 - **长驻应用的真启动**：`gear_app(start)` 派生**脱离调用方进程树**的后台进程（Windows `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP`（+ `CREATE_BREAKAWAY_FROM_JOB`，失败则退化重试）/ Unix `Setsid`）后立即返回，**从不持有**它——判据是「长驻子进程不得出现在 MCP 进程树内」。因此它跨会话存活，也正因如此**必须提供 `stop`**：能活过会话却关不掉才是真缺陷。
 - **台账只负责「找到它去管它」**：进程本来就自持（PRD §14.1），台账不改变归属。存活判据是**双判据**（pid 存活 + 端口探活；两者矛盾给 `unknown`，既不谎报 running 也不自动杀）；确认退出的记录会**结案**并保留结案原因（`final_state`），避免每次启动失败都变成一条永久遗留项。遗留项只**如实汇报**，不静默清理、不静默接管。
 - **写之前先校验**：`gear_validate` 收 YAML、不落库、一次报全；`gear_apply` 是唯一写入口且原子幂等。契约是「能静态查出的问题绝不留到运行期」。
 - **能力不足要上报而不是绕过**：缺能力时不许用 `process` runtime 跑外部脚本绕过门禁，须按 `gear_guide("primitive-gap")` 给出「基础、通用、无业务名词」的原语建议（六条判据）。
 - **密钥不由 MCP 写**：`gear_apply` 只报 `[MISSING_SECRET]` 告警（不影响 `valid`），密钥请人在 CLI 播种 —— 把「谁能写凭据」收敛到人这一侧。
-- **structuredContent 顶层只发对象**：列表类工具经 `objectResult` 包具名键，兼容按 2025-06-18 规范严格校验的客户端（SDK 的 SEP-2106 宽松行为会造成「本地冒烟全绿、接严格客户端全废」的错位）。**新增列表类工具时必须把它登记进 `mcpToolRegistry`**，否则 `TestMCPToolSurfaceMatchesRegistry` 直接 FAIL。诊断线上真实帧用 `plugin/mcp_wire_probe.py`（stdio，默认）或 `plugin/mcp_wire_probe.py --http`（streamable HTTP，与 WorkBuddy 连接器同一条路；自带临时 registry/执行库，探完即杀、不留常驻进程）。
+- **structuredContent 顶层只发对象**：列表类工具经 `objectResult` 包具名键，兼容按 2025-06-18 规范严格校验的客户端（SDK 的 SEP-2106 宽松行为会造成「本地冒烟全绿、接严格客户端全废」的错位）。**新增列表类工具时必须把它登记进 `toolSurface`**（`internal/mcp/tools_surface.go`），否则 `TestMCPToolSurfaceMatchesRegistry` 直接 FAIL。协议侧同时**钉死** `SupportedProtocolVersions=["2025-06-18"]`，并显式关掉 `logging` 与 `listChanged`（不声明自己做不到的能力）。诊断线上真实帧用 `plugin/mcp_wire_probe.py`（stdio，默认）或 `plugin/mcp_wire_probe.py --http`（streamable HTTP，与 WorkBuddy 连接器同一条路；自带临时 registry/执行库，探完即杀、不留常驻进程）。
 - **执行记录同一份 SQLite**：MCP 与 REST 的执行历史互通，「运行中不可注销」跨执行面生效（MCP 发起的执行也会被 `gear_delete` 的 runningChecker 看见）。
 - **默认 stdio 的约束**：stdio 下 stdout **只承载协议帧**，日志/警告一律走 stderr，不污染协议。
   这不只是提示语：引擎默认把执行进度（`✓ step …`）打到 `os.Stdout`，所以 `gear mcp` 必须用

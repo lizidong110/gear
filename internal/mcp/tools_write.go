@@ -465,7 +465,8 @@ func (s *Server) registerWriteTools(ms *mcp.Server) {
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_apply",
 		Description: "把 bundle 落库（**唯一写入口**）：原子、幂等。多文档按依赖顺序 Tool→Flow→Hook 写入，" +
-			"任一非法则整体不写。dry_run=true 等价于先用 validate 看一遍含冲突检测。",
+			"任一非法则整体不写。dry_run=true 等价于先用 validate 看一遍含冲突检测。" +
+			"**不支持密钥写入**：bundle 只声明 requires.secrets，密钥由人在 CLI 播种（见 gear_guide(\"security\")）。",
 		Annotations:  idempotent("落库定义"),
 		OutputSchema: outApply,
 	}, s.handleApply)

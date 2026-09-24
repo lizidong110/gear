@@ -480,13 +480,10 @@ func (s *Server) handleRunTool(w http.ResponseWriter, r *http.Request) {
 
 // blockedInvokeCapability 判定某能力是否禁止经 REST 直调。
 //
-// 只禁 `secret`：它是唯一「读到即不可挽回」的能力（密钥明文），而它的正当用法全在 Flow
-// 内部（`${secrets.NAME}` / `ctx.secret.get`）——没有「从浏览器手调读明文」的合理场景。
-// db / http 同样威力大，但它们有真实的联调用途且不直接吐密钥，故不在此禁（收紧边界见
-// GEAR_工程方法：能用一个精确规则解决的，不要用一个宽泛规则去误伤）。
+// 判据（禁 `secret`）的单一真相源在 `cap.BlockedDirectInvoke`：MCP 面新增 `gear_invoke`
+// 时复用**同一份**禁则，避免「同一进程两个执行面安全口径不一致」（评审 I-8）。
 func blockedInvokeCapability(name string) bool {
-	n := strings.ToLower(strings.TrimSpace(name))
-	return n == "secret" || strings.HasPrefix(n, "secret.")
+	return cap.BlockedDirectInvoke(name)
 }
 
 // handleNews 经引擎同步运行 news.top10 Flow（抓取并整理百度热搜榜 Top10），

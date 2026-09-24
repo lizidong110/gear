@@ -50,7 +50,7 @@ func (s *Server) registerReadTools(ms *mcp.Server) {
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_catalog",
 		Description: "列出目录里现有的对象**摘要**（tool/flow/hook/execution/app）——「先看看有什么」用这个。" +
-			"要看某个对象的完整定义用 gear_describe。",
+			"结果多时用 `offset`/`limit` 翻页（truncated 为 true 时用返回的 next_offset 续取）；要看完整定义用 gear_describe。",
 		Annotations:  readOnly("目录摘要"),
 		OutputSchema: outCatalog,
 	}, s.handleCatalog)
@@ -64,7 +64,7 @@ func (s *Server) registerReadTools(ms *mcp.Server) {
 
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_capabilities",
-		Description: "列出可用的能力目录（内核原语 + ext.*），含方法级参数 schema。" +
+		Description: "列出可用的能力目录（内核原语 + ext.*），含方法级参数 schema；可按 name/kind 过滤以减小返回。" +
 			"写 step.call 的「能力.方法」直调前先看它，不要凭记忆猜方法名与参数。",
 		Annotations:  readOnly("能力目录"),
 		OutputSchema: outCapabilities,
@@ -181,13 +181,24 @@ func (s *Server) handleCatalog(ctx context.Context, _ *mcp.CallToolRequest, in C
 	}
 
 	total := len(items)
+	offset := in.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	items = items[offset:]
 	truncated := false
-	if total > limit {
+	nextOffset := 0
+	if len(items) > limit {
 		items = items[:limit]
 		truncated = true
+		nextOffset = offset + limit
 	}
 	return nil, map[string]any{
 		"items": items, "total": total, "truncated": truncated, "counts": counts,
+		"offset": offset, "limit": limit, "next_offset": nextOffset,
 	}, nil
 }
 
@@ -240,7 +251,11 @@ func (s *Server) handleDescribe(ctx context.Context, _ *mcp.CallToolRequest, in 
 }
 
 // handleCapabilities 返回内核原语 + 已注册 ext.* 的能力目录（含方法级 schema）。
-func (s *Server) handleCapabilities(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+//
+// 支持 name/kind 过滤（评审 I-7）：它是 Instructions 铁律要求「写 step.call 前必看」的
+// 高频工具，而一次全量会随 ext.* 注册数线性膨胀——每个返回都占模型上下文（MCP 场景的
+// 代价远高于 REST）。加两个可选过滤键，让「只想确认 db 有哪些方法」不必付全量的账。
+func (s *Server) handleCapabilities(ctx context.Context, _ *mcp.CallToolRequest, in CapabilitiesArgs) (*mcp.CallToolResult, any, error) {
 	agent := s.engine.AIAgent()
 	if agent == nil {
 		return toolError("CAPABILITIES_UNAVAILABLE", "扩展目录未初始化（引擎未装配 AIAgent）"), nil, nil
@@ -250,7 +265,43 @@ func (s *Server) handleCapabilities(ctx context.Context, _ *mcp.CallToolRequest,
 		return toolErrorFrom("CAPABILITIES_UNAVAILABLE", err), nil, nil
 	}
 	list, _ := caps.([]map[string]any)
-	return nil, objectResult("capabilities", list), nil
+
+	wantName := strings.TrimSpace(in.Name)
+	wantKind := strings.ToLower(strings.TrimSpace(in.Kind))
+	allNames := make([]string, 0, len(list))
+	for _, c := range list {
+		if n, _ := c["name"].(string); n != "" {
+			allNames = append(allNames, n)
+		}
+	}
+	sort.Strings(allNames)
+
+	if wantName != "" || wantKind != "" {
+		filtered := make([]map[string]any, 0, len(list))
+		for _, c := range list {
+			if wantName != "" {
+				if n, _ := c["name"].(string); n != wantName {
+					continue
+				}
+			}
+			if wantKind != "" {
+				if k, _ := c["kind"].(string); !strings.EqualFold(k, wantKind) {
+					continue
+				}
+			}
+			filtered = append(filtered, c)
+		}
+		list = filtered
+	}
+	out := objectResult("capabilities", list)
+	out["total"] = len(list)
+	out["filter_name"] = wantName
+	out["filter_kind"] = wantKind
+	if len(list) == 0 {
+		// 过滤后为空**不是**错误：如实返回空清单 + 可用能力名，免得智能体以为「环境没装东西」。
+		out["hint"] = "没有匹配的能力；可用能力：" + strings.Join(allNames, ", ")
+	}
+	return nil, out, nil
 }
 
 // handleDoctor 做环境自检。

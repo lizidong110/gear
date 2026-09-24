@@ -20,7 +20,7 @@ Gear 是「机制内核」：只给 能力原语 + Tool（执行单元）+ Flow�
 → ④ `gear_validate`（不落库，可无限重试）→ ⑤ `gear_apply`（原子落库）→ ⑥ `gear_app(start, flow_id)`
 → ⑦ `gear_app(status)` + 端口探活 + 日志行 → ⑧ 汇报并**告知如何停止**。
 
-## 七条铁律
+## 八条铁律
 1. 写「能力.方法」前先 `gear_capabilities`，不许猜（`crypto/time/template` 免门禁、`json` 不是能力、`ext.*` 必须声明）。
 2. 先 `gear_validate` 再 `gear_apply`，不要「先写进去再改」。
 3. 长驻应用只能用 `gear_app(action=start)`；`gear_run` 对 service Flow 必拒（设计如此，不是 bug）。
@@ -28,10 +28,13 @@ Gear 是「机制内核」：只给 能力原语 + Tool（执行单元）+ Flow�
 5. 所有 id 必须以 `<app-id>__` 或 `<app-id>.` 开头。
 6. 失败先读 `gear_execution` / `gear_app` 的日志定位到 step 再改；**禁止未验证就宣称成功**。
 7. **缺能力不许凑**（不 shell 外调、不造 `ext.*` 名、不读 env），按 `gear_guide("primitive-gap")` 上报并标注阻塞。
+8. 动手前先 `gear_guide("security")`：**破坏性清单**（`gear_delete` / `gear_app(stop, prune)` / `gear_promote(deprecated)` / `gear_apply(overwrite)`）与**密钥规则**（MCP 不写密钥、由人在 CLI 播种）都在那里。
+
+**读到错误先看 `[CODE]`**（按码去 `gear_guide("errors")` 查修法）。**唯一例外**：缺必填参数的报错由协议层的入参校验直接挡下，**不带 `[CODE]`** ——读里面的 `missing properties` 字段名即可定位，别当成 Gear 的 bug。
 
 ## 工具
 `gear_guide`(手册) · `gear_catalog`(摘要) · `gear_describe`(全量) · `gear_capabilities`(能力与参数)
-· `gear_validate`(校验 YAML) · `gear_apply`(落库) · `gear_delete` · `gear_promote`
+· `gear_validate`(校验 YAML) · `gear_apply`(落库) · `gear_delete` · `gear_promote` · `gear_invoke`(能力直调)
 · `gear_run`(一次性编排) · `gear_execution`(执行记录/日志) · `gear_app`(起停查应用) · `gear_doctor`(环境自检)
 
 ## 完成的证据（缺一不可）

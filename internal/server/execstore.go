@@ -40,6 +40,11 @@ type Execution struct {
 	Result     *engine.RunResult `json:"result,omitempty"`
 	StartedAt  time.Time         `json:"started_at"`
 	FinishedAt *time.Time        `json:"finished_at,omitempty"`
+	// OwnerPID 是发起这次执行的进程 pid（评审 I-1④）。**不出现在 JSON 里**
+	// （json:"-"）：它只服务一个用途——判断一条长期 running 的记录是否是**孤儿**
+	// （发起它的进程已不存在，而记录永远停在 running）。这是「进程被强杀时不更新状态」
+	// 问题的唯一可靠判据；靠 started_at 猜时长会把慢执行误判成孤儿。
+	OwnerPID int `json:"-"`
 }
 
 // ExecStore 是执行记录的**持久化**存储（REQ-EXEC-PERSIST，#70）。
@@ -102,8 +107,12 @@ func (s *ExecStore) migrate() {
 		tool_ids    TEXT,
 		result      TEXT,
 		started_at  TEXT NOT NULL,
-		finished_at TEXT
+		finished_at TEXT,
+		owner_pid   INTEGER NOT NULL DEFAULT 0
 	)`)
+	// 老库补列（评审 I-1④）：列已存在时 SQLite 报错，忽略即可（无 IF NOT EXISTS 语法）。
+	// 新库由上面的 CREATE TABLE 带上本列，这里对它是 no-op。
+	_, _ = s.db.Exec(`ALTER TABLE executions ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0`)
 	_, _ = s.db.Exec(`CREATE TABLE IF NOT EXISTS execution_logs (
 		id       INTEGER PRIMARY KEY AUTOINCREMENT,
 		exec_id  TEXT NOT NULL,
@@ -114,6 +123,9 @@ func (s *ExecStore) migrate() {
 	)`)
 	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_exec_logs ON execution_logs(exec_id, id)`)
 }
+
+// execColumns 是 executions 表的**读取列清单**（单一处定义，防止 Get/List/Create 三处漂移）。
+const execColumns = `id, flow_id, status, error, tool_ids, result, started_at, finished_at, owner_pid`
 
 // LogEntry 是一条执行日志（stdout/stderr 行，关联到 exec + step）。
 type LogEntry struct {
@@ -163,11 +175,14 @@ func (s *ExecStore) LogSink() engine.LogSink {
 }
 
 // Create 登记一次新的执行（状态 running）。
+//
+// OwnerPID 记下**发起本次执行的进程**（评审 I-1④）：进程被强杀时不会有人来更新这条记录，
+// 于是它永远停在 running——只有把属主 pid 落盘，后来的查询才能判断它是不是孤儿。
 func (s *ExecStore) Create(flowID string) Execution {
-	e := Execution{ID: newID("exec_"), FlowID: flowID, Status: StatusRunning, StartedAt: time.Now()}
+	e := Execution{ID: newID("exec_"), FlowID: flowID, Status: StatusRunning, StartedAt: time.Now(), OwnerPID: os.Getpid()}
 	_, _ = s.db.Exec(
-		`INSERT INTO executions (id, flow_id, status, tool_ids, started_at) VALUES (?, ?, ?, '[]', ?)`,
-		e.ID, e.FlowID, e.Status, e.StartedAt.Format(time.RFC3339Nano),
+		`INSERT INTO executions (id, flow_id, status, tool_ids, started_at, owner_pid) VALUES (?, ?, ?, '[]', ?, ?)`,
+		e.ID, e.FlowID, e.Status, e.StartedAt.Format(time.RFC3339Nano), e.OwnerPID,
 	)
 	return e
 }
@@ -239,7 +254,7 @@ func (s *ExecStore) RunningToolIDs() map[string]string {
 
 // Get 返回执行记录的副本（并发安全）。
 func (s *ExecStore) Get(id string) (Execution, bool) {
-	row := s.db.QueryRow(`SELECT id, flow_id, status, error, tool_ids, result, started_at, finished_at FROM executions WHERE id=?`, id)
+	row := s.db.QueryRow(`SELECT `+execColumns+` FROM executions WHERE id=?`, id)
 	e, err := scanExecution(row)
 	if err != nil {
 		return Execution{}, false
@@ -249,7 +264,7 @@ func (s *ExecStore) Get(id string) (Execution, bool) {
 
 // List 返回全部执行记录（按创建顺序，即 started_at 升序；同秒用 id 稳定排序）。
 func (s *ExecStore) List() []Execution {
-	rows, err := s.db.Query(`SELECT id, flow_id, status, error, tool_ids, result, started_at, finished_at FROM executions ORDER BY started_at ASC, id ASC`)
+	rows, err := s.db.Query(`SELECT ` + execColumns + ` FROM executions ORDER BY started_at ASC, id ASC`)
 	if err != nil {
 		return nil
 	}
@@ -263,17 +278,18 @@ func (s *ExecStore) List() []Execution {
 	return out
 }
 
-// scanExecution 从一行（*sql.Row 或 *sql.Rows）扫描为 Execution。
+// scanExecution 从一行（*sql.Row 或 *sql.Rows）扫描为 Execution（列序与 execColumns 一致）。
 func scanExecution(scanner interface {
 	Scan(dest ...interface{}) error
 }) (Execution, error) {
 	var (
 		id, flowID, status, errMsg, toolIDs, result, startedAt, finishedAt sql.NullString
+		ownerPID                                                           sql.NullInt64
 	)
-	if err := scanner.Scan(&id, &flowID, &status, &errMsg, &toolIDs, &result, &startedAt, &finishedAt); err != nil {
+	if err := scanner.Scan(&id, &flowID, &status, &errMsg, &toolIDs, &result, &startedAt, &finishedAt, &ownerPID); err != nil {
 		return Execution{}, err
 	}
-	e := Execution{ID: id.String, FlowID: flowID.String, Status: status.String, Error: errMsg.String}
+	e := Execution{ID: id.String, FlowID: flowID.String, Status: status.String, Error: errMsg.String, OwnerPID: int(ownerPID.Int64)}
 	if b := toolIDs.String; b != "" {
 		_ = json.Unmarshal([]byte(b), &e.ToolIDs)
 	}

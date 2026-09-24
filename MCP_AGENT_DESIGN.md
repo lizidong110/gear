@@ -120,12 +120,12 @@
 
 ```
 ┌─ L0 注入层 ── ServerOptions.Instructions ──────────────── 常驻 ~900 token
-│    心智模型四层 + 七条铁律 + 标准工作流 + 工具选择表
+│    心智模型四层 + 八条铁律 + 标准工作流 + 工具选择表
 ├─ L1 上下文层 ─ gear_guide(topic) / gear://guide/* / gear://schema/* ── 按需
 │    同一份 go:embed 文本，三处引用（instructions 摘要 / 工具全文 / resources）
-├─ L2 工具层 ── 意图级工具（gear_ 前缀，共 12 个）─────────── 调用面
+├─ L2 工具层 ── 意图级工具（gear_ 前缀，共 13 个）─────────── 调用面
 │    guide · catalog · describe · capabilities · validate · apply
-│    delete · promote · run · execution · app · doctor
+│    delete · promote · invoke · run · execution · app · doctor
 ├─ L3 交付物层 ─ Gear App Bundle（多文档 YAML，kind: App + Tool/Flow/Hook）─ 交付形态
 │    静态资源由智能体自身的文件工具落盘；bundle 只声明不搬运
 ├─ L4 验证层 ── validate(dry) → apply → app start(派生后台进程) → 探活/日志 → 证据汇报 ─ 闭环
@@ -185,14 +185,15 @@
    - **Flow 编排执行单元形成业务**：「应用」= 含 `mode: service` 长驻 step 的 Flow。
    - **Hook 是切面**：在 `before_flow`/`before_step`/`after_step`/`on_error`/`on_success`/`before_promote` 插入执行与门禁。
 
-2. **七条铁律**（v1.2 补了第 3 条与第 7 条）：
+2. **八条铁律**（v1.2 补了第 3 条与第 7 条；v1.3 补了第 8 条——指向 `gear_guide("security")` 的破坏性清单与密钥规则）：
    1. 写 `step.call` 的「能力.方法」直调前先 `gear_capabilities`，不许猜方法名与参数；
    2. YAML 先 `gear_validate` 再 `gear_apply`，不要「先写进去再改」；
    3. **起长驻应用只能用 `gear_app(action=start)`**——它会派生后台进程并立即返回；`gear_run` 对 service Flow 一定会拒（不是 bug，是设计）；
    4. 凭据只走 `${secrets.NAME}`，绝不内联明文；扩展原子禁止依赖环境变量；
    5. 所有 id 必须以 `<app-id>__` 或 `<app-id>.` 开头；
    6. 失败先读 `gear_execution` / `gear_app` 的日志定位到具体 step 再改，**禁止未验证就宣称成功**；
-   7. **缺能力不许凑**（不许 shell 出去绕过、不许自造 `ext.*`、不许读 env）——按 `gear_guide("primitive-gap")` 的模板在答复里给出原语建议。
+   7. **缺能力不许凑**（不许 shell 出去绕过、不许自造 `ext.*`、不许读 env）——按 `gear_guide("primitive-gap")` 的模板在答复里给出原语建议；
+   8. **动手前先读 `gear_guide("security")`**——破坏性清单（`gear_delete` / `gear_app(stop, prune)` / `gear_promote(deprecated)` / `gear_apply(overwrite)`）与密钥规则（MCP 不写密钥，由人在 CLI 播种）都在那里。
 
 3. **标准工作流**：8 步（见 §10）。
 4. **工具选择表**：一行一个工具，消除「该调哪个」的猜测。
@@ -241,7 +242,7 @@ var files embed.FS
 
 ---
 
-## 6. L2：工具层 —— 19 → 12
+## 6. L2：工具层 —— 19 → 13（v1.2 收敛为 12，v1.3 因评审 I-8 补 `gear_invoke` 至 13）
 
 ### 6.1 迁移对照
 
@@ -260,10 +261,11 @@ var files embed.FS
 | — | **`gear_guide`** | 新增（L1） |
 | — | **`gear_app`**（`action`: start\|stop\|status\|list）**默认开启**（v1.2 由「可选」升为「必需」，见 §6.2⑤） | 新增（C′） |
 | — | **`gear_doctor`** | 新增（问题 P7） |
+| — | **`gear_invoke`**（`name`/`method`/`args`，能力直调；禁 `secret.*`） | 新增（v1.3，评审 I-8：等价 REST 的 `POST /api/capabilities/invoke`） |
 
-**12 个 = 1 guide + 6 目录/写入 + 2 执行/观察 + 1 app + 1 doctor + 1 promote。**
+**13 个 = 1 guide + 6 目录/写入/直调 + 2 执行/观察 + 1 app + 1 doctor + 1 promote + 1 invoke。**
 
-> **工具数硬预算 12**：新增必须合并或先删一个。原语缺口上报（§9.6）**刻意不新增工具**，走输出契约，就是为了守住这个预算。
+> **工具数硬预算 13**（v1.2 为 12，v1.3 因评审 I-8 补 `gear_invoke` 而上调一位）：新增必须合并或先删一个。原语缺口上报（§9.6）**刻意不新增工具**，走输出契约，就是为了守住这个预算。
 
 ### 6.2 关键设计点
 
@@ -374,7 +376,7 @@ MCP 无别名机制，一次性重命名。**Server `Version` 从 `0.1.0` 升到
 1. ~37 处测试调用点（机械替换，`internal/mcp/*_test.go`、`internal/cli/cli_mcp_test.go`）；
 2. `TestMCPAllToolsReturnObjectStructuredContent` 的覆盖度反查启发式（现为 `strings.HasPrefix(tt.Name, "list_")`）**必须重写为「registry 驱动」**：断言「每个注册的工具都在登记表里」——改完这条红线比原来**更强**（不再依赖命名约定）；
 3. README §12 工具表 + REQUIREMENTS 2 条。
-工具增加 `Annotations`（`ReadOnlyHint`/`DestructiveHint`/`IdempotentHint`）：`gear_validate`/`gear_catalog`/`gear_describe`/`gear_capabilities`/`gear_doctor` = 只读；`gear_delete`/`gear_app(stop)` = 破坏性；`gear_apply` = 幂等。这让客户端能在 UI 上正确提示风险。
+工具增加 `Annotations`（`ReadOnlyHint`/`DestructiveHint`/`IdempotentHint`）：`gear_validate`/`gear_catalog`/`gear_describe`/`gear_capabilities`/`gear_doctor`/`gear_execution` = 只读；`gear_delete`/**`gear_app`**（含 stop/prune，故整体标破坏性，见 §6.2 与评审 I-4）/`gear_invoke` = 破坏性；`gear_apply` = 幂等。这让客户端能在 UI 上正确提示风险。
 
 **⑧ 协议红线照旧（不许忘）**
 新增列表类工具（`gear_catalog`）**必须**经 `objectResult` 包具名键，并登记进 `TestMCPAllToolsReturnObjectStructuredContent` 的 calls 表——该用例会反查覆盖度，漏登记直接 FAIL（README §12.2）。
@@ -552,7 +554,7 @@ steps:
 | 扩展原子 `ext.*` | 需握手/配置/第三方 SDK/侧车，或需长驻 | `plugin/extensions.yaml` 注册，可选 `service: true` | **是** |
 | **不申请原语** | 只在某一个应用里复用 | 直接建 Tool（Lua/process），或 step 直调已有能力 | —（这才是大多数情况的答案） |
 
-**交付方式**：报告写在**给用户的答复里**（人能看到并决定是否加原语），**不新增 MCP 工具**——守住 §6.1 的 12 个工具硬预算。模板见**附录 G**。
+**交付方式**：报告写在**给用户的答复里**（人能看到并决定是否加原语），**不新增 MCP 工具**——守住 §6.1 的工具硬预算（13）。模板见**附录 G**。
 
 ---
 
@@ -705,7 +707,7 @@ Gear 是一个「机制内核」：只提供能力原语 + Tool（执行单元�
 → ⑤ gear_apply 原子落库 → ⑥ gear_app(start, flow_id) 起应用（派生后台进程，立即返回）
 → ⑦ gear_app(status) + 端口探活 + 日志行确认在跑 → ⑧ 汇报并告知如何停止。
 
-七条铁律
+八条铁律
 1. 写 step.call 的「能力.方法」直调前，必须先 gear_capabilities，不许凭记忆猜方法名或参数；
    crypto/time/template 是免门禁纯函数、json 不是能力、ext.* 必须声明——这三条最容易写错。
 2. 任何 YAML 先 gear_validate，再 gear_apply；不要「先写进去再改」。
@@ -716,6 +718,10 @@ Gear 是一个「机制内核」：只提供能力原语 + Tool（执行单元�
 6. 失败先读 gear_execution / gear_app 的日志定位到具体 step，再改 YAML 重跑；禁止未验证就宣称成功。
 7. 缺能力不许凑：不得用 process shell 外调绕过门禁、不得自造 ext.* 名、不得读 env 取凭据。
    按 gear_guide("primitive-gap") 的模板给出「基础通用、不含业务」的原语建议，并标注哪些步骤被阻塞。
+8. 动手前先读 gear_guide("security")：破坏性清单（gear_delete / gear_app(stop,prune) /
+   gear_promote(deprecated) / gear_apply(overwrite)）与密钥规则（MCP 不写密钥，由人在 CLI 播种）都在那里。
+读到错误先看 [CODE]（按码去 gear_guide("errors") 查修法）。唯一例外：缺必填参数的报错来自协议层的
+入参校验，不带 [CODE]——读 missing properties 的字段名即可定位，别当成 gear 的 bug。
 
 工具选择
 - 想了解 gear 怎么用        → gear_guide
@@ -724,6 +730,7 @@ Gear 是一个「机制内核」：只提供能力原语 + Tool（执行单元�
 - 有哪些能力原语与参数       → gear_capabilities
 - 校验 YAML（不改动任何东西）→ gear_validate
 - 落地/更新定义（原子、幂等）→ gear_apply
+- 试一个原子能力（不必写 Flow）→ gear_invoke
 - 跑一次性编排 / 看结果      → gear_run / gear_execution
 - 起/停/查长驻应用          → gear_app
 - 环境不对（侧车缺失、端口占用、遗留应用）→ gear_doctor
@@ -795,28 +802,34 @@ steps:
 { "error": { "code": "...", "message": "...", "field": "...", "step": "...", "hint": "...", "docs": "gear://guide/errors#CODE" } }
 ```
 
+> **完整码表与修法以 `guide/errors.md` 为单一真相源**（它随二进制 `go:embed` 分发，
+> 智能体用 `gear_guide("errors")` 读到的就是同一份）。下表只收「设计层最该记住的十几个」，
+> 刻意**不再维护完整清单**——两处各存一份完整列表必然漂移（评审 I-2 实测到：此处写了
+> `DEP_CYCLE` / `PRIMITIVE_MISSING` / `PORT_IN_USE` / `APP_PLATFORM_UNAVAILABLE` 四个
+> **代码里根本不产生**的码，而手册又漏收了约 17 个**实际在产生**的兜底码）。
+> 双向核对由 `tools/doc_audit.py` 机械守卫（`errors.md` ⇄ 代码产生点），进闸门。
+
 | code | 触发 | hint 要点 |
 |---|---|---|
 | `UNKNOWN_CALL_TARGET` | `step.call` 目标不存在 | 用 `gear_catalog(kind=tool)` 确认，或改用「能力.方法」（先 `gear_capabilities`）；若确认能力不存在 → 走 §9.6 缺口上报 |
 | `UNKNOWN_CAPABILITY` | Tool 声明了不存在的 capability | 先 `gear_capabilities`；`ext.*` 需在 `extensions.yaml` 中注册 |
-| `PRIMITIVE_MISSING` | 所需能力在能力目录与 extensions.yaml 中都不存在 | 不许绕过（禁 shell 外调 / 自造 ext / env 取凭据）；按 `gear_guide("primitive-gap")` 给出原语建议 |
+| `BAD_DEPENDENCY` | 依赖不存在，或成环 | 检查 `depends_on` 与 `${steps.*}` 隐式依赖（**成环也归此码**，旧文档曾写作 `DEP_CYCLE`，已统一） |
 | `BAD_TEMPLATE` | `${}` 前缀非法 | 只允许 `vars` / `steps.<id>.output` / `secrets`；`when` 不写 `${}` |
 | `SCHEMA_NOT_OBJECT` | schema 顶层非 object | 写标准 JSON Schema，不支持简写 |
-| `DEP_CYCLE` | 依赖成环 | 检查 `depends_on` 与 `${steps.*}` 隐式依赖 |
+| `BAD_YAML` | 某份文档不是合法 YAML | 缩进 / 冒号后空格 / 特殊字符引号 |
 | `SERVICE_FLOW_SYNC_RUN` | 对 service Flow 用 `gear_run` | 改用 `gear_app(action=start)` |
+| `EXECUTION_BUSY` | MCP 面在途 Flow 执行数达并发上限（默认 8）被背压拒绝 | 稍后重试；先 `gear_execution` 看进展。**不是 YAML 问题** |
+| `INVOKE_BLOCKED` | `gear_invoke` 调被禁能力（`secret.*`） | 密钥只在 Flow 内用 `${secrets.NAME}`；播种走 CLI |
 | `APP_START_FAILED` | 派生进程后短等仍不通（见 `wait_seconds`） | 读返回的 `log_path` 末若干行；常见原因：端口被占、侧车没 build、registry 路径不符 |
 | `APP_NOT_FOUND` | `stop`/`status` 的 `app_id` 不在台账 | 先 `gear_app(action=list)`；台账目录默认 `~/.gear/apps/` |
 | `ORPHAN_APP` | `stop` 后端口仍未释放，或台账与进程/端口不一致 | 如实上报 pid 与端口；用 `gear_doctor` 看谁占着；**不谎报 stopped** |
-| `APP_PLATFORM_UNAVAILABLE` | 仅在 `--apps` 转发模式下 REST 不可达 | 先启动 `gear serve`，或去掉 `--apps` 改用默认的本地派生（**不会静默降级**） |
-| `ID_NAMESPACE_VIOLATION` | id 未带应用前缀 | 全部 id 以 `<app-id>__` 或 `<app-id>.` 开头 |
-| `MISSING_FILE` | `layout.files` 声明但不存在 | 用你的文件工具先落盘 |
-| `MISSING_SECRET` | `${secrets.X}` 对应密钥未播种 | 请人在 CLI 播种（MCP 不写密钥） |
-| `SIDECAR_NOT_BUILT` | 声明的侧车二进制缺失 | 先构建（`build/*-sidecar.exe`） |
-| `PORT_IN_USE` | 端口被占 | 换端口或先停占用应用（`gear_doctor` 可见） |
-| `IN_USE` | 删除被引用对象 | 错误信息会指出被谁引用，先解引用 |
-| `ENTRY_EXE_UNRESOLVED` | process 型 Tool 的 entry 首 token 指向的可执行文件不存在（**校验期**即拦） | 改路径；Windows 下正/反斜杠都可（反斜杠不再被当转义符）。只有绝对路径报此码——相对路径与裸名字只给告警，因为运行时 cwd/PATH 可能与校验时不同 |
 | `APP_PRUNE_FAILED` | `gear_app(action=prune)` 清理台账失败 | 看返回的 `apps_dir` 是否可写；prune 只删**确定已终止**的记录（`running`/`unknown` 一律保留），不杀进程 |
-| `EXECUTION_BUSY` | MCP 面在途 Flow 执行数达并发上限（默认 8），`gear_run` / `flow__` 被背压拒绝（评审 I-1 新增的有界并发） | 稍后重试；先 `gear_execution` 看现有执行进展。**这不是 YAML 问题**，别去改定义 |
+| `ID_NAMESPACE_VIOLATION` | id 未带应用前缀 | 全部 id 以 `<app-id>__` 或 `<app-id>.` 开头 |
+| `MISSING_SECRET` | `${secrets.X}` 对应密钥未播种 | 请人在 CLI 播种（MCP 不写密钥）；这是 `warnings` 提示，不影响 `valid` |
+| `IN_USE` | 删除被引用对象 | 错误信息会指出被谁引用，先解引用 |
+| `ENTRY_EXE_UNRESOLVED` | process 型 Tool 的 entry 首 token 指向的可执行文件不存在（**校验期**即拦） | 改路径；Windows 下正/反斜杠都可。只有绝对路径报此码——相对路径与裸名字只给告警 |
+| `NOT_FOUND` | 对象 id 不存在（Tool/Flow/Hook/执行记录） | 先用 `gear_catalog` / `gear_execution` 确认 id（注意应用前缀） |
+| `BAD_ARGUMENT` | 必填参数为空 / 枚举值非法 | 按工具描述的取值改写；先用 `gear_catalog` 确认对象 id |
 
 ## 附录 E：智能体常见误解（写进 `gear_guide`，直接减少返工）
 

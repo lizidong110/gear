@@ -629,14 +629,14 @@ func TestMCPGuideAndInstructions(t *testing.T) {
 
 	// instructions：guide/summary.md 必须非空（New 已 fail-closed 校验，这里断言内容质量）。
 	sum := guide.Summary()
-	if !strings.Contains(sum, "gear_app") || !strings.Contains(sum, "七条铁律") {
+	if !strings.Contains(sum, "gear_app") || !strings.Contains(sum, "八条铁律") {
 		t.Fatalf("instructions 内容不像心智模型: %q", sum[:min(120, len(sum))])
 	}
 
-	// 8 个 topic 各自非空，且都是**真实文档**（不是占位符）。
+	// 每个 topic 都非空，且都是**真实文档**（不是占位符）。
 	topics := guide.Topics()
-	if len(topics) < 8 {
-		t.Fatalf("guide 应有 ≥8 个 topic，实际 %d: %v", len(topics), topics)
+	if len(topics) < 9 {
+		t.Fatalf("guide 应有 ≥9 个 topic，实际 %d: %v", len(topics), topics)
 	}
 	for _, topic := range topics {
 		var out map[string]any
@@ -1025,30 +1025,14 @@ func TestMCPNewRequiresExtensionsLoaded(t *testing.T) {
 
 // ---- 工具面红线 ----
 
-// mcpToolRegistry 是工具面的**权威登记表**：工具名 → 是否返回列表形态（需进 calls 表）。
-//
-// 为什么要有这张表：原覆盖度反查靠 `strings.HasPrefix(tt.Name, "list_")` 这个**命名约定**猜
-// 「哪些工具是列表形态」——改名或新增一个不叫 list_ 的列表工具，红线就会静默失守
-// （MCP_AGENT_DESIGN.md §6.2⑦ 的教训）。改成显式登记后，**任何新工具不登记即 FAIL**，
-// 而且顺带把「工具数 ≤ 12」这条硬预算也钉住了。
-var mcpToolRegistry = map[string]bool{
-	"gear_guide":        false,
-	"gear_catalog":      true, // items
-	"gear_describe":     false,
-	"gear_capabilities": true, // capabilities
-	"gear_validate":     false,
-	"gear_apply":        false,
-	"gear_delete":       false,
-	"gear_promote":      false,
-	"gear_run":          false,
-	"gear_execution":    true, // executions / logs
-	"gear_app":          true, // items / orphan
-	"gear_doctor":       false,
-}
+// mcpToolRegistry 是工具面的**权威登记表**——已提升为生产侧常量 `toolSurface`
+// （见 tools_surface.go，评审 O-8）。这里保留一个同义别名，让阅读本文件的用例不用跳文件；
+// 语义与守卫完全不变：**任何新工具不登记即 FAIL**，并钉住工具数预算 `toolBudget`。
+var mcpToolRegistry = toolSurface
 
 // TestMCPToolSurfaceMatchesRegistry 工具面必须与登记表**完全一致**（不多不少）。
 //
-// 三条红线一次断言：① 新增工具必须登记（否则覆盖度反查失守）；② 工具数 ≤12 的硬预算；
+// 三条红线一次断言：① 新增工具必须登记（否则覆盖度反查失守）；② 工具数 ≤ toolBudget（13）的硬预算；
 // ③ 全部工具统一 gear_ 前缀（跨 MCP server 冲突的根治，§6.2⑦）。
 func TestMCPToolSurfaceMatchesRegistry(t *testing.T) {
 	session := newSmokeSession(t)
@@ -1063,8 +1047,8 @@ func TestMCPToolSurfaceMatchesRegistry(t *testing.T) {
 			t.Fatalf("工具 %s 未统一 gear_ 前缀（跨 server 极易误选）", tt.Name)
 		}
 		if _, ok := mcpToolRegistry[tt.Name]; !ok {
-			t.Fatalf("工具 %s 未登记进 mcpToolRegistry——新增工具必须登记，"+
-				"否则线格式覆盖度红线会静默失守；若有意新增，同时确认工具数预算（≤12）", tt.Name)
+			t.Fatalf("工具 %s 未登记进 tools_surface.go 的 toolSurface——新增工具必须登记，"+
+				"否则线格式覆盖度红线会静默失守；若有意新增，同时确认工具数预算（≤%d）", tt.Name, toolBudget)
 		}
 	}
 	for name := range mcpToolRegistry {
@@ -1072,8 +1056,8 @@ func TestMCPToolSurfaceMatchesRegistry(t *testing.T) {
 			t.Fatalf("登记表里的 %s 不在实际工具面中——登记表已过期", name)
 		}
 	}
-	if n := len(got); n > 12 {
-		t.Fatalf("工具数 %d 超过硬预算 12（每多一个，模型选错概率就上升一分）", n)
+	if n := len(got); n > toolBudget {
+		t.Fatalf("工具数 %d 超过硬预算 %d（每多一个，模型选错概率就上升一分）", n, toolBudget)
 	}
 	// 工具名必须落在 SDK 允许的字符集内（`[A-Za-z0-9_.-]`，≤128）。
 	//
@@ -1105,8 +1089,9 @@ func TestMCPArgTagsAvoidReservedPrefix(t *testing.T) {
 	reserved := regexp.MustCompile("^[^ \t\n]*=")
 	types := []reflect.Type{
 		reflect.TypeOf(IDArgs{}), reflect.TypeOf(DescribeArgs{}), reflect.TypeOf(CatalogArgs{}),
-		reflect.TypeOf(GuideArgs{}), reflect.TypeOf(ValidateArgs{}), reflect.TypeOf(ApplyArgs{}),
-		reflect.TypeOf(DeleteArgs{}), reflect.TypeOf(PromoteArgs{}), reflect.TypeOf(RunArgs{}),
+		reflect.TypeOf(GuideArgs{}), reflect.TypeOf(CapabilitiesArgs{}), reflect.TypeOf(ValidateArgs{}),
+		reflect.TypeOf(ApplyArgs{}), reflect.TypeOf(DeleteArgs{}), reflect.TypeOf(PromoteArgs{}),
+		reflect.TypeOf(InvokeArgs{}), reflect.TypeOf(RunArgs{}),
 		reflect.TypeOf(ExecutionArgs{}), reflect.TypeOf(AppArgs{}), reflect.TypeOf(FlowExposeArgs{}),
 	}
 	for _, rt := range types {

@@ -9,10 +9,21 @@ package mcp
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"gear/internal/app"
+	"gear/internal/execstore"
 )
+
+// defaultExecutionListLimit 是 gear_execution 不带 id 时默认返回的条数（评审 I-7）。
+//
+// 为什么要有上限：执行表随运行时间**无限增长**，而 MCP 的每次返回都直接占模型上下文——
+// 全表返回在长跑机器上会一次性吃掉大量 token。默认取最近 20 条，够排障；要更多显式给 limit。
+const defaultExecutionListLimit = 20
 
 // registerRunTools 挂上执行与观察类工具。
 func (s *Server) registerRunTools(ms *mcp.Server) {
@@ -26,7 +37,8 @@ func (s *Server) registerRunTools(ms *mcp.Server) {
 
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_execution",
-		Description: "查看执行记录：给 id 看单次执行（可带日志），不给 id 则列出最近执行。" +
+		Description: "查看执行记录：给 id 看单次执行（可带日志），不给 id 则列出最近执行" +
+			"（默认最近 20 条，`limit` 可调；孤儿记录会标 `orphan`）。" +
 			"排障时先用它定位到具体 step，改完 YAML 再重跑。",
 		Annotations:  readOnly("执行记录"),
 		OutputSchema: outExecution,
@@ -82,9 +94,24 @@ func (s *Server) handleRun(ctx context.Context, _ *mcp.CallToolRequest, in RunAr
 }
 
 // handleExecution 返回单次执行记录或执行列表。
+//
+// 列表分支做两件事（评审 I-1④ / I-7）：
+//   - **分页**：默认只回最近 defaultExecutionListLimit 条（执行表会无限增长，全表返回
+//     在 MCP 场景直接吃模型上下文）；total 仍是全量计数，让调用方知道还有多少。
+//   - **孤儿识别**：状态 running 但发起它的进程已不存在 → 标 `orphan`。进程被强杀时
+//     没人更新记录，于是它会永远停在 running；此前只能靠猜「是不是卡住了」。
 func (s *Server) handleExecution(ctx context.Context, _ *mcp.CallToolRequest, in ExecutionArgs) (*mcp.CallToolResult, any, error) {
 	if strings.TrimSpace(in.ID) == "" {
+		limit := in.Limit
+		if limit <= 0 {
+			limit = defaultExecutionListLimit
+		}
 		list := s.execs.List()
+		total := len(list)
+		// List 按 started_at 升序 → 最近的 N 条在尾部。
+		if total > limit {
+			list = list[total-limit:]
+		}
 		items := make([]map[string]any, 0, len(list))
 		for _, e := range list {
 			m := map[string]any{
@@ -96,9 +123,17 @@ func (s *Server) handleExecution(ctx context.Context, _ *mcp.CallToolRequest, in
 			if e.FinishedAt != nil {
 				m["finished_at"] = *e.FinishedAt
 			}
+			if orphan, reason := s.orphanStatus(e); orphan {
+				m["orphan"] = true
+				m["orphan_reason"] = reason
+			}
 			items = append(items, m)
 		}
-		return nil, map[string]any{"executions": items, "total": len(items)}, nil
+		out := map[string]any{"executions": items, "total": total, "limit": limit}
+		if total > len(items) {
+			out["hint"] = fmt.Sprintf("只返回了最近 %d 条（共 %d 条）；要看更早的用更大的 limit", len(items), total)
+		}
+		return nil, out, nil
 	}
 
 	e, ok := s.execs.Get(in.ID)
@@ -121,6 +156,11 @@ func (s *Server) handleExecution(ctx context.Context, _ *mcp.CallToolRequest, in
 	if e.FinishedAt != nil {
 		out["finished_at"] = *e.FinishedAt
 	}
+	if orphan, reason := s.orphanStatus(e); orphan {
+		out["orphan"] = true
+		out["orphan_reason"] = reason
+		out["hint"] = "这条记录是孤儿：发起它的进程已退出，它不会再更新；不要把它当「仍在跑」"
+	}
 	if in.WithLogs {
 		logs := s.execs.Logs(in.ID)
 		if in.Tail > 0 && len(logs) > in.Tail {
@@ -129,4 +169,24 @@ func (s *Server) handleExecution(ctx context.Context, _ *mcp.CallToolRequest, in
 		out["logs"] = logs
 	}
 	return nil, out, nil
+}
+
+// orphanStatus 判定一条执行记录是否为**孤儿**（评审 I-1④）。
+//
+// 判据只有「属主进程已不存在」这一条可靠判据；**故意不看时长**——正常的长执行与
+// 「被强杀后永远 running」在时间上无法区分，用超时阈值会把慢执行误报成孤儿。
+// 属主 pid 缺失（老记录，owner_pid=0）或属主就是本进程时，一律**不报孤儿**（不猜）。
+func (s *Server) orphanStatus(e execstore.Execution) (bool, string) {
+	if e.Status != execstore.StatusRunning {
+		return false, ""
+	}
+	pid := e.OwnerPID
+	if pid <= 0 || pid == os.Getpid() {
+		return false, ""
+	}
+	if app.ProcessAlive(pid) {
+		return false, ""
+	}
+	return true, fmt.Sprintf("发起该执行的进程（pid=%d）已不存在，但记录仍停在 running——"+
+		"该次执行多半被强杀（进程退出不会回写记录）", pid)
 }

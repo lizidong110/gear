@@ -469,3 +469,18 @@ func (e *MemEvent) WaitCtx(name string, ctx context.Context) (interface{}, error
 		return nil, ctx.Err()
 	}
 }
+
+// BlockedDirectInvoke 判定某能力是否禁止经**外部执行面**（REST `/api/capabilities/invoke`、
+// MCP `gear_invoke`）直调。
+//
+// 只禁 `secret`：它是唯一「读到即不可挽回」的能力（明文密钥），正当用法全在 Flow 内部
+// （`${secrets.NAME}` / `ctx.secret.get`）——没有「从浏览器或 MCP 客户端手调读明文」的合理场景。
+// db / http 同样威力大，但它们有真实的联调用途且不直接吐密钥，故不在此禁。
+//
+// ★ 为什么放在 cap 包而不是各执行面各写一份：REST 面此前有一份 `blockedInvokeCapability`，
+// 而 MCP 面补 `gear_invoke` 时若另写一份，两处**必然漂移**（这正是评审 I-8 点出的
+// 「潜在安全口径不一致」）。禁则的真相源是「能力本身的性质」，故与能力定义同处一地。
+func BlockedDirectInvoke(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	return n == "secret" || strings.HasPrefix(n, "secret.")
+}

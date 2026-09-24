@@ -32,5 +32,13 @@ type (
 	LogEntry = server.LogEntry
 )
 
+// 执行状态常量（转发自 server，避免调用方各写一份字面量）。
+const (
+	StatusRunning   = server.StatusRunning
+	StatusSucceeded = server.StatusSucceeded
+	StatusFailed    = server.StatusFailed
+	StatusRejected  = server.StatusRejected
+)
+
 // NewExecStore 打开（必要时建库并迁移）执行记录存储，与 REST 面同源。
 func NewExecStore() *ExecStore { return server.NewExecStore() }

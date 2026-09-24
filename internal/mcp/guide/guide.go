@@ -74,14 +74,3 @@ func Get(topic string) (string, error) {
 	}
 	return string(b), nil
 }
-
-// All 返回全部 topic → 全文（含 summary），供注册 resources 用。
-func All() map[string]string {
-	out := map[string]string{SummaryTopic: Summary()}
-	for _, t := range Topics() {
-		if b, err := files.ReadFile(t + ".md"); err == nil {
-			out[t] = string(b)
-		}
-	}
-	return out
-}

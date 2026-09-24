@@ -3,23 +3,24 @@
 // 动机：让任何支持 MCP 的智能体（WorkBuddy、Claude Desktop、Cursor…）以对话方式完成
 // 「读目录 → 写配置 → 校验 → 跑起来 → 看结果」——即**创建并运行一个应用**。
 //
-// 工具面（12 个，统一 gear_ 前缀，意图级而非资源级；设计见 MCP_AGENT_DESIGN.md §6）：
+// 工具面（13 个，统一 gear_ 前缀，意图级而非资源级；设计见 MCP_AGENT_DESIGN.md §6）：
 //
 //	gear_guide        按主题取手册（L1 上下文层，与其他两处同源于 guide 包的 embed）
-//	gear_catalog      看现有什么（**摘要**，不吐全量 schema）
+//	gear_catalog      看现有什么（**摘要**，不吐全量 schema；支持 offset/limit 翻页）
 //	gear_describe     看某对象完整定义
-//	gear_capabilities 能力目录（内核原语 + ext.*，含方法级参数 schema）
+//	gear_capabilities 能力目录（内核原语 + ext.*，含方法级参数 schema；可按 name/kind 过滤）
 //	gear_validate     校验 bundle YAML（不落库，字段级诊断）
 //	gear_apply        声明式落库（原子、幂等、可选 dry_run）
 //	gear_delete       删对象（守卫语义不变）
 //	gear_promote      晋升 Tool 版本
+//	gear_invoke       能力直调（试一个原子方法，不必写 Flow；禁 secret.*）
 //	gear_run          跑一次性编排（flow 异步 + wait_seconds）或单个 Tool
-//	gear_execution    执行记录与日志
-//	gear_app          长驻应用生命周期（start/stop/status/list）
+//	gear_execution    执行记录与日志（默认最近 N 条；标出孤儿记录）
+//	gear_app          长驻应用生命周期（start/stop/status/list/prune）
 //	gear_doctor       环境自检（侧车/端口/台账/遗留）
 //
-// 工具实现分文件：tools_read.go（只读 5 个）/ tools_write.go（写 4 个）/ tools_run.go（执行 2 个）/
-// tools_app.go（应用 1 个）；公共部件（结构化错误、入参类型、输出 schema）在 common.go。
+// 工具实现分文件：tools_read.go（只读 5 个）/ tools_write.go（写 4 个）/ tools_invoke.go（能力直调 1 个）/
+// tools_run.go（执行 2 个）/ tools_app.go（应用 1 个）；公共部件（结构化错误、入参类型、输出 schema）在 common.go。
 //
 // 设计取舍：
 //   - MCP 只做**协议翻译**：删除守卫（PRD §8.2）、schema 校验、版本状态机、静态校验全部在
@@ -70,7 +71,12 @@ import (
 //
 // 0.2.0：工具面由 19 个资源级工具收敛为 12 个意图级工具并统一 `gear_` 前缀（**破坏性变更**，
 // 见 MCP_AGENT_DESIGN.md §6.2⑦）。升版本号让客户端能分辨新旧工具面。
-const Version = "0.2.0"
+//
+// 0.3.0（2026-09-24，评审 I-1/I-2/I-3/I-4/I-5/I-7/I-8/I-9 + O-1..O-6/O-8 收敛）：
+// 新增 `gear_invoke`（工具数 12→13）；全部工具声明 `outputSchema`；`gear_app` 标注改为
+// 破坏性；`gear_guide` 的 topic 文案不再枚举；`gear_catalog`/`gear_execution`/`gear_capabilities`
+// 支持分页与过滤；错误码表与手册双向对齐；capabilities 去掉 logging/listChanged 并钉协议版本。
+const Version = "0.3.0"
 
 // Server 是 MCP 执行面：持有与 REST 面同构的 registry + 引擎 + 执行记录存储。
 type Server struct {
@@ -181,11 +187,35 @@ func (s *Server) Close() error {
 	return s.execs.Close()
 }
 
+// supportedProtocolVersion 是 MCP 面**显式钉死**的协议版本（评审 O-3）。
+//
+// 为什么不交给 SDK 默认：SDK 默认放行 2024-11-05 … 2026-07-28 一整段，而本项目的硬约束
+// （`tools/call` 的 `structuredContent` 顶层**必须是 JSON 对象**）是按 2025-06-18 定的；
+// 「声称支持一段自己没验过的范围」正是设计文档要防的事。协商是**优雅降级**的
+// （`negotiatedVersion`：客户端版本不在列表就回落到服务端最新支持项），故钉死不会让
+// 旧客户端连不上；要扩范围请连同该版本的返形态判据一起补测再改这里。
+const supportedProtocolVersion = "2025-06-18"
+
 // newMCPServer 构造底层 SDK server（stdio 与 HTTP 两个 transport 共用同一套工具面与
 // instructions——否则「本地 stdio 能用、HTTP 接进来的智能体看不到手册」）。
 func (s *Server) newMCPServer() (*mcp.Server, error) {
-	ms := mcp.NewServer(&mcp.Implementation{Name: "gear", Version: Version},
-		&mcp.ServerOptions{Instructions: guide.Summary()})
+	ms := mcp.NewServer(&mcp.Implementation{Name: "gear", Version: Version}, &mcp.ServerOptions{
+		Instructions: guide.Summary(),
+		// 协议版本显式收窄（评审 O-3）。
+		SupportedProtocolVersions: []string{supportedProtocolVersion},
+		// ★ capabilities 显式声明（评审 O-1 / O-2），不再吃 SDK 的两处默认：
+		//   - SDK 默认带 `logging`（`&LoggingCapabilities{}`），但本包**从不发日志通知**
+		//     ⇒ 客户端会以为能 `logging/setLevel` 拿到服务端日志，实际永远收不到（接口层谎言）。
+		//     故**不声明 logging**：要日志请读 `gear_execution`。logging 特性本身也已在
+		//     2026-07-28 版规范里被弃用（SEP-2577），不值得为它搭一条日志桥。
+		//   - SDK 默认把 tools/resources 的 `listChanged` 置 true，但工具面与资源面都只在
+		//     `newMCPServer` 注册**一次**、运行期从不变化 ⇒ 该声明是死代码，会诱导客户端去订阅。
+		//     故非 nil 但 ListChanged=false（非 nil 才不会被 SDK 的 augment 分支覆盖回 true）。
+		Capabilities: &mcp.ServerCapabilities{
+			Tools:     &mcp.ToolCapabilities{ListChanged: false},
+			Resources: &mcp.ResourceCapabilities{ListChanged: false},
+		},
+	})
 	if err := s.register(ms); err != nil {
 		return nil, err
 	}
@@ -295,13 +325,29 @@ func (s *Server) ServeHTTP(ctx context.Context, addr string) error {
 	return nil
 }
 
-// registerResources 注册 `gear://guide/{topic}` 资源。
+// guideURITemplate 是手册资源的 URI 模板（`gear://guide/{topic}`）。
+//
+// 为什么既要逐个静态资源、又要模板（评审 O-4）：文档按 `gear://guide/{topic}` 模板宣传，
+// 而实现此前只有 10 个静态 URI——**文档与实现口径不一致**。静态资源让「列举」可用、
+// 模板让「客户端自行构造任意 topic 的 URI」可用；两者并存，模板的读取复用同一份 embed。
+const guideURITemplate = "gear://guide/{topic}"
+
+// registerResources 注册 `gear://guide/{topic}` 资源（静态逐条 + 一条 URI 模板）。
 //
 // 它与 gear_guide 工具、instructions 渲染自**同一个 embed.FS**（guide 包）——
 // 三处同源，杜绝「instructions 说的和 guide 说的不一样」（§5）。
 // 客户端不支持 resources 也不影响闭环：内容主体在 gear_guide 工具里。
+//
+// ★ 只注册 `guide.Topics()`（**不含 summary**，评审 O-6）：summary 已被
+// `ServerOptions.Instructions` 常驻注入，再作为资源暴露一份，等于让客户端把同一段文本
+// 读两遍；工具侧（gear_guide）早已刻意排除 summary，资源侧没有理由不统一。
 func (s *Server) registerResources(ms *mcp.Server) {
-	for topic, content := range guide.All() {
+	topics := guide.Topics()
+	for _, topic := range topics {
+		content, err := guide.Get(topic)
+		if err != nil {
+			continue // 目录里读得到名字却读不到内容，属构建产物异常；不因一条而破坏整体注册
+		}
 		uri, text := "gear://guide/"+topic, content
 		ms.AddResource(&mcp.Resource{
 			URI:         uri,
@@ -314,6 +360,23 @@ func (s *Server) registerResources(ms *mcp.Server) {
 			}, nil
 		})
 	}
+	// URI 模板：让客户端能自行为任意 topic 构造/读取 URI（走同一份 embed）。
+	ms.AddResourceTemplate(&mcp.ResourceTemplate{
+		URITemplate: guideURITemplate,
+		Name:        "gear-guide",
+		Title:       "Gear 手册（按主题）",
+		Description: "按主题取 Gear 手册（topic 见 resources/list 或 gear_guide 返回的 topics 字段）",
+		MIMEType:    "text/markdown",
+	}, func(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		topic := strings.TrimPrefix(req.Params.URI, "gear://guide/")
+		content, err := guide.Get(topic)
+		if err != nil {
+			return nil, err
+		}
+		return &mcp.ReadResourceResult{
+			Contents: []*mcp.ResourceContents{{URI: req.Params.URI, MIMEType: "text/markdown", Text: content}},
+		}, nil
+	})
 }
 
 // objectResult 把列表类结果包成 MCP 规范要求的「顶层对象」形态（见包注释「返回形态」红线）。
@@ -327,12 +390,13 @@ func objectResult[T any](key string, v []T) map[string]any {
 	return map[string]any{key: v}
 }
 
-// register 把全部 MCP 工具挂到 server 上（12 个意图级工具，见包注释的工具表）。
+// register 把全部 MCP 工具挂到 server 上（13 个意图级工具，见包注释的工具表）。
 func (s *Server) register(ms *mcp.Server) error {
-	s.registerReadTools(ms)  // guide / catalog / describe / capabilities / doctor
-	s.registerWriteTools(ms) // validate / apply / delete / promote
-	s.registerRunTools(ms)   // run / execution
-	s.registerAppTools(ms)   // app
+	s.registerReadTools(ms)   // guide / catalog / describe / capabilities / doctor
+	s.registerWriteTools(ms)  // validate / apply / delete / promote
+	s.registerInvokeTools(ms) // invoke
+	s.registerRunTools(ms)    // run / execution
+	s.registerAppTools(ms)    // app
 
 	// 反向暴露：默认关闭（见 Server.exposeFlows 的说明），--expose-flows 显式开启。
 	// service 长驻 Flow 即使开启也不暴露（常驻不结束，会挂死调用方）——与

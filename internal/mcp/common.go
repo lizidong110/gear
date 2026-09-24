@@ -10,6 +10,7 @@ package mcp
 // 两类必须泾渭分明，否则智能体的判断逻辑会分裂（一会儿看 IsError、一会儿看 status）。
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -44,6 +45,12 @@ func toolError(code, msg string, hint ...string) *mcp.CallToolResult {
 //
 // fallbackCode 只在错误链里没有诊断时使用（例如 registry 层的守卫拒绝）——
 // 不让「没做结构化」的错误变成一个没有码的裸文本。
+//
+// ★ 关于「只报第一条」（评审 I-2）：Gear 的诊断是**挂在 error 链上**的，而 `diagWrap`
+// 刻意**不叠加**（内层已有诊断就保留内层那条，只补 step/field），因此一条 error 实际只会
+// 带**一条**诊断——这里的 `diags[0]` 是「唯一那条」，不是「多条里的第一条」，不存在丢信息。
+// 「一次报全」的多诊断面在 `gear_validate` / `gear_apply`（走 diagnosticsJSON，非 error 通道）。
+// 为防将来真有 error 带多条诊断，这里仍把其余几条并入 hint（宁可多带，不静默丢）。
 func toolErrorFrom(fallbackCode string, err error) *mcp.CallToolResult {
 	if err == nil {
 		return nil
@@ -54,7 +61,18 @@ func toolErrorFrom(fallbackCode string, err error) *mcp.CallToolResult {
 		if code == "" || code == engine.CodeUnclassified {
 			code = fallbackCode
 		}
-		return toolError(code, d.Message, d.Hint)
+		hint := d.Hint
+		if len(diags) > 1 {
+			extra := make([]string, 0, len(diags)-1)
+			for _, x := range diags[1:] {
+				extra = append(extra, x.Message)
+			}
+			if hint != "" {
+				hint += "；"
+			}
+			hint += fmt.Sprintf("另有 %d 条诊断：%s", len(diags)-1, strings.Join(extra, "；"))
+		}
+		return toolError(code, d.Message, hint)
 	}
 	return toolError(fallbackCode, err.Error())
 }
@@ -126,12 +144,14 @@ var (
 	})
 	outCatalog = outSchema(map[string]any{
 		"items": sArr(), "total": sNum(), "truncated": sBool(), "counts": sObj(),
+		"offset": sNum(), "limit": sNum(), "next_offset": sNum(),
 	})
 	outDescribe = outSchema(map[string]any{
 		"kind": sStr(), "object": sObj(), "long_running": sBool(),
 	})
 	outCapabilities = outSchema(map[string]any{
-		"capabilities": sArr(),
+		"capabilities": sArr(), "total": sNum(), "filter_name": sStr(), "filter_kind": sStr(),
+		"hint": sStr(),
 	})
 	outDoctor = outSchema(map[string]any{
 		"registry": sObj(), "extensions": sObj(), "ai": sObj(), "ports": sObj(),
@@ -158,15 +178,19 @@ var (
 	outExecution = outSchema(map[string]any{
 		"id": sStr(), "flow_id": sStr(), "status": sStr(), "started_at": sAny(),
 		"error": sStr(), "result": sAny(), "tool_ids": sArr(), "finished_at": sAny(),
-		"logs": sArr(), "executions": sArr(), "total": sNum(),
+		"logs": sArr(), "executions": sArr(), "total": sNum(), "limit": sNum(),
+		"orphan": sBool(), "orphan_reason": sStr(), "hint": sStr(),
 	})
 	outApp = outSchema(map[string]any{
 		"app_id": sStr(), "flow_id": sStr(), "pid": sNum(), "state": sStr(), "log_path": sStr(),
 		"ports": sArr(), "escaped_job": sAny(), "warning": sStr(), "last_logs": sArr(),
 		"error": sStr(), "hint": sStr(), "ports_released": sBool(), "started_at": sAny(),
 		"uptime_s": sNum(), "items": sArr(), "orphan": sArr(), "total": sNum(),
-		"dry_run": sBool(), "pruned": sArr(), "skipped": sArr(),
+		"dry_run": sBool(), "pruned": sArr(), "skipped": sArr(), "destructive": sBool(),
 		"pruned_count": sNum(), "skipped_count": sNum(), "apps_dir": sStr(),
+	})
+	outInvoke = outSchema(map[string]any{
+		"name": sStr(), "method": sStr(), "result": sAny(),
 	})
 )
 
@@ -185,13 +209,33 @@ type DescribeArgs struct {
 
 // CatalogArgs 是 gear_catalog 的入参。
 type CatalogArgs struct {
-	Kind  string `json:"kind,omitempty" jsonschema:"要看哪类：tool | flow | hook | execution | app | all（默认 all）"`
-	Limit int    `json:"limit,omitempty" jsonschema:"最多返回条数（默认 100）"`
+	Kind   string `json:"kind,omitempty" jsonschema:"要看哪类：tool | flow | hook | execution | app | all（默认 all）"`
+	Limit  int    `json:"limit,omitempty" jsonschema:"最多返回条数（默认 100）"`
+	Offset int    `json:"offset,omitempty" jsonschema:"跳过前 N 条再返回（默认 0，用于翻页：结果里 truncated 为 true 时，用返回的 next_offset 续取）"`
 }
 
 // GuideArgs 是 gear_guide 的入参。
+//
+// ⚠ 描述**不枚举 topic**（评审 I-5）：此前把 8 个 topic 硬编码进文案，而磁盘上实际有 9 个
+// （漏了 rest-api），且任何一次往 guide/ 放 md 都会让文案静默过期。单一真相源是磁盘，
+// 故改为「见返回的 topics 字段」——客户端调一次就能拿到权威清单。
 type GuideArgs struct {
-	Topic string `json:"topic,omitempty" jsonschema:"手册主题：overview/authoring/service-app/atoms/errors/primitive-gap/examples/security（默认 overview）"`
+	Topic string `json:"topic,omitempty" jsonschema:"手册主题；留空取默认主题。可用主题**见返回值里的 topics 字段**，或 resources/list 的 gear://guide/{topic}——此处刻意不枚举，避免与磁盘失同步"`
+}
+
+// CapabilitiesArgs 是 gear_capabilities 的入参（评审 I-7：大 payload 需可裁剪）。
+type CapabilitiesArgs struct {
+	Name string `json:"name,omitempty" jsonschema:"只看名字等于该值的能力（如 db / ext.ai；留空=全部）"`
+	Kind string `json:"kind,omitempty" jsonschema:"按类别过滤：builtin（内核原语）| ext（扩展原子）；留空=全部"`
+}
+
+// InvokeArgs 是 gear_invoke 的入参。
+//
+// ⚠ 标签文案不得以 `WORD=` 开头（见 RunArgs 的说明），故写成「name 为…」而不是「name=…」。
+type InvokeArgs struct {
+	Name   string         `json:"name" jsonschema:"能力名：http/call/db/event/subscribe 或已注册的 ext.*（先 gear_capabilities 查）"`
+	Method string         `json:"method" jsonschema:"方法名（如 query / exec / Request / complete；参数 schema 见 gear_capabilities）"`
+	Args   map[string]any `json:"args,omitempty" jsonschema:"方法入参（以参数名为键的对象，与 gear_capabilities 的 schema 对齐）"`
 }
 
 // ValidateArgs 是 gear_validate 的入参。
@@ -235,7 +279,8 @@ type RunArgs struct {
 // ExecutionArgs 是 gear_execution 的入参。
 type ExecutionArgs struct {
 	ID       string `json:"id,omitempty" jsonschema:"执行 id；留空 = 列出最近执行"`
-	WithLogs bool   `json:"with_logs,omitempty" jsonschema:"附带各 step 的 stdout/stderr 日志"`
+	Limit    int    `json:"limit,omitempty" jsonschema:"列出时最多返回条数（默认 20，取最近 N 条；0 表示用默认）"`
+	WithLogs bool   `json:"with_logs,omitempty" jsonschema:"附带各 step 的 stdout/stderr 日志（仅给 id 时有效）"`
 	Tail     int    `json:"tail,omitempty" jsonschema:"with_logs 时只取末 N 行（0=全部）"`
 }
 

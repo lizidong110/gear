@@ -404,6 +404,13 @@ func freeWord(portsFree bool) string {
 	return "仍被占用"
 }
 
+// ProcessAlive 报告 pid 是否仍存活（导出给 MCP 层的「孤儿执行」识别用，评审 I-1④）。
+//
+// 平台差异收在未导出的 processAlive 里（Windows 走 OpenProcess、Unix 走 signal 0）。
+// 单独导出而不让调用方自己 FindProcess：Windows 与 Unix 的「进程不存在」判据不同，
+// 各写一份必然漂移（本包已经踩过一次，见 launch_windows.go 的注释）。
+func ProcessAlive(pid int) bool { return processAlive(pid) }
+
 // Status 返回单个应用的状态快照。
 func Status(opts StatusOptions) (*StatusResult, error) {
 	dir, err := ResolveAppsDir(opts.RegistryPath, opts.AppsDir)

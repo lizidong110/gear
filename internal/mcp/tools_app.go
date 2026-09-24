@@ -13,7 +13,7 @@ package mcp
 //   **调用方一退出就被连坐回收**。此时 `StartResult.EscapedJob = false` 并带 `Warning`。
 //   所以 start 的返回值**必须**如实透传 `escaped_job` / `warning`，文案也**不能**无条件承诺
 //   「跨会话存活」——否则智能体会把「现在能访问」说成「一直能访问」，正是 Instructions
-//   七条铁律点名的「智能体最贵的错误」。
+//   八条铁律点名的「智能体最贵的错误」。
 //   - 进程归属与台账的完整论证见 MCP_AGENT_DESIGN.md §0.2。
 
 import (
@@ -33,7 +33,11 @@ func (s *Server) registerAppTools(ms *mcp.Server) {
 		Description: "长驻应用生命周期。start：派生**独立后台进程**后立即返回（是否跨会话存活见返回的 escaped_job）；status：pid + 端口双判据；" +
 			"stop：终止并复检端口（**破坏性**，收不干净会报 ORPHAN_APP）；list：全部台账与遗留项；" +
 			"prune：清理**确定已终止**的台账项（running/unknown 一律保留，不会误删在跑的应用）。service Flow 只能用这里启动。",
-		Annotations:  idempotent("应用生命周期"),
+		// ★ 标 destructive 而非 idempotent（评审 I-4）：工具内**含 stop / prune 这类破坏性动作**，
+		//   而 MCP 的 annotations 是**工具级**的、无法表达「同一工具内部分动作破坏性」。
+		//   按「宁可过度提示」的取舍标 destructive——否则客户端（IDE 的工具确认 UI）会对
+		//   一次真停应用只字不提示，而同样破坏性的 gear_delete 反而会提示，等于对用户撒谎。
+		Annotations:  destructive("应用生命周期"),
 		OutputSchema: outApp,
 	}, s.handleApp)
 }
@@ -102,6 +106,9 @@ func (s *Server) handleApp(ctx context.Context, _ *mcp.CallToolRequest, in AppAr
 		return nil, map[string]any{
 			"app_id": res.AppID, "flow_id": res.FlowID, "pid": res.PID,
 			"state": res.State, "ports_released": res.PortsReleased, "ports": res.Ports,
+			// 破坏性动作在**返回值**里也回显（评审 I-4 中期建议）：annotations 是工具级的，
+			// 这里让只读结果的客户端也能分辨「刚才那步是有副作用的」。
+			"destructive": true,
 		}, nil
 
 	case "status":
@@ -158,6 +165,8 @@ func (s *Server) handleApp(ctx context.Context, _ *mcp.CallToolRequest, in AppAr
 			"dry_run": res.DryRun, "pruned": res.Pruned, "skipped": res.Skipped,
 			"pruned_count": len(res.Pruned), "skipped_count": len(res.Skipped),
 			"apps_dir": pdir,
+			// 破坏性动作回显（同 stop 的理由；dry_run 时不标——它没实际改动）。
+			"destructive": !res.DryRun,
 		}
 		if len(res.Skipped) > 0 {
 			out["hint"] = "skipped 里的项仍在跑或状态不确定（unknown 不敢删，删了可能变成无人可查的孤儿）；" +

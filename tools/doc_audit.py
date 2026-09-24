@@ -12,8 +12,9 @@ gitignored build/ 里的同名脚本，迁到入库的 tools/ 目录。
   ② 文档引用的 .go 路径       ↔ 磁盘上文件实际存在
   ⑥ REST 端点（server.go 的 mux.HandleFunc） ↔ README 端点表（双向）
   ⑦ CLI 子命令（cli/root.go 的 AddCommand）   ↔ README 提及（双向）
+  ③ MCP 错误码（guide/errors.md 的码表）      ↔ 代码里的产生点（双向；附录 D 亦须 ⊆ 产生点）
 
-每条发现归入三分类之一（退出码只看 ①）：
+每条发现归入三分类之一（退出码只看 ① / ⑥ / ⑦ / ③）：
   ① 需处理     ：文档声称有、代码/磁盘却没有，且文档未声明它「不存在/历史」
   ② 已登记例外 ：文档自己已说明该条目不存在 / 属于历史日志，不算是漂移
   ③ 噪音       ：TestFoo* 通配、裸文件名（无 / 的 .go 名）等，忽略
@@ -147,6 +148,78 @@ def audit_cli_commands():
     return registered, doc_tokens, missing_in_doc, missing_in_code
 
 
+# ---------- ③ MCP 错误码（errors.md ⇄ 代码产生点，双向） ----------
+#
+# 为什么需要它（MCP_接口与协议评审_v1.md I-2）：评审实测到两类断裂——
+#   ① 文档声明但代码**从不产生**的码（`PRIMITIVE_MISSING`/`PORT_IN_USE`/`APP_PLATFORM_UNAVAILABLE`/
+#      `DEP_CYCLE`）⇒ 智能体按码查手册会查到「不存在的条目」，或拿到一个查不到的码；
+#   ② 代码在用、手册**漏收**的兜底码（约 17 个）⇒ 自愈回路在最高频的失败路径上断掉。
+# 这条守卫把「码表」与「产生点」双向钉死，与 ⑥⑦ 同款思路（枚举式声明必须逐项登记）。
+
+# 只在「产生点」形态里取码，避免把注释/文档字符串里的示例码算进来。
+CODE_PATTERNS = [
+    r'toolError(?:From)?\(\s*"([A-Z][A-Z0-9_]*)"',
+    r'diagError\(\s*"([A-Z][A-Z0-9_]*)"',
+    r'Diagf?\(\s*"([A-Z][A-Z0-9_]*)"',          # engine.Diagf / Diag
+    r'diagWrap\(\s*"([A-Z][A-Z0-9_]*)"',
+    r'Code:\s*"([A-Z][A-Z0-9_]*)"',              # Diagnostic{Code: "..."}
+    r'Code\w*\s*=\s*"([A-Z][A-Z0-9_]*)"',        # CodeXxx = "..." 常量
+    r'\.Code\s*=\s*"([A-Z][A-Z0-9_]*)"',         # res.Code = "ORPHAN_APP"
+    r'\[([A-Z][A-Z0-9_]{3,})\]',                 # 警告型码字面量：[MISSING_FILE] …（前缀在 Sprintf 里）
+]
+
+# 方括号形态里**不是错误码**的标记（误报排除，逐项说明理由）：
+#   DONE —— OpenAI 兼容 SSE 的结束哨兵（`data: [DONE]`），属传输层协议字面量；
+#   CODE —— 错误形态的文档占位符（`[CODE] message`），出现在注释里而非运行期值。
+BRACKET_NON_CODES = {"DONE", "CODE"}
+
+
+def produced_error_codes():
+    """返回代码里**实际产生**的错误码集合。"""
+    codes = set()
+    for dirpath, _, files in os.walk(os.path.join(REPO, "internal")):
+        if any(part in ("build", "node_modules", "dist") for part in dirpath.split(os.sep)):
+            continue
+        for fn in files:
+            if not fn.endswith(".go") or fn.endswith("_test.go"):
+                continue
+            src = read(os.path.join(dirpath, fn))
+            for pat in CODE_PATTERNS:
+                for m in re.finditer(pat, src):
+                    codes.add(m.group(1))
+    return codes - BRACKET_NON_CODES
+
+
+def documented_error_codes(doc_path, table_only=True):
+    """从一篇 markdown 的**码表首列**提取码（形如 `| \\`CODE\\` | …`）。"""
+    text = read(doc_path)
+    codes = set()
+    for line in text.splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        cols = line.split("|")
+        if len(cols) < 3:
+            continue
+        first = cols[1].strip().strip("`").strip()
+        if re.fullmatch(r'[A-Z][A-Z0-9_]{2,}', first):
+            codes.add(first)
+    return codes
+
+
+def audit_error_codes():
+    """errors.md ⇄ 产生点 双向核对；附录 D 亦须 ⊆ 产生点。"""
+    guide_errors = os.path.join(REPO, "internal", "mcp", "guide", "errors.md")
+    design = os.path.join(REPO, "MCP_AGENT_DESIGN.md")
+    produced = produced_error_codes()
+    documented = documented_error_codes(guide_errors)
+    appendix = documented_error_codes(design)
+
+    doc_missing = sorted(documented - produced)   # 文档有、代码不产生
+    code_missing = sorted(produced - documented)  # 代码产生、文档漏收
+    appendix_missing = sorted(appendix - produced)
+    return produced, documented, doc_missing, code_missing, appendix_missing
+
+
 # ---------- ① Test 名 ----------
 def all_test_funcs():
     funcs = set()
@@ -262,6 +335,7 @@ def main():
 
     reg6, doc6, miss_doc6, miss_code6 = audit_rest_endpoints()
     reg7, doc7, miss_doc7, miss_code7 = audit_cli_commands()
+    produced, documented, code_doc_missing, code_prod_missing, appendix_missing = audit_error_codes()
     g1, e1, n1 = audit_test_names(doc_files)
     g2, e2, n2 = audit_go_paths(doc_files)
 
@@ -280,6 +354,15 @@ def main():
     lines.append("  提及未注册（文档有、代码无）:")
     lines.append("\n".join(f"    - {k}" for k in miss_code7) or "    (无)")
     lines.append("")
+    lines.append("【③ MCP 错误码 双向核对】（guide/errors.md 码表 ↔ 代码产生点；附录 D 亦须 ⊆ 产生点）")
+    lines.append(f"  产生点实收 {len(produced)} 个码；errors.md 收录 {len(documented)} 个。")
+    lines.append("  文档有、代码不产生（自愈回路会查到不存在的条目）:")
+    lines.append("\n".join(f"    - {k}" for k in code_doc_missing) or "    (无)")
+    lines.append("  代码产生、文档漏收（自愈回路断裂）:")
+    lines.append("\n".join(f"    - {k}" for k in code_prod_missing) or "    (无)")
+    lines.append("  附录 D 有、代码不产生:")
+    lines.append("\n".join(f"    - {k}" for k in appendix_missing) or "    (无)")
+    lines.append("")
     lines.append("【① 文档引用的 Test 名 ↔ 代码】（advisory：历史文档已知漂移，不计入闸门；--strict 才计入）")
     lines.append("  需处理:")
     lines.append(fmt_items(g1))
@@ -297,9 +380,10 @@ def main():
     lines.append(fmt_items(n2) if strict else "    (折叠，--strict 展开)")
     lines.append("")
     lines.append("══════════ 汇总 ═════════")
-    gate_gaps = len(miss_doc6) + len(miss_code6) + len(miss_doc7) + len(miss_code7)
+    code_gaps = len(code_doc_missing) + len(code_prod_missing) + len(appendix_missing)
+    gate_gaps = len(miss_doc6) + len(miss_code6) + len(miss_doc7) + len(miss_code7) + code_gaps
     advisory_gaps = len(g1) + len(g2)
-    lines.append(f"  闸门项（⑥⑦ 双向核对，计入闸门）: {gate_gaps}")
+    lines.append(f"  闸门项（⑥⑦③ 双向核对，计入闸门）: {gate_gaps}")
     lines.append(f"  ① 需处理: {len(g1) + len(g2)}  (advisory，未计入闸门)")
     lines.append(f"  ② 已登记例外: {len(e1) + len(e2)}")
     lines.append(f"  ③ 噪音: {len(n1) + len(n2)}")
