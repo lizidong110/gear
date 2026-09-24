@@ -6,14 +6,18 @@
 //     浏览器即可访问），并可带 proxy 规则把某些前缀（如 /api）反向代理到后端——
 //     静态与接口同源，vite dev proxy 的生产等价物（见 proxy.go）。
 //     port / dir / host / proxy 全部从 args 传入（不读 os.Getenv，缺参即报错）；
-//   - /stop 平滑关闭静态网站服务、释放端口；
+//   - **多站点**（2026-09-24 重构）：一个侧车可同时托管多个网站（不同 port）——
+//     这是多 app 共享同一侧车的前提（如 web_ui.up 托管 8080 的同时 mindstorm.up 托管 8090）。
+//     幂等按「port + dir + host + proxy 全同」判定：全同 → 返回现状；同端口不同配置 →
+//     fail-closed 报错（绝不静默吞掉新参数——那正是「8090 起不来却显示成功」的成因）。
+//   - /stop 平滑停止网站服务、释放端口：带 port 只停该站点；不带 port 停全部站点；
 //   - /caps 返回本侧车已实现的方法名（供「声明 ↔ 实现」红线校验）；
 //   - 维护占用列表，无人需要则自动退出（OnEmpty）。
 //
-// 设计要点（区别于其它侧车）：本侧车有**两个端口**——
+// 设计要点（区别于其它侧车）：本侧车有**两类端口**——
 //
 //	· RPC 端口（COORD_ADDR，如 127.0.0.1:8095）：Gear 经 LocalHTTPTransport 调 /start /stop /caps；
-//	· 网站端口（args.port，如 8080）：http.FileServer 对外服务的真实端口，浏览器访问它。
+//	· 网站端口（args.port，如 8080/8090）：http.FileServer 对外服务的真实端口，浏览器访问它。
 //
 // 两者必须分开：RPC 路由是固定的 /start /stop，会和网站根路径 '/' 上托管的静态资源冲突。
 //
@@ -30,25 +34,30 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
 	"gear/internal/sidecar/coord"
 )
 
-// Service 是 serve-sidecar 的业务核心。
+// site 是一个已托管的静态网站（一个网站端口一个实例）。
+type site struct {
+	srv   *http.Server
+	ln    net.Listener
+	host  string
+	dir   string
+	proxy []proxyRule
+}
+
+// Service 是 serve-sidecar 的业务核心：按网站端口管理多个站点。
 type Service struct {
-	mu      sync.Mutex
-	srv     *http.Server // 网站服务（静态 + 可选反代；复用 srv.Serve 绑定 ln）
-	ln      net.Listener // 静态网站监听套接字
-	port    int          // 当前网站端口
-	dir     string       // 当前网站根目录
-	proxy   []proxyRule  // 当前反向代理规则（空 = 纯静态）
-	serving bool         // 是否正在服务
+	mu    sync.Mutex
+	sites map[int]*site
 }
 
 func newService() *Service {
-	return &Service{}
+	return &Service{sites: map[int]*site{}}
 }
 
 // Handlers 返回 RPC 端点（与 coord 协调端点合并到同一 mux）。
@@ -60,21 +69,23 @@ func (s *Service) Handlers() map[string]http.HandlerFunc {
 	}
 }
 
-// Stop 平滑停止网站服务。
+// Stop 平滑停止全部网站服务（OnEmpty / 进程退出时调用）。
 func (s *Service) Stop() {
 	s.mu.Lock()
-	srv := s.srv
-	s.serving = false
-	s.proxy = nil
+	old := s.sites
+	s.sites = map[int]*site{}
 	s.mu.Unlock()
-	if srv != nil {
-		_ = srv.Shutdown(context.Background())
+	for _, st := range old {
+		_ = st.srv.Shutdown(context.Background())
 	}
 }
 
 // handleStart 在指定端口起「静态网站 + 可选反向代理」服务（类似 nginx）。
 // args：port（必填，数字）、dir（必填，本地目录）、host（可选，默认 0.0.0.0）、
 // proxy（可选，反向代理规则数组：[{path,target,strip_prefix}]，见 proxy.go）。
+//
+// 多站点语义：同端口 + 同配置 → 幂等返回现状；同端口 + 不同配置 → 报错
+// （fail-closed：静默吞掉新参数会让第二个应用「显示成功却没起服」）。
 func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	args, err := decodeArgs(r)
 	if err != nil {
@@ -105,73 +116,93 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"error": err.Error()})
 		return
 	}
+	proxyJSON := mustJSON(proxyRulesJSON(proxyRules)) // 仅用于幂等/冲突比较
+	proxyEcho := proxyRulesJSON(proxyRules)           // 回显给调用方：保持数组形状（verify.py/flow 输出依赖）
 
+	// 从「查重 → 绑定 → 登记」全程持锁：并发 /start 同一端口时只有一个能成功，
+	// 另一个要么命中幂等、要么报冲突，不会双双绑定成功或泄露监听套接字。
 	s.mu.Lock()
-	if s.serving {
-		// 幂等：已经在服务则直接返回当前 URL，避免重复绑定端口冲突。
-		url := s.currentURL()
-		curDir, curProxy := s.dir, s.proxy
+	if old, ok := s.sites[port]; ok {
+		if old.dir == dir && old.host == host && mustJSON(proxyRulesJSON(old.proxy)) == proxyJSON {
+			s.mu.Unlock()
+			writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
+				"url": siteURL(host, port), "port": port, "dir": dir, "serving": true, "proxy": proxyEcho,
+			}})
+			return
+		}
+		conflict := fmt.Sprintf("端口 %d 已被另一站点占用（配置不同）: 当前 dir=%s host=%s proxy=%s；同端口换配置请先 /stop 该端口",
+			port, old.dir, old.host, mustJSON(proxyRulesJSON(old.proxy)))
 		s.mu.Unlock()
-		writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
-			"url": url, "port": s.port, "dir": curDir, "serving": true, "proxy": proxyRulesJSON(curProxy),
-		}})
+		writeJSON(w, map[string]interface{}{"error": conflict})
 		return
 	}
-	s.mu.Unlock()
-
 	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
 	if err != nil {
+		s.mu.Unlock()
 		writeJSON(w, map[string]interface{}{"error": fmt.Sprintf("端口 %d 绑定失败: %v", port, err)})
 		return
 	}
-
-	handler := newSiteHandler(dir, proxyRules)
-	srv := &http.Server{Handler: handler}
-
-	s.mu.Lock()
-	s.ln, s.srv, s.port, s.dir, s.proxy, s.serving = ln, srv, port, dir, proxyRules, true
+	st := &site{ln: ln, host: host, dir: dir, proxy: proxyRules, srv: &http.Server{Handler: newSiteHandler(dir, proxyRules)}}
+	s.sites[port] = st
 	s.mu.Unlock()
 
 	go func() {
-		if e := srv.Serve(ln); e != nil && e != http.ErrServerClosed {
-			log.Printf("[serve] 网站服务异常退出: %v", e)
+		if e := st.srv.Serve(ln); e != nil && e != http.ErrServerClosed {
+			log.Printf("[serve] 网站服务(端口 %d)异常退出: %v", port, e)
 		}
 	}()
 
 	writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
-		"url":     fmt.Sprintf("http://%s:%d/", host, port),
+		"url":     siteURL(host, port),
 		"port":    port,
 		"dir":     dir,
 		"serving": true,
-		"proxy":   proxyRulesJSON(proxyRules),
+		"proxy":   proxyEcho,
 	}})
 }
 
-func (s *Service) currentURL() string {
-	return fmt.Sprintf("http://0.0.0.0:%d/", s.port)
+func siteURL(host string, port int) string {
+	return fmt.Sprintf("http://%s:%d/", host, port)
 }
 
-// handleStop 平滑停止静态网站服务。
+// mustJSON 序列化为稳定字符串（仅用于「幂等/冲突判定」的比较与展示，失败返回 "null"）。
+func mustJSON(v interface{}) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "null"
+	}
+	return string(b)
+}
+
+// handleStop 平滑停止静态网站服务：带 port 只停该站点；不带 port 停全部站点。
 func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 	// 排空请求体：否则未读的 JSON body 会让 Go http 服务端向（可能复用连接的）客户端发 RST，
 	// 表现为「WinError 10054 连接被重置」的偶发失败（handleStart 因 decodeArgs 已读体，无此问题）。
-	_, _ = decodeArgs(r)
+	args, _ := decodeArgs(r)
+	port := intOr(args, "port", 0)
 
 	s.mu.Lock()
-	wasServing := s.serving
-	srv := s.srv
-	s.serving = false
-	s.proxy = nil
+	var toStop map[int]*site
+	if port > 0 {
+		if st, ok := s.sites[port]; ok {
+			toStop = map[int]*site{port: st}
+			delete(s.sites, port)
+		}
+	} else {
+		toStop = s.sites
+		s.sites = map[int]*site{}
+	}
 	s.mu.Unlock()
 
-	if !wasServing {
-		writeJSON(w, map[string]interface{}{"result": map[string]interface{}{"ok": true, "running": false}})
-		return
+	stopped := make([]int, 0, len(toStop))
+	for p, st := range toStop {
+		_ = st.srv.Shutdown(context.Background())
+		stopped = append(stopped, p)
 	}
-	if srv != nil {
-		_ = srv.Shutdown(context.Background())
-	}
-	writeJSON(w, map[string]interface{}{"result": map[string]interface{}{"ok": true, "running": false}})
+	sort.Ints(stopped)
+	writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
+		"ok": true, "running": len(stopped) > 0, "stopped": stopped,
+	}})
 }
 
 // handleCaps 返回本侧车已实现的方法名（供红线校验：extensions.yaml 的 methods ⊆ caps）。
@@ -230,7 +261,7 @@ func main() {
 		CheckInterval: 5 * time.Second,
 		TTL:           15 * time.Second,
 		OnEmpty: func() {
-			// 占用列表为空 → 无人需要该服务 → 自动退出（先停静态网站释放端口）。
+			// 占用列表为空 → 无人需要该服务 → 自动退出（先停全部网站释放端口）。
 			log.Printf("占用列表为空，serve-sidecar 自动退出")
 			svc.Stop()
 			os.Exit(0)

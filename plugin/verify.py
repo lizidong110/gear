@@ -543,6 +543,58 @@ def main():
               "start=%s echo=%s proxy=%s static=%s bad_reject=%s %s"
               % (started2, bool(echoed), proxied, static_ok, bad_rejected, perr))
 
+        # ---- 8d) ext.serve 多站点：同一侧车同时托管两个网站，按端口停其一（2026-09-24 修复面）----
+        # 旧代码是单站点：第二个 /start 被「幂等」静默吞掉（返回第一个站的 url），
+        # 多 app 共享侧车时第二个应用永远起不来。多站点语义：两站共存可访问、
+        # /stop 带 port 只停该站、同端口不同配置 fail-closed 报错。
+        def free_tcp_port():
+            s_ = socket.socket()
+            s_.bind(("127.0.0.1", 0))
+            p_ = s_.getsockname()[1]
+            s_.close()
+            return p_
+        ms_a, ms_b = free_tcp_port(), free_tcp_port()
+        siteA, siteB = tempfile.mkdtemp(prefix="ms-a-"), tempfile.mkdtemp(prefix="ms-b-")
+        with open(os.path.join(siteA, "index.html"), "w", encoding="utf-8") as f:
+            f.write("multi-A")
+        with open(os.path.join(siteB, "index.html"), "w", encoding="utf-8") as f:
+            f.write("multi-B")
+        ja = http_post_json("http://%s/start" % SERVE_COORD, {"args": {"port": ms_a, "dir": siteA}})
+        jb = http_post_json("http://%s/start" % SERVE_COORD, {"args": {"port": ms_b, "dir": siteB}})
+        both_started = "result" in ja and "result" in jb
+        fetched_a = fetched_b = b_gone_after_stop = a_alive_after_stop = conflict_ok = False
+        if both_started:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/index.html" % ms_a, timeout=5) as r:
+                    fetched_a = r.read().decode("utf-8", "ignore") == "multi-A"
+                with urllib.request.urlopen("http://127.0.0.1:%d/index.html" % ms_b, timeout=5) as r:
+                    fetched_b = r.read().decode("utf-8", "ignore") == "multi-B"
+            except Exception as e:
+                serr = str(e)
+            # 同端口换 dir → 必须报错（fail-closed）
+            jc = http_post_json("http://%s/start" % SERVE_COORD, {"args": {"port": ms_a, "dir": siteB}})
+            conflict_ok = "error" in jc and "已被另一站点占用" in jc.get("error", "")
+            # 按端口只停 B
+            jst = http_post_json("http://%s/stop" % SERVE_COORD, {"args": {"port": ms_b}})
+            if "result" in jst:
+                try:
+                    with urllib.request.urlopen("http://127.0.0.1:%d/index.html" % ms_a, timeout=5) as r:
+                        a_alive_after_stop = r.read().decode("utf-8", "ignore") == "multi-A"
+                except Exception as e:
+                    a_alive_after_stop = False; serr = str(e)
+                try:
+                    urllib.request.urlopen("http://127.0.0.1:%d/index.html" % ms_b, timeout=5)
+                    b_gone_after_stop = False
+                except Exception:
+                    b_gone_after_stop = True
+        http_post_json("http://%s/stop" % SERVE_COORD, {"args": {}})
+        check("P3 ext.serve 多站点：两站共存 + 按端口停其一 + 同端口换配置 fail-closed",
+              both_started and fetched_a and fetched_b and conflict_ok
+              and b_gone_after_stop and a_alive_after_stop,
+              "started=%s fetchA=%s fetchB=%s conflict=%s stopB(gone=%s, aAlive=%s) %s"
+              % (both_started, fetched_a, fetched_b, conflict_ok,
+                 b_gone_after_stop, a_alive_after_stop, serr))
+
         # ---- 11) 应用生命周期（REQ-APP-LAUNCH）：MCP 面的 gear_app(start) 与 CLI `app start`
         #          共用 internal/app **同一份实现**，故这里用真实二进制验同一条链路：
         #          派生独立后台进程 → 立即返回 → 端口真能服务 → 幂等 → stop 释放端口。

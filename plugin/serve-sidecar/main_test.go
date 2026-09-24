@@ -188,3 +188,107 @@ func TestStartIdempotent(t *testing.T) {
 func containsStr(s, sub string) bool {
 	return strings.Contains(s, sub)
 }
+
+// writeIndex 往 dir 写一个内容唯一的 index.html，供站点内容断言。
+func writeIndex(t *testing.T, dir, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte(body), 0o644); err != nil {
+		t.Fatalf("写测试页失败: %v", err)
+	}
+}
+
+// fetchBody GET 一次站点页面并返回正文（失败即 t.Fatal）。
+func fetchBody(t *testing.T, port int) string {
+	t.Helper()
+	resp, err := http.Get("http://127.0.0.1:" + strconv.Itoa(port) + "/index.html")
+	if err != nil {
+		t.Fatalf("GET 站点失败: %v", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b)
+}
+
+// TestMultiSiteCoexist：同一侧车同时托管两个站点（多 app 共享侧车的核心场景，
+// 2026-09-24 修复面：旧代码是单站点，第二个 /start 被幂等吞掉，第二个应用 8090 永远起不来）。
+func TestMultiSiteCoexist(t *testing.T) {
+	svc := newServiceForTest(t)
+	portA, portB := freePort(t), freePort(t)
+	dirA, dirB := t.TempDir(), t.TempDir()
+	writeIndex(t, dirA, "site-A")
+	writeIndex(t, dirB, "site-B")
+
+	if out := callHandler(t, svc.handleStart, map[string]interface{}{"port": portA, "dir": dirA}); out["error"] != nil {
+		t.Fatalf("站点A start 失败: %v", out)
+	}
+	b := callHandler(t, svc.handleStart, map[string]interface{}{"port": portB, "dir": dirB})
+	if b["error"] != nil {
+		t.Fatalf("站点B start 失败（旧单站点代码在此把请求吞掉）: %v", b)
+	}
+	if got := fetchBody(t, portA); got != "site-A" {
+		t.Fatalf("站点A 内容不符: %q", got)
+	}
+	if got := fetchBody(t, portB); got != "site-B" {
+		t.Fatalf("站点B 内容不符: %q", got)
+	}
+
+	// 带端口 stop 只停 B，A 必须仍可访问。
+	if out := callHandler(t, svc.handleStop, map[string]interface{}{"port": portB}); out["error"] != nil {
+		t.Fatalf("按端口 stop 失败: %v", out)
+	}
+	if got := fetchBody(t, portA); got != "site-A" {
+		t.Fatalf("停 B 后 A 应仍可访问，实际: %q", got)
+	}
+	_, err := http.Get("http://127.0.0.1:" + strconv.Itoa(portB) + "/index.html")
+	if err == nil {
+		t.Fatalf("B 已 stop，不应再可访问")
+	}
+}
+
+// TestStartConflictSamePortDifferentDir：同端口不同配置必须 fail-closed 报错（不静默吞参数）。
+func TestStartConflictSamePortDifferentDir(t *testing.T) {
+	svc := newServiceForTest(t)
+	port := freePort(t)
+	dirA, dirB := t.TempDir(), t.TempDir()
+	writeIndex(t, dirA, "site-A")
+	if out := callHandler(t, svc.handleStart, map[string]interface{}{"port": port, "dir": dirA}); out["error"] != nil {
+		t.Fatalf("首个站点 start 失败: %v", out)
+	}
+	out := callHandler(t, svc.handleStart, map[string]interface{}{"port": port, "dir": dirB})
+	if out["error"] == nil {
+		t.Fatalf("同端口不同 dir 应报错，实际 %v", out)
+	}
+	if !containsStr(out["error"].(string), "已被另一站点占用") {
+		t.Fatalf("错误文案应点名端口冲突，实际 %v", out["error"])
+	}
+	// 原站点必须不受影响。
+	if got := fetchBody(t, port); got != "site-A" {
+		t.Fatalf("冲突报错后原站点内容不符: %q", got)
+	}
+}
+
+// TestStopWithoutPortStopsAll：不带 port 的 /stop 停掉全部站点（向后兼容旧语义）。
+func TestStopWithoutPortStopsAll(t *testing.T) {
+	svc := newServiceForTest(t)
+	portA, portB := freePort(t), freePort(t)
+	dirA, dirB := t.TempDir(), t.TempDir()
+	writeIndex(t, dirA, "site-A")
+	writeIndex(t, dirB, "site-B")
+	callHandler(t, svc.handleStart, map[string]interface{}{"port": portA, "dir": dirA})
+	callHandler(t, svc.handleStart, map[string]interface{}{"port": portB, "dir": dirB})
+
+	out := callHandler(t, svc.handleStop, map[string]interface{}{})
+	if out["error"] != nil {
+		t.Fatalf("全停 /stop 不应报错: %v", out)
+	}
+	res := out["result"].(map[string]interface{})
+	stopped, ok := res["stopped"].([]interface{})
+	if !ok || len(stopped) != 2 {
+		t.Fatalf("全停应返回两个被停端口，实际 %v", res)
+	}
+	for _, p := range []int{portA, portB} {
+		if _, err := http.Get("http://127.0.0.1:" + strconv.Itoa(p) + "/index.html"); err == nil {
+			t.Fatalf("端口 %d 全停后不应再可访问", p)
+		}
+	}
+}

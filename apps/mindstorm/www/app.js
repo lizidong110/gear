@@ -465,7 +465,6 @@ function updateMidHeader() {
   $("#midTitle").textContent = focus
     ? focus.title
     : ((state.trees.find((t) => t.id === state.currentTree) || {}).title || "节点");
-  $("#midHint").textContent = "视图 · 3 级";
   const addBtn = $("#addBtn");
   if (addBtn) addBtn.textContent = state.selected ? "＋ 子节点" : "＋ 根节点";
   const up = $("#navUp"), down = $("#navDown"), home = $("#navHome");

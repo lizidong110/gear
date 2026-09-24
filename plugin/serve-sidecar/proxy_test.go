@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -29,6 +30,13 @@ func echoBackend(t *testing.T, tag string) *httptest.Server {
 // startSite 在临时目录里放一个 index.html，起服（带给定 args 的 proxy），返回访问端口。
 func startSite(t *testing.T, svc *Service, extra map[string]interface{}) int {
 	t.Helper()
+	port, _ := startSiteArgs(t, svc, extra)
+	return port
+}
+
+// startSiteArgs 同 startSite，但把完整 args 一并返回（供幂等重调用构造「全同配置」）。
+func startSiteArgs(t *testing.T, svc *Service, extra map[string]interface{}) (int, map[string]interface{}) {
+	t.Helper()
 	port := freePort(t)
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<h1>static index</h1>"), 0o644); err != nil {
@@ -42,7 +50,7 @@ func startSite(t *testing.T, svc *Service, extra map[string]interface{}) int {
 	if start["error"] != nil {
 		t.Fatalf("/start 意外报错: %v", start)
 	}
-	return port
+	return port, args
 }
 
 // getBody 取一个 URL 的响应体（带超时，避免后端不可达时测试挂死）。
@@ -120,7 +128,7 @@ func TestStartWithProxyForwardsAndFallsBackToStatic(t *testing.T) {
 	defer svc.Stop()
 	backend := echoBackend(t, "backend")
 
-	port := startSite(t, svc, map[string]interface{}{
+	port, startArgs := startSiteArgs(t, svc, map[string]interface{}{
 		"proxy": []interface{}{
 			map[string]interface{}{"path": "/api", "target": backend.URL},
 		},
@@ -141,11 +149,13 @@ func TestStartWithProxyForwardsAndFallsBackToStatic(t *testing.T) {
 		t.Fatalf("/apix 不应命中 /api 规则，实际被转发: %q", got)
 	}
 
-	// 可观测：/start 回显生效规则，便于起服时核对。
-	dir := t.TempDir()
-	_ = os.WriteFile(filepath.Join(dir, "index.html"), []byte("x"), 0o644)
-	// 已 serving → 幂等分支同样回显当前规则
-	res := callHandler(t, svc.handleStart, map[string]interface{}{"port": port, "dir": dir})
+	// 多站点语义（2026-09-24）：同端口**换配置**（不同 dir）→ fail-closed 报错，绝不静默吞参数；
+	conflict := callHandler(t, svc.handleStart, map[string]interface{}{"port": port, "dir": t.TempDir()})
+	if conflict["error"] == nil || !strings.Contains(conflict["error"].(string), "已被另一站点占用") {
+		t.Fatalf("同端口不同 dir 应 fail-closed 报「已被另一站点占用」，实际 %v", conflict)
+	}
+	// 同端口**全同配置** → 幂等分支同样回显当前规则。
+	res := callHandler(t, svc.handleStart, startArgs)
 	r, ok := res["result"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("/start 幂等分支应返回 result，实际 %v", res)

@@ -2,20 +2,32 @@
 #
 # 注册：gear tool register --registry <db> -   （stdin 喂本文件）
 # 运行：gear tool run static_site.stop --registry <db> '{}'
+#
+# 多站点语义（2026-09-24）：sidecar 可同时托管多个网站（不同端口）。
+#   port 省略 → 停掉该侧车上的全部站点（旧行为，向后兼容）；
+#   port 给定 → 只停该端口对应的站点（多 app 共享侧车时用这个，避免误杀别人的站）。
 id: static_site.stop
 name: 静态网站服务停止（ext.serve 停服）
 runtime: lua
 capabilities: [ext.serve]
 input_schema:
   type: object
-  properties: {}
+  properties:
+    port:
+      type: number
+      description: "要停止的网站端口；省略则停掉侧车上的全部站点"
 output_schema:
   type: object
   properties:
     ok: {type: boolean, description: "是否成功"}
-    running: {type: boolean, description: "停服前是否正在服务"}
+    running: {type: boolean, description: "是否有站点被停止"}
+    stopped:
+      type: array
+      description: "被停止的端口列表"
+      items: {type: number}
 versions:
-  - version: 1.0.0
+  - version: "1.1.0"
     state: stable
+    note: "支持按端口停止单个站点（多站点侧车）"
 entry: |
-  return ctx.ext.serve.stop({})
+  return ctx.ext.serve.stop(args)

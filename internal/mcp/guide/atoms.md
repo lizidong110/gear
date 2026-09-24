@@ -48,7 +48,9 @@
 - 用之前确认三件事：① `gear_capabilities` 里有没有；② `gear_doctor` 里侧车在不在；③ Tool 有没有声明该 `ext.*`。
 - `service: true` 的扩展（`ext.serve` / `ext.kafka` / `ext.mqtt` / `ext.rabbitmq` / `ext.webhook`）是**常驻侧车**：
   必须由 `mode: service` 的 step 持有，后续指令 step 用 anchor 排到下一层（见 `gear_guide("service-app")`）。
-- 常见方法形态：`ext.serve.start{port*,dir*,host,proxy}` / `ext.serve.stop` / `ext.email.send{to*,host*,user*,pass*,…}`。
+- 常见方法形态：`ext.serve.start{port*,dir*,host,proxy}` / `ext.serve.stop{port?}` / `ext.email.send{to*,host*,user*,pass*,…}`。
+- `ext.serve` 是**多站点**的：同一侧车可同时托管多个网站（不同 port）。`stop` 带 `port` 只停该站
+  （多 app 共享侧车时用它，避免误杀别人的站）；省略 `port` 停全部。同端口不同配置再 `start` 会 fail-closed 报错。
 
 ## 5. 三条最容易写错的
 
