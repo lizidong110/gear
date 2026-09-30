@@ -24,6 +24,7 @@
 .vscode/
 *.swp
 .DS_Store
+apps/
 
 # 用户本地扩展配置（由 extensions.example.yaml 复制而来，不纳入版本控制）
 extensions.yaml

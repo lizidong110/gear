@@ -15,7 +15,7 @@ import (
 
 func flowCmd() *cobra.Command {
 	c := &cobra.Command{Use: "flow", Short: "管理 Flow（通用运行单元）"}
-	c.AddCommand(flowRegisterCmd(), flowListCmd(), flowRunCmd(), flowValidateCmd(), flowInspectCmd())
+	c.AddCommand(flowRegisterCmd(), flowListCmd(), flowRunCmd(), flowValidateCmd(), flowInspectCmd(), flowDeleteCmd())
 	return c
 }
 
@@ -80,7 +80,7 @@ func flowRegisterCmd() *cobra.Command {
 			}
 			registered := make([]string, 0, len(flows))
 			for _, f := range flows {
-				if err := reg.UpsertFlow(f); err != nil {
+				if err := reg.UpsertFlow(f, act()); err != nil {
 					return fmt.Errorf("注册 Flow %s 失败（已成功写入 %v，请先处理再重试）: %w", f.ID, registered, err)
 				}
 				registered = append(registered, f.ID)
@@ -239,6 +239,44 @@ func flowInspectCmd() *cobra.Command {
 			out, _ := yaml.Marshal(f)
 			fmt.Print(string(out))
 			return nil
+		},
+	}
+}
+
+// flowDeleteCmd 注销一个 Flow，复用 registry.DeleteFlow 的 §8.2 守卫
+// （被其它 Flow 的 step 引用 / 被 Hook 的 action 引用 / 运行中引用均拒，
+// 错误经 ErrInUse / ErrNotFound 向上传递）。
+//
+// 为什么补这一个子命令：删除能力此前只存在于 REST（DELETE /api/flows/{id}）、MCP
+// 与 Web UI，CLI 面只有 `gear tool unregister`——于是「删掉一个 Flow」在命令行上
+// 是做不到的，只能去 UI 点按钮。补齐后 CLI 与另外三个面同一套守卫，不存在「CLI 能绕
+// 过的删除」。删除本身会留痕（registry 在同一事务里先快照再删，note=delete），可回滚。
+func flowDeleteCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "delete <id|pattern> [...]",
+		Short: "注销 Flow（id 支持 * ? [...] 通配符；被引用 / 运行中则拒）",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			reg, err := openRegistry()
+			if err != nil {
+				return err
+			}
+			defer reg.Close()
+			// 与 `gear tool unregister` 同一套展开规则（globid.go）：只匹配现存 id、
+			// 保序去重、空集报错、命中集里任一被 §8.2 拒则整批失败。
+			ids, err := expandDeleteTargets(args, func(p string) ([]string, error) {
+				all, e := flowIDs(reg)
+				if e != nil {
+					return nil, e
+				}
+				return globMatch(p, all)
+			})
+			if err != nil {
+				return err
+			}
+			return deleteAll("Flow", ids, func(id string) error {
+				return reg.DeleteFlow(id, act())
+			})
 		},
 	}
 }

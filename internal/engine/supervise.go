@@ -28,6 +28,11 @@ type ServiceHandle struct {
 	// 持有看门狗心跳；Supervisor.stopAll 杀进程后调用其 Close() 完成 Deregister
 	//（占用列表空则侧车自动退出，见 EXT_SERVICE_DESIGN.md §12）。
 	Coord *coord.Session
+
+	// Input/Output 落进 runContext（steps.<id>），使下游 step 能用 `${steps.<id>.output.<k>}`
+	// 引用本 step —— service 的 output 是子进程 stdout 首行声明（如 `{"port":8787}`），
+	// 这就是全链路端口分配的那条传递通道。
+	Output map[string]interface{}
 }
 
 // ProcKill 在锁内杀掉当前 service 进程（探针与停机共用，避免与 Relaunch 并发写 Proc 竞争）。
@@ -202,6 +207,10 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 				svcMu.Lock()
 				res.Services = append(res.Services, h)
 				svcMu.Unlock()
+				// 必须 setStep：否则 `${steps.<id>.output.<k>}` 在 service step 上永远取不到，
+				// 全链路端口分配就只差「子进程报得出端口」这一环却仍走不通（2026-09-26 实测：
+				// 一次性 step 走 setStep、service 分支没走，输出通道对长驻进程整个缺失）。
+				rc.setStep(step.ID, h.Input, h.Output)
 				e.progressf("• step %s (%s) 作为 service 长驻启动 (pid=%d)\n", step.ID, step.Call, h.Proc.Pid())
 				return nil
 			}

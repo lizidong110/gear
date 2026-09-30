@@ -28,12 +28,16 @@ var toolSurface = map[string]bool{
 	"gear_execution":    true, // executions / logs
 	"gear_app":          true, // items / orphan
 	"gear_doctor":       false,
+	"gear_export":       true, // files
+	"gear_import":       true, // created / updated
 }
 
 // toolBudget 是工具数的硬预算（机械守卫：超过即 FAIL）。
 //
 // 为什么有预算：每多一个工具，模型在选路时选错的概率就上升一分（§1「负资产」）。
-// 13 = 12（意图级全集）+ 1（评审 I-8 补的 `gear_invoke` 能力直调：它消除了「为一次原子调用
-// 付一整轮编排」的成本，收益明确大于一个工具位的代价）。放宽预算必须连同
-// MCP_AGENT_DESIGN.md §6.1 的论证一起改。
-const toolBudget = 13
+//
+// 15 = 13 + 2（2026-09-26 补的 `gear_export` / `gear_import`）。放宽这一次的理由与
+// `gear_invoke` 那次同型：它们不是「又一个操作」，而是把「用户构建的产品能备份、
+// 能换机器、能交付给别人」这条 L3 必经路径接上——在此之前产物没有形态，
+// 换机器只能整拷 GEAR_HOME（克隆机器，不是交付）。论证见 MCP_AGENT_DESIGN.md §6.1。
+const toolBudget = 15

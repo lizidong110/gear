@@ -3,22 +3,11 @@
 package coord
 
 import (
-	"errors"
-	"syscall"
+	"gear/internal/procalive"
 )
 
-// processAlive 真实探测某 PID 是否存活（EXT_SERVICE_DESIGN.md §12.5）。
+// processAlive 真实探测某 PID 是否存活。
 //
-// Unix 用 `signal(pid, 0)` 的惯例做法：
-//   - nil / EPERM：进程存在（EPERM 表示有进程但无权限发信号，仍算存活）；
-//   - ESRCH：进程不存在（含 zombie 被回收后）→ 不存活。
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	if err == nil {
-		return true
-	}
-	return errors.Is(err, syscall.EPERM)
-}
+// 判据收在 internal/procalive（Unix 走 signal 0：nil / EPERM 为存活，ESRCH 为已退出），
+// 与 internal/app 共用一份，避免两个包各写一份后漂移。
+func processAlive(pid int) bool { return procalive.Alive(pid) }

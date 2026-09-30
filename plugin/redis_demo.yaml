@@ -1,0 +1,116 @@
+# 演示 Tool：一次调用走通 ext.redis 的全数据结构 + 分布式锁 + 延迟队列。
+#
+# 存在意义同 oss_demo.yaml：verify 的 P1g 若只直连侧车 HTTP 端点，只证明「侧车二进制写对了」，
+# 证明不了「能力接进引擎了」。本样例经 `gear tool register` + `gear tool run` 走内核的门禁
+# 与能力目录，补上「ctx.ext.redis.* 真的存在、应用里真能调」这一层证据。
+#
+# 注册：gear tool register --registry <db> -   （stdin 喂本文件）
+# 运行：gear tool run redis.demo --registry <db> --input '{"host":"127.0.0.1","port":PORT}'
+#
+# 注：capabilities 声明 [ext.redis] —— service ext，侧车由内核按 extensions.yaml 的
+#     listen 端口拉起；MCP 工具数 +0。host/port 每次传（侧车刻意不做配置库回退）。
+id: redis.demo
+name: Redis 数据结构 + 锁 + 延迟队列往返（ext.redis）
+runtime: lua
+capabilities: [ext.redis]
+input_schema:
+  type: object
+  properties:
+    host: {type: string, description: "Redis 主机（不含端口）"}
+    port: {type: number, description: "Redis 端口"}
+    db: {type: number, description: "逻辑库号（默认 0）"}
+    password: {type: string, description: "AUTH 密码（无密码可不传）"}
+    kv_key: {type: string, description: "KV 测试键（缺省 demo:kv:1；给含 \\n 的值可触发 bad_key，供反向验证）"}
+  required: [host, port]
+output_schema:
+  type: object
+  properties:
+    kv_got: {type: string, description: "set 后 get 到的值"}
+    incr_val: {type: number, description: "计数器自增后的值"}
+    ttl_set: {type: string, description: "expire 是否生效（true/false）"}
+    hash_val: {type: string, description: "hget 到的字段值"}
+    hash_count: {type: number, description: "hgetall 字段数"}
+    list_vals: {type: string, description: "lrange 串成的逗号列表"}
+    list_first: {type: string, description: "lpop 弹出的首元素"}
+    set_card: {type: number, description: "集合基数"}
+    z_score: {type: string, description: "zscore 取到的分数"}
+    z_first: {type: string, description: "zrange 排第一的成员"}
+    lock_acquired: {type: string, description: "加锁是否成功"}
+    lock_released: {type: string, description: "释放是否成功"}
+    deq_count: {type: number, description: "延迟队列出队条数"}
+    deq_payload: {type: string, description: "出队首条 payload"}
+    error: {type: string, description: "出错时的原因（正常路径不出现）"}
+versions:
+  - version: 1.0.0
+    state: stable
+entry: |
+  local out = {}
+  local ok, r = pcall(function()
+    -- 连接参数每个方法都要带（侧车刻意不做配置库回退），这里拼一次复用
+    local conn = {
+      host = ctx.input.host,
+      port = ctx.input.port,
+      db = ctx.input.db,
+      password = ctx.input.password,
+    }
+    local function A(extra)
+      local t = {}
+      for k, v in pairs(conn) do t[k] = v end
+      for k, v in pairs(extra or {}) do t[k] = v end
+      return t
+    end
+
+    -- ① KV：set/get/incr/expire/ttl
+    local k = ctx.input.kv_key or "demo:kv:1"
+    ctx.ext.redis.set(A({key = k, value = "hello"}))
+    out.kv_got = ctx.ext.redis.get(A({key = k})).value
+
+    local kc = "demo:counter:1"
+    out.incr_val = ctx.ext.redis.incr(A({key = kc, by = 5})).value
+    out.ttl_set = tostring(ctx.ext.redis.expire(A({key = kc, seconds = 100})).set)
+    out.ttl_val = ctx.ext.redis.ttl(A({key = kc})).ttl
+
+    -- ② Hash：hset/hget/hgetall
+    local hk = "demo:hash:1"
+    ctx.ext.redis.hset(A({key = hk, fields = {name = "枢", role = "assistant"}}))
+    out.hash_val = ctx.ext.redis.hget(A({key = hk, field = "name"})).value
+    out.hash_count = #(ctx.ext.redis.hgetall(A({key = hk})).fields)
+
+    -- ③ List：rpush/lrange/lpop/llen
+    local lk = "demo:list:1"
+    ctx.ext.redis.rpush(A({key = lk, values = {"a", "b", "c"}}))
+    out.list_vals = table.concat(ctx.ext.redis.lrange(A({key = lk, start = 0, stop = -1})).values, ",")
+    out.list_first = ctx.ext.redis.lpop(A({key = lk, count = 1})).value
+    out.list_len = ctx.ext.redis.llen(A({key = lk})).length
+
+    -- ④ Set：sadd/smembers/scard
+    local sk = "demo:set:1"
+    ctx.ext.redis.sadd(A({key = sk, members = {"x", "y", "z"}}))
+    out.set_card = ctx.ext.redis.scard(A({key = sk})).cardinality
+
+    -- ⑤ ZSet：zadd/zscore/zrange
+    local zk = "demo:zset:1"
+    ctx.ext.redis.zadd(A({key = zk, members = {
+      {score = 1, value = "low"}, {score = 2, value = "mid"}, {score = 3, value = "high"}}}))
+    out.z_score = ctx.ext.redis.zscore(A({key = zk, member = "mid"})).score
+    out.z_first = ctx.ext.redis.zrange(A({key = zk, start = 0, stop = -1})).values[1]
+
+    -- ⑥ 分布式锁：lock/unlock（token 比对才能释放）
+    local lk2 = "demo:lock:1"
+    local tok = "tok-abc-123"
+    out.lock_acquired = tostring(ctx.ext.redis.lock(A({key = lk2, token = tok, ttl_seconds = 30})).acquired)
+    out.lock_released = tostring(ctx.ext.redis.unlock(A({key = lk2, token = tok})).released)
+
+    -- ⑦ 延迟队列：enqueue(delay=0 立即可取) / dequeue（原子出队）
+    local dk = "demo:delay:1"
+    ctx.ext.redis.enqueue(A({key = dk, items = {
+      {payload = "job1", delay_seconds = 0}, {payload = "job2", delay_seconds = 0}}}))
+    local dq = ctx.ext.redis.dequeue(A({key = dk, batch = 10}))
+    out.deq_count = #dq.items
+    out.deq_payload = dq.items[1] and dq.items[1].payload or ""
+    return true
+  end)
+  if not ok then
+    out.error = tostring(r)
+  end
+  return out

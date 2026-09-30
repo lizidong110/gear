@@ -22,7 +22,7 @@ import (
 // ---- 配置解析（per-call > 环境变量 > 内置默认）----
 
 func TestResolveLLMConfigDefaults(t *testing.T) {
-	cfg := resolveLLMConfig(LLMRequest{})
+	cfg := resolveLLMConfig(LLMRequest{}, nil)
 	if cfg.Provider != "siliconflow" || cfg.BaseURL != "https://api.siliconflow.cn/v1" {
 		t.Fatalf("默认 provider/base 不符: %+v", cfg)
 	}
@@ -51,7 +51,7 @@ func TestResolveLLMConfigPrecedenceAndEnv(t *testing.T) {
 	t.Setenv("GEAR_AI_TOTAL_TIMEOUT", "0") // 非法/非正 → 回落默认
 
 	// 全空请求 → 全部取环境变量
-	cfg := resolveLLMConfig(LLMRequest{})
+	cfg := resolveLLMConfig(LLMRequest{}, nil)
 	if cfg.Provider != "ollama" || cfg.BaseURL != "http://env-host:1" || cfg.APIKey != "env-key" || cfg.Model != "env-model" {
 		t.Fatalf("环境变量未生效: %+v", cfg)
 	}
@@ -69,7 +69,7 @@ func TestResolveLLMConfigPrecedenceAndEnv(t *testing.T) {
 	}
 
 	// per-call 参数优先于环境变量
-	cfg2 := resolveLLMConfig(LLMRequest{Provider: "openai", Model: "m", BaseURL: "http://call", APIKey: "k", Temperature: 0.9, MaxTokens: 7})
+	cfg2 := resolveLLMConfig(LLMRequest{Provider: "openai", Model: "m", BaseURL: "http://call", APIKey: "k", Temperature: 0.9, MaxTokens: 7}, nil)
 	if cfg2.Provider != "openai" || cfg2.Model != "m" || cfg2.BaseURL != "http://call" || cfg2.APIKey != "k" {
 		t.Fatalf("per-call 参数应优先: %+v", cfg2)
 	}
@@ -84,13 +84,13 @@ func TestResolveLLMConfigPrecedenceAndEnv(t *testing.T) {
 }
 
 func TestResolveLLMConfigOllamaDefaultsAndOverrides(t *testing.T) {
-	cfg := resolveLLMConfig(LLMRequest{Provider: "ollama"})
+	cfg := resolveLLMConfig(LLMRequest{Provider: "ollama"}, nil)
 	if cfg.BaseURL != "http://localhost:11434" || cfg.Model != "qwen3:latest" {
 		t.Fatalf("ollama 默认不符: %+v", cfg)
 	}
 	t.Setenv("GEAR_AI_OLLAMA_URL", "http://my-ollama:11434")
 	t.Setenv("GEAR_AI_OLLAMA_MODEL", "llama3:8b")
-	cfg2 := resolveLLMConfig(LLMRequest{Provider: "ollama"})
+	cfg2 := resolveLLMConfig(LLMRequest{Provider: "ollama"}, nil)
 	if cfg2.BaseURL != "http://my-ollama:11434" || cfg2.Model != "llama3:8b" {
 		t.Fatalf("ollama 环境变量覆盖未生效: %+v", cfg2)
 	}

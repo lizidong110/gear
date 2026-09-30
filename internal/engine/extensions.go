@@ -329,22 +329,63 @@ func (p *inProcessProvider) Call(method string, args map[string]interface{}) (in
 // registryMethods 是 ext.registry 暴露的方法（注册与 schema 共用同一份清单，杜绝漂移）。
 var registryMethods = []string{"tools", "flows", "capabilities"}
 
-// registrySchemas 返回 ext.registry 的方法级参数 schema（三个方法都不带参数）。
+// registrySchemas 返回 ext.registry 的方法级参数 schema。
 //
 // ext.registry 由内核**始终注册**，故其 schema 也必须始终登记：否则
 // `ext.registry.<任意名>` 会落在「只校验能力名」的退化路径上——那正是本次要堵的缺口。
+//
+// tools/flows 带 prefix + limit 两个**可选**参数（2026-09-27 加）：全量目录动辄上万 rune，
+// 观察回灌给模型时被截断，模型只数得到看得见的那部分就下结论（实测「查 registry 有多少个
+// Tool」答出 12，实际 34）。有了 prefix 它才能分批看，截断了也有得缩小——「请你缩小范围」
+// 如果没有参数可传就是句空话。
 func registrySchemas() map[string]MethodSchema {
 	desc := map[string]string{
 		"tools":        "列出引擎 registry 的 Tool（id/name/description/runtime/input_schema/output_schema）",
 		"flows":        "列出已注册 Flow（id/name/description）",
 		"capabilities": "返回内核原语（builtin + pure）与已注册 ext.* 的方法级参数 schema",
 	}
+	// 两个可选参数的 schema 定义一次，tools 与 flows 共用（否则改一处漏一处）。
+	listParams := map[string]ParamSchema{
+		"prefix": {Type: "string", Description: "只返回 id 以此开头的条目（用来分批查看）"},
+		"limit":  {Type: "number", Description: "最多返回多少条（默认 50）"},
+	}
 	out := make(map[string]MethodSchema, len(registryMethods))
 	for _, m := range registryMethods {
-		out[m] = MethodSchema{Description: desc[m], Parameters: map[string]ParamSchema{}}
+		params := map[string]ParamSchema{}
+		if m == "tools" || m == "flows" {
+			params = listParams
+		}
+		out[m] = MethodSchema{Description: desc[m], Parameters: params}
 	}
 	return out
 }
+
+// listArgs 解析 ext.registry.tools / .flows 的可选分页参数。零值语义一律「不限/默认」，
+// 与「传了就是 0」区分开：不传 prefix = 不过滤，不传 limit = 默认上限。
+func listArgs(args map[string]interface{}) (prefix string, limit int) {
+	if v, ok := args["prefix"]; ok {
+		if s, ok := v.(string); ok {
+			prefix = s
+		}
+	}
+	if v, ok := args["limit"]; ok {
+		switch n := v.(type) {
+		case int:
+			limit = n
+		case float64: // JSON 数字进 Lua 再回传会变成 float
+			limit = int(n)
+		case string:
+			if _, err := fmt.Sscanf(n, "%d", &limit); err != nil {
+				limit = 0
+			}
+		}
+	}
+	return prefix, limit
+}
+
+// defaultListLimit 是目录类观察的默认返回条数：够模型看清单，又不至于把单次观察顶到
+// 截断线上（截断后模型数不请总数，宁可少给让它分批要）。
+const defaultListLimit = 50
 
 // RegistryExtension 是「进程内」稳定原语：暴露引擎 registry 的工具 / 流程 / 能力目录给 Lua
 // （ctx.ext.registry.tools() / ctx.ext.registry.flows() / ctx.ext.registry.capabilities()）。
@@ -356,6 +397,10 @@ func registrySchemas() map[string]MethodSchema {
 // 也能锚定 capability 级参数（选项2：打通 ctx.* 参数语义，堵住 tool 模式 entry 幻觉的缺口）。
 func RegistryExtension(reg *registry.Registry, extCaps map[string]map[string]MethodSchema) *CapabilityExtension {
 	return InProcessExtension("ext.registry", registryMethods, func(method string, args map[string]interface{}) (interface{}, error) {
+		prefix, limit := listArgs(args)
+		if limit <= 0 {
+			limit = defaultListLimit
+		}
 		switch method {
 		case "tools":
 			tools, err := reg.ListTools()
@@ -364,6 +409,12 @@ func RegistryExtension(reg *registry.Registry, extCaps map[string]map[string]Met
 			}
 			out := make([]map[string]interface{}, 0, len(tools))
 			for _, t := range tools {
+				if prefix != "" && !strings.HasPrefix(t.ID, prefix) {
+					continue
+				}
+				if len(out) >= limit {
+					break
+				}
 				out = append(out, map[string]interface{}{
 					"id":            t.ID,
 					"name":          t.Name,
@@ -372,6 +423,9 @@ func RegistryExtension(reg *registry.Registry, extCaps map[string]map[string]Met
 					"output_schema": orSchema(t.OutputSchema),
 				})
 			}
+			// 刻意仍是数组：examples/ai-create-flow.yaml 里 `local tools =
+			// ctx.ext.registry.tools() or {}` 后接 ipairs，改成 {total=..., tools=...}
+			// 会让那段示例静默拿到空表。分页信息走观察侧的截断提示，不靠改形状传递。
 			return out, nil
 		case "flows":
 			flows, err := reg.ListFlows()
@@ -380,6 +434,12 @@ func RegistryExtension(reg *registry.Registry, extCaps map[string]map[string]Met
 			}
 			out := make([]map[string]interface{}, 0, len(flows))
 			for _, f := range flows {
+				if prefix != "" && !strings.HasPrefix(f.ID, prefix) {
+					continue
+				}
+				if len(out) >= limit {
+					break
+				}
 				out = append(out, map[string]interface{}{"id": f.ID, "name": f.Name, "description": f.Description})
 			}
 			return out, nil
@@ -535,6 +595,11 @@ var builtinCapabilitySchemas = map[string]map[string]MethodSchema{
 			"sql":    {Type: "string", Description: "SQL（用 ? 占位符，配套 params）", Required: true},
 			"params": {Type: "array", Description: "预编译占位符参数（按顺序，可选）"},
 		}},
+		"batch": {Description: "事务批处理：多条语句同事务顺序执行，**全或无**（任一条失败整体回滚，committed=false，results 指明第几条、什么错）。DDL 可与 DML 混批（SQLite 同事务内同原子；其它方言见 atoms.md）", Parameters: map[string]ParamSchema{
+			"driver":     {Type: "string", Enum: []string{"sqlite", "mysql", "postgres"}, Description: "数据库驱动（缺省 sqlite）"},
+			"dsn":        {Type: "string", Description: "连接串（mysql/postgres 必填，含口令优先 ${secrets.*}）"},
+			"statements": {Type: "array", Description: "语句数组，至少一条；每个元素是 {sql, params?} 表或裸 SQL 字符串。sql 为该条语句（用 ? 占位符），params 为该条自己的参数（可选）", Required: true},
+		}},
 		"ping": {Description: "探活（sqlite 文件可打开 / mysql/postgres 网络连得通即 ok）", Parameters: map[string]ParamSchema{
 			"driver": {Type: "string", Enum: []string{"sqlite", "mysql", "postgres"}, Description: "数据库驱动（缺省 sqlite）"},
 			"dsn":    {Type: "string", Description: "连接串（mysql/postgres 必填）"},
@@ -564,11 +629,28 @@ var builtinCapabilitySchemas = map[string]map[string]MethodSchema{
 			"handle": {Type: "string", Description: "订阅句柄", Required: true},
 		}},
 	},
+	"config": {
+		"get": {Description: "读取一项持久化配置（应用级 key/value，落点在 gearhome 的 config.db）；不存在返回错误", Parameters: map[string]ParamSchema{
+			"key": {Type: "string", Description: "配置键（如 ai.api_key、app.mindstorm.theme；不带前缀即全局）", Required: true},
+		}},
+		"set": {Description: "写入一项持久化配置（已存在则覆盖）。传空串 = 存成空值，要清除请用 delete", Parameters: map[string]ParamSchema{
+			"key":   {Type: "string", Description: "配置键", Required: true},
+			"value": {Type: "string", Description: "配置值", Required: true},
+		}},
+		"delete": {Description: "删除一项持久化配置；不存在时返回错误", Parameters: map[string]ParamSchema{
+			"key": {Type: "string", Description: "配置键", Required: true},
+		}},
+		"list": {Description: "列出某前缀下的全部配置（prefix 为空串 = 全部），返回 {key: value} map", Parameters: map[string]ParamSchema{
+			"prefix": {Type: "string", Description: "键前缀（如 ai. / app.mindstorm.；可空）"},
+		}},
+	},
 	// 纯函数核心原子（内核内建、始终可用、不受 capability 门禁）：schema 与实现同文件
 	// （purefunc.go），方法新增/改名时 schema、Lua 绑定、静态校验、能力目录一起动。
 	"time":     pureTimeSchemas,
 	"template": pureTemplateSchemas,
 	"crypto":   pureCryptoSchemas,
+	"id":       pureIDSchemas,
+	"validate": pureValidateSchemas,
 }
 
 // builtinCapabilitySummaries 返回内核原语的能力摘要（门禁：kind=builtin；纯函数：kind=pure），

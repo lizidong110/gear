@@ -18,8 +18,11 @@ import (
 
 // IsolateForTest 把执行记录库指向一个新建的临时目录，返回清理函数。
 //
-// 只改 `GEAR_EXEC_DB` 这一个变量——刻意不碰 `GEAR_HOME`：registry 的默认值仍应保持
-// 「用户数据目录」，因为不少用例（CLI 帮助文本、默认路径断言）要看的正是那个值。
+// 隔离 `GEAR_EXEC_DB` 与 `GEAR_CONFIG_DB`（两个落在用户数据目录里的文件库）——刻意不碰
+// `GEAR_HOME`：registry 的默认值仍应保持「用户数据目录」，因为不少用例（CLI 帮助文本、
+// 默认路径断言）要看的正是那个值。隔离的目标是「别把测试写进真实数据、也别让测试偷读真实
+// 配置」（config.db 里可能存着用户真实的 AI api_key，未隔离会让 doctor 一类用例读到它、
+// 断言「未就绪」直接红），不是「假装没有用户目录」。
 // 隔离的目标是「别把测试写进真实数据」，不是「假装没有用户目录」。
 //
 // 同时**清掉 `GEAR_REGISTRY`**（用完还原）：那个变量是「上一次调用选定的库」的继承信道，
@@ -50,16 +53,36 @@ func IsolateForTest() func() {
 		_ = os.Unsetenv(EnvRegistry)
 	}
 
+	prevConfigDB, hadConfigDB := os.LookupEnv(EnvConfigDB)
+	_ = os.Unsetenv(EnvConfigDB)
+	restoreConfigDB := func() {
+		if hadConfigDB {
+			_ = os.Setenv(EnvConfigDB, prevConfigDB)
+			return
+		}
+		_ = os.Unsetenv(EnvConfigDB)
+	}
+
 	dir, err := os.MkdirTemp("", "gear-test-exec-")
 	if err != nil {
+		restoreConfigDB()
 		return restoreRegistry
 	}
 	if err := os.Setenv(EnvExecDB, filepath.Join(dir, "exec.db")); err != nil {
 		_ = os.RemoveAll(dir)
+		restoreConfigDB()
+		return restoreRegistry
+	}
+	// 把配置库也指向同一个临时目录：否则测试会去读用户真实的 config.db（可能含真实 AI
+	// api_key），导致「未配置即未就绪」这类断言在带配置的机器上随机红（2026-09-25 实测）。
+	if err := os.Setenv(EnvConfigDB, filepath.Join(dir, "config.db")); err != nil {
+		_ = os.RemoveAll(dir)
+		restoreConfigDB()
 		return restoreRegistry
 	}
 	return func() {
 		_ = os.RemoveAll(dir)
 		restoreRegistry()
+		restoreConfigDB()
 	}
 }

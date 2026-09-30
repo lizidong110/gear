@@ -146,8 +146,13 @@ var (
 		"items": sArr(), "total": sNum(), "truncated": sBool(), "counts": sObj(),
 		"offset": sNum(), "limit": sNum(), "next_offset": sNum(),
 	})
+	// ⚠ `object` 用 sAny 而不是 sObj：`gear_describe(kind=app)` 在「没起过、只有清单」时
+	// 如实返回 `object: null`，而 SDK 会对**每次**返回做 outputSchema 校验——写死 "object"
+	// 会让一个完全正常的响应被判失败（2026-09-26 实测：`has type "null", want "object"`）。
+	// 红线仍是「类型不确定/可为 null 的一律 sAny」，这里正是那个场景。
 	outDescribe = outSchema(map[string]any{
-		"kind": sStr(), "object": sObj(), "long_running": sBool(),
+		"kind": sStr(), "object": sAny(), "long_running": sBool(),
+		"manifest": sAny(), "composition": sAny(),
 	})
 	outCapabilities = outSchema(map[string]any{
 		"capabilities": sArr(), "total": sNum(), "filter_name": sStr(), "filter_kind": sStr(),
@@ -191,6 +196,15 @@ var (
 	})
 	outInvoke = outSchema(map[string]any{
 		"name": sStr(), "method": sStr(), "result": sAny(),
+	})
+	outExport = outSchema(map[string]any{
+		"app_id": sStr(), "path": sStr(), "format": sStr(), "components": sObj(),
+		"files": sArr(), "warnings": sArr(), "next": sStr(),
+	})
+	outImport = outSchema(map[string]any{
+		"app_id": sStr(), "valid": sBool(), "dry_run": sBool(), "created": sArr(),
+		"updated": sArr(), "static_landed": sArr(), "static_missing": sArr(),
+		"warnings": sArr(), "next": sStr(),
 	})
 )
 
@@ -245,9 +259,35 @@ type ValidateArgs struct {
 
 // ApplyArgs 是 gear_apply 的入参。
 type ApplyArgs struct {
-	Bundle    string `json:"bundle" jsonschema:"Gear bundle YAML 文本（多文档）"`
+	// omitempty 是必需的：`restore_from` 单独使用时 bundle 为空，
+	// 而缺 omitempty 会让 generated schema 把 bundle 标成 required，纯回滚直接被验参挡掉。
+	Bundle    string `json:"bundle,omitempty" jsonschema:"Gear bundle YAML 文本（多文档）"`
 	DryRun    bool   `json:"dry_run,omitempty" jsonschema:"只校验与检查冲突，不落库（等价于 gear_validate + 覆盖检测）"`
 	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"允许覆盖内容不同但 id 已存在的对象（默认 false，仅更新内容相同的定义）"`
+
+	// RestoreFrom 是「回滚到某次变更之前」的入口：值为 definition_history 的 seq（用
+	// `gear history list` 查）。> 0 时**忽略 bundle**，仅把该历史点的定义写回；
+	// 该点对应「对象当时还不存在」时执行删除（撤回一次新建）。
+	RestoreFrom int `json:"restore_from,omitempty" jsonschema:"回滚到某个历史点（definition_history.seq，见 gear history list）；大于 0 时忽略 bundle"`
+}
+
+// ExportArgs 是 gear_export 的入参。
+//
+// ⚠ 标签文案不得以 `WORD=` 开头（见 RunArgs 的说明）。
+type ExportArgs struct {
+	AppID         string `json:"app_id" jsonschema:"要导出的应用 id（App 清单 id）"`
+	OutDir        string `json:"out_dir" jsonschema:"产物输出路径：dir 形态为要创建的目录（须不存在或为空，gear 不会覆盖非空目录）；zip 形态为包文件路径（扩展名留空会自动补 .gearapp）"`
+	Format        string `json:"format,omitempty" jsonschema:"产物形态：dir（默认，可 diff 可 git 版本化）| zip（打成单个包，便于发送）"`
+	IncludeStatic *bool  `json:"include_static,omitempty" jsonschema:"是否把 layout.files 声明的静态资源拷进产物（默认 true；关掉后产物不自包含，不能当交付物）"`
+	StaticRoot    string `json:"static_root,omitempty" jsonschema:"解析 layout.files 相对路径的根目录；留空表示当前工作目录（gear 不持有静态资源，它在哪只能由调用方告诉）"`
+}
+
+// ImportArgs 是 gear_import 的入参。
+type ImportArgs struct {
+	Source    string `json:"source" jsonschema:"产物路径：gear_export 产出的目录，或 .gearapp / zip 文件"`
+	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"允许覆盖已存在且内容不同的对象（默认 false：整批拒绝，保持原子）"`
+	DryRun    bool   `json:"dry_run,omitempty" jsonschema:"只汇报将创建/更新什么，一个字节不写"`
+	AppsDir   string `json:"apps_dir,omitempty" jsonschema:"静态资源落地根目录；留空表示不落地（只登记清单，符合 gear 不持有静态资源的边界）。落地时会重写 layout 指向实际位置"`
 }
 
 // DeleteArgs 是 gear_delete 的入参。

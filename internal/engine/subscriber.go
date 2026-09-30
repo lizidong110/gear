@@ -14,6 +14,7 @@ package engine
 // 一次性执行无 server 监听，Start 返回明确错误而非静默 no-op。
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -211,11 +212,13 @@ func (s *Subscriber) runTarget(cb cap.SubscriptionCallback, payload interface{})
 	input["payload"] = payload
 
 	if flow, err := s.e.reg.GetFlow(cb.Target); err == nil && flow != nil {
-		_, err := s.e.RunFlowExecWithVars(cb.Target, "", nil, input)
+		// 投递是引擎内部动作（不是外部调用方发起的），故用无身份的 ctx：
+		// 身份不沿订阅链路继承——否则一个事件的来源会冒充发起投递的主体。
+		_, err := s.e.RunFlowExecWithVars(context.Background(), cb.Target, "", nil, input)
 		return err
 	}
 	if tool, err := s.e.reg.GetTool(cb.Target); err == nil && tool != nil {
-		_, err := s.e.RunToolExec(cb.Target, input, "")
+		_, err := s.e.RunToolExec(context.Background(), cb.Target, input, "")
 		return err
 	}
 	return fmt.Errorf("投递目标 %q 既不是已注册 Tool 也不是 Flow", cb.Target)

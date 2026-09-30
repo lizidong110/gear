@@ -81,6 +81,8 @@ func (e *Engine) validateFlowDiags(f *model.Flow, extra map[string]*model.Tool) 
 	}
 
 	var out []Diagnostic
+	// usesServe 是整条 Flow 级的事实（④ 要用），在 ③ 逐 step 的循环里顺带累积。
+	var usesServe bool
 	collect := func(err error) {
 		if err == nil {
 			return
@@ -105,6 +107,15 @@ func (e *Engine) validateFlowDiags(f *model.Flow, extra map[string]*model.Tool) 
 			collect(diagWrap(flowStructureCode(err), err, s.ID, field, structureHintFor(err)))
 			continue // 结构都不成立时，后续判定只会产噪声
 		}
+		// 顺带记下这条 Flow 是否要用 ext.serve 侧车（整条 Flow 级判定，见 ④）。
+		//
+		// **刻意放在解析调用目标之前**：调用目标解析失败（UNKNOWN_CALL_TARGET /
+		// UNKNOWN_CAPABILITY）会 continue，若把本判定跟在解析之后，站点 Tool 还没落库时
+		// 就只剩一条 UNKNOWN_CALL_TARGET，而「压根没有步持有侧车」这个更符合病因的问题
+		// 被它掩盖——那正是初始实现被真机打回的原因。
+		if stepUsesServeHelp(s.Call, extra) {
+			usesServe = true
+		}
 		collect(diagWrap(CodeBadTemplate, singleStepTemplateErr(f, s), s.ID, field+".input",
 			"模板只允许三种前缀：${vars.x} / ${steps.<id>.output.x} / ${secrets.NAME}"))
 		if _, err := compileWhen(s.When); err != nil {
@@ -126,7 +137,53 @@ func (e *Engine) validateFlowDiags(f *model.Flow, extra map[string]*model.Tool) 
 		collect(diagWrap(CodeBadPrimitiveArgs, wrapStepErr(s.ID, e.validatePrimitiveArgs(call.prim, call.method, s.Input)),
 			s.ID, "step("+s.ID+").input", "参数名与必填项以 gear_capabilities 里该能力的方法 schema 为准"))
 	}
+
+	// ④ 侧车持有不变量（整条 Flow 级事实，只能在整条 Flow 上判定，故单独一次）。
+	//
+	// ext.serve 是唯一一个「缺了则这个应用对外根本不存在」的侧车：没有一条 `mode: service`
+	// 的 `ext.serve` 步去持有它，任何要用它的步都会拿到 connection refused。这类定义能写入、
+	// 能 gear_apply，只在真起服时才炸——而校验期「一次报全」的全部价值，就是把这次炸提前。
+	if usesServe && !hasServiceServeStep(f) {
+		collect(diagWrap(CodeMissingServeHolder,
+			fmt.Errorf("Flow %s 要用 ext.serve 侧车，但没有一条 `mode: service` 的 `ext.serve` 步持有它", f.ID),
+			"", "steps", missingServeHolderHint))
+	}
 	return out
+}
+
+// missingServeHolderHint 是 CodeMissingServeHolder 的「怎么修」。
+const missingServeHolderHint = "加一条 `call: ext.serve` + `mode: service` 的步持有侧车；service step 不能作为依赖目标，" +
+	"故用一个 `mode: once` 的锚点步把它后面的站点步推到下一层（见 examples/agent-app/bundle.yaml）"
+
+// stepUsesServeHelp 报告这个 step 的调用目标是否要用 ext.serve 侧车：
+// 直调 `ext.serve`，或调用目标（bundle 内 Tool 优先于已注册 Tool）声明了 ext.serve capability。
+//
+// 只查 bundle 内的 extra：一个尚未落库、也不在本 bundle 里的 Tool，无从判断它的能力——
+// 那种情形会由 UNKNOWN_CALL_TARGET 单独报出，不在本检查里重复猜。
+func stepUsesServeHelp(callName string, extra map[string]*model.Tool) bool {
+	if callName == "ext.serve" || strings.HasPrefix(callName, "ext.serve.") {
+		return true
+	}
+	t := extra[callName]
+	if t == nil {
+		return false
+	}
+	for _, c := range t.Capabilities {
+		if c == "ext.serve" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasServiceServeStep 报告这条 Flow 里有没有一条 `mode: service` 的 `ext.serve` 步持有侧车。
+func hasServiceServeStep(f *model.Flow) bool {
+	for _, s := range f.Steps {
+		if s.IsService() && s.Call == "ext.serve" {
+			return true
+		}
+	}
+	return false
 }
 
 // singleStepStructureErr 取出某个 step **局部**的结构错误。

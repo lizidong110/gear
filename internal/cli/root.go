@@ -20,6 +20,15 @@ var registryPath string
 // 默认 127.0.0.1:8787；可用环境变量 GEAR_ADDR 覆盖（便于联调远端执行面）。
 var serverAddr string
 
+// cliScope 是运行期命名空间守卫的作用域（`--scope`，IDENTITY_CONTEXT_DESIGN.md §4.3）：
+// 一个 registry apps 表里的 App.ID。非空时，本进程运行期只认这个应用名下的定义。
+//
+// 空值（默认）= 不启用守卫，行为与没有本特性时逐字一致。
+//
+// 它是**进程级**开关，不是按请求的：gear serve 的引擎是长驻共享实例，而 cap.Resolver
+// 的签名里没有 context，按请求切换作用域在那个面上做不到。
+var cliScope string
+
 // newRootCmd 构造根命令（供 CLI 入口与测试复用）。
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
@@ -31,8 +40,10 @@ func newRootCmd() *cobra.Command {
 		"registry 数据库路径（默认 ~/.gear/registry.db）")
 	root.PersistentFlags().StringVar(&serverAddr, "addr", defaultAddr(),
 		"REST 执行面地址（默认 127.0.0.1:8787，可用 GEAR_ADDR 覆盖）")
+	root.PersistentFlags().StringVar(&cliScope, "scope", "",
+		"运行期命名空间守卫的作用域（registry 里的 App.ID）：本进程只引用它名下的定义；空=不启用")
 
-	root.AddCommand(toolCmd(), flowCmd(), appCmd(), hookCmd(), serveCmd(), execCmd(), aiCmd(), mcpCmd(), extCmd(), scaffoldCmd())
+	root.AddCommand(toolCmd(), flowCmd(), appCmd(), hookCmd(), serveCmd(), execCmd(), aiCmd(), mcpCmd(), extCmd(), scaffoldCmd(), configCmd(), exportCmd(), importCmd(), historyCmd())
 	return root
 }
 
@@ -111,7 +122,12 @@ func pinRegistryEnv(path string) {
 }
 
 // gearRegistryTables 是 gear registry 自建的表；出现其它表说明该文件不是单纯的 gear 目录库。
-var gearRegistryTables = map[string]bool{"tools": true, "flows": true, "hooks": true}
+// 2026-09-26：加 "apps"（App 清单入 registry），漏掉会让每个已有库都误报「已含非 gear 表」。
+// 同日加 "definition_history"（④ 的留旧表）时漏了这一处，导致每个跑过 history 的库
+// 每次 CLI 调用都刷一行告警；这张表是 gear 自建的，与 tools/flows/hooks 同级。
+var gearRegistryTables = map[string]bool{
+	"tools": true, "flows": true, "hooks": true, "apps": true, "definition_history": true,
+}
 
 // warnIfPosixRegistryPath 对 --registry 做一次「POSIX 路径误用」提示（不阻断）。
 //

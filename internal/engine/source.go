@@ -4,7 +4,7 @@ package engine
 //
 // 背景：service ext 只要在 extensions.yaml 里声明了 `source: <name>`，就承诺能承载同名事件源——
 // ctx.subscribe.start({ source = "kafka" | "mqtt" | ... }) 的 source 字段直接对应这条声明。
-// 四个侧车（mqtt / kafka / rabbitmq / webhook）的订阅线格式**完全一致**：
+// 五个侧车（mqtt / kafka / rabbitmq / webhook / cron）的订阅线格式**完全一致**：
 //
 //	subscribe   { <源专属配置...>, handle, callback_url }   → 建立订阅；事件到达时侧车 POST callback_url
 //	unsubscribe { handle }                                  → 取消订阅（幂等）
@@ -17,11 +17,14 @@ import "fmt"
 
 // knownSources 是已实现的通用事件源名（与 plugin/extensions.yaml 的 source 声明一致）。
 // 新增一个承载订阅的侧车时：这里是第一处、extensions.yaml 的 source 是第二处，两处都要加。
+// ext.cron（2026-09-28）是唯一的「非订阅型」事件源：它不由外部消息驱动，而是自己按时间表
+// 回推，订阅侧与 mqtt/kafka 同构（同 handle / callback_url / unsubscribe），故走同一张表。
 var knownSources = map[string]bool{
 	"mqtt":     true,
 	"kafka":    true,
 	"rabbitmq": true,
 	"webhook":  true,
+	"cron":     true,
 }
 
 // newSourceFactory 按源名构造事件源工厂。t 是该 ext 的侧车调用通道（本地 HTTP 长连接）。
@@ -34,7 +37,7 @@ func newSourceFactory(source string, t SidecarTransport) (SourceFactory, error) 
 	if knownSources[source] {
 		return newSidecarSource(source, t), nil
 	}
-	return nil, fmt.Errorf("未知的事件源 %q（已实现：kafka/mqtt/rabbitmq/webhook）", source)
+	return nil, fmt.Errorf("未知的事件源 %q（已实现：cron/kafka/mqtt/rabbitmq/webhook）", source)
 }
 
 // sidecarSource 是通用事件源：把一次订阅请求透传给侧车的 subscribe / unsubscribe RPC。

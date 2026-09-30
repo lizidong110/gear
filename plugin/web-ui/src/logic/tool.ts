@@ -9,7 +9,7 @@ import {
   RUNTIMES,
   VERSION_STATES,
 } from './enums'
-import type { HealthProbeDTO, HookDTO, ToolDTO, ToolVersionDTO } from '@/api/types'
+import type { HealthProbeDTO, HookDTO, ToolApiDTO, ToolDTO, ToolVersionDTO } from '@/api/types'
 
 // 与 Go 的 semverRegex 等价（Go 用 RE2，该模式与 JS 正则语义一致）。
 const SEMVER_RE =
@@ -17,6 +17,23 @@ const SEMVER_RE =
 
 /** Go time.ParseDuration 接受的形态（简化：数字 + 单位）。 */
 const DURATION_RE = /^\d+(\.\d+)?(ns|us|µs|ms|s|m|h)$/
+
+/** 允许声明的 HTTP 方法（镜像 model.APIMethods）。 */
+const API_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE']
+
+/** 内核已占用的资源根（镜像 model.ReservedRoots，相对 /api/ 的那一段）。 */
+const RESERVED_API_ROOTS = [
+  'apps',
+  'capabilities',
+  'events',
+  'executions',
+  'flows',
+  'healthz',
+  'hooks',
+  'news',
+  'secrets',
+  'tools',
+]
 
 export function isSemver(s: string): boolean {
   return SEMVER_RE.test(s)
@@ -80,6 +97,46 @@ export function toolErrors(t: Partial<ToolDTO>): string[] {
   if (so) errs.push(so)
 
   errs.push(...probeErrors(t.health_probe, t.id ?? ''))
+  errs.push(...apiRouteErrors(t.api, t.id ?? ''))
+  return errs
+}
+
+/** 镜像 model.APIRoute.Validate：声明式 REST 路由的形状校验（FR-3）。 */
+export function apiRouteErrors(a: ToolApiDTO | null | undefined, toolId: string): string[] {
+  if (!a) return []
+  const errs: string[] = []
+  if (!a.method) {
+    errs.push('api.method 不能为空（应为 GET/POST/PUT/PATCH/DELETE 之一）')
+  } else if (!API_METHODS.includes(a.method)) {
+    errs.push(
+      `api.method=${JSON.stringify(a.method)} 非法（应为 ${API_METHODS.join('/')} 之一，且必须大写）`,
+    )
+  }
+
+  const path = (a.path ?? '').trim()
+  if (!path) {
+    errs.push('api.path 不能为空（资源路由必须指向一个路径，如 /api/orders）')
+  } else if (!path.startsWith('/api/')) {
+    // 文案与 model.ValidateAPIPath 逐字对齐（这层是内核校验的手写镜像，差一个字
+    // 就会让人在表单里改了半天仍被内核以「另一套口径」打回）。
+    errs.push(`api.path=${JSON.stringify(path)} 必须以 "/api/" 开头（资源路由挂在内核 REST 面这一棵树上）`)
+  } else {
+    const segs = path.slice('/api/'.length).split('/')
+    if (segs.length === 0 || segs.some((s) => s === '')) {
+      errs.push(`api.path=${JSON.stringify(path)} 非法（段不能为空，不要写 //）`)
+    } else if (segs[segs.length - 1] === '') {
+      errs.push(`api.path=${JSON.stringify(path)} 不能以 / 结尾`)
+    } else if (RESERVED_API_ROOTS.includes(segs[0])) {
+      errs.push(`api.path=${JSON.stringify(path)} 占着内核已占用的资源根 /${segs[0]}，请换自己的子树`)
+    } else {
+      for (const s of segs) {
+        if (s === '{}' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(s.slice(1, -1))) {
+          errs.push(`api.path=${JSON.stringify(path)} 的段 ${JSON.stringify(s)}：占位符要写名字（如 {id}）`)
+          break
+        }
+      }
+    }
+  }
   return errs
 }
 

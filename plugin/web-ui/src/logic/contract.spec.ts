@@ -12,6 +12,7 @@ import {
   VERSION_STATES,
   VERSION_TRANSITIONS,
 } from '@/logic/generated/enums'
+import { CAPABILITY_LABEL } from '@/logic/enums'
 import { capabilityKnown, hookErrors, isSemver, toolErrors } from '@/logic/tool'
 import type { ToolDTO } from '@/api/types'
 
@@ -93,7 +94,14 @@ describe('生成枚举的结构不变量（防漂移，对应内核 TestRuntimeK
     ])
     expect([...PROBE_KINDS]).toEqual(['http', 'tcp', 'cmd'])
     expect([...STEP_MODES]).toEqual(['once', 'service'])
-    expect([...BUILTIN_CAPABILITIES]).toEqual(['http', 'call', 'db', 'secret', 'event', 'subscribe'])
+    // 刻意**不**再把完整清单写死在这里：清单由内核 cap.KnownPrimitives 生成，
+    // 与内核的一致性由 scripts/check-contract.mjs 守（本文件写死只会每次加原语都红一次）。
+    // 这里只断言「该有的都在」，真正要守的是下面那条——每个原语都得有中文标签。
+    for (const c of ['http', 'call', 'db', 'secret', 'event', 'subscribe', 'config']) {
+      expect([...BUILTIN_CAPABILITIES]).toContain(c)
+    }
+    // 新增原语而忘了补 CAPABILITY_LABEL，UI 上就是一片空白——这条替人拦住它。
+    for (const c of BUILTIN_CAPABILITIES) expect(CAPABILITY_LABEL[c]).toBeTruthy()
   })
 
   it('版本状态机：rejected 仅可重开为 draft（终态语义）', () => {
@@ -195,6 +203,22 @@ describe('toolErrors（镜像 model.Tool.Validate）', () => {
       baseTool({ health_probe: { kind: 'http', addr: 'a:1', path: '/', cmd: '', interval: '5 seconds', timeout: '', threshold: 0 } }),
     )
     expect(errs.some((e) => e.includes('health_probe.interval'))).toBe(true)
+  })
+
+  it('api：method 大小写 / path 前缀 / 占位符 / 内核资源根', () => {
+    expect(toolErrors(baseTool({ api: { method: 'GET', path: '/api/nodes/{id}' } }))).toEqual([])
+
+    const lower = toolErrors(baseTool({ api: { method: 'get', path: '/api/nodes/{id}' } }))
+    expect(lower.some((e) => e.includes('api.method'))).toBe(true)
+
+    const noPrefix = toolErrors(baseTool({ api: { method: 'GET', path: 'nodes/{id}' } }))
+    expect(noPrefix.some((e) => e.includes('必须以 "/api/" 开头'))).toBe(true)
+
+    const noName = toolErrors(baseTool({ api: { method: 'GET', path: '/api/nodes/{}' } }))
+    expect(noName.some((e) => e.includes('占位符要写名字'))).toBe(true)
+
+    const reserved = toolErrors(baseTool({ api: { method: 'GET', path: '/api/tools/{id}' } }))
+    expect(reserved.some((e) => e.includes('内核已占用'))).toBe(true)
   })
 })
 

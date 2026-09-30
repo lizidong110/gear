@@ -67,5 +67,5 @@ steps:
     depends_on: [anchor]
     input:
       port: 8080
-      dir: D:/gadern/gear/apps/smoke/www
+      dir: apps/smoke/www
       host: 127.0.0.1

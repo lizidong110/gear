@@ -34,7 +34,7 @@ func hookRegisterCmd() *cobra.Command {
 				return err
 			}
 			defer reg.Close()
-			if err := reg.UpsertHook(&h); err != nil {
+			if err := reg.UpsertHook(&h, act()); err != nil {
 				return err
 			}
 			fmt.Printf("✓ 已注册 Hook: %s, stage=%s, target=%s, action=%s, criticality=%s, order=%d\n",
@@ -107,7 +107,7 @@ func hookRemoveCmd() *cobra.Command {
 				return err
 			}
 			defer reg.Close()
-			if err := reg.DeleteHook(args[0]); err != nil {
+			if err := reg.DeleteHook(args[0], act()); err != nil {
 				return err
 			}
 			fmt.Printf("✓ 已删除 Hook: %s\n", args[0])

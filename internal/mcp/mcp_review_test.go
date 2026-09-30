@@ -89,7 +89,7 @@ func TestMCPToolsAdvertiseOutputSchema(t *testing.T) {
 // 必须**立刻**停止并如实返回当前快照——此前不看 ctx.Done()，客户端早走了还会等满 N 秒。
 func TestExecutionSnapshotStopsOnCancel(t *testing.T) {
 	f := newSmokeFixture(t)
-	rec := f.server.execs.Create("f") // 造一条「运行中」的执行（故意不 Finish）
+	rec := f.server.execs.Create("f", "") // 造一条「运行中」的执行（故意不 Finish）
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 立即取消
@@ -161,7 +161,7 @@ func TestOrphanExecutionDetection(t *testing.T) {
 	}
 
 	// 集成侧：本进程创建的 running 记录在 gear_execution 列表里**不得**被标孤儿（负向方向）。
-	rec := s.execs.Create("smoke.up")
+	rec := s.execs.Create("smoke.up", "")
 	var list map[string]any
 	callTool(t, f.session, "gear_execution", nil, &list)
 	ex, _ := list["executions"].([]any)
@@ -425,6 +425,26 @@ func TestMCPInvokeCapability(t *testing.T) {
 	}, "")
 	if !strings.Contains(blocked, "INVOKE_BLOCKED") {
 		t.Fatalf("调 secret.* 应报 INVOKE_BLOCKED: %s", blocked)
+	}
+
+	// AC-B6：db.batch 经同一条 gear_invoke 通道可用（禁列里只有 secret.*，db 不在禁列），
+	// 且「第 2 条失败」这种**业务失败**要落成返回结构，不能被 INVOKE_BLOCKED 之类误拦。
+	var batched map[string]any
+	callTool(t, session, "gear_invoke", map[string]any{
+		"name": "db", "method": "batch", "args": map[string]any{"statements": []any{
+			map[string]any{"sql": "CREATE TABLE IF NOT EXISTS mcp_batch_demo(k TEXT)"},
+			map[string]any{"sql": "INSERT INTO mcp_batch_demo VALUES('a')"},
+		}},
+	}, &batched)
+	res, isMap := batched["result"].(map[string]any)
+	if !isMap {
+		t.Fatalf("gear_invoke(db.batch) 应返回结果对象: %v", batched)
+	}
+	if res["committed"] != true {
+		t.Fatalf("全成功批应 committed=true，实际 %v", res["committed"])
+	}
+	if n := len(res["rows_affected"].([]any)); n != 2 {
+		t.Fatalf("rows_affected 应有 2 项，实际 %v", res["rows_affected"])
 	}
 
 	// 空 name/method → BAD_ARGUMENT。

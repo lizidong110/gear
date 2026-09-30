@@ -1,0 +1,82 @@
+# 演示 Tool：一次调用同时走通 ext.excel 与 ext.pdf 两条「零依赖写出」链路。
+#
+#   ctx.ext.excel.write({path, sheets, root}) → .xlsx
+#   ctx.ext.pdf.write({path, pages, root})    → .pdf（CJK 自动嵌入字体子集）
+#
+# 这个文件的存在意义（2026-09-30）：
+#   verify 的 P1e 早先只**直连侧车 HTTP 端点**验证 —— 那只证明了「侧车二进制写对了」，
+#   没证明「能力接进引擎了」。实际上当时 `plugin/extensions.yaml` 里压根没有
+#   ext.excel / ext.pdf 两段声明，应用里 `ctx.ext.excel.write` 根本不存在，
+#   而 71/71 全绿照样把它放过去了。
+#   本样例经 `gear tool register` + `gear tool run` 走内核的门禁与能力目录，
+#   补上「ctx.ext.* 真的存在、应用里真能调」这一层证据。
+#
+# 注册：gear tool register --registry <db> -   （stdin 喂本文件）
+# 运行：gear tool run report.export --registry <db> --input '{"root":"<目录>"}'
+#
+# 注：capabilities 声明 [ext.excel, ext.pdf] —— 两个都是 service ext，
+#     侧车由内核按 extensions.yaml 的 listen 端口拉起；MCP 工具数 +0。
+id: report.export
+name: 报表导出（xlsx + pdf，零依赖）
+runtime: lua
+capabilities: [ext.excel, ext.pdf]
+input_schema:
+  type: object
+  properties:
+    root: {type: string, description: "产物根目录（应用 workdir）"}
+    title: {type: string, description: "报表标题（缺省「报表」）"}
+    xlsx_path: {type: string, description: "xlsx 的相对路径（缺省 out/report.xlsx）；给越界值可触发 path_escape，供反向验证"}
+    pdf_path: {type: string, description: "pdf 的相对路径（缺省 out/report.pdf）；同上，供反向验证"}
+  required: [root]
+output_schema:
+  type: object
+  properties:
+    xlsx: {type: string, description: "写出的 xlsx 绝对路径"}
+    xlsx_size: {type: number, description: "xlsx 字节数"}
+    pdf: {type: string, description: "写出的 pdf 绝对路径"}
+    pdf_size: {type: number, description: "pdf 字节数"}
+    error: {type: string, description: "出错时的原因（正常路径不出现）"}
+versions:
+  - version: 1.0.0
+    state: stable
+entry: |
+  local out = {}
+  local ok, r = pcall(function()
+    local root = ctx.input.root
+    local title = ctx.input.title or "报表"
+    local xlsx_path = ctx.input.xlsx_path or "out/report.xlsx"
+    local pdf_path = ctx.input.pdf_path or "out/report.pdf"
+
+    -- ① Excel：cell 混用 字符串/数字/布尔 三类（类型由值自身决定，不用标注）
+    --
+    --    刻意不演示「空单元格」：Lua 的 table 里放 nil 会让序列长度变成未定义
+    --    （{"a", nil, "b"} 的长度可能是 1 也可能是 3），空单元格的覆盖交给
+    --    verify 的 P1e —— 那里直接发 JSON，null 能被精确表达。
+    local x = ctx.ext.excel.write({
+      path = xlsx_path,
+      root = root,
+      sheets = {
+        {name = "明细", rows = {
+          {"项目", "数量", "是否加急"},
+          {title, 12, true},
+          {"合计", 12, false},
+        }},
+      },
+    })
+    out.xlsx = x.path
+    out.xlsx_size = x.size
+
+    -- ② PDF：CJK 走最小字体子集嵌入；字体缺字会被侧车直接报错，绝不画方框
+    local p = ctx.ext.pdf.write({
+      path = pdf_path,
+      root = root,
+      pages = {{text = title .. "\n中文正文：这是一份零依赖生成的对账单。"}},
+    })
+    out.pdf = p.path
+    out.pdf_size = p.size
+    return true
+  end)
+  if not ok then
+    out.error = tostring(r)
+  end
+  return out

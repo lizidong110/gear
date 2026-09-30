@@ -62,7 +62,21 @@ gear_app(action: start|stop|status|list, flow_id?, app_id?, restart?, replace?, 
 ## 5. `start.ports` 为什么要声明
 
 端口声明用于①台账探活、②`stop` 后复检释放。不声明则只按 pid 判存活——能用，但
-「进程在、端口没起」这类半死状态就检测不出来。所以 **bundle 里把端口写进 `start.ports`**。
+「进程在、端口没起」这类半死状态就检测不出来。
+
+**生效来源（2026-09-27 起，REQ-MCP-PORTS-ONE-TRUTH）是一条回退链**：
+
+```
+起服入参（gear_app(start, ports=[...]) / gear app start --port N）
+  > App 清单的 start.ports
+  > 无（只按 pid 判存活）
+```
+
+- 入参**优先**于清单：临时换端口不用改 bundle。
+- 入参缺省时自动回退清单（按 entry_flow 反查；**恰好一个** App 命中才回退——多个 App
+  共用同一 entry_flow 时歧义即放弃，请显式传）。
+- start 的返回里 `ports_source: explicit|bundle|none` 如实说明本次用了哪份；
+  排查「探活为什么没生效」先看它。
 
 ## 6. App Bundle（交付形态）
 

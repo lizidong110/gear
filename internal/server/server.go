@@ -14,8 +14,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -69,6 +71,17 @@ type Server struct {
 	gate          *ConcurrencyGate
 	maxConcurrent int // worker 数（并发执行上限）；0 表示取默认
 	execQueueSize int // 待执行队列长度；0 表示取默认
+
+	// apiIdx 缓存声明式 REST 路由的解析索引（FR-3）：按 registry 的 Tool 表指纹失效，
+	// 因此运行期新建 / 改声明的 Tool 不必重启就生效。零值时按「未缓存」使用。
+	apiIdx apiIndex
+
+	// onListen 在**监听绑定成功、开始 Serve 之前**回调真实地址。
+	//
+	// 为什么需要它：addr=":0" 时真实端口只有内核知道，而 ListenAndServe 是阻塞的、
+	// 调用方（CLI）在它返回前无法打印任何东西。没有这个钩子，「我实际在哪个端口」这件事
+	// 对调用方完全不可见——而那正是长驻子进程要向 Flow 上报的东西。
+	onListen func(realAddr string)
 }
 
 // ServerOption 调整 Server 的构造期配置（目前仅并发闸门相关）。
@@ -91,6 +104,10 @@ func WithRegistryPath(p string) ServerOption { return func(s *Server) { s.regist
 
 // WithAppsDir 显式指定应用台账目录（覆盖 <registry 同目录>/apps 的推导）。
 func WithAppsDir(d string) ServerOption { return func(s *Server) { s.appsDir = d } }
+
+// WithOnListen 注册「监听绑定成功」回调，参数是**真实**绑定地址（含内核分配的端口号）。
+// 回调在 Serve 之前同步执行，故可安全地在里面打印（CLI 用它把真实端口吐给父进程解析）。
+func WithOnListen(h func(realAddr string)) ServerOption { return func(s *Server) { s.onListen = h } }
 
 // New 构造 Server（不启动监听）。支持构造期选项（如 WithMaxConcurrent /
 // WithExecQueueSize 调并发闸门，REQ-CONCURRENCY-CROSS / #73）。
@@ -139,7 +156,9 @@ func New(reg *registry.Registry, opts ...ServerOption) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("初始化扩展失败: %w", err)
 	}
-	s.engine = engine.New(reg, engine.WithLogSink(s.execs.LogSink()), engine.WithCapabilities(capReg), engine.WithAIAgent(agent), engine.WithSecret(s.secrets))
+	s.engine = engine.New(reg, engine.WithLogSink(s.execs.LogSink()), engine.WithCapabilities(capReg), engine.WithAIAgent(agent), engine.WithSecret(s.secrets),
+		// 配置库（config 原语 + AI 缺省配置）：与 CLI 同一个库（gearhome.ConfigDBPath()）。
+		engine.WithConfigStore(engine.NewDefaultConfigStore()))
 	// §8.2 第三条守卫需要「运行期引用」，而运行期状态在 Server 手里 —— 由这里注入，
 	// registry 不反向依赖执行状态。
 	reg.SetRunningChecker(s.runningToolReason)
@@ -163,31 +182,67 @@ func (s *Server) runningToolReason(toolID string) string {
 func (s *Server) Handler() http.Handler { return s.mux }
 
 // serverBaseURL 计算 gear 自身回推基址（供 subscribe 机制拼回推端点 /api/events/{handle}）。
-// addr 是 ListenAndServe 的监听地址：":port" 补 127.0.0.1，空回退默认 8787，已带 scheme 前缀则原样。
-func serverBaseURL(addr string) string {
-	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
-		return strings.TrimRight(addr, "/")
+// addr 是**监听绑定后的真实地址**（realAddr）：":port" 补 127.0.0.1，空回退 127.0.0.1:8787，
+// 已带 scheme 前缀则原样。
+//
+// 必须传真实地址、不能传用户给的 addr：addr=":0"（自动分配）时 user 给的还是 ":0"，
+// 拼出的回推基址是 http://127.0.0.1:0 —— subscribe 会往一个死端口回推。
+func serverBaseURL(realAddr string) string {
+	if strings.HasPrefix(realAddr, "http://") || strings.HasPrefix(realAddr, "https://") {
+		return strings.TrimRight(realAddr, "/")
 	}
-	if addr == "" {
-		addr = ":8787"
+	if realAddr == "" {
+		realAddr = "127.0.0.1:8787"
 	}
-	if strings.HasPrefix(addr, ":") {
-		addr = "127.0.0.1" + addr
+	if strings.HasPrefix(realAddr, ":") {
+		realAddr = "127.0.0.1" + realAddr
 	}
-	return "http://" + addr
+	return "http://" + realAddr
+}
+
+// realAddrOf 从 net.Listener 解析出「host:port」真实绑定地址（错误一律向上抛，绝不静默回退）。
+func realAddrOf(ln net.Listener) (string, error) {
+	switch addr := ln.Addr().(type) {
+	case *net.TCPAddr:
+		host := addr.IP.String()
+		if host == "0.0.0.0" || host == "::" {
+			host = "127.0.0.1"
+		}
+		return net.JoinHostPort(host, strconv.Itoa(addr.Port)), nil
+	case *net.UDPAddr:
+		return ln.Addr().String(), nil
+	default:
+		return "", fmt.Errorf("未知 listener 地址类型 %T，无法解析真实端口", ln.Addr())
+	}
 }
 
 // ListenAndServe 启动 HTTP 服务（阻塞）。
+//
+// 用 net.Listen 显式建监听、再 srv.Serve(ln)，而非 http.Server.ListenAndServe(addr)：
+// 后者在 addr=":0" 时内核分配的真实端口无从回读，调用方（process runtime 的长驻子进程
+// 上报、CLI banner）拿到的就是 ":0"。端口由**内核**分配（不是自己从基址逐个试）就没有
+// TOCTOU 窗口——试成功→释放→被别人抢，两个实例会挑到同一个口，且都报成功。
 func (s *Server) ListenAndServe(addr string) error {
-	// subscribe 机制的回推回调 URL 由 gear 自身监听地址派生（每个 gear 实例独立），
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	realAddr, err := realAddrOf(ln)
+	if err != nil {
+		_ = ln.Close()
+		return err
+	}
+	// subscribe 机制的回推回调 URL 由 gear 自身**真实**监听地址派生（每个 gear 实例独立），
 	// 而非经 env 传给 sidecar（多 gear 并行时单一 env 会串扰）。
-	s.engine.SetSubscribeCallbackBase(serverBaseURL(addr))
+	s.engine.SetSubscribeCallbackBase(serverBaseURL(realAddr))
+	if s.onListen != nil {
+		s.onListen(realAddr)
+	}
 	srv := &http.Server{
-		Addr:              addr,
 		Handler:           s.mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	return srv.ListenAndServe()
+	return srv.Serve(ln)
 }
 
 // Shutdown 停止所有受管 app 并**等待其收敛**（供测试与优雅退出使用）。
@@ -250,6 +305,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/apps", s.handleListApps)
 	s.mux.HandleFunc("POST /api/apps/prune", s.handlePruneApps)
 	s.mux.HandleFunc("DELETE /api/apps/{id}", s.handleDeleteApp)
+
+	// 声明式资源路由（FR-3）：Tool YAML 里写了 `api:` 的就在这几个挂载点上生效，
+	// 由 handleToolAPIAny 在**请求期**按 registry 当前的声明匹配到具体 Tool。
+	// 用「每方法一条 /api/{path...}」而不是「每条声明一条」：后者会因同名 pattern
+	// 二次注册而 panic（net/http 实测行为），「改声明 / 删 Tool / 运行期新建 Tool」
+	// 每次都会把服务打挂——挂载点只有一条，就没有「注册即固化」这个坑。
+	for _, m := range []string{"GET", "POST", "PUT", "PATCH", "DELETE"} {
+		s.mux.HandleFunc(m+" /api/{path...}", s.handleToolAPIAny)
+	}
 }
 
 // ---- 通用响应helper ----
@@ -467,7 +531,10 @@ func (s *Server) handleRunTool(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("入参不是合法 JSON 对象: %w", derr))
 		return
 	}
-	out, err := s.engine.RunTool(id, input)
+	// 身份链路（IDENTITY_CONTEXT_DESIGN.md §3.5）：REST 是**真身份面**，在引擎边界把
+	// 调用主体注入执行上下文，此后 Hook 与 ctx.caller 都能看到。
+	ctx := engine.WithCaller(r.Context(), callerOf(r))
+	out, err := s.engine.RunToolExec(ctx, id, input, "")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -569,7 +636,8 @@ func (s *Server) handleCreateTool(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.reg.UpsertTool(&t); err != nil {
+	// ③ 审计：把调用主体记进 definition_history.actor，否则这条历史查出来是「无主变更」。
+	if err := s.reg.UpsertTool(&t, registry.WithActor(subjectOf(r))); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
@@ -578,7 +646,7 @@ func (s *Server) handleCreateTool(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteTool(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.reg.DeleteTool(id); err != nil {
+	if err := s.reg.DeleteTool(id, registry.WithActor(subjectOf(r))); err != nil {
 		writeErr(w, statusForErr(err), err)
 		return
 	}
@@ -610,7 +678,7 @@ func (s *Server) handlePromoteVersion(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("非法目标状态: %q（应为 draft/testing/stable/deprecated/rejected）", req.Target))
 		return
 	}
-	if err := s.engine.PromoteTool(toolID, version, target); err != nil {
+	if err := s.engine.PromoteTool(toolID, version, target, registry.WithActor(subjectOf(r))); err != nil {
 		writeErr(w, statusForErr(err), err)
 		return
 	}
@@ -646,7 +714,7 @@ func (s *Server) handleCreateFlow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.reg.UpsertFlow(&f); err != nil {
+	if err := s.reg.UpsertFlow(&f, registry.WithActor(subjectOf(r))); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
@@ -689,7 +757,7 @@ func (s *Server) handleCreateHook(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.reg.UpsertHook(&h); err != nil {
+	if err := s.reg.UpsertHook(&h, registry.WithActor(subjectOf(r))); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
@@ -702,7 +770,7 @@ func (s *Server) handleCreateHook(w http.ResponseWriter, r *http.Request) {
 // 不重复实现判定（守卫必须只有一份，否则 CLI 与 REST 会漂移）。
 func (s *Server) handleDeleteFlow(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.reg.DeleteFlow(id); err != nil {
+	if err := s.reg.DeleteFlow(id, registry.WithActor(subjectOf(r))); err != nil {
 		writeErr(w, statusForErr(err), err)
 		return
 	}
@@ -714,7 +782,7 @@ func (s *Server) handleDeleteFlow(w http.ResponseWriter, r *http.Request) {
 // 不静默 no-op。
 func (s *Server) handleDeleteHook(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.reg.DeleteHook(id); err != nil {
+	if err := s.reg.DeleteHook(id, registry.WithActor(subjectOf(r))); err != nil {
 		writeErr(w, statusForErr(err), err)
 		return
 	}
@@ -745,16 +813,22 @@ func (s *Server) handleCreateExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rec := s.execs.Create(req.FlowID)
+	// 身份链路（IDENTITY_CONTEXT_DESIGN.md §3.5）：把调用主体**在派发前抓成字符串**。
+	// 不能沿用 r.Context() 进这个闭包——执行是在闸门 worker 里异步跑的，handler 一返回
+	// 请求 ctx 就被取消，跑到一半会被判超时。抓字符串、在这里重新构造活着的 ctx 才对。
+	// 必须在 Create **之前**取：主体要一起落进执行记录，而下面那条 429 分支也要用到它。
+	caller := callerOf(r)
+	rec := s.execs.Create(req.FlowID, caller.Subject)
 	// 经并发闸门派发（REQ-CONCURRENCY-CROSS / #73）：worker 全忙且队列已满 → 拒绝（背压），
 	// 执行记录置 rejected 并回 429，由调用方决定退避重试，而非放任高扇出打爆机器。
 	job := func() {
 		// 引擎在加载完 Flow + Hook 快照后回报「本次可能用到的 Tool」，
 		// 作为 §8.2「运行中不可注销」守卫的判据（静态引用可能已被删/改）。
 		// RunFlowExec 带上 exec id，使 step 运行日志经 logSink 落盘（REQ-API-LOGS / #71）。
-		res, runErr := s.engine.RunFlowExec(rec.FlowID, rec.ID, func(toolIDs []string) {
-			s.execs.SetTools(rec.ID, toolIDs)
-		})
+		res, runErr := s.engine.RunFlowExecCtx(
+			engine.WithCaller(context.Background(), caller), rec.FlowID, rec.ID, func(toolIDs []string) {
+				s.execs.SetTools(rec.ID, toolIDs)
+			})
 		s.execs.Finish(rec.ID, res, runErr)
 	}
 	if !s.gate.Submit(job) {

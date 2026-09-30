@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"gear/internal/cap"
 	"gear/internal/engine"
 	"gear/internal/model"
 )
@@ -166,23 +167,30 @@ func TestDoctorReportsAIReadiness(t *testing.T) {
 	f := newSmokeFixture(t)
 	var doc struct {
 		AI struct {
-			Provider   string `json:"provider"`
-			KeyFromEnv bool   `json:"key_from_env"`
-			Ready      bool   `json:"ready"`
-			Blocked    string `json:"blocked"`
-			HowToFix   string `json:"how_to_fix"`
-			KeyEnv     string `json:"key_env"`
+			Provider      string `json:"provider"`
+			KeyFromEnv    bool   `json:"key_from_env"`
+			KeyFromConfig bool   `json:"key_from_config"`
+			Ready         bool   `json:"ready"`
+			Blocked       string `json:"blocked"`
+			HowToFix      string `json:"how_to_fix"`
+			KeyEnv        string `json:"key_env"`
 		} `json:"ai"`
 		Warnings []string `json:"warnings"`
 	}
+
+	// 隔离配置库：doctor 的 aiReadiness 现在会读「配置库层」（gear config set ai.*），
+	// 而真实 config.db 可能已被用户在别处配过 key——不隔离就会读到真实库、断言失真。
+	// 指到临时空库即确定性地走「配置库也没配」分支。
+	cfgDB := filepath.Join(t.TempDir(), "config.db")
+	t.Setenv("GEAR_CONFIG_DB", cfgDB)
 
 	t.Setenv("GEAR_AI_API_KEY", "")
 	callTool(t, f.session, "gear_doctor", nil, &doc)
 	if doc.AI.Provider == "" || doc.AI.KeyEnv != "GEAR_AI_API_KEY" {
 		t.Fatalf("ai 块缺基本信息: %+v", doc.AI)
 	}
-	if doc.AI.Ready || doc.AI.KeyFromEnv {
-		t.Fatalf("未设 Key 时应报未就绪: %+v", doc.AI)
+	if doc.AI.Ready || doc.AI.KeyFromEnv || doc.AI.KeyFromConfig {
+		t.Fatalf("env 与配置库都没设 Key 时应报未就绪: %+v", doc.AI)
 	}
 	if doc.AI.Blocked == "" || doc.AI.HowToFix == "" {
 		t.Fatalf("未就绪必须给出阻塞原因与修法: %+v", doc.AI)
@@ -193,6 +201,28 @@ func TestDoctorReportsAIReadiness(t *testing.T) {
 	// 绝不能在响应里出现明文——key_env 只能是**变量名**。
 	if strings.Contains(doc.AI.Blocked, "sk-") {
 		t.Fatal("响应泄漏了疑似密钥明文")
+	}
+
+	// 配置库层就绪：把 ai.api_key 写进临时库，doctor 应认到 key_from_config=true 且 ready。
+	store := cap.NewConfigStore(cfgDB)
+	if err := store.Set("ai.api_key", "sk-from-config-not-real"); err != nil {
+		t.Fatalf("写临时配置库失败: %v", err)
+	}
+	_ = store.Close()
+
+	var docCfg struct {
+		AI struct {
+			KeyFromEnv    bool `json:"key_from_env"`
+			KeyFromConfig bool `json:"key_from_config"`
+			Ready         bool `json:"ready"`
+		} `json:"ai"`
+	}
+	callTool(t, f.session, "gear_doctor", nil, &docCfg)
+	if !docCfg.AI.KeyFromConfig || !docCfg.AI.Ready {
+		t.Fatalf("配置库有 key 时应报就绪（key_from_config）: %+v", docCfg.AI)
+	}
+	if docCfg.AI.KeyFromEnv {
+		t.Fatalf("配置库就绪不应污染 env 标记: %+v", docCfg.AI)
 	}
 
 	t.Setenv("GEAR_AI_API_KEY", "sk-test-not-a-real-key")

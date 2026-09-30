@@ -72,9 +72,16 @@ func (s *Server) handleApp(ctx context.Context, _ *mcp.CallToolRequest, in AppAr
 			out["last_logs"] = res.LastLogs
 		}
 		if res.State == string(app.StateStartupFailed) {
-			// 短等窗口内进程就退出了：这不是「启动成功」，如实说明并指向日志。
+			// 短等窗口内进程就退出了：这不是「启动成功」。根因由内核从监管进程日志里挑出
+			// （res.Reason，见 internal/app/launch_reason.go 的口径）；挑不出就如实指向日志，
+			// 不再印那句对所有故障都成立的「常见原因」清单。
 			out["error"] = "进程在短等窗口内退出（见 last_logs）"
-			out["hint"] = "常见原因：端口被占、侧车未构建、registry 路径不符；先用 gear_doctor 看环境"
+			if res.Reason != "" {
+				out["reason"] = res.Reason
+				out["hint"] = "按 reason 给出的根因去改；认不出根因时（reason 与原文一致）才需要读 last_logs"
+			} else {
+				out["hint"] = "读 last_logs 找根因"
+			}
 			return nil, out, nil
 		}
 		// hint 按 escaped_job 分三种：已脱离才敢承诺，未脱离要说破，未探测也不能承诺。

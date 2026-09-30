@@ -82,6 +82,12 @@ type Tool struct {
 	//
 	// 该值在**注册期**即解析校验（非法即拒绝注册），不留到运行期。
 	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	// API 是可选字段（ENTERPRISE_PRD FR-3）：声明了就额外挂一条 RESTful 资源路由
+	// （如 `GET /api/orders/{id}`），路径参数映射进 Tool 输入、响应体即 Tool 输出。
+	//
+	// 未声明的 Tool **行为一字不变**——这是 AC-C4 的红线，注册期只当它不存在。
+	// 声明是「加挂」而不是「替换」：`POST /api/tools/{id}/run` 照旧可用。
+	API *APIRoute `yaml:"api,omitempty" json:"api,omitempty"`
 }
 
 // ExecTimeout 解析 Tool 声明的执行超时。

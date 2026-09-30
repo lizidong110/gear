@@ -1,6 +1,8 @@
 /* mindstorm 前端 —— Finder 风格三栏思维导图（原生 JS，零依赖）
  *
  * 后端契约：所有操作经 POST /api/tools/{id}/run（body=入参 map，响应 {id,output}）。
+ *   调用统一走 api.js（gen-client.mjs 从 Tool YAML 生成）暴露的 API.* 方法，
+ *   不在此文件里手写 tool id 字符串；AI 流式路径（SSE 直调 ext.ai）除外。
  * 视图状态（当前树 / 选中节点 / 聚焦根 / 阅读编辑模式）存 localStorage，便于刷新后恢复。
  *
  * 渲染策略：中栏是「聚焦 3 级窗口」——以 focusId 为锚，只渲染其下最多 3 级，
@@ -16,22 +18,6 @@ const el = (tag, cls, txt) => {
   if (txt != null) e.textContent = txt;
   return e;
 };
-
-/* ---------- API ---------- */
-async function api(tool, input) {
-  const res = await fetch(`/api/tools/${tool}/run`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input || {}),
-  });
-  if (!res.ok) {
-    let msg = `请求失败 ${res.status}`;
-    try { const e = await res.json(); msg = e.error || msg; } catch (_) {}
-    throw new Error(msg);
-  }
-  const data = await res.json();
-  return data.output;
-}
 
 /* ---------- Markdown（阅读模式渲染，零依赖、转义防 XSS） ---------- */
 function escapeHtml(s) {
@@ -107,6 +93,7 @@ const state = {
   catFilter: "",       // 左栏分类筛选（"" = 全部）
   searchQ: "",         // 左栏搜索关键词（非空时左栏显示搜索结果）
   searchHits: [],      // 搜索结果缓存
+  aiCfg: {},           // AI 配置（内核配置库 config.db 持久化，与 gear config 同源），SSE 直调 ext.ai 时作调用参数带上
   nodes: {},           // id -> node (含 _parent / _expanded / _childrenLoaded / _children / _tags)
   roots: [],           // root node 列表（_parent=null）
   visible: [],         // 当前可见节点 id（渲染顺序，键盘导航用）
@@ -117,8 +104,6 @@ const LS = {
   set tree(v) { localStorage.setItem("mindstorm.tree", v); },
   get node() { return localStorage.getItem("mindstorm.node"); },
   set node(v) { v ? localStorage.setItem("mindstorm.node", v) : localStorage.removeItem("mindstorm.node"); },
-  get mode() { return localStorage.getItem("mindstorm.mode"); },
-  set mode(v) { localStorage.setItem("mindstorm.mode", v); },
   // AI 续写要求：是「意图」而非「数据」，刷新后保留能省去重复输入。
   get instr() { return localStorage.getItem("mindstorm.instr") || ""; },
   set instr(v) { v ? localStorage.setItem("mindstorm.instr", v) : localStorage.removeItem("mindstorm.instr"); },
@@ -134,7 +119,8 @@ function toast(msg, isErr) {
   t.style.background = isErr ? "#5a1d1d" : "#333";
   t.classList.add("show");
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => t.classList.remove("show"), 2600);
+  // 错误消息停留 8 秒且可点击关闭（此前 2.6s 一闪而过，「没看清报了什么错」——2026-09-24）
+  toast._t = setTimeout(() => t.classList.remove("show"), isErr ? 8000 : 2600);
 }
 function showBanner(msg) {
   const b = $("#banner");
@@ -198,6 +184,95 @@ function ask(opts) {
   });
 }
 
+/* ---------- AI 配置面板（⚙） ----------
+ * 把 AI 相关配置（provider / 端点 / 模型 / api_key）放进界面并持久化到内核配置库（config.db，
+ * 经 ctx.config，与 `gear config set ai.*` 同源），替代「每次在命令行 export GEAR_AI_API_KEY 再起服务」。后端两侧都认这份配置：
+ *   - Tool 同步路径：mindstorm_ai.yaml 的 aiCfg() 从库里读出来，作为 ext.ai.complete 调用参数；
+ *   - 前端流式路径：state.aiCfg 在 boot 时拉一次，streamComplete 直接带在 SSE 调用参数里。
+ * 留空的字段 = 不覆盖，回退引擎默认链（调用参数 → GEAR_AI_* 环境变量 → 内置默认）。
+ */
+function openSettings() {
+  const back = el("div", "modal-back");
+  const box = el("div", "modal settings-modal");
+  box.appendChild(el("div", "modal-msg", "AI 配置"));
+
+  const mkRow = (labelText, input, hint) => {
+    const wrap = el("div", "set-row");
+    wrap.appendChild(el("label", "set-label", labelText));
+    wrap.appendChild(input);
+    if (hint) wrap.appendChild(el("span", "hint-inline", hint));
+    return wrap;
+  };
+
+  const provider = el("select", "modal-input");
+  for (const p of ["", "siliconflow", "openai", "ollama"]) {
+    const opt = el("option", null, p === "" ? "（默认 siliconflow）" : p);
+    opt.value = p;
+    if ((state.aiCfg.ai_provider || "") === p) opt.selected = true;
+    provider.appendChild(opt);
+  }
+  const base = el("input", "modal-input");
+  base.value = state.aiCfg.ai_base_url || "";
+  base.placeholder = "留空用 provider 默认端点（如 https://api.siliconflow.cn/v1）";
+  const model = el("input", "modal-input");
+  model.value = state.aiCfg.ai_model || "";
+  model.placeholder = "留空用 provider 默认模型";
+  const key = el("input", "modal-input");
+  key.type = "password";
+  key.value = state.aiCfg.ai_api_key || "";
+  key.placeholder = state.aiCfg.ai_api_key ? "已保存（输入新值可覆盖，清空并保存 = 删除）" : "sk-…";
+  box.appendChild(mkRow("Provider", provider));
+  box.appendChild(mkRow("API 端点", base));
+  box.appendChild(mkRow("模型", model));
+  box.appendChild(mkRow("API Key", key, "只存在本地 mindstorm.db，不上传"));
+
+  const actions = el("div", "modal-actions");
+  const cancel = el("button", "tiny", "取消");
+  const ok = el("button", "tiny primary", "保存");
+  actions.appendChild(cancel); actions.appendChild(ok);
+  box.appendChild(actions);
+  back.appendChild(box);
+  document.body.appendChild(back);
+
+  const done = (val) => { document.removeEventListener("keydown", onKey, true); back.remove(); if (val) val(); };
+  const onKey = (e) => {
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); done(); }
+    else if (e.key === "Enter" && e.target.tagName !== "SELECT") { e.preventDefault(); e.stopPropagation(); ok.onclick(); }
+  };
+  document.addEventListener("keydown", onKey, true);
+  cancel.onclick = () => done();
+  back.onclick = (e) => { if (e.target === back) done(); };
+  ok.onclick = async () => {
+    const cfg = {
+      ai_provider: provider.value,
+      ai_base_url: base.value.trim(),
+      ai_model: model.value.trim(),
+      ai_api_key: key.value.trim(),
+    };
+    try {
+      await API.settingsSet(cfg);
+      state.aiCfg = cfg;   // 本地缓存同步更新，流式路径立即生效，无需刷新
+      updateCfgBtnTitle();
+      done(() => toast("AI 配置已保存"));
+    } catch (e) { toast("保存失败：" + e.message, true); }
+  };
+  setTimeout(() => (state.aiCfg.ai_api_key ? ok : key).focus(), 0);
+}
+
+function updateCfgBtnTitle() {
+  const btn = $("#aiCfgBtn");
+  if (btn) btn.title = state.aiCfg.ai_api_key
+    ? "AI 配置（已设置 Key）" : "AI 配置（未设置 Key：真实生成会失败，可先用 demo 勾选体验）";
+}
+
+async function loadSettings() {
+  try {
+    const out = await API.settingsGet({});
+    state.aiCfg = out.settings || {};
+    updateCfgBtnTitle();
+  } catch (_) { /* 拉不到就维持空配置（回退环境变量） */ }
+}
+
 /* ---------- 左栏：搜索 / 分类 / 思维树 ---------- */
 function renderCats() {
   const box = $("#catChips");
@@ -259,7 +334,7 @@ async function editTreeField(t, field, cur) {
   const payload = { id: t.id };
   if (field === "title") payload.title = val; else payload.category = val;
   try {
-    await api("mindstorm__tree_update", payload);
+    await API.treeUpdate(payload);
     toast("已更新");
     await loadTrees();
     if (state.currentTree === t.id) {
@@ -269,7 +344,7 @@ async function editTreeField(t, field, cur) {
   } catch (e) { toast("更新失败：" + e.message, true); }
 }
 async function loadTrees() {
-  const out = await api("mindstorm__tree_list", {});
+  const out = await API.treeList({});
   state.trees = out.trees || [];
   renderCats();
   renderTrees();
@@ -286,7 +361,7 @@ async function runSearch(q) {
   state.searchQ = q;
   if (!q) { state.searchHits = []; renderTrees(); return; }
   try {
-    const out = await api("mindstorm__search", { q });
+    const out = await API.search({ q });
     state.searchHits = out.nodes || [];
   } catch (e) {
     state.searchHits = [];
@@ -329,14 +404,14 @@ async function openSearchResult(treeId, nodeId) {
 /* 把某节点在树上「滚出来」：焦点设到能看见它的祖先，展开链路后选中 */
 async function revealNode(nodeId) {
   let full;
-  try { full = await api("mindstorm__node_get", { id: nodeId }); } catch (e) { toast("定位失败：" + e.message, true); return; }
+  try { full = await API.nodeGet({ id: nodeId }); } catch (e) { toast("定位失败：" + e.message, true); return; }
   const chain = String(full.path || "").split("/").filter(Boolean);  // root..node
   const D = chain.length - 1;
   const d0 = Math.max(0, D - MAX_REL);
   // 加载链上缺失节点
   for (const nid of chain) {
     if (!state.nodes[nid]) {
-      try { const f = await api("mindstorm__node_get", { id: nid }); cacheNode(f, f.parent_id || null); } catch (_) {}
+      try { const f = await API.nodeGet({ id: nid }); cacheNode(f, f.parent_id || null); } catch (_) {}
     }
   }
   state.focusId = d0 === 0 ? null : chain[d0];
@@ -351,7 +426,7 @@ async function newTree() {
   const title = await ask({ message: "新建思维树", input: true, defaultValue: "未命名想法", placeholder: "输入标题" });
   if (!title) return;
   const id = genId();
-  await api("mindstorm__tree_create", { id, title, category: "" });
+  await API.treeCreate({ id, title, category: "" });
   // 新建后退出搜索态，回到树列表
   state.searchQ = ""; state.searchHits = []; if ($("#searchBox")) $("#searchBox").value = "";
   await loadTrees();
@@ -362,7 +437,7 @@ async function deleteTree(t) {
     message: `删除思维树「${t.title}」及其所有节点？\n此操作不可撤销。`,
     okText: "删除", danger: true,
   }))) return;
-  await api("mindstorm__tree_delete", { id: t.id });
+  await API.treeDelete({ id: t.id });
   if (state.currentTree === t.id) { state.currentTree = null; state.roots = []; state.selected = null; renderTrees(); renderMiddle(); renderDetail(); }
   await loadTrees();
 }
@@ -398,7 +473,7 @@ async function ensureSubtree(id, levels) {
 }
 
 async function loadRoots() {
-  const out = await api("mindstorm__node_children", { tree_id: state.currentTree });
+  const out = await API.nodeChildren({ tree_id: state.currentTree });
   state.roots = (out.nodes || []).map((n) => cacheNode(n, null));
 }
 function cacheNode(n, parentId) {
@@ -415,7 +490,7 @@ async function ensureChildren(id) {
   if (!node || node._childrenLoaded) return;
   node._loading = true; renderMiddle();
   try {
-    const out = await api("mindstorm__node_children", { tree_id: state.currentTree, parent_id: id });
+    const out = await API.nodeChildren({ tree_id: state.currentTree, parent_id: id });
     node._children = (out.nodes || []).map((c) => cacheNode(c, id));
     node.child_count = node._children.length;
     node._childrenLoaded = true;
@@ -561,7 +636,7 @@ function renderDetail() {
     // 阅读模式引导：一键进编辑模式（那里才有 AI 续写 / 生成轮廓 / 删除）
     const hint = el("button", "tiny hint-btn",
       "👉 切到「✏️ 编辑」可 AI 续写子节点 / 生成完整轮廓 / 删除节点");
-    hint.onclick = () => { state.readMode = false; LS.mode = "edit"; renderDetail(); };
+    hint.onclick = () => { state.readMode = false; renderDetail(); };
     box.appendChild(hint);
     return;
   }
@@ -618,6 +693,13 @@ function renderDetail() {
   const demo = el("input"); demo.type = "checkbox"; demo.id = "demoChk";
   const demoLbl = el("label", null, "demo（无 Key 也能试）"); demoLbl.prepend(demo);
   row.appendChild(demoLbl);
+  // 联网检索（2026-09-24）：勾上后生成前先用必应搜一次节点标题+要求，把结果锚进 prompt。
+  // 解决「纯记忆生成」对领域知识类主题（如软考考纲）自由发挥、结构跑偏的问题。默认不勾——
+  // 大多数节点是纯组织性内容，搜了反而掺噪声、多等几秒。
+  const web = el("input"); web.type = "checkbox"; web.id = "webChk";
+  const webLbl = el("label", null, "🔍 联网检索"); webLbl.prepend(web);
+  row.appendChild(webLbl);
+  row.appendChild(el("span", "hint-inline", "（考纲/标准/技术选型类主题建议勾上）"));
   // regroup 只对「续写一层」有意义（分层大纲本就是一次整体生成），层>1 时禁用并解释
   const syncRegroup = () => {
     const multi = (parseInt(depth.value, 10) || 1) > 1;
@@ -670,7 +752,7 @@ function appendTags(box, node, editable) {
         x.title = "移除标签";
         x.onclick = async () => {
           try {
-            await api("mindstorm__tag_remove", { node_id: node.id, tag });
+            await API.tagRemove({ node_id: node.id, tag });
             node._tags = (node._tags || []).filter((t) => t !== tag);
             renderChips(); toast("已移除标签");
           } catch (e) { toast("移除失败：" + e.message, true); }
@@ -690,7 +772,7 @@ function appendTags(box, node, editable) {
     const tag = inp.value.trim();
     if (!tag) return;
     try {
-      await api("mindstorm__tag_add", { node_id: node.id, tag });
+      await API.tagAdd({ node_id: node.id, tag });
       node._tags = [...new Set([...(node._tags || []), tag])];
       inp.value = ""; renderChips(); toast("已加标签");
     } catch (e) { toast("加标签失败：" + e.message, true); }
@@ -704,7 +786,7 @@ function appendTags(box, node, editable) {
 async function saveNode(id) {
   const n = state.nodes[id]; if (!n) return;
   try {
-    await api("mindstorm__node_update", { id, title: n.title, summary: n.summary, body: n.body });
+    await API.nodeUpdate({ id, title: n.title, summary: n.summary, body: n.body });
   } catch (e) { toast("保存失败：" + e.message, true); }
 }
 
@@ -774,10 +856,21 @@ const AI_STALL_REPEAT = 5;
 // opts: { signal?: AbortSignal, onStall?: (kind: "idle"|"repeat", gapMs: number) => void }
 async function streamComplete(system, prompt, onDelta, opts) {
   const o = opts || {};
+  // 带上设置面板里保存的 AI 配置（key/model/端点）——SSE 直调 ext.ai 不经过后端 Tool，
+  // 不带的话会回退环境变量，界面里配了等于没配。
+  // 注意：settings_get 返回的字段名是 ai_*（对应 config.db 里的 ai.* 键），ext.ai 调用参数名不带前缀（api_key/base_url/model/provider），
+  // 必须改名；原样塞 ai_* 会被 ext.ai 静默忽略（多出来的字段不报错），回退后表现为 401 Token invalid。
+  const s = state.aiCfg || {};
+  const cfg = {};
+  if (s.ai_provider) cfg.provider = s.ai_provider;
+  if (s.ai_base_url) cfg.base_url = s.ai_base_url;
+  if (s.ai_model) cfg.model = s.ai_model;
+  if (s.ai_api_key) cfg.api_key = s.ai_api_key;
   const res = await fetch("/api/capabilities/invoke/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: "ext.ai", method: "complete_stream", args: { system, prompt, format: "json" } }),
+    body: JSON.stringify({ name: "ext.ai", method: "complete_stream",
+      args: Object.assign({ system, prompt, format: "json" }, cfg) }),
     signal: o.signal,
   });
   if (!res.ok) throw new Error("流式接口返回 " + res.status);
@@ -805,6 +898,12 @@ async function streamComplete(system, prompt, onDelta, opts) {
         if (!payload) continue;
         let obj = null;
         try { obj = JSON.parse(payload); } catch { continue; }
+        // 服务端出错发 event:error + {"error":...}。必须立刻抛出，把真实原因
+        // （key 无效 / 端点不通 / 超时）透给用户——此前被静默吞掉，acc 为空，
+        // 最后报成误导性的「未能解析出子主题」（2026-09-24 实测踩坑）。
+        if (obj && typeof obj.error === "string" && obj.error) {
+          throw new Error("AI 服务报错: " + obj.error);
+        }
         if (obj && typeof obj.delta === "string" && obj.delta) {
           acc += obj.delta;
           lastAt = Date.now();
@@ -855,6 +954,25 @@ function updateStreamBar(titles, stage, opts) {
 }
 function hideStreamBar() { const b = $("#streamBar"); if (b) b.style.display = "none"; }
 
+/* 生成前联网检索：勾选「🔍 联网检索」时调用，把必应搜索结果转成 prompt 锚定资料。
+ * 检索失败不阻塞主流程——toast 提示后返回空串，等价于「无检索直接生成」（降级路径）。 */
+async function webContextFor(title, instruction) {
+  if (!$("#webChk") || !$("#webChk").checked) return "";
+  const q = [title, instruction].filter((x) => x && x.trim()).join(" ").trim();
+  if (!q) return "";
+  try {
+    const out = await API.webSearch({ query: q });
+    const n = (out.results || []).length;
+    if (n) toast(`🔍 已检索到 ${n} 条参考资料，正在生成…`);
+    return out.text || "";
+  } catch (e) {
+    // 剥掉后端带出来的 stack traceback，toast 只留人能读的原因
+    const why = String(e.message || "").replace(/。?\s*stack traceback[\s\S]*$/, "");
+    toast("联网检索不可用（" + why + "），改为直接生成", true);
+    return "";
+  }
+}
+
 async function aiExpand(id, count, depth, instruction, btn, regroup) {
   depth = depth || 1;
   const node = state.nodes[id];
@@ -869,11 +987,12 @@ async function aiExpand(id, count, depth, instruction, btn, regroup) {
     if (demo) {
       // demo 秒回，不需要流式
       toast("demo 模式，直接生成…");
-      out = await api("mindstorm__expand", { node_id: id, count, depth, instruction: instruction || "", demo: true, mode });
+      out = await API.expand({ node_id: id, count, depth, instruction: instruction || "", demo: true, mode });
     } else {
+      // ⓪ 联网检索（勾选时）：先搜后生成，资料经 web_context 进 prompt（后端 dry_run 组装时带上）
+      const webctx = await webContextFor(node ? node.title : "", instruction);
       // ① 取 prompt（后端组装，秒回）
-      const p = await api("mindstorm__expand",
-        { node_id: id, count, depth, instruction: instruction || "", mode, dry_run: true });
+      const p = await API.expand({ node_id: id, count, depth, instruction: instruction || "", mode, dry_run: true, web_context: webctx });
       showStreamBar();
       const ctl = new AbortController();
       const stopIt = () => ctl.abort();
@@ -894,20 +1013,29 @@ async function aiExpand(id, count, depth, instruction, btn, regroup) {
           });
       } catch (se) {
         if (ctl.signal.aborted) { hideStreamBar(); toast("已中止生成（未写入任何节点）"); return; }
+        // AI 服务本身报错（key/端点/超时等）：转同步也没用，直接把真实原因报给用户
+        if (String(se.message).startsWith("AI 服务报错")) {
+          hideStreamBar();
+          toast(se.message + "（点左栏 ⚙ 检查 AI 配置）", true);
+          return;
+        }
         // 流式不可用（端点不通 / 浏览器不支持）→ 回退同步路径，功能不丢，只是要等
         hideStreamBar();
         toast("流式不可用（" + se.message + "），改用同步生成…（约 20–160 秒）");
-        out = await api("mindstorm__expand", { node_id: id, count, depth, instruction: instruction || "", demo: false, mode });
+        out = await API.expand({ node_id: id, count, depth, instruction: instruction || "", demo: false, mode, web_context: webctx });
       }
       if (out === null) {
         // ③ 解析完整输出后回传后端落库
         const items = parseAIArray(acc);
         // 带上原始输出：否则「解析不出东西」无从判断是模型没按格式、还是被截断
         if (!items || !items.length) {
+          if (!acc.trim()) {
+            throw new Error("AI 没有返回任何内容（流为空）。请检查 ⚙ AI 配置里的 Key 与端点是否有效");
+          }
           throw new Error("未能解析出子主题（AI 输出可能不符合 JSON 或已被截断）。原始输出前 200 字符: " + acc.slice(0, 200));
         }
         updateStreamBar(items.map((x) => x.title), "写入中");
-        out = await api("mindstorm__expand", { node_id: id, depth, mode, items_json: JSON.stringify(items) });
+        out = await API.expand({ node_id: id, depth, mode, items_json: JSON.stringify(items) });
       }
     }
     hideStreamBar();
@@ -1045,9 +1173,10 @@ async function aiEnrich(id, instruction, btn) {
   try {
     if (demo) {
       toast("demo 模式，直接生成…");
-      out = await api("mindstorm__enrich", { node_id: id, instruction: instruction || "", demo: true });
+      out = await API.enrich({ node_id: id, instruction: instruction || "", demo: true });
     } else {
-      const p = await api("mindstorm__enrich", { node_id: id, instruction: instruction || "", dry_run: true });
+      const webctx = await webContextFor(node ? node.title : "", instruction);
+      const p = await API.enrich({ node_id: id, instruction: instruction || "", dry_run: true, web_context: webctx });
       const ctl = new AbortController();
       showEnrichStream(() => ctl.abort());
       let acc = "";
@@ -1060,14 +1189,23 @@ async function aiEnrich(id, instruction, btn) {
         });
       } catch (se) {
         if (ctl.signal.aborted) { hideEnrichStream(); toast("已中止生成（未写入内容）"); return; }
+        // AI 服务本身报错（key/端点/超时等）：转同步也没用，直接把真实原因报给用户
+        if (String(se.message).startsWith("AI 服务报错")) {
+          hideEnrichStream();
+          toast(se.message + "（点左栏 ⚙ 检查 AI 配置）", true);
+          return;
+        }
         hideEnrichStream();
         toast("流式不可用（" + se.message + "），改用同步生成…（约 30–160 秒）");
-        out = await api("mindstorm__enrich", { node_id: id, instruction: instruction || "", demo: false });
+        out = await API.enrich({ node_id: id, instruction: instruction || "", demo: false, web_context: webctx });
       }
       if (out === null) {
         const parsed = parseAIObject(acc);
-        if (!parsed) throw new Error("未能解析出摘要/正文（AI 输出可能不符合 JSON 格式）");
-        out = await api("mindstorm__enrich", { node_id: id, result_json: JSON.stringify(parsed) });
+        if (!parsed) {
+          if (!acc.trim()) throw new Error("AI 没有返回任何内容（流为空）。请检查 ⚙ AI 配置里的 Key 与端点是否有效");
+          throw new Error("未能解析出摘要/正文（AI 输出可能不符合 JSON 格式）。前 200 字符: " + acc.slice(0, 200));
+        }
+        out = await API.enrich({ node_id: id, result_json: JSON.stringify(parsed) });
       }
     }
     hideEnrichStream();
@@ -1102,13 +1240,13 @@ async function selectNode(id, remember) {
   if (!node || node.body === undefined) {
     // 详情需要 body，node_children 不回 body → 用 node_get 补全
     try {
-      const full = await api("mindstorm__node_get", { id });
+      const full = await API.nodeGet({ id });
       Object.assign(state.nodes[id], full);
     } catch (e) { toast("读取节点详情失败：" + e.message, true); }
   }
   // 标签：首次选中该节点时拉取
   if (state.nodes[id] && state.nodes[id]._tags === undefined) {
-    try { const t = await api("mindstorm__tag_list", { node_id: id }); state.nodes[id]._tags = t.tags || []; }
+    try { const t = await API.tagList({ node_id: id }); state.nodes[id]._tags = t.tags || []; }
     catch (_) { state.nodes[id]._tags = []; }
   }
   renderMiddle(); renderDetail(); updateMidHeader();
@@ -1124,7 +1262,7 @@ async function addChild(parentId) {
   const payload = { id, tree_id: state.currentTree, title };
   if (parentId) payload.parent_id = parentId;
   try {
-    await api("mindstorm__node_create", payload);
+    await API.nodeCreate(payload);
     const parent = parentId ? state.nodes[parentId] : null;
     if (parent) { parent._childrenLoaded = false; parent._expanded = true; await ensureChildren(parentId); }
     else { await loadRoots(); await ensureSubtree(null, MAX_REL); }
@@ -1140,7 +1278,7 @@ async function deleteNode(id) {
     okText: "删除", danger: true,
   }))) return;
   try {
-    await api("mindstorm__node_delete", { id });
+    await API.nodeDelete({ id });
     const parentId = node && node._parent;
     if (state.focusId === id) state.focusId = parentId || null;   // 删掉焦点根 → 焦点上移到父
     delete state.nodes[id];
@@ -1207,8 +1345,13 @@ function onKey(e) {
 
 /* ---------- 启动 ---------- */
 async function boot() {
-  state.readMode = LS.mode !== "edit";   // 默认阅读
+  // 详情栏每次打开都默认阅读模式（东东 2026-09-24）：编辑是临时动作，不再跨会话持久化。
+  state.readMode = true;
+  localStorage.removeItem("mindstorm.mode");   // 清掉旧版本的 mode 持久化残留
   $("#newTree").onclick = newTree;
+  $("#aiCfgBtn").onclick = openSettings;
+  // 错误 toast 停留 8s，点击可立即关掉（配合 toast() 的时长区分）
+  $("#toast").onclick = () => $("#toast").classList.remove("show");
   $("#addBtn").onclick = () => addChild(state.selected);
   $("#navUp").onclick = focusUp;
   $("#navDown").onclick = () => { if (state.selected) drillInto(state.selected); };
@@ -1236,7 +1379,8 @@ async function boot() {
     return;
   }
   try {
-    await api("mindstorm__init", {});   // 幂等建表
+    await API.init({});   // 幂等建表
+    await loadSettings();
     await loadTrees();
     if (LS.tree && state.trees.some((t) => t.id === LS.tree)) {
       await selectTree(LS.tree);

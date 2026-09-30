@@ -73,7 +73,7 @@ func scaffoldToolCmd() *cobra.Command {
 
 versions[].state 取值：draft / testing / stable / deprecated / rejected
 capabilities 合法值（最小权限，未声明即不能用）：
-  - 受门禁内核原语（须声明才可用）：http / call / db / secret / event / subscribe
+  - 受门禁内核原语（须声明才可用）：http / call / db / secret / event / subscribe / config
   - 纯函数原子（始终可用，无需声明）：time / template / crypto
   - 扩展原语 ext.*（须 extensions.yaml 登记，如 ext.ai / ext.email / ext.kafka）
 
@@ -267,7 +267,7 @@ name: %s
 description: "TODO: 用一句话描述这个原子能力做什么"
 runtime: %s
 %s
-capabilities: []            # 最小权限白名单：http/call/db/secret/event/subscribe；ext.* 需 extensions.yaml 登记；time/template/crypto 无需声明
+capabilities: []            # 最小权限白名单：http/call/db/secret/event/subscribe/config；ext.* 需 extensions.yaml 登记；time/template/crypto/id/validate 无需声明
 input_schema:
   type: object
   properties:

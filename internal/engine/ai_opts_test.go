@@ -28,6 +28,11 @@ func (l *recordingLLM) Complete(_ context.Context, req LLMRequest) (string, erro
 	return "{}", nil
 }
 
+func (l *recordingLLM) CompleteTools(_ context.Context, req LLMRequest, _ []ToolSpec) (ChatResult, error) {
+	l.got = append(l.got, req)
+	return ChatResult{Text: "{}"}, nil
+}
+
 func (l *recordingLLM) CompleteStream(_ context.Context, req LLMRequest, onDelta func(content, reasoning string) error) error {
 	l.got = append(l.got, req)
 	if onDelta != nil {

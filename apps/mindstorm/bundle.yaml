@@ -12,6 +12,7 @@
 # 结构：anchor(once) → ext.serve(service) → mindstorm__api(service, process 起 gear serve)
 #       → static_site.serve(depends_on anchor, 把 www 托管到 8090, /api 反代到 8790)。
 # 所有路径用绝对路径（正斜杠），避免 cwd 漂移导致的静默失败。
+# www/api.js 由 gen-client.mjs 从 Tool YAML 生成（node apps/mindstorm/gen-client.mjs），勿手改。
 kind: App
 id: mindstorm
 name: 头脑风暴（Finder 三栏思维导图）
@@ -48,7 +49,7 @@ id: mindstorm__api
 name: mindstorm REST 后端
 description: 用 process 长驻起 gear REST 执行面，作为 mindstorm 的后台（默认 127.0.0.1:8790）。
 runtime: process
-entry: "D:/gadern/gear/build/gear.exe serve --addr 127.0.0.1:8790"
+entry: "gear serve --addr 127.0.0.1:8790"
 input_schema:
   type: object
 output_schema:
@@ -78,7 +79,7 @@ steps:
     depends_on: [anchor]
     input:
       port: 8090
-      dir: D:/gadern/gear/apps/mindstorm/www
+      dir: apps/mindstorm/www
       host: 127.0.0.1
       proxy:
         - path: /api

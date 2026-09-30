@@ -30,6 +30,12 @@ export interface HealthProbeDTO {
   threshold: number
 }
 
+/** Tool 的声明式 REST 路由（model.APIRoute）。 */
+export interface ToolApiDTO {
+  method: string
+  path: string
+}
+
 /** 原子能力（model.Tool）。 */
 export interface ToolDTO {
   id: string
@@ -42,6 +48,8 @@ export interface ToolDTO {
   versions: ToolVersionDTO[] | null
   capabilities: string[] | null
   health_probe?: HealthProbeDTO | null
+  /** 声明式 REST 路由（model.Tool.API）；未声明即不挂资源路由。 */
+  api?: ToolApiDTO | null
 }
 
 /** Flow 内执行单元（model.Step）。 */

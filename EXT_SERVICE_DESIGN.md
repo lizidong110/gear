@@ -56,7 +56,7 @@
   让同主机的外部 service 成为**每主机单例**：首个需要的 gear 拉起 sidecar 并绑定端口，
   其余 gear 注册 PID 复用同一实例；占用列表空则 sidecar 自动退出。即 Gear 保证
   "单 gear 进程内一份"升级为"单主机一份"。
-- 不改现有内核原语（受门禁 6 个 http/call/db/secret/event/subscribe + 纯函数 3 个 time/template/crypto）与 `lua` / `go-host` runtime（它们依旧不支持 service，与现状一致）。
+- 不改现有内核原语（受门禁 7 个 http/call/db/secret/event/subscribe/config + 纯函数 5 个 time/template/crypto/id/validate）与 `lua` / `go-host` runtime（它们依旧不支持 service，与现状一致）。
 
 ---
 
@@ -289,7 +289,7 @@ sub 守护收消息 + pub 被 Gear 调通。
 
 - **单元**：ext 加载识别 `service` 并生成虚拟 Tool；`LocalHTTPTransport` 调用 / 超时 / 重连；
 - **集成**：测试常驻侧车 + flow service step → 拉起 / 探针失败重启 / cancel 杀掉（含进程树级联回收，无孤儿）；
-- **回归**：现有内核原语（受门禁 7 + 纯函数 3）+ 非 service ext 的 once 调用全绿（确认未破坏）；
+- **回归**：现有内核原语（受门禁 7 + 纯函数 5）+ 非 service ext 的 once 调用全绿（确认未破坏）；
 - **样例**：mqtt-sidecar 接真实 broker 跑通 sub 守护 + pub 被调。
 
 ---

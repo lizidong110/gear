@@ -3,7 +3,7 @@
 // 动机：让任何支持 MCP 的智能体（WorkBuddy、Claude Desktop、Cursor…）以对话方式完成
 // 「读目录 → 写配置 → 校验 → 跑起来 → 看结果」——即**创建并运行一个应用**。
 //
-// 工具面（13 个，统一 gear_ 前缀，意图级而非资源级；设计见 MCP_AGENT_DESIGN.md §6）：
+// 工具面（15 个，统一 gear_ 前缀，意图级而非资源级；设计见 MCP_AGENT_DESIGN.md §6）：
 //
 //	gear_guide        按主题取手册（L1 上下文层，与其他两处同源于 guide 包的 embed）
 //	gear_catalog      看现有什么（**摘要**，不吐全量 schema；支持 offset/limit 翻页）
@@ -18,14 +18,16 @@
 //	gear_execution    执行记录与日志（默认最近 N 条；标出孤儿记录）
 //	gear_app          长驻应用生命周期（start/stop/status/list/prune）
 //	gear_doctor       环境自检（侧车/端口/台账/遗留）
+//	gear_export       导出应用为产物（目录或 .gearapp）
+//	gear_import       从产物导入（与 gear_apply 共享 artifact.ApplyBundle 唯一一份）
 //
-// 工具实现分文件：tools_read.go（只读 5 个）/ tools_write.go（写 4 个）/ tools_invoke.go（能力直调 1 个）/
+// 工具实现分文件：tools_read.go（只读 5 个）/ tools_write.go（写 6 个）/ tools_invoke.go（能力直调 1 个）/
 // tools_run.go（执行 2 个）/ tools_app.go（应用 1 个）；公共部件（结构化错误、入参类型、输出 schema）在 common.go。
 //
 // 设计取舍：
 //   - MCP 只做**协议翻译**：删除守卫（PRD §8.2）、schema 校验、版本状态机、静态校验全部在
 //     registry/engine/app 层，本包不重复实现（守卫必须只有一份，否则各执行面会漂移）。
-//   - **能力原语的边界**（§9.2 四类）：受门禁 6（http/call/db/secret/event/subscribe）、
+//   - **能力原语的边界**（§9.2 四类）：受门禁 7（http/call/db/secret/event/subscribe/config）、
 //     免门禁纯函数 3（time/template/crypto，声明了反而被拒）、`json` 只是 Lua 绑定不是能力、
 //     `ext.*` 须注册且须声明。这四条最容易写错，`gear_guide("atoms")` 有完整表。
 //   - **长驻子进程不得出现在本进程树内**（§9.1 第 5 条）：`gear_app(start)` 派生 detach 的
@@ -46,7 +48,6 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -58,6 +59,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"gear/internal/app"
+	"gear/internal/artifact"
 	"gear/internal/cap"
 	"gear/internal/engine"
 	"gear/internal/execstore"
@@ -83,6 +85,9 @@ type Server struct {
 	reg    *registry.Registry
 	engine *engine.Engine
 	execs  *execstore.ExecStore
+	// dbm 是执行 `kind: Migrations` 用的库实现（取引擎的宿主 DB，不另造一个池）。
+	// nil 表示此入口跑不了迁移：bundle 声明了 migrations 时按 fail-closed 拒绝。
+	dbm artifact.Migrator
 
 	// registryPath 是 registry 数据库路径：gear_app 派生子进程时必须显式继承它
 	// （否则子进程读默认 ~/.gear/registry.db，可能启动另一个库里的同名 Flow）。
@@ -147,6 +152,16 @@ func New(reg *registry.Registry, eng *engine.Engine, opts ...Option) (*Server, e
 		return nil, fmt.Errorf("MCP Server 装配失败：guide/summary.md 未嵌入（instructions 为空）")
 	}
 	s := &Server{reg: reg, engine: eng, execs: execstore.NewExecStore(), execSem: make(chan struct{}, maxConcurrentExecs)}
+	// 迁移用的库直接取引擎宿主那份：另建一个 MultiDB 就是多一个连接池。
+	//
+	// 这里做**类型断言**而不是直接收下 cap.DB：迁移不是给智能体的原语方法（`cap.DB` 的
+	// 方法面就是能力目录里那几个），它是内核自己的事。少一个 Tx 就跑不了迁移，此时
+	// dbm 为 nil → bundle 万一声明了 migrations 会被 fail-closed 拒掉，而不是静默跳过。
+	if h := eng.Host(); h != nil {
+		if m, ok := h.DB.(artifact.Migrator); ok {
+			s.dbm = m
+		}
+	}
 	for _, o := range opts {
 		o(s)
 	}
@@ -257,38 +272,13 @@ func (s *Server) httpHandler() (http.Handler, error) {
 
 // checkBindAddr 校验 MCP 的监听地址：非回环地址必须显式开 allowRemote。
 //
-// 为什么 fail-closed：MCP 面无鉴权，绑到 0.0.0.0 等于把「写 registry / 删对象 / 执行编排」
-// 的能力暴露给局域网。此前代码注释写着「只应绑 127.0.0.1」、文档给的示例却是 `--http :8788`
-// （绑全网卡），而 ServeHTTP 从不校验——安全建议形同虚设（评审 B-2）。
+// 判定逻辑在 httpsafe.CheckBindAddr（共享单一真相源，REST 面同用一份）：
+// 这里只传面名与暴露面描述。为什么 fail-closed：MCP 面无鉴权，绑到 0.0.0.0 等于把
+// 「写 registry / 删对象 / 执行编排」的能力暴露给局域网。此前代码注释写着「只应绑
+// 127.0.0.1」、文档给的示例却是 `--http :8788`（绑全网卡），而 ServeHTTP 从不校验——
+// 安全建议形同虚设（评审 B-2）。
 func checkBindAddr(addr string, allowRemote bool) error {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("MCP 监听地址 %q 非法（应为 host:port）: %w", addr, err)
-	}
-	if isLoopbackHost(host) {
-		return nil
-	}
-	if allowRemote {
-		// 放行，但把代价说清楚——静默放行等于替使用者做了一个他们不知情的决定。
-		fmt.Fprintf(os.Stderr,
-			"gear mcp: ⚠ 监听非回环地址 %s（当前无鉴权：任何能访问该地址的人都可调用 gear_apply / gear_delete / gear_run）\n", addr)
-		return nil
-	}
-	return fmt.Errorf("拒绝监听非回环地址 %q：MCP 面当前无鉴权，绑全网卡会把「写 registry / 删对象 / 执行编排」"+
-		"暴露给局域网；请改用 127.0.0.1:<port>（确有远程需求时显式加 --allow-remote）", addr)
-}
-
-// isLoopbackHost 判定 host 是否回环。空 host（`:8788`）视为**全网卡**，不算回环。
-func isLoopbackHost(host string) bool {
-	h := strings.ToLower(strings.TrimSpace(host))
-	switch h {
-	case "localhost", "127.0.0.1", "::1":
-		return true
-	}
-	if ip := net.ParseIP(h); ip != nil {
-		return ip.IsLoopback()
-	}
-	return false
+	return httpsafe.CheckBindAddr("MCP", addr, "调用 gear_apply / gear_delete / gear_run", allowRemote)
 }
 
 // ServeHTTP 在 addr（host:port）以 streamable HTTP transport 暴露 MCP Server，
@@ -492,12 +482,18 @@ func (s *Server) startFlowExec(flowID string, vars map[string]any) (string, erro
 			"稍后重试；或先 gear_execution 看现有执行的进展",
 			"并发执行已达上限（%d），请稍后重试", maxConcurrentExecs)
 	}
-	rec := s.execs.Create(flowID)
+	// actor 恒为空串 = **无身份**（§3.5：MCP 的 tool handler 拿不到 *http.Request）。
+	// 这里不在展示层补 "-"/"anonymous"——空串是「发起方本来就没身份」这个事实，
+	// 补一个占位词会把两件不同的事糊成一件，审计就废了。
+	rec := s.execs.Create(flowID, "")
 	s.execWG.Add(1)
 	go func() {
 		defer s.execWG.Done()
 		defer func() { <-s.execSem }()
-		res, runErr := s.engine.RunFlowExecWithVars(flowID, rec.ID, func(toolIDs []string) {
+		// 调用上下文待接：MCP 工具面拿不到传输层身份（设计文档 §3.5），
+		// 接身份时改这里（声明式 `as` → WithCaller）。在此之前显式用 Background，
+		// 不留「忘了传」的口子。
+		res, runErr := s.engine.RunFlowExecWithVars(context.Background(), flowID, rec.ID, func(toolIDs []string) {
 			s.execs.SetTools(rec.ID, toolIDs)
 		}, vars)
 		s.execs.Finish(rec.ID, res, runErr)
@@ -583,5 +579,10 @@ func (s *Server) appStart(a AppArgs) (*app.StartResult, error) {
 		Ports:        a.Ports,
 		WaitSeconds:  a.WaitSeconds,
 		Replace:      a.Replace,
+		// 入参 ports 缺省时回退 App 清单的 start.ports（REQ-MCP-PORTS-ONE-TRUTH）；
+		// 生效来源在返回的 ports_source 里如实上报。
+		AppLookup: func(flowID string) ([]int, bool, error) {
+			return app.AppPortsFromRegistry(regPath, flowID)
+		},
 	})
 }

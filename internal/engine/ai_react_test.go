@@ -25,6 +25,9 @@ import (
 // scriptedLLM 按脚本逐轮返回文本，并记录收到的请求（用于断言 opts 是否真的透传）。
 type scriptedLLM struct {
 	texts []string
+	// calls 让测试能驱动「模型要求调工具」这条路径：calls[i] 非空时，第 i 轮除 texts[i]
+	// 外还带上这些 tool_calls。与 texts 共用下标，保证「第 i 轮说了什么 + 要求调什么」是写死的。
+	calls [][]ToolCall
 	i     int
 	got   []LLMRequest
 	err   error
@@ -41,6 +44,25 @@ func (s *scriptedLLM) Complete(_ context.Context, req LLMRequest) (string, error
 	t := s.texts[s.i]
 	s.i++
 	return t, nil
+}
+
+// CompleteTools 复用同一份脚本：texts[i] 作正文，calls[i]（若有）作该轮的工具调用。
+// 走它与走 Complete 消耗同一个下标，因此「先调工具、再给答案」这类多轮脚本可以一次写全。
+func (s *scriptedLLM) CompleteTools(_ context.Context, req LLMRequest, _ []ToolSpec) (ChatResult, error) {
+	s.got = append(s.got, req)
+	if s.err != nil {
+		return ChatResult{}, s.err
+	}
+	if s.i >= len(s.texts) {
+		return ChatResult{}, fmt.Errorf("脚本已耗尽（第 %d 次调用）", s.i+1)
+	}
+	t := s.texts[s.i]
+	var calls []ToolCall
+	if s.i < len(s.calls) {
+		calls = s.calls[s.i]
+	}
+	s.i++
+	return ChatResult{Text: t, ToolCalls: calls}, nil
 }
 
 func (s *scriptedLLM) CompleteStream(_ context.Context, req LLMRequest, onDelta func(content, reasoning string) error) error {
@@ -266,12 +288,21 @@ func TestReactPromptAndToolsText(t *testing.T) {
 		"ext.demo": {"run": {Description: "演示扩展方法", Parameters: map[string]ParamSchema{"x": {Type: "string"}}}},
 	})
 
-	all := a.reactSystemPrompt(nil, 4)
+	all := a.reactSystemPrompt(nil, 4, false)
 	if !strings.Contains(all, "最多 4 步") || !strings.Contains(all, "Final Answer") {
 		t.Fatal("系统提示须含步数上限与输出格式约定")
 	}
 	if !strings.Contains(all, "ctx.ext.demo.run") {
 		t.Fatal("已注册的 ext.* 应出现在可用工具清单里")
+	}
+	// 走 function calling 时必须**不再**要求手写 ```json 围栏：协议已经给了调用通道，
+	// 再让模型手打一遍 JSON 就是基线 B-1 那种「两头打架」。
+	withTools := a.reactSystemPrompt(nil, 4, true)
+	if strings.Contains(withTools, "```json") {
+		t.Fatal("下发 function 声明后不应再要求模型手写 json 围栏")
+	}
+	if !strings.Contains(withTools, "工具调用") {
+		t.Fatal("走协议时应提示用工具调用机制")
 	}
 	only := a.reactToolsText([]string{"db"})
 	if strings.Contains(only, "ctx.http") {
@@ -279,6 +310,139 @@ func TestReactPromptAndToolsText(t *testing.T) {
 	}
 	if !strings.Contains(only, "ctx.db.exec") {
 		t.Fatal("allow 内的原语应列出")
+	}
+}
+
+// TestReactUsesNativeToolCalls：模型给 tool_calls 时，react 必须按协议执行——
+// 不再去正文里抠 ```json 围栏。这是从「猜格式」换成「按协议」的判据。
+func TestReactUsesNativeToolCalls(t *testing.T) {
+	llm := &scriptedLLM{
+		// 第一轮模型只给了 tool_calls、正文为空；第二轮给 Final Answer。
+		texts: []string{"", "Thought: 已拿到结果\nFinal Answer: 答案是 42"},
+		calls: [][]ToolCall{
+			{{ID: "c1", Name: SanitizeToolName("db.exec"), Arguments: `{"sql":"SELECT 1"}`}},
+			nil,
+		},
+	}
+	a, entries := newReactAgent(t, llm)
+
+	res, err := a.React(context.Background(), "查一下", ReactOpts{})
+	if err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	m, _ := res.(map[string]interface{})
+	if m["answer"] != "答案是 42" {
+		t.Fatalf("answer 应为 Final Answer，实际 %q", m["answer"])
+	}
+	// 压平名必须被反查回 db.exec，并编出真实调用入口。
+	if len(*entries) != 1 {
+		t.Fatalf("应只执行一次工具调用，实际 %v", *entries)
+	}
+	if !strings.Contains((*entries)[0], "ctx.db.exec") {
+		t.Fatalf("应还原成 ctx.db.exec 的调用入口，实际 %q", (*entries)[0])
+	}
+	// 空正文不能被误判成「格式不遵守」——那正是基线 B-1 白扔一步的成因。
+	steps, _ := m["steps"].([]map[string]interface{})
+	for _, s := range steps {
+		if obs, _ := s["observation"].(string); strings.Contains(obs, "既未输出合法") {
+			t.Fatalf("走 tool_calls 的轮次不应报格式错误，实际 %q", obs)
+		}
+	}
+}
+
+// TestReactRejectsUnknownToolNameFromToolCall：模型给了目录里没有的工具名时，
+// 必须明确回绝并列出可用工具，而不是丢一段 Lua 栈错误让它猜（基线 B-3）。
+func TestReactRejectsUnknownToolNameFromToolCall(t *testing.T) {
+	llm := &scriptedLLM{
+		texts: []string{"", "Thought: 换个工具\nFinal Answer: 放弃"},
+		calls: [][]ToolCall{
+			{{ID: "c1", Name: "no_such_tool", Arguments: `{}`}},
+			nil,
+		},
+	}
+	a, entries := newReactAgent(t, llm)
+
+	res, err := a.React(context.Background(), "随便查点什么", ReactOpts{})
+	if err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	if len(*entries) != 0 {
+		t.Fatalf("未知工具名不应被执行，实际 %v", *entries)
+	}
+	m, _ := res.(map[string]interface{})
+	steps, _ := m["steps"].([]map[string]interface{})
+	if len(steps) == 0 {
+		t.Fatal("应记录一步（被拒的那一步）")
+	}
+	obs, _ := steps[0]["observation"].(string)
+	if !strings.Contains(obs, "不存在") {
+		t.Fatalf("观察应明确说工具不存在，实际 %q", obs)
+	}
+	if !strings.Contains(obs, "可用工具") {
+		t.Fatalf("回绝时应列出可用工具，实际 %q", obs)
+	}
+	if strings.Contains(obs, "attempt to index") {
+		t.Fatalf("不应把 Lua 栈错误丢给模型，实际 %q", obs)
+	}
+}
+
+// TestReactToolSpecsCoverCapabilityCatalog：工具声明必须与能力目录同源，
+// 且压平名能反查回「能力.方法」（压平不可逆，反查表是唯一还原手段）。
+func TestReactToolSpecsCoverCapabilityCatalog(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, map[string]map[string]MethodSchema{
+		"ext.demo": {"run": {Description: "演示扩展方法", Parameters: map[string]ParamSchema{
+			"x": {Type: "string", Required: true},
+		}}},
+	})
+
+	specs, byName := a.reactToolSpecs(nil)
+	if len(specs) == 0 {
+		t.Fatal("能力目录非空时工具声明不得为空")
+	}
+	for _, s := range specs {
+		if strings.Contains(s.Name, ".") {
+			t.Fatalf("function name 不得含点（OpenAI 字符集限制）：%q", s.Name)
+		}
+		orig, ok := byName[s.Name]
+		if !ok {
+			t.Fatalf("压平名 %q 必须能反查回原名", s.Name)
+		}
+		if !strings.Contains(orig, ".") {
+			t.Fatalf("反查结果应是「能力.方法」，实际 %q", orig)
+		}
+		if s.Parameters == nil {
+			t.Fatalf("工具 %q 必须带 parameters schema", s.Name)
+		}
+	}
+	if _, ok := byName[SanitizeToolName("ext.demo.run")]; !ok {
+		t.Fatal("已注册的 ext.demo.run 应进入工具目录")
+	}
+	// required 要传下去，否则模型不知道哪个参数必填。
+	var found bool
+	for _, s := range specs {
+		if s.Name == SanitizeToolName("ext.demo.run") {
+			found = true
+			req, _ := s.Parameters["required"].([]string)
+			if len(req) != 1 || req[0] != "x" {
+				t.Fatalf("必填参数应传进 schema，实际 %v", req)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("ext.demo.run 未出现在 specs 里")
+	}
+
+	// allow 过滤后只剩该能力名下的方法。
+	specs2, byName2 := a.reactToolSpecs([]string{"ext.demo"})
+	if len(specs2) == 0 {
+		t.Fatal("allow 内应保留工具")
+	}
+	for _, s := range specs2 {
+		if !strings.HasPrefix(byName2[s.Name], "ext.demo") {
+			t.Fatalf("allow 过滤后不得出现 %q", byName2[s.Name])
+		}
 	}
 }
 
@@ -692,6 +856,36 @@ func TestReactTextHelpers(t *testing.T) {
 	if got := truncateRunes("短", 5); got != "短" {
 		t.Fatal("未超长不应改动")
 	}
+
+	// ── truncateObservation：截断必须「如实告知」，只截不说等于把假数字喂给模型 ──
+	// 实测（2026-09-27）：模型拿一份带 ...(truncated) 的目录数出 12 条就回答「共 12 个 Tool」，
+	// 真实 34。截断本身没错，错在截完之后模型无从知道「看到的不是全部」，于是凑一个合理的数。
+	big := `[{"id":"a"},` + strings.Repeat(`{"id":"x"},`, 30) + `{"id":"z"}]` // 32 条
+	obs := truncateObservation(big, 200)
+	if !strings.Contains(obs, "共 32 条") {
+		t.Fatalf("截断提示必须带清单的真实条数，否则模型只能去数半截清单:\n%s", obs)
+	}
+	if !strings.Contains(obs, "共 ") {
+		t.Fatalf("截断提示必须带原文总长:\n%s", obs)
+	}
+	if strings.HasSuffix(obs, "...(truncated)") {
+		t.Fatal("截断提示不得退回无信息的旧形态")
+	}
+	// 负向：非数组（-map 序列化结果）也要如实报总长，不能因为解析不出来就吞掉提示
+	if got := truncateObservation("{\"k\":\"", 3); !strings.Contains(got, "原文共 ") {
+		t.Fatalf("非数组的超长观察也要报总长，实际 %q", got)
+	}
+	// 未超长必须原样返回，不许在末尾追加提示
+	if got := truncateObservation(`[{"id":"a"}]`, 500); got != `[{"id":"a"}]` {
+		t.Fatalf("未超长不应改动，实际 %q", got)
+	}
+	// jsonArrayLen：读不出条数时必须如实报「不知道」，不许猜 0
+	if n, ok := jsonArrayLen("not json at all"); ok || n != 0 {
+		t.Fatalf("非 JSON 应返回 (0,false)，实际 %d,%v", n, ok)
+	}
+	if n, ok := jsonArrayLen(`[{"a":1},{"b":2}]`); !ok || n != 2 {
+		t.Fatalf("应读出 2 条，实际 %d,%v", n, ok)
+	}
 	if got := appendUnique([]string{"a"}, "a"); len(got) != 1 {
 		t.Fatal("重复元素不应追加")
 	}
@@ -745,5 +939,163 @@ func TestBuildActionEntryShapes(t *testing.T) {
 	entry, err = buildActionEntry("ext.ai", "complete", map[string]interface{}{"prompt": "hi"})
 	if err != nil || !strings.Contains(entry, "ctx.ext.ai.complete({") {
 		t.Fatalf("ext 应编成单 table 调用: (%s, %v)", entry, err)
+	}
+}
+
+// ───────── react 的默认工具权限：能力边界的落点 ─────────
+//
+// 背景（2026-09-27）：旧语义里「allow 没传 = 全部门禁原语」，于是一个只声明
+// `capabilities: [ext.ai]` 的 agent Tool 实际能把 secret.get / db.exec 交给模型——
+// 能力边界写在 Tool 声明上，却不在执行通道上。下面几条把这个边界钉死。
+
+// reactToolSection 取系统提示里「## 可用工具」那一小节，用来断言「模型被声明有哪些工具」。
+// 只取这一小节：提示的「规则」段里有 `http.Request / db.query / secret.get` 这类**静态样例**，
+// 拿整篇提示做子串判断会把样例当成工具清单（第一次写出来就是这样误报的）。
+func reactToolSection(t *testing.T, llm *scriptedLLM) string {
+	t.Helper()
+	if len(llm.got) == 0 {
+		t.Fatal("模型没被询问过")
+	}
+	var prompt string
+	for _, m := range llm.got[0].Messages {
+		if role, _ := m["role"].(string); role == "system" {
+			prompt, _ = m["content"].(string)
+		}
+	}
+	const marker = "## 可用工具"
+	i := strings.Index(prompt, marker)
+	if i < 0 {
+		t.Fatalf("系统提示里找不到「%s」小节：\n%s", marker, prompt)
+	}
+	rest := prompt[i+len(marker):]
+	if j := strings.Index(rest, "\n## "); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+// ① 负向核心：没传 allow 时，工具集 = 调用方自己声明的那份，不是全目录。
+func TestReactMethodDefaultsToCallerCapabilitiesNotWholeCatalog(t *testing.T) {
+	llm := &scriptedLLM{texts: []string{
+		actionJSON("secret.get", `{"name":"db.password"}`),
+		"Final Answer: 拿到密码了",
+	}}
+	a, entries := newReactAgent(t, llm)
+
+	// 调用方只声明了 ext.ai：agent 不该看得见 secret / db / http。
+	_, err := a.ReactMethod(map[string]interface{}{"task": "去把密码取出来"}, "ext.ai")
+	if err != nil {
+		t.Fatalf("ReactMethod 失败: %v", err)
+	}
+	if len(*entries) != 0 {
+		t.Fatalf("调用方未声明的能力不得被执行，实际 entry=%v", *entries)
+	}
+	section := reactToolSection(t, llm)
+	for _, want := range []string{"secret", "db.", "http."} {
+		if strings.Contains(section, want) {
+			t.Errorf("调用方只声明了 [ext.ai] 却把 %q 也带进了工具清单：\n%s", want, section)
+		}
+	}
+}
+
+// ② 调用方一份都没声明时，**一个工具都不给**——而不是退回全目录。
+func TestReactMethodWithoutAnyCapabilityGrantsNoTool(t *testing.T) {
+	llm := &scriptedLLM{texts: []string{
+		actionJSON("db.exec", `{"sql":"SELECT 1"}`),
+		"Final Answer: 放弃",
+	}}
+	a, entries := newReactAgent(t, llm)
+
+	_, err := a.ReactMethod(map[string]interface{}{"task": "查一下"})
+	if err != nil {
+		t.Fatalf("ReactMethod 失败: %v", err)
+	}
+	if len(*entries) != 0 {
+		t.Fatalf("未声明任何 capability 的 Tool 不该能调 db.exec，实际 entry=%v", *entries)
+	}
+	if section := reactToolSection(t, llm); strings.Contains(section, "db") {
+		t.Errorf("未声明任何 capability 时工具清单应为空，实际：\n%s", section)
+	}
+}
+
+// ③ 显式 allow 可以**放宽到**调用方声明的范围（在范围内就该放行），但不能超出。
+func TestReactMethodRejectsAllowBeyondCallerCapabilities(t *testing.T) {
+	llm := &scriptedLLM{texts: []string{"Final Answer: 无"}}
+	a, _ := newReactAgent(t, llm)
+
+	_, err := a.ReactMethod(map[string]interface{}{
+		"task":  "查一下",
+		"allow": []interface{}{"http", "secret"},
+	}, "http")
+	if err == nil {
+		t.Fatal("allow 超出自己的 capability 必须报错，否则就是绕过门禁的后门")
+	}
+	if !strings.Contains(err.Error(), "只声明了") {
+		t.Errorf("报错要说清「超出自己的 capability」，实际 %v", err)
+	}
+}
+
+// ④ 范围内的 allow 照样能跑通：别把收紧做成「一刀切不给」。
+func TestReactMethodAllowsWithinCallerCapabilities(t *testing.T) {
+	llm := &scriptedLLM{texts: []string{
+		actionJSON("db.exec", `{"sql":"SELECT 1"}`),
+		"Final Answer: 拿到",
+	}}
+	a, entries := newReactAgent(t, llm)
+
+	res, err := a.ReactMethod(map[string]interface{}{
+		"task":  "查一下",
+		"allow": []interface{}{"db"},
+	}, "db")
+	if err != nil {
+		t.Fatalf("范围内的 allow 应放行: %v", err)
+	}
+	if len(*entries) != 1 || !strings.Contains((*entries)[0], "ctx.db.exec") {
+		t.Fatalf("范围内的工具应经宿主通道执行，实际 entry=%v", *entries)
+	}
+	if used, _ := res.(map[string]interface{})["used_tools"].([]string); len(used) != 1 {
+		t.Fatalf("used_tools 应记录 db.exec，实际 %v", used)
+	}
+}
+
+// react 的数值入参（max_steps / temperature）经 Lua 传进来是 **int64** 而不是 float64
+// （见 lua.go 的 fromLuaValue 整数收敛）。只认 float64 的话这两个参数会静默失效：
+// 范例里写 `max_steps = 8` 实际按默认 6 步跑，肉眼看不出来。
+func TestReactMethodReadsIntegerNumbersFromLua(t *testing.T) {
+	for _, v := range []interface{}{int64(8), float64(8), 8} {
+		llm := &scriptedLLM{texts: []string{"Final Answer: 无"}}
+		a, _ := newReactAgent(t, llm)
+
+		_, err := a.ReactMethod(map[string]interface{}{"task": "查", "max_steps": v, "temperature": v}, "ext.ai")
+		if err != nil {
+			t.Fatalf("入参 %#v 应被接受: %v", v, err)
+		}
+		// 给了 8 就该是 8（不是「被丢掉后落到默认的 0.3」）。
+		if len(llm.got) == 0 || llm.got[0].Temperature != 8 {
+			t.Fatalf("入参 %#v 未被解析，got=%+v", v, llm.got)
+		}
+	}
+
+	// 真的把步数带进去：脚本第 3 轮才给答案，2 步看不完，9 步够。
+	scripts := []struct {
+		maxSteps interface{}
+		wantDone bool
+	}{
+		{int64(2), false},
+		{int64(9), true},
+	}
+	for _, c := range scripts {
+		llm := &scriptedLLM{texts: []string{
+			"Thought: 一步", actionJSON("db.exec", `{"sql":"SELECT 1"}`), "Final Answer: 完成",
+		}}
+		a, _ := newReactAgent(t, llm)
+		res, err := a.ReactMethod(map[string]interface{}{"task": "查", "max_steps": c.maxSteps}, "db")
+		if err != nil {
+			t.Fatalf("max_steps=%v: %v", c.maxSteps, err)
+		}
+		answer, _ := res.(map[string]interface{})["answer"].(string)
+		if got := strings.Contains(answer, "完成"); got != c.wantDone {
+			t.Errorf("max_steps=%v 时 answer 应含「完成」=%v，实际 %q", c.maxSteps, c.wantDone, answer)
+		}
 	}
 }

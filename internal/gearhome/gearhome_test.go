@@ -240,3 +240,95 @@ func TestRunCoverage(t *testing.T) {
 		}
 	}
 }
+
+// TestAppDataDirIsPortable：应用持久数据目录是「db 原语相对库名」的落点，
+// 它必须与 cwd 无关（否则应用换个目录启动就换一份数据，与硬编码绝对路径同样不可移植）。
+func TestAppDataDirIsPortable(t *testing.T) {
+	t.Chdir(t.TempDir())
+	before := AppDataDir()
+
+	other := filepath.Join(t.TempDir(), "deep", "nested")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(other)
+	if got := AppDataDir(); got != before {
+		t.Fatalf("AppDataDir 随 cwd 变化：%q → %q", before, got)
+	}
+	// 与 registry / exec / config 同源同目录是既定口径：一台机器上一套 gear 一份持久面。
+	if filepath.Dir(before) != filepath.Dir(RegistryPath()) {
+		t.Fatalf("AppDataDir 应与 registry 同根：%q vs %q", before, RegistryPath())
+	}
+}
+
+// TestAppDataDirEnvOverride：GEAR_APP_DATA 是显式逃生门（便携模式 / 测试隔离），必须优先。
+func TestAppDataDirEnvOverride(t *testing.T) {
+	want := filepath.Join(t.TempDir(), "apps-data")
+	t.Setenv(EnvAppData, want)
+	if got := AppDataDir(); got != want {
+		t.Fatalf("AppDataDir 应优先取 %s：want %q got %q", EnvAppData, want, got)
+	}
+}
+
+// TestInstallRootFrom：反推安装根的剥层规则是本包唯一的「布局约定」，用纯函数表驱动锁死。
+//
+// 正向：build 与 build/plugin 两种已知布局都必须剥到安装根。
+// 负向：未知布局不得瞎猜——返回原目录，交给调用方的存在性判断（fail-closed）。
+func TestInstallRootFrom(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "opt", "gear")
+	cases := []struct{ name, dir, want string }{
+		{"gear 在 build 下", filepath.Join(root, "build"), root},
+		{"侧车在 build/plugin 下", filepath.Join(root, "build", "plugin"), root},
+		{"未知布局不猜测", filepath.Join(root, "tmp", "go-build"), filepath.Join(root, "tmp", "go-build")},
+		{"根目录不越界", string(filepath.Separator), string(filepath.Separator)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := installRootFrom(c.dir); got != c.want {
+				t.Fatalf("installRootFrom(%q) = %q, want %q", c.dir, got, c.want)
+			}
+		})
+	}
+}
+
+// TestExeDirIsAbsolute：ExeDir 收口了「exe 在哪」这件事，返回值必须是绝对路径——
+// 相对值会让调用方拼出来的路径重新挂回 cwd，正是本包要消灭的行为。
+func TestExeDirIsAbsolute(t *testing.T) {
+	dir := ExeDir()
+	if dir == "" {
+		t.Fatal("ExeDir 不得返回空串")
+	}
+	if !filepath.IsAbs(dir) {
+		t.Fatalf("ExeDir 应为绝对路径，实际 %q", dir)
+	}
+}
+
+// TestConfigDBPath：config 库路径的 env 优先级（GEAR_CONFIG_DB 优先，否则 <Home>/config.db）。
+// 2026-09-25 补：缓存失效后实测该函数 0 覆盖——它是 config 原语与 doctor 的落盘真相源，
+// 不能靠「别的测试顺手带到」。
+func TestConfigDBPath(t *testing.T) {
+	t.Setenv(EnvConfigDB, "/tmp/custom-config.db")
+	if got := ConfigDBPath(); got != "/tmp/custom-config.db" {
+		t.Fatalf("GEAR_CONFIG_DB 已设时应原样返回，实际 %q", got)
+	}
+	t.Setenv(EnvConfigDB, "")
+	want := filepath.Join(Home(), "config.db")
+	if got := ConfigDBPath(); got != want {
+		t.Fatalf("未设 env 时应回退 <Home>/config.db（%q），实际 %q", want, got)
+	}
+}
+
+// TestInstallRoot：薄封装的行为锁——ExeDir 可用时返回 installRootFrom(ExeDir())。
+// 真实 build/ 布局的剥层规则已由 TestInstallRootFrom 覆盖，这里只锁「封装不丢值」。
+func TestInstallRoot(t *testing.T) {
+	exeDir := ExeDir()
+	if exeDir == "" {
+		t.Skip("os.Executable 不可用，无法锁 InstallRoot 封装")
+	}
+	if got := InstallRoot(); got != installRootFrom(exeDir) {
+		t.Fatalf("InstallRoot 应等于 installRootFrom(ExeDir())：%q vs %q", got, installRootFrom(exeDir))
+	}
+	if got := InstallRoot(); got == "" {
+		t.Fatal("ExeDir 非空时 InstallRoot 不得返回空串")
+	}
+}

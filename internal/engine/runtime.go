@@ -41,6 +41,28 @@ type ExitReporter interface {
 	ExitInfo() (code int, tail []string)
 }
 
+// OutputReporter 是 Process 的**可选**扩展：能报出「首次输出声明」的进程实现它。
+//
+// 同 ExitReporter：长驻进程（如 `gear serve`）在 stdout 第一行吐一次声明（`{"port":8787}`），
+// 父侧解析成 step output，下游就能用 `${steps.<id>.output.port}` 引用——全链路端口分配
+// 靠的就是这一行。只有 process runtime 的 execProcess 实现它（go-host / Lua runtime 的
+// Start 本就拒绝 service 模式）；未实现者 output 为 nil，下游引用时报错而非静默空串。
+type OutputReporter interface {
+	// Output 阻塞等待首行声明（有界）并解析；到不了返回 nil（如实，不凑数）。
+	Output() map[string]interface{}
+}
+
+// outputOf 按类型断言取 OutputReporter；未实现返回 nil。
+func outputOf(p Process) map[string]interface{} {
+	if p == nil {
+		return nil
+	}
+	if or, ok := p.(OutputReporter); ok {
+		return or.Output()
+	}
+	return nil
+}
+
 // runtimeFor 按 Tool.Runtime 返回对应适配器。
 //
 // 「已实现」判定以 model.ImplementedRuntimes 为**唯一来源**（C），本函数不再维护第二份白名单：

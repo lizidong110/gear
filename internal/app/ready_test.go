@@ -61,14 +61,14 @@ func TestWaitReadyReportsFailureForProcessDyingInsideWindow(t *testing.T) {
 		t.Fatalf("起辅助子进程失败: %v", err)
 	}
 	pid := cmd.Process.Pid
-	// 关键一步：释放我们持有的进程句柄。
+	// 保持与生产一致的一步：释放我们持有的进程句柄。
 	//
-	// Windows 上「进程已退出」与「OpenProcess 还能拿到它」是两件事：只要**还有任何句柄**
-	// 指向该进程对象，内核就不会销毁它，于是 pid 探测依旧返回「存活」（Go 的
-	// os.FindProcess 走 OpenProcess，正是 processAlive 的判据）。不释放句柄的话，这条用例
-	// 会看到子进程「永远活着」，反而测不出任何东西——实测踩过。
-	// 真实生产路径同样如此：launchDetached 派生后立即 Release（它只是启动器，不是持有者），
-	// 所以这里必须在这一点上与生产一致。
+	// 2026-09-28 注：这一步**曾经**是本用例能否成立的必要条件——那时 processAlive 在 Windows
+	// 上只看「句柄打不打得开」，而进程退出后只要还有句柄指向它，内核就不销毁进程对象，
+	// 于是 pid 探测依旧返回「存活」，本例会看到子进程永远活着（实测踩过）。
+	// 判据修好后（改走 OpenProcess + GetExitCodeProcess，见 internal/procalive）已退出即判死，
+	// 释放句柄不再是判别力的前提；仍然保留它，是因为生产路径同样这么干
+	// （launchDetached 派生后立即 Release，它只是启动器，不是持有者）。
 	_ = cmd.Process.Release()
 
 	// 日志尾部要能取到东西：startup_failed 必须附病因（否则调用方只知道「没起来」）。

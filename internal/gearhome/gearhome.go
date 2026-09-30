@@ -34,6 +34,13 @@ const EnvHome = "GEAR_HOME"
 // EnvExecDB 是覆盖执行记录库路径的环境变量。
 const EnvExecDB = "GEAR_EXEC_DB"
 
+// EnvConfigDB 是覆盖键值配置库路径的环境变量。
+//
+// config 原语的落点默认与 registry / exec 同目录（<Home>/config.db），理由与 ExecDBPath 相同：
+// 三者都是「这台机器上这一套 gear」的持久面，分开只会重现「换 cwd 就换一份配置」。
+// 要隔离就设 GEAR_HOME，而不是单独挪这一个库。
+const EnvConfigDB = "GEAR_CONFIG_DB"
+
 // EnvRegistry 是覆盖 registry（目录库）路径的环境变量。
 //
 // 它存在的理由是「**继承**」而不是「配置」：一个进程用 `--registry X` 起服后，它派生出去的子进程
@@ -85,6 +92,87 @@ func ExecDBPath() string {
 		return p
 	}
 	return filepath.Join(Home(), "exec.db")
+}
+
+// ConfigDBPath 返回键值配置库（config 原语 + 内核 AI 缺省配置）的默认路径：
+// `GEAR_CONFIG_DB` 优先，否则 `<Home>/config.db`。
+//
+// 它是「应用配置不用每次靠环境变量灌进进程」这一诉求的落点：应用声明 `capabilities: [config]`
+// 即可经 ctx.config.get/set 读写，Lua 沙箱里读不到 GEAR_HOME 也无妨——宿主知道库在哪。
+func ConfigDBPath() string {
+	if p := os.Getenv(EnvConfigDB); p != "" {
+		return p
+	}
+	return filepath.Join(Home(), "config.db")
+}
+
+// EnvAppData 是覆盖「应用持久数据目录」的环境变量。
+const EnvAppData = "GEAR_APP_DATA"
+
+// AppDataDir 返回应用持久数据的根目录：`GEAR_APP_DATA` 优先，否则 `<Home>/data`。
+//
+// 存在的理由（2026-09-25 实测缺陷）：db 原语的 dsn 缺省回退「引擎内存 scratch 库，
+// 重启即丢且不报错」，应用想持久化就必须显式传 dsn；而相对 dsn 由 SQLite 按**子进程
+// cwd** 解析，Lua 沙箱又禁了 os 库、模板也没有 ${env} 前缀，脚本根本读不到 GEAR_HOME
+// ——于是应用只能把绝对路径硬编码进 YAML（mindstorm_data.yaml 里 18 处
+// `local DSN = "D:/gadern/gear/build/mindstorm.db"`），整个仓库拷到别的机器就跑不起来。
+//
+// 由宿主把「相对库名」锚定到这里之后，应用只需写 `dsn = "mindstorm.db"`：落点与 cwd 无关、
+// 与机器无关。要隔离就设 GEAR_HOME（或单独设 GEAR_APP_DATA），与 ExecDBPath 同口径。
+func AppDataDir() string {
+	if v := os.Getenv(EnvAppData); v != "" {
+		return v
+	}
+	return filepath.Join(Home(), "data")
+}
+
+// ExeDir 返回本进程可执行文件所在目录；os.Executable 失败时返回空串。
+//
+// 调用方必须判空：拿空串去拼路径等于退化成「相对 cwd」，正是本包要消灭的行为。
+//
+// 为什么收口在这里：此前 internal/engine/extensionpath.go、internal/app/launch.go 与本包
+// 各自算一遍 os.Executable——同一件事五处实现，改一处漏四处。
+func ExeDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Dir(exe)
+}
+
+// InstallRoot 返回 gear 的**安装根目录**（apps/、plugin/、README.md 所在的那一层）。
+//
+// 布局约定（scripts/build.sh 的产物形态）：`<root>/build/gear.exe`、
+// `<root>/build/plugin/*-sidecar.exe`。于是规则是「从 exe 所在目录向上剥掉 plugin / build
+// 这两层已知的名字」：静态站点这类**随仓库发布**的资源（apps/mindstorm/www）相对安装根
+// 表达才是可移植的，相对 cwd 表达只在「恰好从仓库根启动」时成立。
+//
+// 未知布局（`go run` 时 exe 落在临时目录）不猜测：返回 exe 所在目录，由调用方的存在性
+// 判断决定成败（fail-closed，绝不静默拼一个不存在的路径出来）。
+func InstallRoot() string {
+	dir := ExeDir()
+	if dir == "" {
+		return ""
+	}
+	return installRootFrom(dir)
+}
+
+// installRootFrom 是 InstallRoot 的纯函数内核：把「从 exe 目录反推安装根」这一步单独
+// 拎出来，测试才能在不摆真实 build/ 布局的前提下锁死剥层规则。
+func installRootFrom(dir string) string {
+	clean := filepath.Clean(dir)
+	cur := clean
+	for i := 0; i < 2; i++ {
+		if strings.EqualFold(filepath.Base(cur), "build") {
+			return filepath.Dir(cur)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return clean
 }
 
 // ArtifactDirs 返回「构建产物可能待在哪些目录」的候选序列，按可信度排序、已去重。

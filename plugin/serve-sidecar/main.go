@@ -6,6 +6,7 @@
 //     浏览器即可访问），并可带 proxy 规则把某些前缀（如 /api）反向代理到后端——
 //     静态与接口同源，vite dev proxy 的生产等价物（见 proxy.go）。
 //     port / dir / host / proxy 全部从 args 传入（不读 os.Getenv，缺参即报错）；
+//     port=0 表示自动分配，由内核挑端口、真实值从 ln.Addr() 回读并在返回值里带回；
 //   - **多站点**（2026-09-24 重构）：一个侧车可同时托管多个网站（不同 port）——
 //     这是多 app 共享同一侧车的前提（如 web_ui.up 托管 8080 的同时 mindstorm.up 托管 8090）。
 //     幂等按「port + dir + host + proxy 全同」判定：全同 → 返回现状；同端口不同配置 →
@@ -34,10 +35,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
 
+	"gear/internal/gearhome"
 	"gear/internal/sidecar/coord"
 )
 
@@ -93,21 +96,34 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// port=0 是「自动分配」：交给内核挑（listen "host:0"），真实端口从 ln.Addr() 回读。
+	// 为什么用内核挑而不是「自己从某基址逐个试」：内核挑到的一定可用，且没有
+	// 「试成功→释放→被抢」的 TOCTOU 窗口——自己顺延时，两个应用可能挑到同一个空闲口，
+	// 表现为「两个都报成功、一个其实是死端口」，排查成本极高。
+	// 真实端口是本文件的**唯一真相**：下面所有用端口的地方（幂等键、url、返回体）
+	// 一律读 realPort，不再信任入参 port，避免「入参写 0 却返回 0」这种自欺。
+	autoPort := false
 	port := intOr(args, "port", 0)
-	if port <= 0 {
-		writeJSON(w, map[string]interface{}{"error": "port 必填（对外服务的监听端口，数字）"})
+	if port < 0 {
+		writeJSON(w, map[string]interface{}{"error": "port 不能为负（0 表示自动分配）"})
 		return
+	}
+	if port == 0 {
+		autoPort = true
 	}
 	dir := strOr(args, "dir", "")
 	if dir == "" {
 		writeJSON(w, map[string]interface{}{"error": "dir 必填（静态网站根目录，本地路径，传给 ext.serve）"})
 		return
 	}
-	// fail-closed：目录必须真实存在且是目录，否则不静默起一个空服务。
-	if fi, e := os.Stat(dir); e != nil || !fi.IsDir() {
+	// 可移植：相对 dir 依次按「安装根 / 当前目录」解析（详见 resolveSiteDir）。
+	// 绝对 dir 原样校验。fail-closed：解析后仍不存在即报错，绝不静默起空服务。
+	resolved, ok := resolveSiteDir(dir, wd(), gearhome.InstallRoot())
+	if !ok {
 		writeJSON(w, map[string]interface{}{"error": "dir 不存在或不是目录: " + dir})
 		return
 	}
+	dir = resolved
 	host := strOr(args, "host", "0.0.0.0")
 	// fail-closed：规则写错就报错（缺 path/target、target 非 http(s) URL…），绝不静默丢弃——
 	// 静默丢弃正是「UI 的 /api 全 404」这类问题的成因。放在幂等判断之前，保证错误必被报出。
@@ -122,19 +138,21 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	// 从「查重 → 绑定 → 登记」全程持锁：并发 /start 同一端口时只有一个能成功，
 	// 另一个要么命中幂等、要么报冲突，不会双双绑定成功或泄露监听套接字。
 	s.mu.Lock()
-	if old, ok := s.sites[port]; ok {
-		if old.dir == dir && old.host == host && mustJSON(proxyRulesJSON(old.proxy)) == proxyJSON {
+	if !autoPort {
+		if old, ok := s.sites[port]; ok {
+			if old.dir == dir && old.host == host && mustJSON(proxyRulesJSON(old.proxy)) == proxyJSON {
+				s.mu.Unlock()
+				writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
+					"url": siteURL(host, port), "port": port, "dir": dir, "serving": true, "proxy": proxyEcho,
+				}})
+				return
+			}
+			conflict := fmt.Sprintf("端口 %d 已被另一站点占用（配置不同）: 当前 dir=%s host=%s proxy=%s；同端口换配置请先 /stop 该端口",
+				port, old.dir, old.host, mustJSON(proxyRulesJSON(old.proxy)))
 			s.mu.Unlock()
-			writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
-				"url": siteURL(host, port), "port": port, "dir": dir, "serving": true, "proxy": proxyEcho,
-			}})
+			writeJSON(w, map[string]interface{}{"error": conflict})
 			return
 		}
-		conflict := fmt.Sprintf("端口 %d 已被另一站点占用（配置不同）: 当前 dir=%s host=%s proxy=%s；同端口换配置请先 /stop 该端口",
-			port, old.dir, old.host, mustJSON(proxyRulesJSON(old.proxy)))
-		s.mu.Unlock()
-		writeJSON(w, map[string]interface{}{"error": conflict})
-		return
 	}
 	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
 	if err != nil {
@@ -142,8 +160,14 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"error": fmt.Sprintf("端口 %d 绑定失败: %v", port, err)})
 		return
 	}
+	// 回读真实端口：入参可能是 0（自动分配），而调用方要靠这个数去拼反代 target、
+	// 写台账、打印访问地址。返回 0 等于让所有人去猜。
+	realPort := port
+	if tcp, ok := ln.Addr().(*net.TCPAddr); ok && tcp.Port > 0 {
+		realPort = tcp.Port
+	}
 	st := &site{ln: ln, host: host, dir: dir, proxy: proxyRules, srv: &http.Server{Handler: newSiteHandler(dir, proxyRules)}}
-	s.sites[port] = st
+	s.sites[realPort] = st
 	s.mu.Unlock()
 
 	go func() {
@@ -153,8 +177,8 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
-		"url":     siteURL(host, port),
-		"port":    port,
+		"url":     siteURL(host, realPort),
+		"port":    realPort,
 		"dir":     dir,
 		"serving": true,
 		"proxy":   proxyEcho,
@@ -248,6 +272,53 @@ func intOr(m map[string]interface{}, k string, def int) int {
 	default:
 		return def
 	}
+}
+
+// wd 返回进程当前工作目录；取不到时退化为 "."（解析相对路径的兜底，fail-closed 由调用方保证）。
+func wd() string {
+	d, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return d
+}
+
+// resolveSiteDir 把 /start 收到的 dir 解析为真实存在的目录（可移植锚点核心）。
+//
+// 规则：
+//   - 绝对路径 → 原样校验（存在且是目录才通过）；
+//   - 相对路径 → 依次按 installRoot（gear 安装根，apps/ 与 plugin/ 所在的那一层）、
+//     cwd 解析，取第一个真实存在的目录。优先 installRoot：应用发布的静态站点随仓库走，
+//     相对安装根表达才不依赖「恰好从仓库根启动」。两种都不存在 → 返回 (dir, false)，
+//     由调用方报「dir 不存在」错误（fail-closed，绝不拼一个不存在的路径出来）。
+//
+// 为什么不做「相对 cwd 直接接收」：此前 dir 必须写绝对路径（如 D:/gadern/gear/apps/...），
+// 仓库拷到别的机器就跑不起来——这正是 2026-09-25 修复的可移植性根因之一。
+func resolveSiteDir(dir, cwd, installRoot string) (string, bool) {
+	if dir == "" {
+		return "", false
+	}
+	if filepath.IsAbs(dir) {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return dir, true
+		}
+		return dir, false
+	}
+	seen := make(map[string]bool)
+	for _, base := range []string{installRoot, cwd} {
+		if base == "" {
+			continue
+		}
+		cand := filepath.Join(base, dir)
+		if seen[cand] {
+			continue
+		}
+		seen[cand] = true
+		if fi, err := os.Stat(cand); err == nil && fi.IsDir() {
+			return cand, true
+		}
+	}
+	return dir, false
 }
 
 func main() {

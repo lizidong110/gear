@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gear/internal/model"
 	"gear/internal/registry"
@@ -433,6 +434,36 @@ action: ""
 	}
 }
 
+// TestAppDelete 覆盖 `gear app delete`：它是 DeleteFlow 第 4 条守卫给出的处置办法，
+// CLI 面没有入口的话那条建议就是句空话（被拦住的人手上只有 `gear flow delete`）。
+func TestAppDelete(t *testing.T) {
+	db := tempDB(t)
+	reg, err := registry.Open(db)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := reg.UpsertApp(&model.App{ID: "demo", Name: "演示", EntryFlow: "demo.up"}); err != nil {
+		t.Fatalf("UpsertApp: %v", err)
+	}
+	_ = reg.Close()
+
+	if err := runCLI(t, "app", "delete", "demo", "--registry", db); err != nil {
+		t.Fatalf("app delete: %v", err)
+	}
+	reg2, err := registry.Open(db)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer reg2.Close()
+	if a, _ := reg2.GetApp("demo"); a != nil {
+		t.Fatal("删除后不应再读到该 App")
+	}
+	// 重复删除必须报错（不能把「删了个不存在的东西」报成成功）。
+	if err := runCLI(t, "app", "delete", "demo", "--registry", db); err == nil {
+		t.Fatal("期望报错：App 不存在")
+	}
+}
+
 // TestAppRunIllegalRestart 覆盖 app run 非法 --restart 的错误分支（不拉起 supervisor）。
 func TestAppRunIllegalRestart(t *testing.T) {
 	db := tempDB(t)
@@ -451,6 +482,33 @@ func TestServeCmdConstruction(t *testing.T) {
 	}
 	if fl.DefValue != "127.0.0.1:8787" {
 		t.Errorf("--addr 默认值应为 127.0.0.1:8787，实为 %q", fl.DefValue)
+	}
+	// 监听闸开关（评审 B-2 同类，2026-09-26）：serve 与 mcp 对齐——非回环默认拒绝。
+	serve, _, err := root.Find([]string{"serve"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serve.Flags().Lookup("allow-remote") == nil {
+		t.Fatal("serve 缺少 --allow-remote 标志（非回环监听的显式放行开关）")
+	}
+}
+
+// TestServeRefusesNonLoopbackBind 监听闸必须在起服**之前**拒绝非回环地址：
+// 空 host（`:8787`）在 net.Listen 里绑全网卡，与 0.0.0.0 等价，同样拒绝。
+// 报错发生在 openRegistry 之前，因此无需真库。带超时护栏：若闸被误删，
+// RunE 会阻塞在 ListenAndServe——要让它变成测试失败而不是测试卡死。
+func TestServeRefusesNonLoopbackBind(t *testing.T) {
+	for _, addr := range []string{"0.0.0.0:8787", ":8787"} {
+		done := make(chan error, 1)
+		go func() { done <- runCLI(t, "serve", "--addr", addr) }()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("serve 监听非回环地址 %q 应默认拒绝", addr)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("serve 监听 %q 未被拒绝（闸丢失或被绕过，RunE 阻塞在监听上）", addr)
+		}
 	}
 }
 
@@ -479,6 +537,223 @@ func TestToolUnregisterInUse(t *testing.T) {
 	}
 	if err := runCLI(t, "tool", "unregister", "t1", "--registry", db); err == nil {
 		t.Fatal("期望报错：Tool 被 Flow 引用，§8.2 守卫应拒")
+	}
+}
+
+// toolYAML 把 validTool 的 id 换成指定 id（其余字段不变，注册可玩性一致）。
+func toolYAML(id string) string {
+	return strings.Replace(validTool, "id: t1", "id: "+id, 1)
+}
+
+// regToolIDs 返回 registry 现存 Tool id（顺序无关），供删除后断言。
+func regToolIDs(t *testing.T, reg *registry.Registry) []string {
+	t.Helper()
+	out, err := reg.ListTools()
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	ids := make([]string, 0, len(out))
+	for _, tt := range out {
+		ids = append(ids, tt.ID)
+	}
+	return ids
+}
+
+// TestToolUnregisterWildcard 覆盖 tool unregister 的通配符：批量命中、保序去重、
+// 以及「命中集为空必须报错」。
+func TestToolUnregisterWildcard(t *testing.T) {
+	db := tempDB(t)
+	for _, id := range []string{"slice_a", "slice_b", "slice_c", "keep_me"} {
+		if err := runCLI(t, "tool", "register", writeTempYAML(t, toolYAML(id)), "--registry", db); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+	}
+	// 两个重叠 pattern：slice_a 会被命中两次，去重后不该报错、也不该删两次。
+	if err := runCLI(t, "tool", "unregister", "slice_*", "slice_a", "--registry", db); err != nil {
+		t.Fatalf("unregister wildcard: %v", err)
+	}
+	reg, err := registry.Open(db)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer reg.Close()
+	left := regToolIDs(t, reg)
+	if len(left) != 1 || left[0] != "keep_me" {
+		t.Fatalf("期望只剩 keep_me，实际: %v", left)
+	}
+
+	// 命中集为空 = 报错，不许静默 no-op 后打印成功。
+	if err := runCLI(t, "tool", "unregister", "nope_*", "--registry", db); err == nil {
+		t.Fatal("期望报错：通配符没有匹配到任何 Tool")
+	}
+	// 精确 id 的路径不受影响（仍走 DeleteTool 原样报错）。
+	if err := runCLI(t, "tool", "unregister", "keep_me", "--registry", db); err != nil {
+		t.Fatalf("unregister 精确 id: %v", err)
+	}
+}
+
+// TestToolUnregisterWildcardFailClosed 覆盖批量删除的 fail-closed：命中集里**任何一个**
+// 被 §8.2 守卫拒绝，整个命令就失败，不允许「删掉能删的、剩下的算了」。
+func TestToolUnregisterWildcardFailClosed(t *testing.T) {
+	db := tempDB(t)
+	for _, id := range []string{"t1", "t2"} {
+		if err := runCLI(t, "tool", "register", writeTempYAML(t, toolYAML(id)), "--registry", db); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+	}
+	if err := runCLI(t, "flow", "register", writeTempYAML(t, validFlow), "--registry", db); err != nil {
+		t.Fatalf("register flow: %v", err)
+	}
+	// t1 被 f1 引用，t2 孤儿；`t*` 命中两者。
+	if err := runCLI(t, "tool", "unregister", "t*", "--registry", db); err == nil {
+		t.Fatal("期望报错：命中集含被 Flow 引用的 t1，守卫应拒")
+	}
+	reg, err := registry.Open(db)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer reg.Close()
+	if left := regToolIDs(t, reg); len(left) != 2 {
+		t.Fatalf("fail-closed 应整批失败，实际只剩: %v", left)
+	}
+}
+
+// TestFlowDelete 覆盖 flow delete 成功路径与重复删除报错（§8.2 守卫与留痕）。
+func TestFlowDelete(t *testing.T) {
+	db := tempDB(t)
+	if err := runCLI(t, "tool", "register", writeTempYAML(t, validTool), "--registry", db); err != nil {
+		t.Fatalf("前置 tool register: %v", err)
+	}
+	if err := runCLI(t, "flow", "register", writeTempYAML(t, validFlow), "--registry", db); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := runCLI(t, "flow", "delete", "f1", "--registry", db); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	// 重复删除必须报错而不是静默成功：删没了还报成功，会让人以为删了两次。
+	if err := runCLI(t, "flow", "delete", "f1", "--registry", db); err == nil {
+		t.Fatal("期望报错：重复 delete 不存在的 Flow")
+	}
+}
+
+// TestFlowDeleteInUse 覆盖 Flow 级 §8.2 守卫：**CLI 这层不许绕过 registry 的守卫**。
+// 用 Flow 级 Hook（action 指向 Flow）做引用者——Flow 之间的 step 引用走 `call`，
+// 而 `call` 必须是 Tool，靠 Flow 是注册不进来的。
+func TestFlowDeleteInUse(t *testing.T) {
+	db := tempDB(t)
+	if err := runCLI(t, "tool", "register", writeTempYAML(t, validTool), "--registry", db); err != nil {
+		t.Fatalf("前置 tool register: %v", err)
+	}
+	if err := runCLI(t, "flow", "register", writeTempYAML(t, validFlow), "--registry", db); err != nil {
+		t.Fatalf("register flow: %v", err)
+	}
+	hook := `id: h_flow
+target: "*"
+stage: before_flow
+action: f1
+criticality: critical
+order: 1
+`
+	if err := runCLI(t, "hook", "register", writeTempYAML(t, hook), "--registry", db); err != nil {
+		t.Fatalf("register hook: %v", err)
+	}
+	if err := runCLI(t, "flow", "delete", "f1", "--registry", db); err == nil {
+		t.Fatal("期望报错：Flow 被 Hook 的 action 引用，§8.2 守卫应拒")
+	}
+	// 摘掉引用者之后必须能删：守卫挡的是「还有人用」，不是「你想删」。
+	if err := runCLI(t, "hook", "remove", "h_flow", "--registry", db); err != nil {
+		t.Fatalf("remove hook: %v", err)
+	}
+	if err := runCLI(t, "flow", "delete", "f1", "--registry", db); err != nil {
+		t.Fatalf("引用清除后应可删除 Flow: %v", err)
+	}
+}
+
+// flowYAML 把 validFlow 的 id 换成指定 id（其余字段不变，注册可玩性一致）。
+func flowYAML(id string) string {
+	return strings.Replace(validFlow, "id: f1", "id: "+id, 1)
+}
+
+// regFlowIDs 返回 registry 现存 Flow id（顺序无关），供删除后断言。
+func regFlowIDs(t *testing.T, reg *registry.Registry) []string {
+	t.Helper()
+	out, err := reg.ListFlows()
+	if err != nil {
+		t.Fatalf("ListFlows: %v", err)
+	}
+	ids := make([]string, 0, len(out))
+	for _, f := range out {
+		ids = append(ids, f.ID)
+	}
+	return ids
+}
+
+// TestFlowDeleteWildcard 覆盖 flow delete 的通配符：批量命中、重叠 pattern 去重、
+// 以及命中集为空必须报错。
+func TestFlowDeleteWildcard(t *testing.T) {
+	db := tempDB(t)
+	// Flow 的 step 必须 call 一个已注册 Tool，先备好 validTool 的 t1。
+	if err := runCLI(t, "tool", "register", writeTempYAML(t, validTool), "--registry", db); err != nil {
+		t.Fatalf("前置 tool register: %v", err)
+	}
+	// 注意别把 keep_me  naming 成 f_* 能命中的形状 —— `*` 会匹配任意字符，
+	// `f_*` 同样命中 `f_keep`，那这条用例就测不到「只删命中的那几个」。
+	for _, id := range []string{"demo_a", "demo_b", "keep_me"} {
+		if err := runCLI(t, "flow", "register", writeTempYAML(t, flowYAML(id)), "--registry", db); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+	}
+	// 第二个 pattern 与第一个重叠（demo_a 被命中两次），去重后不该报错、也不该删两次。
+	if err := runCLI(t, "flow", "delete", "demo_*", "demo_a", "--registry", db); err != nil {
+		t.Fatalf("delete wildcard: %v", err)
+	}
+	reg, err := registry.Open(db)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer reg.Close()
+	if left := regFlowIDs(t, reg); len(left) != 1 || left[0] != "keep_me" {
+		t.Fatalf("期望只剩 keep_me，实际: %v", left)
+	}
+	// 命中集为空 = 报错，不许静默 no-op 后打印成功。
+	if err := runCLI(t, "flow", "delete", "nope_*", "--registry", db); err == nil {
+		t.Fatal("期望报错：通配符没有匹配到任何 Flow")
+	}
+}
+
+// TestFlowDeleteWildcardFailClosed 覆盖 flow delete 批量删除的 fail-closed：命中集里
+// 任何一个被 §8.2 守卫拒绝（此处是被 Flow 级 Hook 的 action 引用），整批失败。
+func TestFlowDeleteWildcardFailClosed(t *testing.T) {
+	db := tempDB(t)
+	if err := runCLI(t, "tool", "register", writeTempYAML(t, validTool), "--registry", db); err != nil {
+		t.Fatalf("前置 tool register: %v", err)
+	}
+	for _, id := range []string{"f_a", "f_b"} {
+		if err := runCLI(t, "flow", "register", writeTempYAML(t, flowYAML(id)), "--registry", db); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+	}
+	hook := `id: h_flow
+target: "*"
+stage: before_flow
+action: f_a
+criticality: critical
+order: 1
+`
+	if err := runCLI(t, "hook", "register", writeTempYAML(t, hook), "--registry", db); err != nil {
+		t.Fatalf("register hook: %v", err)
+	}
+	// f_a 被 Hook 引用，f_b 无人引用；`f*` 命中两者。
+	if err := runCLI(t, "flow", "delete", "f*", "--registry", db); err == nil {
+		t.Fatal("期望报错：命中集含被 Hook 引用的 f_a，守卫应拒")
+	}
+	reg, err := registry.Open(db)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer reg.Close()
+	if left := regFlowIDs(t, reg); len(left) != 2 {
+		t.Fatalf("fail-closed 应整批失败（f_b 也不许被顺手删掉），实际只剩: %v", left)
 	}
 }
 

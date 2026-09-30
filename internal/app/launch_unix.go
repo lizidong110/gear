@@ -57,14 +57,4 @@ func killTree(pid int) error {
 	return nil
 }
 
-// processAlive 报告 pid 是否仍存活：信号 0 的投递结果即判据（Go 1.27 src/os/exec.go）。
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	return p.Signal(syscall.Signal(0)) == nil
-}
+// processAlive 见 launch.go：判据收在 internal/procalive，不与 Windows 那份分叉。

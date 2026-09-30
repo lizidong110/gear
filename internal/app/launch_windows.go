@@ -86,18 +86,5 @@ func killTree(pid int) error {
 	return nil
 }
 
-// processAlive 报告 pid 是否仍存活。
-//
-// Windows 上 os.FindProcess 走 OpenProcess，进程不存在即返回错误（Go 1.27
-// src/os/exec_windows.go）——这正是我们需要的判据，无需额外系统调用。
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	_ = p.Release()
-	return true
-}
+// processAlive 见 launch.go：判据收在 internal/procalive（Windows 必须走
+// OpenProcess + GetExitCodeProcess，不能只看句柄打不打得开，否则已退出的进程会被判活）。

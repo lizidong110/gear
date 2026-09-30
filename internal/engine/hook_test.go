@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gear/internal/model"
+	"gear/internal/registry"
 )
 
 // objSchema 是测试用的宽松 object schema。
@@ -21,8 +22,12 @@ func nameSchema() map[string]interface{} {
 	}
 }
 
+// 窄接口刻意带上 `...registry.UpsertOption`：registry 的 Upsert* 是变长参数签名，
+// 窄接口若写成 `UpsertTool(*model.Tool) error`，*registry.Registry 会**不再**满足它
+// （实现的方法是 `UpsertTool(*model.Tool, ...UpsertOption) error`）——这类不匹配只在
+// 编译测试时才暴露，很容易被误当成「registry 改坏了」。
 func putTool(t *testing.T, reg interface {
-	UpsertTool(*model.Tool) error
+	UpsertTool(*model.Tool, ...registry.UpsertOption) error
 }, tool *model.Tool) {
 	t.Helper()
 	if err := reg.UpsertTool(tool); err != nil {
@@ -31,7 +36,7 @@ func putTool(t *testing.T, reg interface {
 }
 
 func putHook(t *testing.T, reg interface {
-	UpsertHook(*model.Hook) error
+	UpsertHook(*model.Hook, ...registry.UpsertOption) error
 }, h *model.Hook) {
 	t.Helper()
 	if err := reg.UpsertHook(h); err != nil {
@@ -40,7 +45,7 @@ func putHook(t *testing.T, reg interface {
 }
 
 func putFlow(t *testing.T, reg interface {
-	UpsertFlow(*model.Flow) error
+	UpsertFlow(*model.Flow, ...registry.UpsertOption) error
 }, f *model.Flow) {
 	t.Helper()
 	if err := reg.UpsertFlow(f); err != nil {

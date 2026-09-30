@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"gear/internal/gearhome"
 )
 
 // Command 把一行命令翻译成可直接 Start/Run 的 *exec.Cmd，**默认不经 shell**。
@@ -52,15 +54,27 @@ func Command(ctx context.Context, line string) (*exec.Cmd, error) {
 
 // LookExecutable 解析 argv[0]：
 //   - 含路径分隔符 → 原样返回，交给 os/exec 的平台语义（Windows 会按 PATHEXT 补扩展名）；
-//   - 裸名字 → 先走 exec.LookPath（进程 PATH），再在 shell 所在目录里找
-//     （让 `cat` / `echo` / `sleep` 这类随 Git 安装的 POSIX 工具在 usr\bin 不在 PATH
-//     时同样可用；gear 自己的 entry 全是显式路径，这条只为兼容既有写法）。
+//   - 裸名字 → 依次在「gear 可执行文件所在目录」「进程 PATH」「shell 所在目录」里找。
+//
+// 裸名的解析顺序是 2026-09-25 定的：**exe 同目录优先于 PATH**。
+// 理由是应用的 process entry 写 `gear serve --addr ...` 时，要起的是**这一个** gear，
+// 而不是 PATH 里可能存在的另一个版本；这条也是应用定义能跨机器可移植的前提——
+// 此前 entry 只能写成 `D:/gadern/gear/build/gear.exe`，换台机器即废。
+// PATH 与 shell 同目录两条保留给 `cat` / `echo` / `sleep` 这类随 Git 安装的 POSIX 工具
+// （它们的 usr\bin 常常不在 PATH 里）。
 func LookExecutable(name string, sh *Shell) (string, error) {
 	if name == "" {
 		return "", errors.New("可执行文件名为空")
 	}
 	if strings.ContainsAny(name, `/\`) {
 		return name, nil
+	}
+	if d := gearhome.ExeDir(); d != "" {
+		for _, cand := range exeCandidates(filepath.Join(d, name)) {
+			if fileExists(cand) {
+				return cand, nil
+			}
+		}
 	}
 	if p, err := exec.LookPath(name); err == nil {
 		return p, nil

@@ -6,6 +6,9 @@ MCP 面管**你自己**（智能体）怎么操作 Gear；REST 面管**你造出
 ## 1. 地址与启动
 
 - 默认 `127.0.0.1:8787`，用 `--addr` 或 `GEAR_ADDR` 覆盖。
+- **非回环地址默认拒绝**（与 `gear mcp` 同一份判定，internal/httpsafe）：REST 面当前无鉴权，
+  绑 `0.0.0.0` 或空 host（`:8787`）会把「读写 registry 与明文 secrets、执行编排」暴露给局域网；
+  确有远程需求时显式 `--allow-remote`（放行时 stderr 留警告）。
 - 两种起法：`gear serve --addr 127.0.0.1:8787`（前台），或写成一个 `runtime: process` +
   `mode: service` 的 Tool，让应用自己把它当后端拉起来（参考 registry 里的 `web_ui.api`）。
 - **`gear_app(start)` 起的应用与 `gear serve` 是两个进程**：前者跑 Flow，后者才是 REST 面。
@@ -81,7 +84,7 @@ steps:
   - {id: site,   call: static_site.serve, depends_on: [anchor],
      input:
        port: 8088
-       dir: /abs/path/to/apps/myapp/www                     # 必须绝对路径
+       dir: apps/myapp/www                                  # 相对「安装根」（apps/ 所在那一层），可移植；不再需要绝对路径
        host: 127.0.0.1
        proxy: [{path: "/api", target: "http://127.0.0.1:8788"}]}
 ```

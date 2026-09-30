@@ -92,6 +92,11 @@ func (e *Engine) resolveStepCallView(step model.Step, extra map[string]*model.To
 		if err != nil {
 			return resolvedCall{}, err
 		}
+		// 运行期命名空间守卫（`--scope`）：只允许引用本应用名下的 Tool。
+		// 原语直调不走这里（它们根本不是 registry 对象，见 guardScope 注释）。
+		if err := e.guardScope(eff.ID); err != nil {
+			return resolvedCall{}, err
+		}
 		return resolvedCall{tool: eff}, nil
 	}
 
@@ -227,6 +232,7 @@ func (e *Engine) primitiveHost(prim string, rc *runContext) (*cap.Context, error
 	c := withCallChain(cap.New(cap.Grants{p: true}, e.host), callChainOf(rc))
 	if rc != nil {
 		c.SetSubscriptionOwner(cap.SubscriptionOwner{FlowID: rc.flowID, ExecID: rc.execID})
+		c.SetCaller(rc.caller) // 与 hostFor 同口径（原语直调也必须是同一份身份）
 	}
 	if ext, ok := e.capReg.Lookup(prim); ok {
 		if v, err := ext.Provider(c); err == nil {

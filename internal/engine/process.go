@@ -63,6 +63,7 @@ func (p *processRuntime) Start(ctx context.Context, entry string, input map[stri
 		kill:    func() error { return killProcessTree(sp.cmd) },
 		tail:    sp.tail,
 		drained: sp.drained,
+		first:   sp.first,
 	}, nil
 }
 
@@ -78,15 +79,44 @@ type execProcess struct {
 	// 供 ExitInfo 在进程退出后回答「为什么退出」。
 	tail    *serviceTail
 	drained chan struct{}
+	first   *serviceFirst
 
 	mu      sync.Mutex
 	waitErr error
 	waited  bool
+	killed  bool
+}
+
+// Kill 标记「本进程已被我们杀掉」。
+//
+// 为什么要记：被杀的进程 ProcessState 仍是 nil（要等 Wait 才填），而 Output() 的
+// 提前收工判据若只看它，每个「不报声明的 service」都要白等满 serviceFirstTimeout（2s）。
+func (e *execProcess) Kill() error {
+	e.mu.Lock()
+	e.killed = true
+	e.mu.Unlock()
+	return e.kill()
+}
+
+// Output 阻塞等待（上限 serviceFirstTimeout）子进程首行声明，解析成 step output。
+//
+// 首行到不了（普通长驻进程 / 秒退）时返回 nil —— 如实。下游引用
+// `${steps.x.output.port}` 若拿到 nil，由模板解析报「未知字段」，不静默串成空字符串。
+func (e *execProcess) Output() map[string]interface{} {
+	if e.first == nil {
+		return nil
+	}
+	return e.first.wait(e.exited)
+}
+
+// exited 报告进程是否已「不会再有新输出」（供 serviceFirst.wait 提前收工）。
+func (e *execProcess) exited() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.waited || e.killed || e.cmd.ProcessState != nil
 }
 
 func (e *execProcess) Pid() int { return e.cmd.Process.Pid }
-
-func (e *execProcess) Kill() error { return e.kill() }
 
 // Wait 等待子进程结束，并**记住**退出结果：ExitInfo 依赖它把退出码报给监管侧。
 func (e *execProcess) Wait() error {
@@ -212,6 +242,15 @@ func withHostCapabilities(input map[string]interface{}, host *cap.Context) map[s
 	}
 	ctxObj["capabilities"] = host.Capabilities()
 	ctxObj["sandbox"] = host.Sandbox()
+	// 调用上下文（IDENTITY_CONTEXT_DESIGN.md §3.3）：与 capabilities 同批注入。
+	// 必须在 **input_schema 校验之后** 才写（runOnceStep 的顺序），否则会破坏入参校验——
+	// 子进程因此总能看到是谁发起的这次执行，鉴权 Hook 也可以用它的对外形态做对外服务。
+	caller := host.Caller()
+	ctxObj["caller"] = map[string]interface{}{
+		"subject": caller.Subject,
+		"app_id":  caller.AppID,
+		"via":     caller.Via,
+	}
 	input["ctx"] = ctxObj
 	return input
 }
@@ -222,6 +261,13 @@ const (
 	// serviceDrainTimeout 是 ExitInfo 等待「最后几行落进缓冲」的上限。
 	// 必须有界：若孙进程仍持有写端（级联回收完成前的窗口），读到 EOF 可能永远等不到。
 	serviceDrainTimeout = 300 * time.Millisecond
+	// serviceFirstTimeout 是等待长驻子进程「首行声明」的上限（见 serviceFirst）。
+	//
+	// 取 2s 而非 serviceDrainTimeout 的 300ms：`gear serve` 这类进程要先 net.Listen、
+	// 加载 registry，首行常滞后百毫秒以上；而首行 output 一旦漏掉，下游
+	// `${steps.x.output.port}` 拿到 nil，失败形态是「反代 target 变成
+	// http://127.0.0.1:」这种静默错串——比多等一会儿贵得多。
+	serviceFirstTimeout = 2 * time.Second
 )
 
 // serviceTail 是 service 子进程输出的内存环形缓冲（只留尾部 serviceTailLines 行）。
@@ -259,22 +305,99 @@ func (t *serviceTail) snapshot() []string {
 	return out
 }
 
+// serviceFirst 捕获长驻子进程输出的**第一行**，并尝试把它解析成 JSON object。
+//
+// 长驻进程用它上报一次性声明（`{"port":8787}`），process runtime 再把这行当 step output，
+// 于是 `${steps.api.output.port}` 能直接喂给 static_site 的 proxy.target —— 全链路端口
+// 分配缺的正是这一环（其余两环：内核挑端口、能查到真实端口）。
+//
+// 契约：**第一行非空行**必须是那个 JSON；解析不出来就留空。绝不用「看起来像端口」的东西
+// 凑数——0 之类的假值会让下游写出查不出原因的错串。
+type serviceFirst struct {
+	mu      sync.Mutex
+	arrived bool
+	object  map[string]interface{}
+}
+
+// set 记录一行并尝试解析；**只认第一行**（后续调用被忽略——有人重复喂也绝不覆盖）。
+func (f *serviceFirst) set(line string) {
+	var obj map[string]interface{}
+	if trimmed := strings.TrimSpace(line); trimmed != "" {
+		if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+			return // 不是 JSON（banner / 普通日志）：如实留空，不猜
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.arrived {
+		return
+	}
+	f.arrived = true
+	f.object = obj
+}
+
+// take 返回已解析的 object（未到或解析失败为 nil）。调用方**必须**先 wait 过。
+func (f *serviceFirst) take() map[string]interface{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.object
+}
+
+// arrivedNow 在锁内报告首行是否已到（供 wait 提前结束）。
+func (f *serviceFirst) arrivedNow() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.arrived
+}
+
+// wait 有界等待首行（上限 serviceFirstTimeout），返回解析结果（可能 nil）。
+//
+// 为什么要等：rt.Start 返回时子进程往往**还没打印第一行**（要先 listen），而调用方
+// 紧接着就会读 output。进程已退出时可立即收工——不必为「秒退且没输出」白等满超时。
+func (f *serviceFirst) wait(procDone func() bool) map[string]interface{} {
+	deadline := time.NewTimer(serviceFirstTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if f.arrivedNow() {
+			return f.take()
+		}
+		if procDone != nil && procDone() {
+			return f.take() // 进程已走，首行不会再来了
+		}
+		select {
+		case <-deadline.C:
+			return f.take()
+		case <-ticker.C:
+		}
+	}
+}
+
 // drainServiceTail 把自有管道按行抽干进缓冲，直到 EOF（写端全关时触发）后关闭读端。
-func drainServiceTail(rc io.ReadCloser, t *serviceTail) {
+// 第一行非空行额外送进 first（长驻进程的一次性声明），供 step output 使用。
+func drainServiceTail(rc io.ReadCloser, t *serviceTail, first *serviceFirst) {
 	defer rc.Close()
 	sc := bufio.NewScanner(rc)
 	// 单行上限提到 1MB：默认 64KB 会让超长行提前终止抽取，连带丢掉其后（可能含失败原因）的行。
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	firstLine := true
 	for sc.Scan() {
-		t.push(sc.Text())
+		line := sc.Text()
+		t.push(line)
+		if firstLine {
+			firstLine = false
+			first.set(line)
+		}
 	}
 }
 
-// startedProcess 是 startProcess 的产物：命令本体 + 输出缓冲 + 抽干完成信号。
+// startedProcess 是 startProcess 的产物：命令本体 + 输出缓冲 + 抽干完成信号 + 首行声明。
 type startedProcess struct {
 	cmd     *exec.Cmd
 	tail    *serviceTail
 	drained chan struct{}
+	first   *serviceFirst
 }
 
 // startProcess 拉起一个 process 子进程但**不等待其结束**（service 模式用，见 PRD §14.2）。
@@ -312,10 +435,11 @@ func startProcess(ctx context.Context, entry string, input map[string]interface{
 	_ = pw.Close()
 
 	tail := &serviceTail{}
+	first := &serviceFirst{}
 	drained := make(chan struct{})
 	go func() {
 		defer close(drained)
-		drainServiceTail(pr, tail)
+		drainServiceTail(pr, tail, first)
 	}()
-	return &startedProcess{cmd: cmd, tail: tail, drained: drained}, nil
+	return &startedProcess{cmd: cmd, tail: tail, drained: drained, first: first}, nil
 }

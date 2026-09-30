@@ -75,7 +75,7 @@ func hookFail(h model.Hook, cause error) error {
 //   - Hook 返回非空 object 时**整体替换** payload；返回空则不改动。
 //   - Hook 的工具侧 schema 不做校验（Hook 是变换函数）；**被改写后的 payload 由调用方按
 //     step 的 Tool schema 重新校验**（§9.1 不可绕过 Schema）。
-func (e *Engine) applyHooks(ctx context.Context, all []model.Hook, stage, flowID, toolID string, payload map[string]interface{}) (map[string]interface{}, bool, error) {
+func (e *Engine) applyHooks(ctx context.Context, rc *runContext, all []model.Hook, stage, flowID, toolID string, payload map[string]interface{}) (map[string]interface{}, bool, error) {
 	applied := hooksFor(all, stage, flowID, toolID)
 	if len(applied) == 0 {
 		return payload, false, nil
@@ -94,6 +94,11 @@ func (e *Engine) applyHooks(ctx context.Context, all []model.Hook, stage, flowID
 			}
 			continue
 		}
+		// 运行期命名空间守卫（`--scope`）：Hook 的 action 是由别人定义的行为，
+		// 比 step.call 更容易被顺手改成「顺手清一下别人应用的表」——必须同口径拦。
+		if err := e.guardScope(tool.ID); err != nil {
+			return nil, rewritten, err
+		}
 
 		rt, err := runtimeForCaps(tool.Runtime, e.sandboxPolicy, e.capReg)
 		if err != nil {
@@ -104,7 +109,10 @@ func (e *Engine) applyHooks(ctx context.Context, all []model.Hook, stage, flowID
 		}
 
 		hctx, cancel := context.WithTimeout(ctx, execTimeoutFor(tool))
-		host := e.hostFor(tool, nil)
+		// rc 非 nil 时宿主视图带上调用上下文（IDENTITY_CONTEXT_DESIGN.md）：
+		// 「谁发起的」必须能被 Hook 看到，鉴权 Hook 才有依据。传 nil 会退化成无身份，
+		// 那是**静默丢身份**，不是「Hook 不需要身份」——故调用方**必须**传 rc。
+		host := e.hostFor(tool, rc)
 		out, err := rt.Run(hctx, tool.Entry, cur, host)
 		cancel()
 		if err != nil {
@@ -124,8 +132,8 @@ func (e *Engine) applyHooks(ctx context.Context, all []model.Hook, stage, flowID
 // notifyError 触发 on_error Hook（补偿 / 告警）。
 // 其输出**被丢弃**：on_error 不能恢复或重试主流程（PRD §5.4）。
 // 返回值仅用于把「critical on_error 自身失败」附加到原错误上，绝不改变「主流程失败」的事实。
-func (e *Engine) notifyError(ctx context.Context, all []model.Hook, toolID string, stepErr error, input map[string]interface{}) error {
-	_, _, hookErr := e.applyHooks(ctx, all, model.StageOnError, "", toolID, map[string]interface{}{
+func (e *Engine) notifyError(ctx context.Context, rc *runContext, all []model.Hook, toolID string, stepErr error, input map[string]interface{}) error {
+	_, _, hookErr := e.applyHooks(ctx, rc, all, model.StageOnError, "", toolID, map[string]interface{}{
 		"step_error": stepErr.Error(),
 		"input":      input,
 	})
@@ -161,6 +169,10 @@ func (e *Engine) applyFlowScopedHooks(ctx context.Context, rc *runContext, all [
 			return fmt.Errorf("Hook %s 解析 action Tool 失败: %w", h.ID, err)
 		}
 		if tool != nil {
+			// 运行期命名空间守卫（`--scope`）：与 step 级 Hook 同口径（见 applyHooks）。
+			if err := e.guardScope(tool.ID); err != nil {
+				return err
+			}
 			if err := e.applyFlowScopedToolHook(ctx, rc, h, stage); err != nil {
 				return err
 			}
@@ -170,6 +182,9 @@ func (e *Engine) applyFlowScopedHooks(ctx context.Context, rc *runContext, all [
 		sub, err := e.reg.GetFlow(h.Action)
 		if err != nil {
 			return fmt.Errorf("Hook %s 解析 action Flow 失败: %w", h.ID, err)
+		}
+		if err := e.guardScope(sub.ID); err != nil {
+			return err
 		}
 		if sub == nil {
 			if ferr := hookFail(h, fmt.Errorf("Hook %s 引用的 action 既不是已注册 Tool 也不是已注册 Flow: %s", h.ID, h.Action)); ferr != nil {
@@ -186,7 +201,7 @@ func (e *Engine) applyFlowScopedHooks(ctx context.Context, rc *runContext, all [
 
 // applyFlowScopedToolHook 执行 Flow 级 Hook 的 Tool 载体（action = Tool id）。
 func (e *Engine) applyFlowScopedToolHook(ctx context.Context, rc *runContext, h model.Hook, stage string) error {
-	tool, _ := e.reg.GetTool(h.Action) // 已确认非 nil（调用方解析过）
+	tool, _ := e.reg.GetTool(h.Action) // 已确认非 nil（调用方解析过，命名空间守卫同样在那儿判过）
 	rt, err := runtimeForCaps(tool.Runtime, e.sandboxPolicy, e.capReg)
 	if err != nil {
 		if ferr := hookFail(h, fmt.Errorf("Hook %s: %w", h.ID, err)); ferr != nil {
@@ -263,7 +278,7 @@ func (e *Engine) prepareStepInput(ctx context.Context, rc *runContext, hooks []m
 		return nil, fmt.Errorf("step %s 解析 input 失败: %w", step.ID, err)
 	}
 
-	input, rewritten, err := e.applyHooks(ctx, hooks, model.StageBeforeStep, flowID, call.id(), input)
+	input, rewritten, err := e.applyHooks(ctx, rc, hooks, model.StageBeforeStep, flowID, call.id(), input)
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +364,7 @@ func (e *Engine) runOnceStep(ctx context.Context, rc *runContext, hooks []model.
 	cancel()
 	if err != nil {
 		stepErr := fmt.Errorf("step %s 执行失败: %w", step.ID, err)
-		if hookErr := e.notifyError(ctx, hooks, call.id(), err, input); hookErr != nil {
+		if hookErr := e.notifyError(ctx, rc, hooks, call.id(), err, input); hookErr != nil {
 			return nil, nil, fmt.Errorf("%w（另：%v）", stepErr, hookErr)
 		}
 		return nil, nil, stepErr
@@ -364,7 +379,7 @@ func (e *Engine) runOnceStep(ctx context.Context, rc *runContext, hooks []model.
 		}
 	}
 
-	output, rewritten, err := e.applyHooks(ctx, hooks, model.StageAfterStep, flowID, call.id(), output)
+	output, rewritten, err := e.applyHooks(ctx, rc, hooks, model.StageAfterStep, flowID, call.id(), output)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -423,7 +438,7 @@ func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []m
 		})
 		if err != nil {
 			stepErr := fmt.Errorf("step %s 启动 service ext 协调失败: %w", step.ID, err)
-			if hookErr := e.notifyError(ctx, hooks, tool.ID, err, input); hookErr != nil {
+			if hookErr := e.notifyError(ctx, rc, hooks, tool.ID, err, input); hookErr != nil {
 				return nil, fmt.Errorf("%w（另：%v）", stepErr, hookErr)
 			}
 			return nil, stepErr
@@ -433,13 +448,17 @@ func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []m
 			Probe:     tool.HealthProbe,
 			StartedAt: time.Now(),
 			Coord:     sess,
+			// Output 恒为 nil：coord 会话下的 Proc 是侧车进程，它的 stdout 是协调协议不是
+			// step 声明，无从解析。**不伪造**：下游引用 `steps.<id>.output.*` 会吃到未知字段
+			// 报错，而不是拿到一个查不出原因的空串。
+			Output: nil,
 		}, nil
 	}
 
 	proc, err := rt.Start(context.Background(), tool.Entry, input, host)
 	if err != nil {
 		stepErr := fmt.Errorf("step %s 拉起 service 失败: %w", step.ID, err)
-		if hookErr := e.notifyError(ctx, hooks, tool.ID, err, input); hookErr != nil {
+		if hookErr := e.notifyError(ctx, rc, hooks, tool.ID, err, input); hookErr != nil {
 			return nil, fmt.Errorf("%w（另：%v）", stepErr, hookErr)
 		}
 		return nil, stepErr
@@ -449,5 +468,6 @@ func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []m
 		StepID: step.ID, Runtime: tool.Runtime, Proc: proc, Entry: tool.Entry, Input: input, Host: host,
 		Probe:     tool.HealthProbe, // service 健康检查探针（REQ-APP-HEALTH / #75）；nil = 不探
 		StartedAt: time.Now(),       // 供 Supervisor 判定「存活时长」以决定是否重置退避
+		Output:    outputOf(proc),   // 阻塞等首行声明（有界）；只有 process runtime 报得出，其余 nil
 	}, nil
 }

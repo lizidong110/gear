@@ -16,7 +16,8 @@ gear 只提供**机制**，不提供**策略**：
 ```
 能力原语（底座）              →  执行单元            →  编排      →  切面
 http/call/db/secret/event/subscribe    Tool（可复用）        Flow         Hook
-time/template/crypto（免门禁纯函数）       ↳ 或 step 直调「能力.方法」
+     /config（键值配置，落点由宿主决定）
+time/template/crypto/id/validate（免门禁纯函数，5 个）  ↳ 或 step 直调「能力.方法」
 ext.*（须注册 + 须声明）
 ```
 
@@ -108,7 +109,8 @@ steps:
 | `gear_app(start)` 会阻塞到应用结束 | 不会。派生后立即返回；`wait_seconds` 只是短等确认 |
 | 应用会随会话结束而停止 | 不一定。它是独立进程，**原则上跨会话存活**——但 Windows 下若没能脱离调用方的 Job Object，结果会给 `escaped_job:false`，表示它随发起启动的那次会话结束被回收。此时**必须如实告知用户**，不要报「已在后台常驻」；无论哪种情况都要给出如何 stop |
 | `stop` 返回 `stopped` 就一定收干净了 | 以 `ports_released` 为准；不一致会返回 `ORPHAN_APP` |
-| `crypto`/`time`/`template` 要声明 capability | 不用，它们是免门禁纯函数；**声明了反而被拒** |
+| `crypto`/`time`/`template`/`id`/`validate` 要声明 capability | 不用，它们是免门禁纯函数；**声明了反而被拒** |
+| 纯函数原子还是当初那三个？ | 不，现在是 5 个：`time`（4 方法）/ `template`（1）/ `crypto`（13，含 `jwt_*` 与 `password_*`）/ `id`（3）/ `validate`（1）。**以 `gear_capabilities` 目录返回为准** |
 | `json` 是原子能力，可以直调 | 不是。`json` 只是 Lua 里的 `ctx.json.encode/decode`，Flow 不能直调 |
 | `ext.*` 不用声明就能用 | 不行，`ext.` 前缀同样受门禁，且该 ext 须在 `extensions.yaml` 注册 |
 | 能力不够就用 process runtime 跑脚本调外部程序 | 不行，那是绕过门禁。必须走 `gear_guide("primitive-gap")` 的上报流程 |
@@ -117,4 +119,4 @@ steps:
 | 写 `{"x": "string"}` 就算 schema | 不行，必须标准 JSON Schema 且顶层 `type: object` |
 | `when` 里写 `${...}` | 不行，`when` 是表达式；`${}` 只用于 `input` |
 | 侧车会自动被拉起 | 需要 `mode: service` 的 step 持有它；后续 step 经 `anchor` 排到下一层 |
-| 相对路径随便写 | 依赖进程 cwd。**派生的应用继承的是 MCP/CLI 服务端的 cwd**，请用绝对路径或 `layout.workdir` 下的路径 |
+| 相对路径随便写 | 依赖进程 cwd。**派生的应用继承的是 MCP/CLI 服务端的 cwd**，请用**相对安装根**的路径（如 `apps/myapp/www`、`build/dist`）或裸名 `entry`；写机器相关绝对路径会被 `tools/portable_audit.py` 闸门拦下 |

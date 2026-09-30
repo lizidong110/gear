@@ -35,15 +35,20 @@
 | `BAD_DEPENDENCY` | 依赖不存在，或成环 | 检查 `depends_on` 与 `${steps.*}` 推断出的隐式依赖 |
 | `BAD_FLOW_STRUCTURE` | 缺 id / 缺 call / mode 非法 / 并行标注冲突 | 对照 `gear_guide("authoring")` 的全字段语义 |
 | `BAD_TOOL_STRUCTURE` | Tool 缺 id / runtime 未实现 / 无 versions | runtime 只支持 process / lua / go-host |
+| `ROUTE_INVALID` | `api:` 声明的形状非法（`method` 不在 GET/POST/PUT/PATCH/DELETE 里，或 `path` 不以 `/api/` 开头 / 空段 / `{}` 没名字 / 占着内核资源根如 `/api/tools`） | 方法写大写；path 以 `/api/` 开头并换一棵不属于内核的子树（如 `/api/orders`）；占位符写 `{id}` 这种带名字的。**为什么必须挡在写作期**：net/http 对同名 pattern 的第二次注册是 panic，而注册发生在起服那一刻——一个 YAML 字段就能让服务起不来 |
+| `ROUTE_CONFLICT` | 两个 Tool 声明了同一个 `method`+`path`（两边各自都合法，只是不能共存） | 诊断会点名两个 Tool，改任一即可。同一 method+path 只能有一个：**两处声明同一资源等于让起服时 panic** |
 | `BAD_HOOK_STRUCTURE` | Hook 缺字段 / stage 非法 | stage ∈ before_flow/before_step/after_step/on_error/on_success/before_promote |
 | `SCHEMA_NOT_OBJECT` | `input_schema`/`output_schema` 顶层非 object | 写标准 JSON Schema，不支持 `{"x":"string"}` 简写 |
 | `BAD_PRIMITIVE_ARGS` | 直调入参有未知参数名或缺必填 | 以 `gear_capabilities` 里该能力的方法 schema 为准 |
+| `MISSING_SERVE_HOLDER` | 这条 Flow 要用 `ext.serve` 侧车，却没有一条 `mode: service` 的 `ext.serve` 步持有它。**能写入、能 `gear_apply`，只在 `gear_app(start)` 时才炸 connection refused** | 加一条 `call: ext.serve` + `mode: service` 的步持有侧车；service step 不能作为依赖目标，故用一个 `mode: once` 的锚点把后续步推到下一层（见 `examples/agent-app/bundle.yaml`） |
 | `BAD_YAML` | 某份文档不是合法 YAML | 常见原因：缩进不一致、冒号后缺空格、字符串里的特殊字符没加引号 |
-| `UNKNOWN_KIND` | 某份文档的 `kind` 不是 App / Tool / Flow / Hook | 第一份通常是 `kind: App` 清单，其余是 `kind: Tool` / `kind: Flow` / `kind: Hook` |
+| `UNKNOWN_KIND` | 某份文档的 `kind` 不是 App / Tool / Flow / Hook / Migrations | 第一份通常是 `kind: App` 清单，其余是 `kind: Tool` / `kind: Flow` / `kind: Hook`，还有可选的 `kind: Migrations`（库怎么演进，见 `gear_guide("authoring")` §4） |
 | `BAD_APP_MANIFEST` | App 清单缺 id / 缺 `entry_flow` / 出现多份 App | 一个 bundle 只放一份 `kind: App`，并给上 id 与 entry_flow |
 | `ID_NAMESPACE_VIOLATION` | bundle 里的 id 未带应用前缀 | 全部 id 以 `<app-id>__` 或 `<app-id>.` 开头 |
+| `SCOPE_VIOLATION` | 运行期命名空间守卫（`--scope`）拦下的跨应用引用：本进程 scope 只认自己名下的已注册对象（Tool / Flow / Hook 的 action） | 把被拒的 id 改成 `<app-id>__` 或 `<app-id>.` 开头；或去掉 `--scope` 关闭守卫。**注意**：这一码只在 CLI / Flow 层能查到，经 `ctx.call` 触发时错误已被 Lua 边界拍成文本 |
 | `APPLY_CONFLICT` | 对象已存在且内容不同，而 `overwrite=false` | 确需覆盖就显式传 `overwrite=true`；否则换个 id（带应用前缀） |
 | `ENTRY_EXE_UNRESOLVED` | process 型 Tool 的 entry 首 token 指向的可执行文件**不存在** | 改路径（Windows 下正斜杠、反斜杠都可，反斜杠不会被当转义符）。只有绝对路径才报此码；相对路径与裸名字只给告警——运行时 cwd / PATH 可能与校验时不同 |
+| `PORTABLE_PATH_HARDCODED` | 应用定义里出现机器相关绝对路径（`C:\...` / `/Users/...` / `/d/gadern/...`，**含 Lua 脚本体内的 dsn**） | 改用相对锚点：db dsn 用相对库名（`mindstorm.db`→GEAR_APP_DATA）、process entry 用裸名（`gear serve ...`→exe 目录）、ext.serve dir 用相对安装根（`apps/<app>/www`→InstallRoot）；详见 `gear_guide("portability")` 与 REQ-APP-PORTABLE |
 | `IN_USE` | 删除被引用的对象 | 错误信息会指出被谁引用，先解引用 |
 | `MISSING_FILE` | `layout.files` 声明了但文件不存在 | 用你自己的文件工具先落盘（这是 `warnings` 里的提示，不影响 `valid`） |
 | `MISSING_SECRET` | `${secrets.X}` 对应密钥未播种 | 请人在 CLI 播种（MCP 不写密钥）（`warnings` 里的提示，不影响 `valid`） |
@@ -59,6 +64,10 @@
 | `TOOL_RUN_FAILED` | `gear_run(kind=tool)` 同步执行单个 Tool 失败 | 看返回的 message；入参按 `gear_capabilities` 的 schema 核对 |
 | `INVOKE_FAILED` | `gear_invoke` 直调原子能力失败 | 方法名/参数以 `gear_capabilities` 的 schema 为准；`ext.*` 需已注册 |
 | `INVOKE_BLOCKED` | `gear_invoke` 调用被禁能力（`secret.*`） | **不许绕过**：密钥只在 Flow 内部用 `${secrets.NAME}` / `ctx.secret.get`；播种走 CLI |
+| `TX_BEGIN_FAILED` | `db.batch` 开启事务失败 | 同 `APP_START_FAILED` 的排查面：库不可写 / 连接被拒；先确认库路径可写再重试 |
+| `TX_BATCH_FAILED` | `db.batch` 某条语句失败（属业务结果，**不是**异常：整批已回滚） | 读 `results` 定位第几条、什么错；`committed=false` 意味着**这一次写入按未发生处理**，修正后整批重跑（batch 无跨调用状态） |
+| `TX_COMMIT_FAILED` | `db.batch` 提交失败（事务未生效） | 未提交即未写入：直接整批重跑；反复出现去 `gear_doctor` 看库权限/磁盘 |
+| `TX_ROLLBACK_FAILED` | `db.batch` 回滚本身失败（**异常路径**：事务可能部分生效） | 判定「写入是否发生过」**不要只看本次返回**；先 `gear_doctor` 看库权限/磁盘，必要时人工核对库状态 |
 | `APP_START_FAILED` | 起应用后短等窗口内不通 | 读返回的 `log_path` 末几行；常见：端口被占、侧车没 build、registry 路径不符 |
 | `APP_NOT_FOUND` | `stop`/`status` 的 `app_id` 不在台账 | 先 `gear_app(action=list)` |
 | `APP_LIST_FAILED` | 读应用台账失败 | 先 `gear_doctor` 看 `apps_dir` 是否可读 |
@@ -81,6 +90,14 @@
 | `DELETE_FAILED` | 删除失败（非 NOT_FOUND / IN_USE） | 看 message 与 hint |
 | `APPLY_FAILED` | 落库写入失败（非校验类，如写库错误） | 看 message；先 `gear_doctor` 确认 registry 可写 |
 | `PROMOTE_FAILED` | 版本晋升失败（非非法目标状态） | 看 message；确认 Tool 与版本号存在 |
+| `EXPORT_FAILED` | `gear_export` 失败（应用不存在 / 目标目录非空 / 写文件失败） | 应用不存在先 `gear_catalog(kind=app)` 确认；**dir 形态的目标必须不存在或为空**（gear 不会为一个可重新生成的产物删未知目录） |
+| `IMPORT_FAILED` | `gear_import` 失败（格式不认识 / 产物损坏 / 落库冲突） | 看具体码：`ARTIFACT_VERSION_UNSUPPORTED` 与 `ARTIFACT_INVALID` 都从这里报出 |
+| `ARTIFACT_VERSION_UNSUPPORTED` | 产物的 `gear-artifact.yaml` 里 `version` 不是本 gear 支持的版本 | 用同版本 gear 重新导出，或升级 gear 再导入。**不猜、不静默降级**——导一半的库比拒绝难收拾 |
+| `ARTIFACT_INVALID` | 产物缺文件 / 元信息损坏 / 定义解析不过 / `entry_flow` 无法解析 | 重新 `gear_export` 一份；确认传的是产物**根目录**（含 `gear-artifact.yaml`/`app.yaml`/`bundle.yaml`/`kind: Migrations` 那份若带迁移） |
+| `MIGRATE_INVALID` | bundle 的 `kind: Migrations` 声明不合法（version 未严格递增 / sql 空 / 缺 dsn / version 非正） | 版本号从 1 起**依次 +1**；每条都要有非空 `sql`，`dsn` 必须写（迁移的目标库不能是内存 scratch 库）。`gear_validate` 会在这条报出并带 `migrations[i]` 字段 |
+| `MIGRATE_VERSION_GAP` | 声明的 version 与库里已应用的接不上（中间缺号） | 例：库里已应用到 1，本次声明里出现 3 → 补上 2 或重新编号。**不要**为了让导入通过而跳号：跳号意味着那条中间迁移从未执行过 |
+| `MIGRATE_SQL_FAILED` | 某条迁移的 SQL 执行失败（该条已整条回滚） | 错误信息里带 `version=N(name)` 与数据库原始错误；修 SQL 后整条重跑（`gear_apply` 会拒掉整包，定义一个都不落库）。MySQL 上 DDL 会隐式提交，**回滚不保证生效**，先拿 `--dry-run` 验 |
+| `MIGRATE_NO_DB` | bundle 声明了 `migrations:` 但本次导入没有 db 实现 | 换用带宿主 db 的入口（如 `gear serve` 起的 MCP / `gear import`）；本码刻意 fail-closed：宁可拒绝，也不让「声明了迁移却没跑」成为合法状态 |
 | `CAPABILITIES_UNAVAILABLE` | 能力目录取不到（引擎未装配 AIAgent，或读取失败） | `gear_doctor` 看 `extensions` 块 |
 
 ### 三个「不是错误码，但必须先看」的坑

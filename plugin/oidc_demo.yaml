@@ -1,0 +1,89 @@
+# 演示 Tool：把一个「企业 IdP 单点登录」的完整链路跑一遍。
+#
+#   discovery → code_exchange（授权码换令牌，支持 PKCE）→ jwks（长驻缓存）
+#             → crypto.jwt_verify（验签，第 0 批的纯算法）
+#
+# 最后一步是本文件的重点：ext.oidc **不验签**（PRD §4.2 写死的边界），它只负责把令牌拿回来；
+# 验签归 `crypto.jwt_verify`。这个样例把两截接起来，证明「ext.oidc 吐出的 id_token 确实能被验」——
+# 而不是各自 잘 通、中间一断谁也不知道。
+#
+# 注册：gear tool register --registry <db> -   （stdin 喂本文件）
+# 运行：gear tool run oidc.login --registry <db> --input '{"issuer":"...","code":"...", ...}'
+#
+# 注：capabilities 只声明 [ext.oidc]；crypto.* 是纯算法族，不受门禁（同 examples/auth-app）。
+id: oidc.login
+name: OIDC 单点登录（取令牌 + 验签）
+runtime: lua
+capabilities: [ext.oidc]
+input_schema:
+  type: object
+  properties:
+    issuer: {type: string, description: "Issuer 的绝对 URL"}
+    code: {type: string, description: "授权码"}
+    client_id: {type: string, description: "客户端 ID"}
+    client_secret: {type: string, description: "客户端密钥（公开客户端可省）"}
+    redirect_uri: {type: string, description: "回调地址"}
+    code_verifier: {type: string, description: "PKCE 验证器（可省）"}
+  required: [issuer, code, client_id, redirect_uri]
+output_schema:
+  type: object
+  properties:
+    issuer: {type: string, description: "发现到的 issuer"}
+    token_endpoint: {type: string, description: "发现到的令牌端点"}
+    subject: {type: string, description: "验签通过的令牌主体（sub）"}
+    alg: {type: string, description: "id_token 的签名算法"}
+    jwks_kid: {type: string, description: "交回给 sidecar 的 kid（决定要不要强制刷新键集）"}
+    jwks_stale: {type: boolean, description: "JWKS 是否来自退回的旧缓存"}
+    access_token_kind: {type: string, description: "access_token 的前若干位（不吐全文）"}
+    error: {type: string, description: "出错时的原因（正常路径不出现）"}
+versions:
+  - version: 1.0.0
+    state: stable
+entry: |
+  local out = {}
+  local ok, r = pcall(function()
+    local issuer = ctx.input.issuer
+
+    -- ① 发现元数据（issuer 混淆检查在这一步生效）
+    local d = ctx.ext.oidc.discovery({issuer = issuer})
+    out.issuer = d.issuer
+    out.token_endpoint = d.token_endpoint
+
+    -- ② 授权码换令牌（code_verifier 给了才随表单发出）
+    local x = ctx.ext.oidc.code_exchange({
+      issuer = issuer,
+      code = ctx.input.code,
+      client_id = ctx.input.client_id,
+      client_secret = ctx.input.client_secret,
+      redirect_uri = ctx.input.redirect_uri,
+      code_verifier = ctx.input.code_verifier,
+    })
+    out.access_token_kind = (x.access_token or ""):sub(1, 10)
+
+    -- ③ JWKS（长驻缓存；命中不发 HTTP，刷新失败会带 stale=true 回来）
+    --
+    --    **必须**把 id_token 头里的 kid 交回去。不给的话拿回的是「上次抓的那份」，
+    --    而 IdP 一换钥匙这份就成了旧账——缓存行为完全正确，可校验却发生在旧钥匙上，
+    --    表现为「签名不对」。这类假故障最难查：查缓存、查验签、查 IdP，全都说自己没错。
+    local dec = ctx.crypto.jwt_decode({token = x.id_token})
+    local kid = dec.header.kid
+    local j = ctx.ext.oidc.jwks({issuer = issuer, kid = kid})
+    out.jwks_kid = kid
+    out.jwks_stale = j.stale
+
+    -- ④ 验签：这一步归 crypto，不归 ext.oidc
+    local v = ctx.crypto.jwt_verify({
+      token = x.id_token,
+      jwks = {keys = j.keys},
+      iss = issuer,
+      aud = ctx.input.client_id,
+      leeway = 60,
+    })
+    out.subject = v.subject
+    out.alg = v.header.alg
+    return true
+  end)
+  if not ok then
+    out.error = tostring(r)
+  end
+  return out

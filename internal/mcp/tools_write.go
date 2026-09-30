@@ -14,12 +14,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"gopkg.in/yaml.v3"
 
+	"gear/internal/artifact"
 	"gear/internal/cmdline"
 	"gear/internal/engine"
 	"gear/internal/gearhome"
@@ -27,41 +26,30 @@ import (
 	"gear/internal/registry"
 )
 
-// appManifest 是 bundle 的 `kind: App` 清单。
+// appManifest 是 bundle 的 `kind: App` 清单，等价于 model.App。
 //
-// ⚠ **它不入 registry**：bundle 只是「多文档 YAML 的组织约定 + 依赖声明」，落库后仍然只有
-// Tool/Flow/Hook。这保持 PRD 的非目标（「只有 Flow + app run」，没有 App 实体），
-// 也避免为了「创建应用」而在内核里长出一个新模型（§7）。
-type appManifest struct {
-	ID          string `yaml:"id" json:"id"`
-	Name        string `yaml:"name" json:"name"`
-	Description string `yaml:"description" json:"description"`
-	EntryFlow   string `yaml:"entry_flow" json:"entry_flow"`
-	Layout      struct {
-		Workdir string `yaml:"workdir" json:"workdir"`
-		Files   []struct {
-			Path     string `yaml:"path" json:"path"`
-			Required bool   `yaml:"required" json:"required"`
-		} `yaml:"files" json:"files"`
-	} `yaml:"layout" json:"layout"`
-	Start struct {
-		Restart string `yaml:"restart" json:"restart"`
-		Ports   []int  `yaml:"ports" json:"ports"`
-	} `yaml:"start" json:"start"`
-	Requires struct {
-		Secrets      []string `yaml:"secrets" json:"secrets"`
-		Sidecars     []string `yaml:"sidecars" json:"sidecars"`
-		Capabilities []string `yaml:"capabilities" json:"capabilities"`
-	} `yaml:"requires" json:"requires"`
-}
+// ## 2026-09-26 变更：App 清单**入 registry**（此前刻意不入）
+//
+// 旧注释是「保持 PRD 的非目标（只有 Flow + app run，没有 App 实体），避免为了创建应用
+// 而在内核里长出一个新模型」。这个取舍在 gear 自己用时成立；但当目标是**发布后让用户
+// 在 gear 上自助构建**时，它的代价是：gear 里没有「用户构建的产品」这个对象——定义散在
+// registry.db、静态资源游离在文件系统、清单只在客户端 YAML 里，于是没有导出、没有组成
+// 清单、没有可交付物。
+//
+// 因此把清单提升为 `model.App`（与 Tool/Flow/Hook 同列），落 apps 表。
+// 这里保留**类型别名**而不是改所有引用：解析、校验、warnings 逻辑一行不动，
+// 改动面收敛到「多写一张表」这一件事上。
+//
+// 动机与后果的完整论证见 `internal/model/app.go` 的包注释。
+type appManifest = model.App
 
-// bundle 是一个解析后的交付物。
-type bundle struct {
-	Apps  []*appManifest
-	Tools []*model.Tool
-	Flows []*model.Flow
-	Hooks []*model.Hook
-}
+// bundle 是解析后的交付物。
+//
+// 2026-09-26：定义**上提**到 internal/artifact（这里改为类型别名）。
+// 原因是加了 gear_import 之后有两个「写入口」（本文件的 gear_apply 与 artifact.Import），
+// 若各持有一份结构，「导入进来的东西与 apply 进去的东西形态不一致」只是时间问题。
+// 别名让所有既有代码（b.Tools / b.Apps …）一行不改。
+type bundle = artifact.Bundle
 
 // parseBundle 把多文档 YAML 解析成 bundle。
 //
@@ -75,98 +63,12 @@ type bundle struct {
 //	              「runtime 非法」错，把真正的问题埋掉）
 //
 // 解析失败不中断：把问题作为诊断收集起来继续解析其余文档——一次报多条才是「编译器」该有的样子。
+//
+// 2026-09-26：实现委托给 internal/artifact.ParseBundle（产物导入复用同一份解析）。
+// 规则与文案的**完整说明在 artifact 包**，此处只保留调用点：改解析规则必须改那里，
+// 否则「gear_apply 认的 YAML」与「gear_import 认的产物」会分叉。
 func parseBundle(text string) (*bundle, []engine.Diagnostic) {
-	b := &bundle{}
-	var diags []engine.Diagnostic
-	for i, doc := range registry.SplitYAMLDocs([]byte(text)) {
-		if strings.TrimSpace(doc) == "" {
-			continue
-		}
-		docNo := i + 1
-		var probe map[string]any
-		if err := yaml.Unmarshal([]byte(doc), &probe); err != nil {
-			diags = append(diags, engine.Diagnostic{
-				Code: "BAD_YAML", Field: fmt.Sprintf("doc[%d]", docNo),
-				Message: fmt.Sprintf("第 %d 份文档不是合法 YAML: %v", docNo, err),
-				Hint:    "常见原因：缩进不一致、冒号后缺空格、字符串里的特殊字符没加引号",
-			})
-			continue
-		}
-		if len(probe) == 0 {
-			continue // 分隔符产生的空文档
-		}
-		switch classifyDoc(probe) {
-		case "app":
-			var a appManifest
-			if err := yaml.Unmarshal([]byte(doc), &a); err != nil {
-				diags = append(diags, badDocDiag(docNo, "App", err))
-				continue
-			}
-			b.Apps = append(b.Apps, &a)
-		case "tool":
-			var t model.Tool
-			if err := yaml.Unmarshal([]byte(doc), &t); err != nil {
-				diags = append(diags, badDocDiag(docNo, "Tool", err))
-				continue
-			}
-			b.Tools = append(b.Tools, &t)
-		case "flow":
-			var f model.Flow
-			if err := yaml.Unmarshal([]byte(doc), &f); err != nil {
-				diags = append(diags, badDocDiag(docNo, "Flow", err))
-				continue
-			}
-			b.Flows = append(b.Flows, &f)
-		case "hook":
-			var h model.Hook
-			if err := yaml.Unmarshal([]byte(doc), &h); err != nil {
-				diags = append(diags, badDocDiag(docNo, "Hook", err))
-				continue
-			}
-			b.Hooks = append(b.Hooks, &h)
-		default:
-			raw, _ := probe["kind"].(string)
-			diags = append(diags, engine.Diagnostic{
-				Code: "UNKNOWN_KIND", Field: fmt.Sprintf("doc[%d].kind", docNo),
-				Message: fmt.Sprintf("第 %d 份文档的 kind=%q 未知（只认 App / Tool / Flow / Hook）", docNo, raw),
-				Hint:    "bundle 的第一份通常是 `kind: App` 清单，其余是 `kind: Tool` / `kind: Flow` / `kind: Hook`",
-			})
-		}
-	}
-	return b, diags
-}
-
-func badDocDiag(docNo int, kind string, err error) engine.Diagnostic {
-	return engine.Diagnostic{
-		Code: "BAD_YAML", Field: fmt.Sprintf("doc[%d]", docNo),
-		Message: fmt.Sprintf("第 %d 份文档按 %s 解析失败: %v", docNo, kind, err),
-		Hint:    "对照 gear_guide(\"authoring\") 的全字段语义检查字段名与类型",
-	}
-}
-
-// classifyDoc 判定一份文档的类型（见 parseBundle 的规则表）。
-func classifyDoc(probe map[string]any) string {
-	if k, ok := probe["kind"].(string); ok {
-		switch strings.ToLower(strings.TrimSpace(k)) {
-		case "app":
-			return "app"
-		case "tool":
-			return "tool"
-		case "flow":
-			return "flow"
-		case "hook":
-			return "hook"
-		default:
-			return "unknown"
-		}
-	}
-	if _, isFlow := probe["steps"]; isFlow {
-		return "flow"
-	}
-	if _, isHook := probe["stage"]; isHook {
-		return "hook"
-	}
-	return "tool"
+	return artifact.ParseBundle(text)
 }
 
 // validateResult 是 validateBundle 的产出。
@@ -186,6 +88,11 @@ func (s *Server) validateBundle(text string) *validateResult {
 	b, diags := parseBundle(text)
 	res := &validateResult{Bundle: b, Diags: diags, Warnings: []string{}}
 
+	// 可移植性：应用定义不得硬编码机器相关绝对路径（与 CI 闸门第⑨项同口径）。
+	// 应用主要由智能体经 MCP 编写，这里即时拦截比发布后移植失败更省事——
+	// 一旦命中即 fatal 诊断，gear_apply 会据此拒绝落库。
+	res.Diags = append(res.Diags, engine.CheckPortablePaths(text)...)
+
 	// 命名空间约束：bundle 含 App 清单时，其余对象的 id 必须带该应用的前缀。
 	// 这是防「一次性生成污染 registry」的关键——registry 与 CLI/REST 共享（§7）。
 	ns := ""
@@ -200,6 +107,35 @@ func (s *Server) validateBundle(text string) *validateResult {
 			Message: fmt.Sprintf("一个 bundle 里出现了 %d 份 App 清单（应只有一份）", len(b.Apps)),
 			Hint:    "一个 bundle 描述一个应用：只保留一份 `kind: App`",
 		})
+	}
+
+	// 命名规范引导（2026-09-25）：无 App 清单的裸注册没有引擎级命名空间约束，
+	// registry 曾被测试残留（m_t1 / ext_probe 一类）塞满过，事后只能人工考古归属。
+	// 这里**不拦**（定义本身合法、不影响 valid），只在 warnings 里提醒补前缀——
+	// 定位与「环境未就绪」警告同级，不该升级成 fatal 诊断。
+	if len(b.Apps) == 0 {
+		var offenders []string
+		for _, t := range b.Tools {
+			if !hasAppNamespace(t.ID) {
+				offenders = append(offenders, "tool:"+t.ID)
+			}
+		}
+		for _, f := range b.Flows {
+			if !hasAppNamespace(f.ID) {
+				offenders = append(offenders, "flow:"+f.ID)
+			}
+		}
+		for _, h := range b.Hooks {
+			if !hasAppNamespace(h.ID) {
+				offenders = append(offenders, "hook:"+h.ID)
+			}
+		}
+		if len(offenders) > 0 {
+			res.Warnings = append(res.Warnings,
+				fmt.Sprintf("以下 id 无应用命名空间前缀（<app-id>__ / <app-id>.），registry 会越来越难辨认归属：%s。"+
+					"建议改为应用前缀命名；测试/临时对象用 fixture_ 前缀并隔离 GEAR_HOME。规范见 gear_guide(\"authoring\") 的「命名规范」一节",
+					strings.Join(offenders, ", ")))
+		}
 	}
 
 	// Tool / Hook 用 model 层校验（与注册期同一份规则）。
@@ -219,6 +155,17 @@ func (s *Server) validateBundle(text string) *validateResult {
 				"stage 只认 before_flow / before_step / after_step / on_error / on_success / before_promote")...)
 		}
 	}
+	// 迁移声明（FR-2b）：version 断号 / 重复 / 空 sql / 缺 dsn 都在**这一层**挡掉——
+	// 它们是写作期的错误，等到 apply 才报，等于把「校验」的功劳让给「写入」。
+	res.Diags = append(res.Diags, checkMigrations(b)...)
+	if len(b.Migrations) > 0 && s.dbm == nil {
+		res.Warnings = append(res.Warnings,
+			"本 bundle 声明了 migrations，但当前 MCP 会话没有 db 实现：apply 会按 fail-closed 拒绝"+
+				"（不会静默跳过）。请用 gear serve 起的同一个内核，或确认引擎宿主已装配 db 原语")
+	}
+	// 声明式 REST 路由（FR-3）：形状非法与「两个 Tool 撞同一 method+path」都在这一层挡掉——
+	// 前者写错一个字段就能让服务起不来（net/http 同名 pattern 会 panic），必须给字段级诊断。
+	res.Diags = append(res.Diags, artifact.CheckToolRoutes(b.Tools)...)
 	// Flow 用 engine 静态校验，并把 bundle 内待落库的 Tool 一并视为可见——
 	// 否则「Tool 与 Flow 互相引用」的 bundle 会被自己判成 UNKNOWN_CALL_TARGET。
 	for _, f := range b.Flows {
@@ -230,6 +177,15 @@ func (s *Server) validateBundle(text string) *validateResult {
 		res.Warnings = append(res.Warnings, s.appManifestWarnings(a)...)
 	}
 	return res
+}
+
+// hasAppNamespace 判断 id 是否带应用命名空间前缀：<app-id>__ 或至少含一个「.」。
+// fixture_ 前缀是测试/临时对象的合法豁免（它们本就不该进真实 registry，见 authoring §5 命名规范）。
+func hasAppNamespace(id string) bool {
+	if strings.HasPrefix(id, "fixture_") {
+		return true
+	}
+	return strings.Contains(id, "__") || strings.Contains(id, ".")
 }
 
 // checkToolEntryResolvable 对 process 型 Tool 的 entry 做**静态可达性检查**。
@@ -334,13 +290,13 @@ func wrapModelDiag(code, id, what string, err error, kind, hint string) []engine
 }
 
 // checkNamespace 校验 bundle 内所有 id 都带应用前缀。
+//
+// 前缀规则只有 `model.App.Owns` 一份（写入期与运行期同调，见 IDENTITY_CONTEXT_DESIGN.md §4.2）。
 func checkNamespace(b *bundle, appID string) []engine.Diagnostic {
 	var out []engine.Diagnostic
-	ok := func(id string) bool {
-		return strings.HasPrefix(id, appID+"__") || strings.HasPrefix(id, appID+".")
-	}
+	app := &model.App{ID: appID}
 	check := func(kind, id string) {
-		if id == "" || ok(id) {
+		if id == "" || app.Owns(id) {
 			return
 		}
 		prefix := appID + "__（或 " + appID + ".）"
@@ -359,6 +315,26 @@ func checkNamespace(b *bundle, appID string) []engine.Diagnostic {
 	}
 	for _, h := range b.Hooks {
 		check("hook", h.ID)
+	}
+	return out
+}
+
+// checkMigrations 校验 bundle 里的迁移声明（静态部分）。
+//
+// 与 artifact.ApplyMigrations 共用 model.MigrationSet.Validate——校验规则只能有一份，
+// 否则「gear_validate 说没问题、gear_apply 却拒了」这种最劝退的组合迟早出现。
+func checkMigrations(b *bundle) []engine.Diagnostic {
+	var out []engine.Diagnostic
+	for i, set := range b.Migrations {
+		if err := set.Validate(); err != nil {
+			out = append(out, engine.Diagnostic{
+				Code:    artifact.CodeMigrateInvalid,
+				Field:   fmt.Sprintf("migrations[%d].version", i),
+				Message: fmt.Sprintf("migrations 声明非法: %v", err),
+				Hint: "version 必须严格递增且从 1 起；每条要有非空 sql 与 dsn" +
+					"（dsn 不能省：迁移的目标库不能是内存 scratch 库）",
+			})
+		}
 	}
 	return out
 }
@@ -464,9 +440,10 @@ func (s *Server) registerWriteTools(ms *mcp.Server) {
 
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_apply",
-		Description: "把 bundle 落库（**唯一写入口**）：原子、幂等。多文档按依赖顺序 Tool→Flow→Hook 写入，" +
-			"任一非法则整体不写。dry_run=true 等价于先用 validate 看一遍含冲突检测。" +
-			"**不支持密钥写入**：bundle 只声明 requires.secrets，密钥由人在 CLI 播种（见 gear_guide(\"security\")）。",
+		Description: "把 bundle 落库（**唯一写入口**）：原子、幂等。多文档按 Tool→Flow→Hook 顺序写入，" +
+			"任一非法则整体不写。dry_run=true 等价于先 validate 一遍（含冲突检测）。" +
+			"改崩了可用 restore_from=<seq> 回滚（seq 见 gear history）。" +
+			"**不支持密钥写入**：bundle 只声明 requires.secrets，密钥由人在 CLI 播种。",
 		Annotations:  idempotent("落库定义"),
 		OutputSchema: outApply,
 	}, s.handleApply)
@@ -486,6 +463,22 @@ func (s *Server) registerWriteTools(ms *mcp.Server) {
 		Annotations:  idempotent("晋升版本"),
 		OutputSchema: outPromote,
 	}, s.handlePromote)
+
+	mcp.AddTool(ms, &mcp.Tool{
+		Name: "gear_export",
+		Description: "把应用导出成可移植产物（目录或 .gearapp 包）：清单 + 名下 Tool/Flow/Hook + 静态资源，" +
+			"用于备份、换机器、交付。目录形态可 diff 可版本化，是默认形态。",
+		Annotations:  &mcp.ToolAnnotations{Title: "导出应用产物"},
+		OutputSchema: outExport,
+	}, s.handleExport)
+
+	mcp.AddTool(ms, &mcp.Tool{
+		Name: "gear_import",
+		Description: "把产物导进 registry。契约同 gear_apply：dry_run 先看、冲突则整批拒绝。" +
+			"默认不落地静态资源，传 apps_dir 才落地。",
+		Annotations:  idempotent("导入应用产物"),
+		OutputSchema: outImport,
+	}, s.handleImport)
 }
 
 // handleValidate：收 YAML、返回诊断、**不落库**。
@@ -508,6 +501,24 @@ func (s *Server) handleValidate(ctx context.Context, _ *mcp.CallToolRequest, in 
 
 // handleApply：唯一的写入口（声明式、原子、幂等）。
 func (s *Server) handleApply(ctx context.Context, _ *mcp.CallToolRequest, in ApplyArgs) (*mcp.CallToolResult, any, error) {
+	// 回滚先于 bundle：它压根不看 bundle（seq 已经说明要回到哪）。放在最前面是为了让
+	// 「bundle 为空 + restore_from」这种最常见的救火姿势直接能用，不必先补一份 YAML。
+	if in.RestoreFrom > 0 {
+		row, rerr := s.reg.RestoreSnapshot(in.RestoreFrom)
+		if rerr != nil {
+			return toolErrorFrom("NOT_FOUND", rerr), nil, nil
+		}
+		return nil, map[string]any{
+			"valid":       true,
+			"dry_run":     false,
+			"diagnostics": diagnosticsJSON(nil),
+			"warnings":    []string{fmt.Sprintf("已回滚到 seq=%d：%s %s", in.RestoreFrom, row.Kind, row.ID)},
+			// 刻意复用 applied 而不是加一个顶层键：outApply 的输出 schema 已定死，
+			// 多一个键会让 SDK 的 outputSchema 校验在每次返回时炸（类型不确定一律 sAny 的红线）。
+			"applied": map[string]any{"restored": row.Kind + ":" + row.ID},
+			"next":    "回滚本身也会留痕（note=`restore from N`），可继续往前滚；跑起来前先 gear_app(action=start)",
+		}, nil
+	}
 	if strings.TrimSpace(in.Bundle) == "" {
 		return toolError("BAD_ARGUMENT", "bundle 不能为空", "先用 gear_guide(\"examples\") 拿一个骨架"), nil, nil
 	}
@@ -523,6 +534,17 @@ func (s *Server) handleApply(ctx context.Context, _ *mcp.CallToolRequest, in App
 		}, nil
 	}
 	if in.DryRun {
+		// 迁移在 dry run 里是**真跑 + 全回滚**（artifact.ApplyMigrations 的 dryRun 语义）：
+		// 值不值这个代价？值——它让 SQL 语法错在写作期被抓出来，而不是等真导入时才发现
+		// schema 已经改了一半。MySQL 的 DDL 会隐式提交，那条路上 dry run 兜不住，文档里写明。
+		var wouldMigrate []int
+		if m, err := artifact.ApplyMigrations(s.dbm, res.Bundle, true); err != nil {
+			// dry run 的迁移失败**不改 valid**：这一趟本来就要回滚，把它当「定义非法」
+			// 会让智能体去改一份正常的 YAML。它是一条 warning，把原因如实带上。
+			res.Warnings = append(res.Warnings, "dry-run 迁移校验失败（未写入）："+err.Error())
+		} else {
+			wouldMigrate = m
+		}
 		return nil, map[string]any{
 			"valid":       true,
 			"dry_run":     true,
@@ -535,128 +557,58 @@ func (s *Server) handleApply(ctx context.Context, _ *mcp.CallToolRequest, in App
 				"app":     appID(res.Bundle),
 				"created": s.diffExisting(res.Bundle, false),
 				"updated": s.diffExisting(res.Bundle, true),
+				// 空数组而不是省略键：智能体按「有这个键」分支时，键不存在与「没有迁移」是两回事。
+				"migrations": wouldMigrate,
 			},
 		}, nil
 	}
 
-	created, updated, err := s.persistBundle(res.Bundle, in.Overwrite)
+	created, updated, migrations, err := s.persistBundle(res.Bundle, in.Overwrite)
 	if err != nil {
 		return toolErrorFrom("APPLY_FAILED", err), nil, nil
+	}
+	applied := map[string]any{
+		"tools": ids(res.Bundle.Tools),
+		"flows": flowIDs(res.Bundle.Flows),
+		"hooks": hookIDs(res.Bundle.Hooks),
+		"app":   appID(res.Bundle),
+	}
+	// 迁移是「副作用」而不是「定义」：单列一处，别塞进 created/updated 里装成定义。
+	if len(migrations) > 0 {
+		applied["migrations"] = migrations
 	}
 	return nil, map[string]any{
 		"valid":       true,
 		"diagnostics": diagnosticsJSON(nil),
 		"warnings":    res.Warnings,
-		"applied": map[string]any{
-			"tools": ids(res.Bundle.Tools),
-			"flows": flowIDs(res.Bundle.Flows),
-			"hooks": hookIDs(res.Bundle.Hooks),
-			"app":   appID(res.Bundle),
-		},
-		"created": created,
-		"updated": updated,
-		"next":    "接着用 gear_app(action=start, flow_id=…, ports=[…]) 起应用（写入 ≠ 运行）",
+		"applied":     applied,
+		"created":     created,
+		"updated":     updated,
+		"next":        "接着用 gear_app(action=start, flow_id=…, ports=[…]) 起应用（写入 ≠ 运行）",
 	}, nil
 }
 
-// persistBundle 按依赖顺序落库：Tool → Flow → Hook。
+// persistBundle 按依赖顺序落库：App → Tool → Flow → Hook。
 //
-// 顺序由**依赖**决定而不是文档顺序：Hook 的 action 常指向 Tool/Flow，Flow 的 step 常指向 Tool；
-// 先落被依赖者，任何一步失败时前面已写的部分是可解释的（并在错误里列出）。
-//
-// overwrite=false 时，对「已存在且内容不同」的对象**拒绝覆盖**——防止智能体一次性生成把
-// 人手工维护的定义悄悄改掉（§13 R4）。内容相同则视为幂等更新（updated 里如实列出）。
-func (s *Server) persistBundle(b *bundle, overwrite bool) (created, updated []string, err error) {
-	created, updated = []string{}, []string{}
-
-	for _, t := range b.Tools {
-		existing, gerr := s.reg.GetTool(t.ID)
-		if gerr != nil {
-			return created, updated, gerr
-		}
-		if existing != nil && !overwrite && !sameJSON(existing, t) {
-			return created, updated, diagError("APPLY_CONFLICT", "tool("+t.ID+")",
-				"确需覆盖就显式传 overwrite=true；否则换个 id（带应用前缀）",
-				"Tool %s 已存在且内容不同，已拒绝覆盖（本次未写入；已写入：%v）", t.ID, created)
-		}
-		if err := s.reg.UpsertTool(t); err != nil {
-			return created, updated, fmt.Errorf("写入 Tool %s 失败（已写入 %v）: %w", t.ID, created, err)
-		}
-		if existing == nil {
-			created = append(created, "tool:"+t.ID)
-		} else {
-			updated = append(updated, "tool:"+t.ID)
-		}
-	}
-	for _, f := range b.Flows {
-		existing, gerr := s.reg.GetFlow(f.ID)
-		if gerr != nil {
-			return created, updated, gerr
-		}
-		if existing != nil && !overwrite && !sameJSON(existing, f) {
-			return created, updated, diagError("APPLY_CONFLICT", "flow("+f.ID+")",
-				"确需覆盖就显式传 overwrite=true；否则换个 id（带应用前缀）",
-				"Flow %s 已存在且内容不同，已拒绝覆盖（本次未写入；已写入：%v）", f.ID, created)
-		}
-		if err := s.reg.UpsertFlow(f); err != nil {
-			return created, updated, fmt.Errorf("写入 Flow %s 失败（已写入 %v）: %w", f.ID, created, err)
-		}
-		if existing == nil {
-			created = append(created, "flow:"+f.ID)
-		} else {
-			updated = append(updated, "flow:"+f.ID)
-		}
-	}
-	for _, h := range b.Hooks {
-		existing, gerr := s.reg.GetHook(h.ID)
-		if gerr != nil {
-			return created, updated, gerr
-		}
-		if existing != nil && !overwrite && !sameJSON(existing, h) {
-			return created, updated, diagError("APPLY_CONFLICT", "hook("+h.ID+")",
-				"确需覆盖就显式传 overwrite=true；否则换个 id（带应用前缀）",
-				"Hook %s 已存在且内容不同，已拒绝覆盖（本次未写入；已写入：%v）", h.ID, created)
-		}
-		if err := s.reg.UpsertHook(h); err != nil {
-			return created, updated, fmt.Errorf("写入 Hook %s 失败（已写入 %v）: %w", h.ID, created, err)
-		}
-		if existing == nil {
-			created = append(created, "hook:"+h.ID)
-		} else {
-			updated = append(updated, "hook:"+h.ID)
-		}
-	}
-	return created, updated, nil
+// 2026-09-26：实现委托给 artifact.ApplyBundle（与 gear_import 共用唯一一份）。
+// 顺序语义、冲突语义、错误文案的**完整说明在 artifact/apply.go**——改那边，
+// 不要让两个写入口各写一套。
+func (s *Server) persistBundle(b *bundle, overwrite bool) (created, updated []string, migrations []int, err error) {
+	return artifact.ApplyBundle(s.reg, b, s.dbm, overwrite)
 }
 
 // diffExisting 列出 bundle 里「已存在」的对象（updated=true）或「新增」的对象。
+//
+// 同样委托给 artifact（与 import 的 dry_run 同一份判定）。
 func (s *Server) diffExisting(b *bundle, wantExisting bool) []string {
-	out := []string{}
-	note := func(kind, id string, exists bool) {
-		if exists == wantExisting {
-			out = append(out, kind+":"+id)
-		}
-	}
-	for _, t := range b.Tools {
-		if cur, err := s.reg.GetTool(t.ID); err == nil {
-			note("tool", t.ID, cur != nil)
-		}
-	}
-	for _, f := range b.Flows {
-		if cur, err := s.reg.GetFlow(f.ID); err == nil {
-			note("flow", f.ID, cur != nil)
-		}
-	}
-	for _, h := range b.Hooks {
-		if cur, err := s.reg.GetHook(h.ID); err == nil {
-			note("hook", h.ID, cur != nil)
-		}
-	}
-	sort.Strings(out)
-	return out
+	return artifact.DiffExisting(s.reg, b, wantExisting)
 }
 
 // handleDelete 删对象（守卫语义与 REST/CLI 完全一致，本层只做协议翻译）。
+//
+// **不**传 actor：MCP 面拿不到传输层身份（§3.5），所以这次删除在 definition_history 里
+// 的 actor 就是空串 = 无身份。**不要**在这里填一个推断出来的主体来「让它好看点」——
+// 审计要的是真实，编出来的主体比空白更危险。
 func (s *Server) handleDelete(ctx context.Context, _ *mcp.CallToolRequest, in DeleteArgs) (*mcp.CallToolResult, any, error) {
 	kind := strings.ToLower(strings.TrimSpace(in.Kind))
 	if in.ID == "" {
@@ -670,8 +622,11 @@ func (s *Server) handleDelete(ctx context.Context, _ *mcp.CallToolRequest, in De
 		err = s.reg.DeleteFlow(in.ID)
 	case "hook":
 		err = s.reg.DeleteHook(in.ID)
+	case "app":
+		// 2026-09-26：App 清单已入 registry，给个删除口子，否则改了 id 会留下孤儿清单。
+		err = s.reg.DeleteApp(in.ID)
 	default:
-		return toolError("BAD_ARGUMENT", "kind 必须是 tool | flow | hook（实际: "+in.Kind+")", ""), nil, nil
+		return toolError("BAD_ARGUMENT", "kind 必须是 tool | flow | hook | app（实际: "+in.Kind+")", ""), nil, nil
 	}
 	if err != nil {
 		// 守卫拒绝（被引用 / 运行中）与「对象本来就不存在」是**两种不同的失败**：
@@ -700,10 +655,83 @@ func (s *Server) handlePromote(ctx context.Context, _ *mcp.CallToolRequest, in P
 		return toolError("BAD_ARGUMENT",
 			fmt.Sprintf("非法目标状态: %q（应为 draft/testing/stable/deprecated/rejected）", in.Target), ""), nil, nil
 	}
-	if err := s.engine.PromoteTool(in.ToolID, in.Version, target); err != nil {
+	if err := s.engine.PromoteTool(in.ToolID, in.Version, target, registry.WithActor("")); err != nil {
 		return toolErrorFrom("PROMOTE_FAILED", err), nil, nil
 	}
 	return nil, map[string]any{"tool_id": in.ToolID, "version": in.Version, "state": in.Target}, nil
+}
+
+// handleExport 导出一个应用为可移植产物。
+//
+// 这是「用户构建的东西能带走」的那一半（另一半是 gear_import）。它只读 registry 与文件系统，
+// 不改 registry——导出失败不会留下任何半成品（产物先写 staging 再整体落地）。
+func (s *Server) handleExport(ctx context.Context, _ *mcp.CallToolRequest, in ExportArgs) (*mcp.CallToolResult, any, error) {
+	if strings.TrimSpace(in.AppID) == "" {
+		return toolError("BAD_ARGUMENT", "app_id 不能为空", "先用 gear_catalog(kind=app) 看有哪些应用"), nil, nil
+	}
+	if strings.TrimSpace(in.OutDir) == "" {
+		return toolError("BAD_ARGUMENT", "out_dir 不能为空",
+			"dir 形态给一个**不存在的目录**（gear 不覆盖非空目录）；zip 形态给 .gearapp 文件路径"), nil, nil
+	}
+	include := true // 缺省自包含：产物不能交付的导出没有意义
+	if in.IncludeStatic != nil {
+		include = *in.IncludeStatic
+	}
+	res, err := artifact.Export(s.reg, artifact.ExportOptions{
+		AppID:       in.AppID,
+		Out:         in.OutDir,
+		Format:      in.Format,
+		NoStatic:    !include,
+		StaticRoot:  in.StaticRoot,
+		GearVersion: Version,
+	})
+	if err != nil {
+		return toolErrorFrom("EXPORT_FAILED", err), nil, nil
+	}
+	return nil, map[string]any{
+		"app_id":     res.AppID,
+		"path":       res.Path,
+		"format":     res.Format,
+		"components": res.Components,
+		"files":      res.Files,
+		"warnings":   res.Warnings,
+		"next": "产物已落地。zip 形态可直接发给别人；目录形态可 git 版本化。" +
+			"到另一台机器用 gear_import(source=<path>) 导回（静态资源默认不落地，传 apps_dir 才落地）",
+	}, nil
+}
+
+// handleImport 把一个产物导进 registry。
+//
+// 语义与 gear_apply **逐条对齐**（都走 artifact.ApplyBundle）：dry_run 一个字节不写、
+// 未传 overwrite 且内容冲突则整批拒绝。智能体不需要为它学第二套规则。
+func (s *Server) handleImport(ctx context.Context, _ *mcp.CallToolRequest, in ImportArgs) (*mcp.CallToolResult, any, error) {
+	if strings.TrimSpace(in.Source) == "" {
+		return toolError("BAD_ARGUMENT", "source 不能为空", "给 gear_export 产出的目录或 .gearapp 文件路径"), nil, nil
+	}
+	res, err := artifact.Import(s.reg, artifact.ImportOptions{
+		Source:    in.Source,
+		Overwrite: in.Overwrite,
+		DryRun:    in.DryRun,
+		AppsDir:   in.AppsDir,
+	})
+	if err != nil {
+		return toolErrorFrom("IMPORT_FAILED", err), nil, nil
+	}
+	next := "导入完成。接着 gear_describe(kind=app, id=…) 确认组成，再用 gear_app(action=start) 起应用"
+	if res.DryRun {
+		next = "dry_run：一个字节未写。确认 created/updated 后再去掉 dry_run 真导入"
+	}
+	return nil, map[string]any{
+		"app_id":         res.AppID,
+		"valid":          true,
+		"dry_run":        res.DryRun,
+		"created":        res.Created,
+		"updated":        res.Updated,
+		"static_landed":  res.StaticLanded,
+		"static_missing": res.StaticMissing,
+		"warnings":       res.Warnings,
+		"next":           next,
+	}, nil
 }
 
 // ---- 小工具 ----
@@ -739,18 +767,5 @@ func appID(b *bundle) string {
 	return ""
 }
 
-// sameJSON 比较两个对象的内容是否等价（用 YAML/JSON 往返，忽略结构体零值与字段顺序差异）。
-//
-// 用「序列化后比较」而不是 reflect.DeepEqual：后者对 map 的 nil/空切片差异敏感，
-// 会把「人工填的标准定义」与「智能体重发的等价定义」判为不同，从而误报冲突。
-func sameJSON(a, b any) bool {
-	ja, err := yaml.Marshal(a)
-	if err != nil {
-		return false
-	}
-	jb, err := yaml.Marshal(b)
-	if err != nil {
-		return false
-	}
-	return string(ja) == string(jb)
-}
+// 2026-09-26：sameJSON 已随 persistBundle 一起上提到 internal/artifact（本包不再需要）。
+// 「已存在且内容是否相同」的判定只允许有一处——两个写入口各判一次迟早分叉。

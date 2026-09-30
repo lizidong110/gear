@@ -11,7 +11,7 @@ import (
 // cliEngine 构造 CLI 侧引擎，统一注入扩展原语目录（配置化加载，含内建 ext.registry）。
 //
 // 去内置化（PRD §9）：AI 不再内建，而是经 ext.ai 扩展原语提供。CLI 作为「应用层」选择
-// 注册它——引擎内核只认内核原语（受门禁 7 个 + 纯函数 3 个），扩展由 app 装配。sidecar 二进制缺失时调用
+// 注册它——引擎内核只认内核原语（受门禁 7 个 + 纯函数 5 个），扩展由 app 装配。sidecar 二进制缺失时调用
 // ctx.ext.ai.* 返回 ErrCapabilityUnavailable（fail-closed），不影响其它能力。
 // 扩展来源：extensions.yaml（GEAR_EXT_CONFIG 可覆盖路径），无配置则回退默认 ext.ai。
 //
@@ -31,7 +31,17 @@ func cliEngine(reg *registry.Registry, opts ...func(*engine.Engine)) (*engine.En
 	if err := secrets.SeedFromEnv(); err != nil {
 		return nil, fmt.Errorf("播种环境变量密钥失败: %w", err)
 	}
-	opts = append(opts, engine.WithCapabilities(capReg), engine.WithAIAgent(agent), engine.WithSecret(secrets))
+	opts = append(opts,
+		engine.WithCapabilities(capReg),
+		engine.WithAIAgent(agent),
+		engine.WithSecret(secrets),
+		// 运行期命名空间守卫（`--scope`）：CLI 侧所有入口（tool run / flow run / app run · start /
+		// serve）都经这里构造引擎，故一处注入即全贯通——不存在某个子命令忘了传 scope 的漏网。
+		engine.WithScope(cliScope),
+		// 配置库（config 原语 + AI 缺省配置）：落点取 gearhome.ConfigDBPath()，
+		// 与 REST 面同一个库——同一份配置必须在所有入口可见，否则「界面配了、CLI 读不到」。
+		engine.WithConfigStore(engine.NewDefaultConfigStore()),
+	)
 	return engine.New(reg, opts...), nil
 }
 

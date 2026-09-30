@@ -7,6 +7,9 @@
 #   gear tool run static_site.serve --registry <db> --input \
 #     '{"port":8080,"dir":"./dist","proxy":[{"path":"/api","target":"http://127.0.0.1:8787"}]}'
 #   → /api/** 转发到 8787，其余走 dir 下的静态文件。
+# 不指定端口（或填 0）：内核自动分配空闲端口，返回值带回真实 port，可直接拼进反代 target——
+#   gear tool run static_site.serve --registry <db> --input '{"dir":"/dist","proxy":[{"path":"/api","target":"http://127.0.0.1:8790"}]}'
+#   → 返回值含 "port":<真实端口>，用 ${steps.<step>.output.port} 即可传给依赖它的 step。
 # 停止：gear tool run static_site.stop --registry <db> '{}'
 #   （不手动 stop 也没关系：gear 进程退出后占用列表清空，侧车会自动退出释放端口）
 id: static_site.serve
@@ -16,11 +19,11 @@ capabilities: [ext.serve]
 input_schema:
   type: object
   properties:
-    port: {type: number, description: "对外服务端口（必填，传给 ext.serve）"}
+    port: {type: number, description: "对外服务端口（可选；省略或填 0 表示自动分配——内核挑空闲端口，返回值带回真实 port 供拼反代 target）"}
     dir: {type: string, description: "静态网站根目录（本地路径，必填，传给 ext.serve）"}
     host: {type: string, description: "绑定地址（默认 0.0.0.0 即所有网卡；改 127.0.0.1 仅本机）"}
     proxy: {type: array, description: "反向代理规则（可选，传给 ext.serve）：[{path,target,strip_prefix}]，命中前缀转发到 target、其余走静态；用于让 SPA 的 /api 与静态站同源"}
-  required: [port, dir]
+  required: [dir]
 output_schema:
   type: object
   properties:

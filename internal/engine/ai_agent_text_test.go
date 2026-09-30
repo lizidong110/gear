@@ -190,3 +190,41 @@ func fmtKind(v interface{}) string {
 	}
 	return ""
 }
+
+// TestReactToolsTextCoversAllPrimitives 锁死 ReAct 工具清单必须覆盖全部内核原语：
+// 此前写死的「6+1」名单漏了 subscribe，也漏了纯函数 time/template/crypto；且 call 被渲染成
+// 非法的 ctx.call.Call(...) 形态（Lua 侧 call 是裸函数 ctx.call(target, input)，运行期才炸）。
+func TestReactToolsTextCoversAllPrimitives(t *testing.T) {
+	txt := (&AIAgent{}).reactToolsText(nil)
+
+	// 受门禁原语：位置参数形态必须齐全（含此前遗漏的 subscribe / config）
+	for _, want := range []string{
+		"ctx.http.Request(", "ctx.db.query(", "ctx.secret.get(",
+		"ctx.event.notify(", "ctx.subscribe.start(", "ctx.config.get(",
+	} {
+		if !strings.Contains(txt, want) {
+			t.Fatalf("ReAct 清单缺受门禁原语 %q:\n%s", want, txt)
+		}
+	}
+	// call 是裸函数：必须是 ctx.call(target, input)，绝不能是 ctx.call.Call(...)
+	if !strings.Contains(txt, "ctx.call(") || strings.Contains(txt, "ctx.call.Call") {
+		t.Fatalf("call 必须按裸函数形态渲染（ctx.call(...)，不得 ctx.call.Call(...)）：\n%s", txt)
+	}
+	// 纯函数原子：单具名 table 形态（与 ctx.ext.* 同款），模型才不会写成位置参数
+	for _, want := range []string{"ctx.time.now({", "ctx.template.render({", "ctx.crypto.hash({"} {
+		if !strings.Contains(txt, want) {
+			t.Fatalf("ReAct 清单缺纯函数 %q:\n%s", want, txt)
+		}
+	}
+}
+
+// TestParamListOptionalMarker 锁死 paramList 的 `?` 语义：必填参数**不带** `?`，可选参数带 `?`。
+// 此前写反（Required 时标 `?`），模型据此把必填项当可选、漏传参数导致调用失败。
+func TestParamListOptionalMarker(t *testing.T) {
+	if got := paramList(map[string]ParamSchema{
+		"url":  {Type: "string", Required: true},
+		"body": {Type: "string"},
+	}); got != "body?:string, url:string" {
+		t.Fatalf("paramList `?` 语义错误（必填不带?、可选带?），实际 %q", got)
+	}
+}

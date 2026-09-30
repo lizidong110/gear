@@ -127,6 +127,34 @@ func newAIAgent(reg *registry.Registry, llm LLM, recipes RecipeLoader, extCaps m
 	return &AIAgent{reg: reg, llm: llm, recipes: recipes, extCaps: extCaps}
 }
 
+// SetConfigStore 把配置库设为 AI 缺省配置的读取源（ai.provider / ai.model / ai.base_url /
+// ai.api_key / ai.max_tokens）。由 Engine 在装配了 config 原语时调用（bindAIAgent）。
+//
+// 只对 HTTPLLM 生效：MockLLM 是离线确定性实现，让它读本机配置会让测试结果随开发者机器漂移。
+// 未装配（c == nil）或 llm 不是 HTTPLLM 时静默跳过——「没配就是没配」，回退链退化为
+// 「调用参数 > 环境变量 > 内置默认」，与装配前行为完全一致。
+func (a *AIAgent) SetConfigStore(c cap.Config) {
+	if c == nil {
+		return
+	}
+	if h, ok := a.llm.(*HTTPLLM); ok {
+		h.Config = configLookupFrom(c)
+	}
+}
+
+// configLookupFrom 把 cap.Config 适配成 AI 缺省配置的读取源。
+// 「该项不存在」与「读库失败」都报告未配置（false），统一交给下一级回退——
+// 配置库不可用不该让 AI 调用直接失败，它只是默认值的一个来源。
+func configLookupFrom(c cap.Config) ConfigLookup {
+	return func(key string) (string, bool) {
+		v, err := c.Get(key)
+		if err != nil {
+			return "", false
+		}
+		return v, true
+	}
+}
+
 // ---- 稳定层方法（供 Lua ctx.ext.ai.* 与 Go 直接调用） ----
 
 // Complete 走 LLM 层（参数化 model/url/key/provider），format=json 时解析为 {data}，否则 {text}。
@@ -292,7 +320,8 @@ func (a *AIAgent) GenerateMethod(args map[string]interface{}) (interface{}, erro
 // ReactOpts 携带 react 的可选项。
 type ReactOpts struct {
 	MaxSteps    int      // 最大步数（默认 6）
-	Allow       []string // 限制可用工具（如 ["http","secret"]）；空 = 全部内置原语 + 已注册 ext.*
+	Allow       []string // 限制可用工具（如 ["http","secret"]）
+	AllowSet    bool     // Allow 是否由调用方**显式**给定（= 该 Tool 自己声明的那份 capability）
 	Provider    string   // 模型厂商（可选，覆盖 env）
 	Model       string   // 模型名（可选）
 	BaseURL     string   // API base（可选）
@@ -300,12 +329,145 @@ type ReactOpts struct {
 	Temperature float64  // 采样温度（可选，默认 0.3）
 }
 
+// reactAllow 把「react 能调哪些工具」从**隐式约定**变成**显式值**。
+//
+// 旧语义里「allow 没传 = 全部门禁原语」：一个只声明 `capabilities: [ext.ai]` 的 agent Tool
+// 实际能把 secret.get / db.exec 交给模型调——能力边界写在 Tool 声明上，却不在执行通道上。
+// 这里不再靠 len(names)==0 猜意图：all 为 true 才表示「未限定」，否则 names 就是白名单
+// （连空名单也表示「一个都不给」。
+type reactAllow struct {
+	names   []string
+	methods map[string]bool // "能力.方法" 精确白名单；空 = 该能力整体开放，不按方法收窄
+	all     bool
+}
+
+// reactAllowAll 是 allow 里的通配符：显式要求不设限（整个能力目录）。
+//
+// 默认不再是全量。能力目录实测 28 个能力 / 115 个方法，全量下发意味着每轮请求都塞进
+// 115 条 function 声明——工具越多模型越选不准（工具面膨胀），且重型扩展里绝大多数方法
+// 与当前任务无关。要全量必须显式写出来。
+const reactAllowAll = "*"
+
+// maxReactTools 是单次 react 允许下发的工具数上限，超出直接报错（不静默截断）。
+//
+// 不截断的理由：截断等于偷偷改了 agent 的能力边界，模型调不到某个工具却不知道为什么，
+// 只能在错误里瞎猜。报错能逼调用方显式收窄——换用方法级 allow，或砍掉无关能力。
+const maxReactTools = 48
+
+// defaultReactCapabilities 是「没显式给 allow」时的默认工具集（Go 直调路径：CLI / 测试 / 宿主）。
+//
+// 刻意排除重型扩展（ext.redis 一家 29 个方法、ext.oss 6 个）与 crypto（13 个方法）：
+// 它们跟大多数任务无关，白占请求体积还干扰选择，要用就显式声明。
+// ext.registry 必留：agent 靠它查 registry 里有什么 Tool / Flow，是「按需发现」的入口。
+var defaultReactCapabilities = []string{
+	"http", "call", "db", "secret", "config",
+	"time", "template", "id", "validate",
+	"ext.registry",
+}
+
+// resolveReactAllow 由调用方给定的原始 allow 与「是否显式给定」解析出允许集。
+//
+// set=false 不再是「不设限」，而是回到默认集——历史行为会把 115 个方法全塞进请求。
+// 允许项可以是能力名（"ext.redis"，该能力所有方法）或方法名（"ext.redis.set"）；
+// 认不出来的项直接报错，不静默忽略（忽略等于让调用方以为开了权限实际没开）。
+func (a *AIAgent) resolveReactAllow(names []string, set bool) (reactAllow, error) {
+	if !set {
+		caps := make([]string, 0, len(defaultReactCapabilities))
+		for _, c := range defaultReactCapabilities {
+			if a.knownCapability(c) {
+				caps = append(caps, c)
+			}
+		}
+		return reactAllow{names: caps}, nil
+	}
+	caps := []string{}
+	methods := map[string]bool{}
+	seen := map[string]bool{}
+	for _, raw := range names {
+		x := strings.TrimSpace(raw)
+		if x == "" {
+			continue
+		}
+		if x == reactAllowAll {
+			return reactAllow{all: true}, nil
+		}
+		if a.knownCapability(x) {
+			if !seen[x] {
+				seen[x] = true
+				caps = append(caps, x)
+			}
+			continue
+		}
+		// 不是能力名，按「<能力>.<方法>」解析：方法名不含点，取最后一段为方法名
+		// （ext.ai.complete → ext.ai + complete；http.Request → http + Request）。
+		capName, method, ok := splitCapMethod(x)
+		if !ok || !a.knownMethod(capName, method) {
+			return reactAllow{}, fmt.Errorf("react 的 allow 含 %q：既不是已知能力，也不是「已知能力.方法」；"+
+				"可用 gear ai capabilities 或 ext.ai.capabilities() 看目录", x)
+		}
+		if !seen[capName] {
+			seen[capName] = true
+			caps = append(caps, capName)
+		}
+		methods[x] = true
+	}
+	return reactAllow{names: caps, methods: methods}, nil
+}
+
+// allows 报告 capName.method 是否可以调用：all 时不问名单；命中能力后，只有在存在方法级
+// 收窄时才逐个方法比对（没有方法级 allow 即该能力整体开放）。
+func (r reactAllow) allows(capName, method string) bool {
+	if r.all {
+		return true
+	}
+	if !allowContains(r.names, capName) {
+		return false
+	}
+	if len(r.methods) == 0 {
+		return true
+	}
+	return r.methods[capName+"."+method]
+}
+
+// knownCapability 报告 name 是否是当前装配的能力名（门禁原语 / 纯函数原子 / 已注册 ext.*）。
+func (a *AIAgent) knownCapability(name string) bool {
+	for _, p := range allBuiltinPrimitives() {
+		if p == name {
+			return true
+		}
+	}
+	_, ok := a.extCaps[name]
+	return ok
+}
+
+// knownMethod 报告 capName.method 是否在能力目录里真实存在。
+func (a *AIAgent) knownMethod(capName, method string) bool {
+	if ms, ok := builtinCapabilitySchemas[capName]; ok {
+		_, ok := ms[method]
+		return ok
+	}
+	if ms, ok := a.extCaps[capName]; ok {
+		_, ok := ms[method]
+		return ok
+	}
+	return false
+}
+
+// splitCapMethod 把 "ext.redis.set" 拆成 ("ext.redis", "set")。
+func splitCapMethod(s string) (string, string, bool) {
+	i := strings.LastIndex(s, ".")
+	if i <= 0 || i == len(s)-1 {
+		return "", "", false
+	}
+	return s[:i], s[i+1:], true
+}
+
 // React 跑一个 ReAct 循环：把任务交给 LLM，让它逐步「思考 + 调用内置工具」，Go 侧把工具调用
 // 编成一段 Lua 入口、经与真实 Tool 完全相同的宿主能力通道（host.* / ctx.ext.*）执行，观察结果再
 // 喂回 LLM，直到 LLM 给出 Final Answer 或达到最大步数。
 //
 // react「可以使用内置所有工具」即此意：每步 LLM 选中的工具（内核原语 http/call/db/secret/event/subscribe
-// 与纯函数原子 time/template/crypto，或已注册 ext.*）都经 exec 执行——复用引擎既有的最小权限 + Lua 沙箱，
+// 与纯函数原子 time/template/crypto/id/validate，或已注册 ext.*）都经 exec 执行——复用引擎既有的最小权限 + Lua 沙箱，
 // react 不会越出宿主能力边界。
 //
 // 用户可经 ctx.ext.ai.react 直接调用（"用户爱用就用，不爱用就自己写"）：写一个 Tool 的 entry 调
@@ -324,64 +486,72 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 		opts.Temperature = 0.3
 	}
 
-	sys := a.reactSystemPrompt(opts.Allow, opts.MaxSteps)
-	conv := "任务：" + task + "\n\n请开始（先写 Thought，再输出 Action 或 Final Answer）。"
+	// 允许集在这里定型，不再有「没传就全给」的隐式回退。
+	// Allow 非空即视为「已给定」：否则 Go 侧写 `Allow:["http"]` 却忘了 AllowSet，会静默
+	// 落回默认集——那正是被收掉的同一个坑，只是换了个方向。只有「两个都没给」才是默认集。
+	allow, err := a.resolveReactAllow(opts.Allow, opts.AllowSet || len(opts.Allow) > 0)
+	if err != nil {
+		return nil, err
+	}
+	tools, toolByName := a.reactToolSpecs(allow)
+	// 工具数上限在这里拦（写作期可查，不必等模型选错）：宁可报错让人收窄，也不静默截断。
+	if len(tools) > maxReactTools {
+		return nil, fmt.Errorf("react 工具数 %d 超过上限 %d：工具越多模型越选不准；"+
+			"请用方法级 allow（形如 \"ext.redis.set\"）收窄，或砍掉与本次任务无关的能力", len(tools), maxReactTools)
+	}
+	sys := a.reactSystemPrompt(allow, opts.MaxSteps, len(tools) > 0)
+	// msgs 是本任务的完整消息序列（取代原先「把历史拼成一段长文本」的做法）。
+	//
+	// 必须按协议维护而不是拼文本：assistant 消息里带了 tool_calls 之后，紧跟着的必须是
+	// `{"role":"tool","tool_call_id":...}`——拼成普通 user 文本的话模型看不到「工具已经跑过了」，
+	// 会再次发起同一个调用（真机实测：连发三次同一调用，全被重复调用守卫拦下，任务跑废）。
+	msgs := []map[string]any{
+		{"role": "system", "content": sys},
+		{"role": "user", "content": "任务：" + task + "\n\n请开始（先写 Thought，再输出 Action 或 Final Answer）。"},
+	}
 	steps := []map[string]interface{}{}
 	usedTools := []string{}
 	seen := map[string]bool{}
 	finalAnswer := ""
 
-	for i := 0; i < opts.MaxSteps; i++ {
-		resp, err := a.llm.Complete(ctx, LLMRequest{
-			System:      sys,
-			Prompt:      conv,
-			Provider:    opts.Provider,
-			Model:       opts.Model,
-			BaseURL:     opts.BaseURL,
-			APIKey:      opts.APIKey,
-			Temperature: opts.Temperature,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("react 第 %d 步 LLM 调用失败: %w", i+1, err)
+	// appendAssistant 把模型这一轮的回话按协议塞回序列：带 tool_calls 时必须原样带上，
+	// 否则下一条 tool 结果没有可对应的 id（OpenAI 兼容端点会直接判非法）。
+	appendAssistant := func(text string, calls []ToolCall) {
+		m := map[string]any{"role": "assistant", "content": text}
+		if len(calls) > 0 {
+			tcs := make([]map[string]any, 0, len(calls))
+			for _, c := range calls {
+				tcs = append(tcs, map[string]any{
+					"id":       c.ID,
+					"type":     "function",
+					"function": map[string]any{"name": c.Name, "arguments": c.Arguments},
+				})
+			}
+			m["tool_calls"] = tcs
 		}
+		msgs = append(msgs, m)
+	}
 
-		// Final Answer 优先于 Action。
-		if fa, ok := extractFinalAnswer(resp); ok {
-			finalAnswer = strings.TrimSpace(fa)
-			steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": nil, "observation": finalAnswer})
-			break
+	// execute 跑一次工具调用并返回回灌给模型的 Observation：allow 守卫 → 重复调用守卫 →
+	// 编 Lua 入口 → 沙箱执行。抽成闭包是因为「原生 tool_calls」与「文本解析兜底」两条路径
+	// 共用同一套守卫——抄两份的话，将来加一条守卫必然漏改其中一份（判据③：保持简洁）。
+	execute := func(tool, method string, args map[string]interface{}, thought string) string {
+		action := tool + "." + method
+		record := func(obs string) string {
+			steps = append(steps, map[string]interface{}{"thought": thought, "action": action, "observation": obs})
+			return obs
 		}
-
-		tool, method, args, ok := parseReactAction(resp)
-		if !ok {
-			obs := "你本轮既未输出合法 Action（```json {...} ```）也未输出 Final Answer，请严格按格式继续。"
-			conv += "\n\n" + resp + "\n\nObservation: " + obs
-			steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": nil, "observation": obs})
-			continue
+		if !allow.allows(tool, method) {
+			return record(fmt.Sprintf("工具 %q 不在允许列表 [%s] 中，请改用允许的工具", action, allow.String()))
 		}
-		// 工具可用性守卫（allow 限制）。
-		if len(opts.Allow) > 0 && !allowContains(opts.Allow, tool) {
-			obs := fmt.Sprintf("工具 %q 不在允许列表 %v 中，请改用允许的工具", tool, opts.Allow)
-			conv += "\n\n" + resp + "\n\nObservation: " + obs
-			steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": tool + "." + method, "observation": obs})
-			continue
-		}
-		// 重复调用守卫（防止模型陷入同一工具+参数的死循环）。
-		key := tool + "." + method + " " + stableJSON(args)
+		key := action + " " + stableJSON(args)
 		if seen[key] {
-			obs := "检测到重复调用相同工具与参数，疑似陷入循环，已停止该步"
-			conv += "\n\n" + resp + "\n\nObservation: " + obs
-			steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": tool + "." + method, "observation": obs})
-			continue
+			return record("检测到重复调用相同工具与参数，疑似陷入循环，已停止该步")
 		}
 		seen[key] = true
-
 		entry, err := buildActionEntry(tool, method, args)
 		if err != nil {
-			obs := "构建工具调用失败：" + err.Error()
-			conv += "\n\n" + resp + "\n\nObservation: " + obs
-			steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": tool + "." + method, "observation": obs})
-			continue
+			return record("构建工具调用失败：" + err.Error())
 		}
 		out, err := a.exec(ctx, entry, map[string]interface{}{})
 		var obs string
@@ -396,10 +566,100 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 		} else {
 			obs = "(无输出)"
 		}
-		obs = truncateRunes(obs, 3000)
-		conv += "\n\n" + resp + "\n\nObservation: " + obs
-		steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": tool + "." + method, "observation": obs})
-		usedTools = appendUnique(usedTools, tool+"."+method)
+		obs = truncateObservation(obs, 3000)
+		usedTools = appendUnique(usedTools, action)
+		return record(obs)
+	}
+
+	for i := 0; i < opts.MaxSteps; i++ {
+		req := LLMRequest{
+			Messages:    msgs,
+			Provider:    opts.Provider,
+			Model:       opts.Model,
+			BaseURL:     opts.BaseURL,
+			APIKey:      opts.APIKey,
+			Temperature: opts.Temperature,
+		}
+		var resp string
+		var calls []ToolCall
+		if len(tools) > 0 {
+			// 带工具声明走原生 function calling —— 模型按协议给出调用意图。
+			res, err := a.llm.CompleteTools(ctx, req, tools)
+			if err != nil {
+				return nil, fmt.Errorf("react 第 %d 步 LLM 调用失败: %w", i+1, err)
+			}
+			resp, calls = res.Text, res.ToolCalls
+		} else {
+			text, err := a.llm.Complete(ctx, req)
+			if err != nil {
+				return nil, fmt.Errorf("react 第 %d 步 LLM 调用失败: %w", i+1, err)
+			}
+			resp = text
+		}
+
+		// Final Answer 优先于 Action。
+		if fa, ok := extractFinalAnswer(resp); ok {
+			finalAnswer = strings.TrimSpace(fa)
+			steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": nil, "observation": finalAnswer})
+			break
+		}
+
+		// 原生 tool_calls 优先：模型按协议给出的调用意图，比从自由文本里抠 JSON 可靠得多——
+		// 基线 B-1（格式不遵守白扔一步）与 B-3（编造工具名只换回一段 Lua 栈错误）都出在老路径上。
+		// 有 tool_calls 就不再解析正文。
+		if len(calls) > 0 {
+			// 每轮只处理第一个调用（与「每轮只能调用一个工具」的约定一致），并且只把这
+			// 一个记回 assistant 消息——协议要求每个 tool_call 都有对应的 tool 结果，
+			// 记多了对不上会被端点判非法。
+			active := calls[0]
+			appendAssistant(resp, []ToolCall{active})
+			toolMsg := func(obs string) {
+				msgs = append(msgs, map[string]any{"role": "tool", "tool_call_id": active.ID, "content": obs})
+			}
+
+			orig, ok := toolByName[active.Name]
+			if !ok {
+				// 模型给了目录里没有的名字：明确回绝并列出可用工具。少了这一步，它拿到的是
+				// 一段 Lua 栈错误（attempt to index a nil value），只能瞎猜重试。
+				names := make([]string, 0, len(tools))
+				for _, t := range tools {
+					names = append(names, t.Name)
+				}
+				obs := fmt.Sprintf("工具 %q 不存在，可用工具：%s", active.Name, strings.Join(names, ", "))
+				steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": nil, "observation": obs})
+				toolMsg(obs)
+				continue
+			}
+			args := map[string]interface{}{}
+			if s := strings.TrimSpace(active.Arguments); s != "" {
+				if err := json.Unmarshal([]byte(s), &args); err != nil {
+					obs := fmt.Sprintf("工具 %q 的参数不是合法 JSON：%v", orig, err)
+					steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": orig, "observation": obs})
+					toolMsg(obs)
+					continue
+				}
+				if args == nil {
+					args = map[string]interface{}{}
+				}
+			}
+			tool, method := splitToolMethod(orig, "")
+			obs := execute(tool, method, args, trimThought(resp))
+			toolMsg(obs)
+			continue
+		}
+
+		// 文本兜底：模型没给 tool_calls（不支持 function calling，或这轮只想说话）时沿用老路径。
+		// 这里没有 tool_calls，回灌就用普通 user 消息——不带 tool_call_id 才合法。
+		appendAssistant(resp, nil)
+		tool, method, args, ok := parseReactAction(resp)
+		if !ok {
+			obs := "你本轮既未输出合法 Action（```json {...} ```）也未输出 Final Answer，请严格按格式继续。"
+			steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": nil, "observation": obs})
+			msgs = append(msgs, map[string]any{"role": "user", "content": "Observation: " + obs})
+			continue
+		}
+		obs := execute(tool, method, args, trimThought(resp))
+		msgs = append(msgs, map[string]any{"role": "user", "content": "Observation: " + obs})
 	}
 
 	if finalAnswer == "" {
@@ -413,13 +673,37 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 }
 
 // ReactMethod 暴露给 Lua ctx.ext.ai.react：解析参数后跑 React 循环。
-func (a *AIAgent) ReactMethod(args map[string]interface{}) (interface{}, error) {
+//
+// callerCaps 是**调用方 Tool 自己声明的 capability**（由 Lua 绑定从 cap.Context 取来），
+// 是「没显式给 allow」时的默认工具集。这一层是能力边界的落点：不收口的话，一个只声明
+// `capabilities: [ext.ai]` 的 agent Tool 会拿到全部门禁原语，等于把凭据通道交给了模型。
+func (a *AIAgent) ReactMethod(args map[string]interface{}, callerCaps ...string) (interface{}, error) {
 	task, _ := args["task"].(string)
 	opts := ReactOpts{}
-	if v, ok := args["max_steps"].(float64); ok && int(v) > 0 {
+	// toFloat 而不是直接断言 float64：Lua 侧的整数字面量（max_steps = 8）经 fromLuaValue
+	// 出来是 **int64**（lua.go 的整数收敛规则），只认 float64 会让这两个参数静默失效——
+	// `max_steps = 8` 一直按默认 6 步跑，肉眼看不出来。
+	if v, ok := toFloat(args["max_steps"]); ok && int(v) > 0 {
 		opts.MaxSteps = int(v)
 	}
-	opts.Allow = toStringSlice(args["allow"])
+	// 显式给 allow 时必须是调用方自己声明的子集——否则「给个 allow 绕过门禁」就成了后门。
+	explicit := toStringSlice(args["allow"])
+	if len(explicit) > 0 && len(callerCaps) > 0 {
+		for _, name := range explicit {
+			if !containsString(callerCaps, name) {
+				return nil, fmt.Errorf("react 的 allow 含 %q，但本 Tool 只声明了 %v——allow 不能超出自己的 capability；"+
+					"要用更多能力，请在本 Tool 的 capabilities 里声明", name, callerCaps)
+			}
+		}
+	}
+	if len(explicit) > 0 {
+		opts.Allow = explicit
+		opts.AllowSet = true
+	} else {
+		// 缺省 = 调用方声明的那一份；一份都没声明就一个工具都不给（而不是退回全目录）。
+		opts.Allow = callerCaps
+		opts.AllowSet = true
+	}
 	if s, ok := args["provider"].(string); ok && s != "" {
 		opts.Provider = s
 	}
@@ -432,29 +716,43 @@ func (a *AIAgent) ReactMethod(args map[string]interface{}) (interface{}, error) 
 	if s, ok := args["api_key"].(string); ok && s != "" {
 		opts.APIKey = s
 	}
-	if v, ok := args["temperature"].(float64); ok && v > 0 {
+	if v, ok := toFloat(args["temperature"]); ok && v > 0 {
 		opts.Temperature = v
 	}
 	return a.React(context.Background(), task, opts)
 }
 
 // reactSystemPrompt 拼装 ReAct 的系统提示：可用工具（来自能力目录，可经 allow 过滤）+ 输出格式 + 规则。
-func (a *AIAgent) reactSystemPrompt(allow []string, maxSteps int) string {
+// useTools 表示本轮会随请求下发 function 声明（原生 function calling）。为 true 时不再要求模型
+// 手写 ```json 围栏——协议已经给了调用通道，再要求它手打一遍 JSON 只会两头打架（基线 B-1 的
+// 「格式不遵守白扔一步」就是这么来的）。
+func (a *AIAgent) reactSystemPrompt(allow []string, maxSteps int, useTools bool) string {
 	tools := a.reactToolsText(allow)
 	var b strings.Builder
 	b.WriteString("你是一个运行在 Gear 引擎内的 ReAct（推理 + 行动）智能体。你可以通过调用「内置工具」逐步推理与行动，直到能回答用户任务。\n\n")
 	b.WriteString("## 可用工具（只能使用下列工具，不要编造）\n")
 	b.WriteString(tools)
 	b.WriteString("\n\n## 每轮输出格式（严格遵守）\n")
-	b.WriteString("先写思考，再决定「调用一个工具」或「给出最终答案」：\n\n")
-	b.WriteString("Thought: <这一步你在想什么>\n")
-	b.WriteString("Action:\n```json\n{\"tool\": \"http.Request\", \"args\": {\"method\": \"GET\", \"url\": \"https://example.com\", \"body\": null, \"headers\": {}}}\n```\n\n")
+	if useTools {
+		b.WriteString("先写思考，然后用**工具调用**发起一次调用（不要把参数手写成 JSON 文本）：\n\n")
+		b.WriteString("Thought: <这一步你在想什么>\n")
+		b.WriteString("（随后发起一次工具调用）\n")
+	} else {
+		b.WriteString("先写思考，再决定「调用一个工具」或「给出最终答案」：\n\n")
+		b.WriteString("Thought: <这一步你在想什么>\n")
+		b.WriteString("Action:\n```json\n{\"tool\": \"http.Request\", \"args\": {\"method\": \"GET\", \"url\": \"https://example.com\", \"body\": null, \"headers\": {}}}\n```\n")
+	}
 	b.WriteString("当你认为信息已足够、可以回答用户时，输出：\n\n")
 	b.WriteString("Thought: <总结>\n")
 	b.WriteString("Final Answer: <给用户的完整回答>\n\n")
 	b.WriteString("## 规则\n")
-	b.WriteString("- 每轮只能调用一个工具。Action 必须是合法 JSON（放在 ```json ... ``` 围栏内）。\n")
-	b.WriteString("- tool 字段为「<能力名>.<方法>」：内置原语如 http.Request / db.query / secret.get；扩展如 ext.ai.complete。\n")
+	if useTools {
+		b.WriteString("- 每轮只能调用一个工具，用工具调用发起；参数是结构化的，不要手写 JSON 文本。\n")
+		b.WriteString("- 工具名形如 http_Request / ext_ai_complete：下划线处原本是「.」（能力名与方法名的分隔），字符集所限才压平。\n")
+	} else {
+		b.WriteString("- 每轮只能调用一个工具。Action 必须是合法 JSON（放在 ```json ... ``` 围栏内）。\n")
+		b.WriteString("- tool 字段为「<能力名>.<方法>」：内置原语如 http.Request / db.query / secret.get；扩展如 ext.ai.complete。\n")
+	}
 	b.WriteString("- 内置原语按「位置参数」调用，args 的键对应上面列出的参数名（可选参数缺省传 null）。\n")
 	b.WriteString("- 扩展（ext.*）按「单个具名 table」调用，args 整体作为 { ... } 传入 ctx.ext.<name>.<method>({...})。\n")
 	b.WriteString("- Observation（工具返回）会由系统填回作为下一步输入；不要自己编造 Observation。\n")
@@ -468,16 +766,34 @@ func (a *AIAgent) reactToolsText(allow []string) string {
 	for _, x := range allow {
 		allowed[x] = true
 	}
+	// nil = 不设限（Go 直调路径的历史行为）；**空 slice = 一个都不给**。
+	// 不能写成 `len(allowed) == 0`：那会把「显式清空」也解释成「全给」，正是 2026-09-27
+	// 收口 react 默认权限时要堵的口。
 	filter := func(name string) bool {
-		return len(allowed) == 0 || allowed[name]
+		return allow == nil || allowed[name]
 	}
 	var sb strings.Builder
-	for _, p := range []string{"http", "call", "db", "secret", "event"} {
+	// 与 capabilitiesText 同源（allBuiltinPrimitives 单一来源），不再写死 6+1 个名字——
+	// 这样 subscribe / 纯函数 time/template/crypto/id/validate 都会自然进入 ReAct 工具清单，
+	// 且裸函数原语（call）按 ctx.call(...) 形态渲染（见 bareFunctionPrimitives）。
+	for _, p := range allBuiltinPrimitives() {
 		if !filter(p) {
 			continue
 		}
-		if ms, ok := builtinCapabilitySchemas[p]; ok {
-			for m, sch := range ms {
+		ms, ok := builtinCapabilitySchemas[p]
+		if !ok {
+			continue
+		}
+		for _, m := range sortedKeys(ms) {
+			sch := ms[m]
+			switch {
+			case bareFunctionPrimitives[p]:
+				// call 在 Lua 侧是裸函数 ctx.call(target, input)，不是 ctx.call.Call(...)。
+				// 写成带 .Call 的形态会让模型编出「索引函数」的非法调用，到运行期才炸。
+				sb.WriteString(fmt.Sprintf("- ctx.%s(%s): %s\n", p, paramList(sch.Parameters), sch.Description))
+			case pureFuncPrimitives[p]:
+				sb.WriteString(fmt.Sprintf("- ctx.%s.%s({ %s }): %s\n", p, m, fieldsList(sch.Parameters), sch.Description))
+			default:
 				sb.WriteString(fmt.Sprintf("- ctx.%s.%s(%s): %s\n", p, m, paramList(sch.Parameters), sch.Description))
 			}
 		}
@@ -496,6 +812,92 @@ func (a *AIAgent) reactToolsText(allow []string) string {
 	return sb.String()
 }
 
+// reactToolSpecs 生成给模型的工具声明（原生 function calling 用），并带回「压平名 → 原名」的反查表。
+//
+// 为什么要压平：OpenAI 的 function name 只接受 [A-Za-z0-9_-]，而 Gear 的工具名带点
+// （http.Request / ext.ai.complete）。压平不可逆，所以反查表必须一起返回——模型回的是压平名，
+// 执行前要还原成「<能力>.<方法>」。
+//
+// 与 reactToolsText 同源（都是能力目录的另一种渲染），两边都受 allow 过滤，保证
+// 「prompt 里写了的工具」与「协议里声明的工具」是同一批——不然模型会调到一个 prompt 里没有的。
+func (a *AIAgent) reactToolSpecs(allow []string) ([]ToolSpec, map[string]string) {
+	allowed := map[string]bool{}
+	for _, x := range allow {
+		allowed[x] = true
+	}
+	// 见 reactToolsText 同款注释：nil = 不设限，空 slice = 一个都不给。
+	filter := func(name string) bool { return allow == nil || allowed[name] }
+
+	specs := []ToolSpec{}
+	byName := map[string]string{}
+	add := func(orig string, sch MethodSchema) {
+		flat := SanitizeToolName(orig)
+		if _, dup := byName[flat]; dup {
+			return // 压平后撞名：保留先登记的，避免一个名字指向两个不同能力
+		}
+		desc := sch.Description
+		if desc == "" {
+			desc = orig + "（能力目录未给描述）"
+		}
+		specs = append(specs, ToolSpec{Name: flat, Description: desc, Parameters: methodSchemaToJSON(sch)})
+		byName[flat] = orig
+	}
+	for _, p := range allBuiltinPrimitives() {
+		if !filter(p) {
+			continue
+		}
+		ms, ok := builtinCapabilitySchemas[p]
+		if !ok {
+			continue
+		}
+		for _, m := range sortedKeys(ms) {
+			add(p+"."+m, ms[m])
+		}
+	}
+	// ext 名来自 map，遍历顺序不稳定——排序后再进数组，保证 tools 顺序可复现
+	// （顺序不稳会让「模型第一轮看到的工具」在不同进程里不一样，难复现问题）。
+	extNames := make([]string, 0, len(a.extCaps))
+	for name := range a.extCaps {
+		extNames = append(extNames, name)
+	}
+	sort.Strings(extNames)
+	for _, name := range extNames {
+		if !filter(name) {
+			continue
+		}
+		for _, m := range sortedKeys(a.extCaps[name]) {
+			add(name+"."+m, a.extCaps[name][m])
+		}
+	}
+	return specs, byName
+}
+
+// methodSchemaToJSON 把方法级参数 schema 转成 JSON Schema（function calling 的 parameters）。
+// 只转能力目录已经声明的东西：type / description / enum / required，不凭空补 items 之类的细节——
+// 编不出来就交给模型按 description 猜，好过编一个错的把调用卡死在校验上。
+func methodSchemaToJSON(ms MethodSchema) map[string]any {
+	props := map[string]any{}
+	required := []string{}
+	for name, p := range ms.Parameters {
+		prop := map[string]any{"type": p.Type}
+		if p.Description != "" {
+			prop["description"] = p.Description
+		}
+		if len(p.Enum) > 0 {
+			prop["enum"] = p.Enum
+		}
+		props[name] = prop
+		if p.Required {
+			required = append(required, name)
+		}
+	}
+	out := map[string]any{"type": "object", "properties": props}
+	if len(required) > 0 {
+		out["required"] = required
+	}
+	return out
+}
+
 // bareFunctionPrimitives 是「在 Lua 侧绑定成**裸函数**、而非带方法的表」的原语——目前只有 call
 // （lua.go：ctx.call(target, input)，插件间唯一通信通道；其余原语都是 ctx.<name>.<method> 形态）。
 //
@@ -506,20 +908,22 @@ var bareFunctionPrimitives = map[string]bool{"call": true}
 
 // builtinParamOrder 是**受 capability 门禁的内核原语**各方法的「位置参数名」顺序（与 lua.go 的
 // ctx.* 绑定一一对应），供 buildActionEntry 把 LLM 提供的 args map 编成位置调用。
-// 纯函数原子（time/template/crypto）与扩展（ext.*）都走单具名 table，不在此列。
+// 纯函数原子（time/template/crypto/id/validate）与扩展（ext.*）都走单具名 table，不在此列。
 var builtinParamOrder = map[string]map[string][]string{
 	"http":      {"Request": {"method", "url", "body", "headers"}},
 	"call":      {"Call": {"target", "input"}},
-	"db":        {"query": {"table"}, "exec": {"table"}, "ping": {"table"}},
+	"db":        {"query": {"table"}, "exec": {"table"}, "batch": {"table"}, "ping": {"table"}},
 	"secret":    {"get": {"name"}},
 	"event":     {"notify": {"name", "payload"}, "wait": {"name"}},
 	"subscribe": {"start": {"table"}, "stop": {"handle"}},
+	// config 全部走单具名 table（与 db.* 同形态）：ctx.config.get({key=...})。
+	"config": {"get": {"table"}, "set": {"table"}, "delete": {"table"}, "list": {"table"}},
 }
 
 // buildActionEntry 把一次解析出的工具调用编成一段 Lua 入口（复用真实 Tool 的 ctx.* 通道）：
 //   - 内置原语：位置参数调用 ctx.<tool>.<method>(a, b, ...)，缺失可选参数传 nil（Lua 绑定按 GetTop 判缺省）；
 //     裸函数绑定的原语（call）用 ctx.<tool>(a, b, ...)。
-//   - 纯函数原子（time/template/crypto）：单具名 table 调用 ctx.<tool>.<method>({ ... })（与 ctx.ext.* 同款）。
+//   - 纯函数原子（time/template/crypto/id/validate）：单具名 table 调用 ctx.<tool>.<method>({ ... })（与 ctx.ext.* 同款）。
 //   - 扩展 ext.*：单具名 table 调用 ctx.<tool>.<method>({ ... })。
 func buildActionEntry(tool, method string, args map[string]interface{}) (string, error) {
 	// 纯函数原子先拦「方法名不存在」：react / invoke 路径直接调本函数，
@@ -709,6 +1113,36 @@ func trimThought(resp string) string {
 	return strings.TrimSpace(resp)
 }
 
+// toFloat 宽容地把数值型入参转成 float64。
+// Lua → Go 的整数收敛在 lua.go 的 fromLuaValue 里（整数字面量出 int64），调用方不该
+// 猜自己拿到的到底是哪个类型——猜错的表现是「参数写了但没生效」，最难查。
+func toFloat(v interface{}) (float64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return t, true
+	case float32:
+		return float64(t), true
+	case int64:
+		return float64(t), true
+	case int32:
+		return float64(t), true
+	case int:
+		return float64(t), true
+	}
+	return 0, false
+}
+
+// containsString 报告一个字符串是否在列表里（纯标量比较，不含 "ext.*" 通配——通配只在
+// react 的工具名判定里才有意义）。
+func containsString(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
 // allowContains 报告工具是否在 allow 列表内（支持 "ext.*" 通配）。
 func allowContains(allow []string, tool string) bool {
 	for _, a := range allow {
@@ -738,6 +1172,41 @@ func truncateRunes(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "...(truncated)"
+}
+
+// jsonArrayLen 尝试读出「字符串里顶层 JSON 数组的条数」。观察回灌给模型前会被序列化成
+// JSON，而目录类返回值（ext.registry.tools 等）恰好是数组——条数是模型最需要的那个数字。
+// 读出来写进截断提示，模型就不必去数一份被截断的半截清单（2026-09-27 实测：数出 12，真实 34）。
+func jsonArrayLen(s string) (int, bool) {
+	i := strings.Index(s, "[")
+	if i < 0 {
+		return 0, false
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal([]byte(s[i:]), &arr); err != nil {
+		return 0, false
+	}
+	return len(arr), true
+}
+
+// truncateObservation 截断观察并**把「截掉了多少」如实写回给模型**。
+//
+// 只截断不给信息是这次实踩的坑：模型拿到带 `...(truncated)` 的目录后数出 12 条就回答「共 12 个
+// Tool」（真实 34）。截断本身没错，错在截完之后模型无从知道自己看到的不是全部，只能凑一个
+// 看起来合理的数字。所以提示里必须带**原文总长**（任何情况都能给）与**数组条数**（能解析出来时），
+// 并告诉它分次查询的手段——`... 请你缩小范围` 如果没有参数可传，就是一句空话。
+func truncateObservation(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	head := string(r[:n])
+	if cnt, ok := jsonArrayLen(s); ok {
+		return head + fmt.Sprintf("\n\n...(已截断：原文共 %d rune，以上只是开头。这是长度为 %d 的清单，"+
+			"请按「共 %d 条」理解，不要按上面能数出的条目下结论——"+
+			"换用 prefix/limit 分次查询可看到完整清单)", len(r), cnt, cnt)
+	}
+	return head + fmt.Sprintf("\n\n...(已截断：原文共 %d rune，以上只是开头)", len(r))
 }
 
 // appendUnique 向切片追加不重复的元素。
@@ -994,7 +1463,9 @@ func paramList(params map[string]ParamSchema) string {
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
 		req := ""
-		if params[k].Required {
+		// `?` 是「可选」标记（Lua 惯用法 name?）。必填参数**不加**标记——此前写反成
+		// `if Required { req = "?" }`，会把必填项显示成可选，模型据此漏传参数导致调用失败。
+		if !params[k].Required {
 			req = "?"
 		}
 		parts = append(parts, k+req+":"+params[k].Type)
@@ -1043,7 +1514,7 @@ func (a *AIAgent) normalizeDef(kind string, def map[string]interface{}) {
 // 而 GrantsFromStrings 只认 cap.KnownPrimitives ∪ 已注册 ext.* → 生成出来的 Tool 会在
 // 「未知的 capability "time"」上校验失败（一句话：自动推导只登记真需要授权的原语）。
 var builtinCapabilityNames = map[string]bool{
-	"http": true, "call": true, "db": true, "secret": true, "event": true, "subscribe": true,
+	"http": true, "call": true, "db": true, "secret": true, "event": true, "subscribe": true, "config": true,
 }
 
 var (
@@ -1211,23 +1682,25 @@ type overrideLLM struct {
 }
 
 func (o overrideLLM) Complete(ctx context.Context, req LLMRequest) (string, error) {
-	if req.Provider == "" {
-		req.Provider = o.opts.Provider
-	}
-	if req.Model == "" {
-		req.Model = o.opts.Model
-	}
-	if req.BaseURL == "" {
-		req.BaseURL = o.opts.BaseURL
-	}
-	if req.APIKey == "" {
-		req.APIKey = o.opts.APIKey
-	}
+	o.apply(&req)
 	return o.base.Complete(ctx, req)
 }
 
 // CompleteStream 与 Complete 同款：先填 opts 的空字段，再转发给底层 LLM 的流式实现。
 func (o overrideLLM) CompleteStream(ctx context.Context, req LLMRequest, onDelta func(content, reasoning string) error) error {
+	o.apply(&req)
+	return o.base.CompleteStream(ctx, req, onDelta)
+}
+
+// CompleteTools 同款转发：工具声明本身不改，只补请求里空着的模型参数。
+func (o overrideLLM) CompleteTools(ctx context.Context, req LLMRequest, tools []ToolSpec) (ChatResult, error) {
+	o.apply(&req)
+	return o.base.CompleteTools(ctx, req, tools)
+}
+
+// apply 把 opts 的模型参数填进请求的空字段。抽出来是因为三个方法都要做同一件事——
+// 复制三份的话，将来加一个参数就会漏改其中一份。
+func (o overrideLLM) apply(req *LLMRequest) {
 	if req.Provider == "" {
 		req.Provider = o.opts.Provider
 	}
@@ -1240,7 +1713,6 @@ func (o overrideLLM) CompleteStream(ctx context.Context, req LLMRequest, onDelta
 	if req.APIKey == "" {
 		req.APIKey = o.opts.APIKey
 	}
-	return o.base.CompleteStream(ctx, req, onDelta)
 }
 
 // GenResult 是 generate 的产物。
@@ -1266,7 +1738,8 @@ var aiMethodNames = []string{"complete", "catalog", "domains", "validate", "gene
 var aiSyncMethods = []string{"complete", "catalog", "domains", "validate", "generate", "capabilities", "react"}
 
 // callAIMethod 按方法名分发到 AIAgent 的稳定层方法（同步路径），供 Lua / go-host Provider 共用。
-func callAIMethod(a *AIAgent, method string, args map[string]interface{}) (interface{}, error) {
+// callerCaps 是调用方 Tool 声明的 capability，只有 react 用它——见 ReactMethod。
+func callAIMethod(a *AIAgent, method string, args map[string]interface{}, callerCaps ...string) (interface{}, error) {
 	switch method {
 	case "complete":
 		return a.Complete(args)
@@ -1281,7 +1754,7 @@ func callAIMethod(a *AIAgent, method string, args map[string]interface{}) (inter
 	case "generate":
 		return a.GenerateMethod(args)
 	case "react":
-		return a.ReactMethod(args)
+		return a.ReactMethod(args, callerCaps...)
 	default:
 		return nil, fmt.Errorf("ext.ai 不支持的方法 %q（仅 complete/catalog/domains/validate/generate/capabilities/react/complete_stream）", method)
 	}
@@ -1289,23 +1762,38 @@ func callAIMethod(a *AIAgent, method string, args map[string]interface{}) (inter
 
 // aiInProcessProvider 是 ext.ai 的 go-host 原生实现（host.Extension("ext.ai") 取用）。
 // complete_stream 无法在同步 Provider 接口上表达流式回调，故显式报错引导到 Lua / REST 流式面。
-type aiInProcessProvider struct{ a *AIAgent }
+type aiInProcessProvider struct {
+	a    *AIAgent
+	caps []string // 宿主上下文声明的 capability（react 的默认工具集）
+}
 
 func (p *aiInProcessProvider) Call(method string, args map[string]interface{}) (interface{}, error) {
 	if method == "complete_stream" {
 		return nil, fmt.Errorf("ext.ai.complete_stream 仅支持 Lua 回调式调用（ctx.ext.ai.complete_stream(args, function)）或 REST SSE 端点，无法通过同步 Provider 调用")
 	}
-	return callAIMethod(p.a, method, args)
+	return callAIMethod(p.a, method, args, p.caps...)
 }
 
 // AIExtensionInProcess 构造 ext.ai 的进程内扩展定义：同步方法 + complete_stream 回调式。
 func AIExtensionInProcess(a *AIAgent) *CapabilityExtension {
 	return &CapabilityExtension{
 		Provider: func(c *cap.Context) (interface{}, error) {
-			return &aiInProcessProvider{a: a}, nil
+			var caps []string
+			if c != nil {
+				caps = c.Capabilities()
+			}
+			return &aiInProcessProvider{a: a, caps: caps}, nil
 		},
 		BuildLua: func(L *lua.LState, c *cap.Context) (lua.LValue, error) {
 			tbl := L.NewTable()
+			// c 是**这一次执行**的宿主上下文（见 lua.go 的 ext.BuildLua(L, host)），
+			// 故 c.Capabilities() 就是调用方 Tool 自己声明的那份 capability。react 拿它当
+			// 默认工具集——这是「能力边界」的落点，不能省。
+			// 判空：有调用路径（含测试）会用 nil 上下文构造扩展，直接调会 nil panic。
+			var callerCaps []string
+			if c != nil {
+				callerCaps = c.Capabilities()
+			}
 			// 同步方法：与旧 InProcessExtension 同款（args table → 同步结果）。
 			for _, m := range aiSyncMethods {
 				method := m
@@ -1314,7 +1802,7 @@ func AIExtensionInProcess(a *AIAgent) *CapabilityExtension {
 					if mt, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{}); ok {
 						args = mt
 					}
-					res, err := callAIMethod(a, method, args)
+					res, err := callAIMethod(a, method, args, callerCaps...)
 					if err != nil {
 						L.RaiseError("%v", err)
 						return 0

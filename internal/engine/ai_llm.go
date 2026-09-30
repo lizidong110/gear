@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -46,6 +47,56 @@ type LLMRequest struct {
 	Temperature float64 `json:"temperature"`
 	Format      string  `json:"format"` // "json" → 解析 JSON 并以 {data} 返回结构化结果
 	MaxTokens   int     `json:"max_tokens"`
+
+	// Messages 是完整消息序列（React 的多轮 + tool 结果回灌用）。**非空时优先于 System/Prompt**。
+	//
+	// 为什么必须有它：function calling 下，assistant 消息里带 tool_calls 之后**必须**跟一条
+	// `{"role":"tool","tool_call_id":...}` 消息——只把观察结果拼成普通 user 文本是非法序列，
+	// 模型会以为工具没被调用过、于是重复发起同一个调用（真机实测：连发三次同一调用，
+	// 全被重复调用守卫拦下，任务直接跑废）。这个字段就是为了能按协议回灌。
+	Messages []map[string]any `json:"messages,omitempty"`
+}
+
+// ToolSpec 是声明给模型的一个可调用工具（OpenAI function calling 的 function 形态）。
+//
+// 名字有字符集限制：OpenAI 兼容接口只接受 [A-Za-z0-9_-]{1,64}，而 Gear 的工具名带点
+// （http.Request / ext.ai.complete）与双下划线（mindstorm__node_create）。所以**调用方负责
+// 先用 SanitizeToolName 压平并自行保存「压平名 → 原名」的映射**，模型返回的是压平名。
+// 本层只做协议、不做语义，避免在模型层散落两套名字。
+type ToolSpec struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+// ToolCall 是模型要求的一次工具调用。Arguments 是 JSON 文本——流式下由分片拼成完整串，
+// 可能为空对象（无参工具），调用方须自行 json.Unmarshal。
+type ToolCall struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// ChatResult 是一次带工具声明的补全结果。Text 与 ToolCalls 通常互斥，但模型也可能同时给，
+// 故两者都保留，由调用方决定优先级。
+type ChatResult struct {
+	Text      string
+	ToolCalls []ToolCall
+}
+
+// toolCallPart 是流式响应里 tool_calls 的一次分片：index 标识第几个调用，
+// 只有首个分片带 id 与 name，arguments 是逐片累加的 JSON 片段。
+type toolCallPart struct {
+	index int
+	id    string
+	name  string
+	args  string
+}
+
+// SanitizeToolName 把 Gear 工具名压成 OpenAI 函数名的合法字符集（点换成单下划线）。
+// 只做字符替换、不做语义推断，因此**不可逆**——调用方必须自己留存反查映射。
+func SanitizeToolName(name string) string {
+	return strings.ReplaceAll(name, ".", "_")
 }
 
 // LLM 是模型层接口（稳定层契约）。complete/catalog/domains/validate 不需要它；generate 的
@@ -57,7 +108,23 @@ type LLMRequest struct {
 type LLM interface {
 	Complete(ctx context.Context, req LLMRequest) (string, error)
 	CompleteStream(ctx context.Context, req LLMRequest, onDelta func(content, reasoning string) error) error
+	// CompleteTools 是带工具声明的补全（原生 function calling）。tools 为空时等价于 Complete。
+	//
+	// 与 Complete 的区别只在协议层：请求体多带 tools，返回值多带模型要求的 tool_calls。
+	// 走它之后「调什么工具」由模型的 tool_calls 字段直接给出，不再靠解析自由文本——
+	// 这是 react 从「猜格式」换成「按协议」的那一环（判据②）。
+	CompleteTools(ctx context.Context, req LLMRequest, tools []ToolSpec) (ChatResult, error)
 }
+
+// ConfigLookup 是「AI 缺省配置」的读取源：按 key 取值，第二个返回值报告该项是否已配置。
+//
+// 它让「配置一次、处处生效」成为可能：用户把 provider/model/base_url/api_key 写进 config 库
+// （`gear config set ai.api_key ...`），此后 ext.ai 的每一次调用都自动带上，不必再给每个进程
+// export GEAR_AI_*。key 固定为 ai.provider / ai.model / ai.base_url / ai.api_key / ai.max_tokens。
+//
+// 刻意不做成包级全局变量：解析结果必须可追溯到来路，测试才能用「注入 nil」得到确定的
+// 「不读配置库」行为（AI 缺省配置若隐式生效，单机会因开发者本机的配置而漂移）。
+type ConfigLookup func(key string) (string, bool)
 
 // llmConfig 是解析后的最终配置（已合并 per-call 覆盖 + 环境变量 + 默认）。
 type llmConfig struct {
@@ -75,38 +142,70 @@ type llmConfig struct {
 }
 
 // HTTPLLM 是走真实 HTTP 的模型层实现（Ollama / SiliconFlow / OpenAI 兼容），全部流式。
-type HTTPLLM struct{}
+type HTTPLLM struct {
+	// Config 是 AI 缺省配置的读取源（宿主把 config 原语装配进来时注入）。
+	// nil = 不读配置库，回退链退化为「调用参数 > 环境变量 > 内置默认」。
+	Config ConfigLookup
+}
 
 // DefaultLLM 返回生产默认 LLM（HTTPLLM）。env GEAR_AI_PROVIDER=mock 时仍走 mock（便于离线）。
+//
+// 默认**不带**配置源：AI 缺省配置是宿主显式装配的结果，不是模型层的隐式全局状态。
+// 需要让配置库生效时用 LLMWithConfig。
 func DefaultLLM() LLM { return &HTTPLLM{} }
 
+// LLMWithConfig 返回带 AI 缺省配置源的 HTTPLLM（宿主装配了 config 原语时用）。
+func LLMWithConfig(lookup ConfigLookup) LLM { return &HTTPLLM{Config: lookup} }
+
 // Complete 解析配置 → 选 provider → 发流式请求 → 返回拼接后的文本。
-func (HTTPLLM) Complete(ctx context.Context, req LLMRequest) (string, error) {
+func (h HTTPLLM) Complete(ctx context.Context, req LLMRequest) (string, error) {
 	if req.Provider == "mock" || os.Getenv("GEAR_AI_PROVIDER") == "mock" {
 		return mockChatText(req), nil
 	}
-	cfg := resolveLLMConfig(req)
+	cfg := resolveLLMConfig(req, h.Config)
+	// 显式给了消息序列就原样发出（React 多轮）；否则走既有的 system/prompt 两件套。
+	if len(req.Messages) > 0 {
+		text, _, err := postChatMessages(ctx, cfg, req.Messages, nil, nil)
+		return text, err
+	}
 	return postChat(ctx, cfg, req.System, req.Prompt)
 }
 
 // CompleteStream 是 Complete 的增量版：把 SSE 增量逐条经 onDelta 回调出去，复用 readStream
 // 的空闲超时 / 重复检测。onDelta 为 nil 时退化为「拼完整串后回调一次」（无害）。
-func (HTTPLLM) CompleteStream(ctx context.Context, req LLMRequest, onDelta func(content, reasoning string) error) error {
+func (h HTTPLLM) CompleteStream(ctx context.Context, req LLMRequest, onDelta func(content, reasoning string) error) error {
 	if onDelta == nil {
 		onDelta = func(string, string) error { return nil }
 	}
 	if req.Provider == "mock" || os.Getenv("GEAR_AI_PROVIDER") == "mock" {
 		return onDelta(mockChatText(req), "")
 	}
-	cfg := resolveLLMConfig(req)
-	_, err := postChatWith(ctx, cfg, req.System, req.Prompt, onDelta)
+	cfg := resolveLLMConfig(req, h.Config)
+	_, _, err := postChatWith(ctx, cfg, req.System, req.Prompt, nil, onDelta)
 	return err
+}
+
+// CompleteTools 带上工具声明发请求，并把模型返回的 tool_calls 一并返回。
+func (h HTTPLLM) CompleteTools(ctx context.Context, req LLMRequest, tools []ToolSpec) (ChatResult, error) {
+	if req.Provider == "mock" || os.Getenv("GEAR_AI_PROVIDER") == "mock" {
+		return ChatResult{Text: mockChatText(req)}, nil
+	}
+	cfg := resolveLLMConfig(req, h.Config)
+	// 走 requestMessages：React 会带完整序列（含 tool 回灌），普通调用仍由 system/prompt 兜底。
+	text, calls, err := postChatMessages(ctx, cfg, requestMessages(req), tools, nil)
+	if err != nil {
+		return ChatResult{}, err
+	}
+	return ChatResult{Text: text, ToolCalls: calls}, nil
 }
 
 // MockLLM 是测试/离线用的确定性 LLM：按 system 内容返回结构化 JSON 文本（不联网）。
 // Respond 允许覆盖默认行为（按 system 关键词返回自定义文本）。
 type MockLLM struct {
 	Respond func(req LLMRequest) string
+	// ToolCalls 让离线测试能断言「模型要求调工具」这条路径：非空时 CompleteTools 原样返回它，
+	// 不去看 Respond（真实模型给了 tool_calls 时通常就不给正文，mock 对齐这个形态）。
+	ToolCalls []ToolCall
 }
 
 // Complete 调用 MockLLM.Respond（未设置则回退默认 mockChatText）。
@@ -131,12 +230,40 @@ func (m *MockLLM) CompleteStream(_ context.Context, req LLMRequest, onDelta func
 	return onDelta(text, "")
 }
 
-// resolveLLMConfig 合并优先级：per-call 参数 > 环境变量 > 内置默认。
-func resolveLLMConfig(req LLMRequest) llmConfig {
-	provider := firstNonEmpty(req.Provider, os.Getenv("GEAR_AI_PROVIDER"), "siliconflow")
-	baseURL := firstNonEmpty(req.BaseURL, os.Getenv("GEAR_AI_BASE_URL"), defaultBaseURL(provider))
-	apiKey := firstNonEmpty(req.APIKey, os.Getenv("GEAR_AI_API_KEY"), "")
-	model := firstNonEmpty(req.Model, os.Getenv("GEAR_AI_MODEL"), defaultModel(provider))
+// CompleteTools 是 MockLLM 的工具调用版：ToolCalls 非空则直接返回（模拟模型要求调工具），
+// 否则退化为「只有文本」的普通补全。
+func (m *MockLLM) CompleteTools(_ context.Context, req LLMRequest, _ []ToolSpec) (ChatResult, error) {
+	if len(m.ToolCalls) > 0 {
+		return ChatResult{ToolCalls: m.ToolCalls}, nil
+	}
+	if m.Respond != nil {
+		return ChatResult{Text: m.Respond(req)}, nil
+	}
+	return ChatResult{Text: mockChatText(req)}, nil
+}
+
+// resolveLLMConfig 合并优先级：per-call 参数 > 环境变量 > 配置库（lookup）> 内置默认。
+//
+// 配置库插在环境变量**之后**是刻意的：env 的用途是「这一次换个模型/换个 key 试试」的临时覆盖，
+// 配置库是「配一次、处处生效」的持久默认。这个顺序既让新能力成立，又**不改变任何既有行为**——
+// 此前唯一生效的两层（调用参数、环境变量）优先级原样保留，没配过的人感知不到这一层存在。
+//
+// lookup 为 nil 时退化为原先的三层链（测试与未装配 config 的宿主走这条）。
+func resolveLLMConfig(req LLMRequest, lookup ConfigLookup) llmConfig {
+	// cfg 读配置库的一项：未装配 lookup、该项不存在、或值为空白 → 空串，交给下一级回退。
+	cfg := func(key string) string {
+		if lookup == nil {
+			return ""
+		}
+		if v, ok := lookup(key); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+		return ""
+	}
+	provider := firstNonEmpty(req.Provider, os.Getenv("GEAR_AI_PROVIDER"), cfg("ai.provider"), "siliconflow")
+	baseURL := firstNonEmpty(req.BaseURL, os.Getenv("GEAR_AI_BASE_URL"), cfg("ai.base_url"), defaultBaseURL(provider))
+	apiKey := firstNonEmpty(req.APIKey, os.Getenv("GEAR_AI_API_KEY"), cfg("ai.api_key"), "")
+	model := firstNonEmpty(req.Model, os.Getenv("GEAR_AI_MODEL"), cfg("ai.model"), defaultModel(provider))
 	temp := req.Temperature
 	if temp == 0 {
 		temp = 0.2
@@ -144,6 +271,11 @@ func resolveLLMConfig(req LLMRequest) llmConfig {
 	mt := req.MaxTokens
 	if mt == 0 {
 		if n, ok := intFromEnv("GEAR_AI_MAX_TOKENS"); ok {
+			mt = n
+		}
+	}
+	if mt == 0 {
+		if n, err := strconv.Atoi(cfg("ai.max_tokens")); err == nil && n > 0 {
 			mt = n
 		}
 	}
@@ -221,21 +353,44 @@ func durFromEnvSec(name string, def time.Duration) time.Duration {
 
 // postChat 是 postChatWith 的同步版：onDelta 为 nil（供 Complete 使用），签名保持稳定，既有测试无需改动。
 func postChat(ctx context.Context, cfg llmConfig, system, user string) (string, error) {
-	return postChatWith(ctx, cfg, system, user, nil)
+	text, _, err := postChatWith(ctx, cfg, system, user, nil, nil)
+	return text, err
 }
 
 // postChatWith 按 provider 选择协议（Ollama 原生 vs OpenAI 兼容）发流式请求，
 // 并把每个 SSE 增量经 onDelta 回调出去（增量版 CompleteStream 用；nil 时仅拼完整串）。
-func postChatWith(ctx context.Context, cfg llmConfig, system, user string, onDelta func(content, reasoning string) error) (string, error) {
-	msgs := []map[string]string{}
+//
+// tools 非空时随请求下发 function 声明，返回值多带模型要求的 tool_calls；
+// msgs 放宽到 map[string]any 是为了让调用方能塞 `{"role":"tool",...}` 这类带
+// tool_call_id 的消息——function calling 的回灌必须能带得上这个 id。
+func postChatWith(ctx context.Context, cfg llmConfig, system, user string, tools []ToolSpec, onDelta func(content, reasoning string) error) (string, []ToolCall, error) {
+	msgs := []map[string]any{}
 	if system != "" {
-		msgs = append(msgs, map[string]string{"role": "system", "content": system})
+		msgs = append(msgs, map[string]any{"role": "system", "content": system})
 	}
-	msgs = append(msgs, map[string]string{"role": "user", "content": user})
+	msgs = append(msgs, map[string]any{"role": "user", "content": user})
+	return postChatMessages(ctx, cfg, msgs, tools, onDelta)
+}
+
+// postChatMessages 是 postChatWith 的下层：直接收完整消息序列（React 的多轮与 tool 回灌走它）。
+func postChatMessages(ctx context.Context, cfg llmConfig, msgs []map[string]any, tools []ToolSpec, onDelta func(content, reasoning string) error) (string, []ToolCall, error) {
 	if cfg.Provider == "ollama" {
-		return postOllama(ctx, cfg, msgs, onDelta)
+		return postOllama(ctx, cfg, msgs, tools, onDelta)
 	}
-	return postOpenAI(ctx, cfg, msgs, onDelta)
+	return postOpenAI(ctx, cfg, msgs, tools, onDelta)
+}
+
+// requestMessages 决定一次请求真正发出去的消息序列：显式给了 Messages 就用它，
+// 否则由 System/Prompt 兜底构造（既有行为不变）。
+func requestMessages(req LLMRequest) []map[string]any {
+	if len(req.Messages) > 0 {
+		return req.Messages
+	}
+	msgs := []map[string]any{}
+	if req.System != "" {
+		msgs = append(msgs, map[string]any{"role": "system", "content": req.System})
+	}
+	return append(msgs, map[string]any{"role": "user", "content": req.Prompt})
 }
 
 // newStreamClient 构造「无总超时」的客户端：可靠性交给 readStream 的空闲/总时长保护，
@@ -255,7 +410,7 @@ func newStreamClient(idle time.Duration) *http.Client {
 	}
 }
 
-func postOpenAI(ctx context.Context, cfg llmConfig, msgs []map[string]string, onDelta func(content, reasoning string) error) (string, error) {
+func postOpenAI(ctx context.Context, cfg llmConfig, msgs []map[string]any, tools []ToolSpec, onDelta func(content, reasoning string) error) (string, []ToolCall, error) {
 	url := strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions"
 	body := map[string]interface{}{
 		"model":       cfg.Model,
@@ -268,13 +423,16 @@ func postOpenAI(ctx context.Context, cfg llmConfig, msgs []map[string]string, on
 	if cfg.Provider == "siliconflow" && cfg.Thinking != nil {
 		body["chat_template_kwargs"] = map[string]interface{}{"enable_thinking": *cfg.Thinking}
 	}
+	if len(tools) > 0 {
+		body["tools"] = toolSpecsToWire(tools)
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(raw))
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
@@ -283,75 +441,120 @@ func postOpenAI(ctx context.Context, cfg llmConfig, msgs []map[string]string, on
 	}
 	resp, err := newStreamClient(cfg.Idle).Do(req)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("LLM HTTP %d: %s", resp.StatusCode, string(data))
+		return "", nil, fmt.Errorf("LLM HTTP %d: %s", resp.StatusCode, string(data))
 	}
-	out, err := readStreamWith(ctx, resp.Body, cfg.Idle, cfg.Total, parseOpenAILine, onDelta)
+	out, calls, err := readStreamWith(ctx, resp.Body, cfg.Idle, cfg.Total, parseOpenAILine, onDelta)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	if strings.TrimSpace(out) == "" {
-		return "", fmt.Errorf("OpenAI 兼容接口流式返回为空")
+	// function calling 下模型可能只给 tool_calls、正文为空——那是合法结果，不算「返回为空」。
+	if strings.TrimSpace(out) == "" && len(calls) == 0 {
+		return "", nil, fmt.Errorf("OpenAI 兼容接口流式返回为空")
 	}
-	return out, nil
+	return out, calls, nil
 }
 
-func postOllama(ctx context.Context, cfg llmConfig, msgs []map[string]string, onDelta func(content, reasoning string) error) (string, error) {
+func postOllama(ctx context.Context, cfg llmConfig, msgs []map[string]any, tools []ToolSpec, onDelta func(content, reasoning string) error) (string, []ToolCall, error) {
 	url := strings.TrimRight(cfg.BaseURL, "/") + "/api/chat"
 	body := map[string]interface{}{
 		"model":    cfg.Model,
 		"messages": msgs,
 		"stream":   true,
 	}
+	if len(tools) > 0 {
+		// Ollama 原生协议直接收 function 对象（不套 {"type":"function"} 这层）。
+		body["tools"] = ollamaTools(tools)
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(raw))
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := newStreamClient(cfg.Idle).Do(req)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("Ollama HTTP %d: %s", resp.StatusCode, string(data))
+		return "", nil, fmt.Errorf("Ollama HTTP %d: %s", resp.StatusCode, string(data))
 	}
-	out, err := readStreamWith(ctx, resp.Body, cfg.Idle, cfg.Total, parseOllamaLine, onDelta)
+	out, calls, err := readStreamWith(ctx, resp.Body, cfg.Idle, cfg.Total, parseOllamaLine, onDelta)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	if strings.TrimSpace(out) == "" {
-		return "", fmt.Errorf("Ollama 流式返回为空")
+	if strings.TrimSpace(out) == "" && len(calls) == 0 {
+		return "", nil, fmt.Errorf("Ollama 流式返回为空")
 	}
-	return out, nil
+	return out, calls, nil
+}
+
+// toolSpecsToWire 把工具声明压成 OpenAI 兼容的 tools 数组（外层 {"type":"function"}）。
+func toolSpecsToWire(tools []ToolSpec) []map[string]any {
+	out := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, map[string]any{"type": "function", "function": t.functionObject()})
+	}
+	return out
+}
+
+// ollamaTools 是 Ollama 原生协议的工具数组：直接是 function 对象，不套 type 层。
+func ollamaTools(tools []ToolSpec) []map[string]any {
+	out := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, t.functionObject())
+	}
+	return out
+}
+
+// functionObject 是两种协议共用的 function 描述体。parameters 缺省补一个空 object——
+// 无参工具也必须给 schema，否则部分厂商直接 400。
+func (t ToolSpec) functionObject() map[string]any {
+	fn := map[string]any{"name": t.Name}
+	if t.Description != "" {
+		fn["description"] = t.Description
+	}
+	if t.Parameters != nil {
+		fn["parameters"] = t.Parameters
+	} else {
+		fn["parameters"] = map[string]any{"type": "object"}
+	}
+	return fn
 }
 
 // streamDelta 是流式响应的一次增量。content 用于拼接最终结果；reasoning 仅用于「有活动」判定
 // （推理模型先吐 reasoning_content，只要它在动就说明没卡死）。
+// toolParts 是本行携带的 tool_calls 分片（可能多个，按 index 区分）。
 type streamDelta struct {
 	content   string
 	reasoning string
+	toolParts []toolCallPart
 }
 
 // readStream 是 readStreamWith 的同步版：onDelta 为 nil，把增量折叠成完整字符串返回（供 Complete 使用）。
 // 原函数签名保持稳定，既有测试无需改动。
 func readStream(ctx context.Context, body io.Reader, idle, total time.Duration, parse func(line []byte) (streamDelta, bool, bool)) (string, error) {
-	return readStreamWith(ctx, body, idle, total, parse, nil)
+	text, _, err := readStreamWith(ctx, body, idle, total, parse, nil)
+	return text, err
 }
 
 // readStreamWith 逐行读取流式响应，落地两种保护（空闲超时 + 重复输出检测）。
 // parse 把一行原始数据解析为增量，返回 (delta, done, recognized)：recognized=false 表示该行与本流无关（忽略）。
 // onDelta 非 nil 时，每个增量会经它回调出去（增量版 CompleteStream 用）；nil 时仅拼完整串。
-func readStreamWith(ctx context.Context, body io.Reader, idle, total time.Duration, parse func(line []byte) (streamDelta, bool, bool), onDelta func(content, reasoning string) error) (string, error) {
+//
+// 第二个返回值是模型要求的 tool_calls（按 index 聚合后的完整列表，无则 nil）。
+// 流式下 tool_calls 是分片到达的：只有首个分片带 id/name，arguments 是逐片累加的 JSON 片段，
+// 所以聚合放在这里而不是 parse 里——parse 只管一行，跨行的拼接必须落在读循环上。
+func readStreamWith(ctx context.Context, body io.Reader, idle, total time.Duration, parse func(line []byte) (streamDelta, bool, bool), onDelta func(content, reasoning string) error) (string, []ToolCall, error) {
 	type chunk struct {
 		d   streamDelta
 		err error
@@ -391,6 +594,7 @@ func readStreamWith(ctx context.Context, body io.Reader, idle, total time.Durati
 	defer totalT.Stop()
 
 	var content, reason strings.Builder
+	calls := map[int]*ToolCall{} // index → 累积中的工具调用（流式分片按 index 归拢）
 	lastCheck := 0
 	const checkEvery = 64 // 每新增这么多字节才做一次重复检测，摊薄开销
 	const maxTailReport = 120
@@ -399,12 +603,15 @@ func readStreamWith(ctx context.Context, body io.Reader, idle, total time.Durati
 		select {
 		case c, ok := <-ch:
 			if !ok {
-				return content.String(), nil
+				return content.String(), finishToolCalls(calls), nil
 			}
 			if c.err != nil {
-				return "", c.err
+				return "", nil, c.err
 			}
-			// 收到任何增量（含推理增量）就算「有活动」，重置空闲计时。
+			for _, p := range c.d.toolParts {
+				mergeToolPart(calls, p)
+			}
+			// 收到任何增量（含推理增量与 tool_calls 分片）就算「有活动」，重置空闲计时。
 			if !idleT.Stop() {
 				select {
 				case <-idleT.C:
@@ -416,7 +623,7 @@ func readStreamWith(ctx context.Context, body io.Reader, idle, total time.Durati
 			if c.d.content != "" || c.d.reasoning != "" {
 				if onDelta != nil {
 					if err := onDelta(c.d.content, c.d.reasoning); err != nil {
-						return "", err
+						return "", nil, err
 					}
 				}
 			}
@@ -429,20 +636,55 @@ func readStreamWith(ctx context.Context, body io.Reader, idle, total time.Durati
 			if grown := content.Len() + reason.Len(); grown-lastCheck >= checkEvery {
 				lastCheck = grown
 				if loop, frag := detectRepetition(reason.String()); loop {
-					return "", fmt.Errorf("检测到模型重复输出（推理片段陷入死循环）：片段 %q 连续反复出现", clip(frag, maxTailReport))
+					return "", nil, fmt.Errorf("检测到模型重复输出（推理片段陷入死循环）：片段 %q 连续反复出现", clip(frag, maxTailReport))
 				}
 				if loop, frag := detectRepetition(content.String()); loop {
-					return "", fmt.Errorf("检测到模型重复输出（疑似死循环）：片段 %q 连续反复出现", clip(frag, maxTailReport))
+					return "", nil, fmt.Errorf("检测到模型重复输出（疑似死循环）：片段 %q 连续反复出现", clip(frag, maxTailReport))
 				}
 			}
 		case <-idleT.C:
-			return "", fmt.Errorf("LLM 流式输出空闲超时：%s 内无任何新增（连接可能假死）", idle)
+			return "", nil, fmt.Errorf("LLM 流式输出空闲超时：%s 内无任何新增（连接可能假死）", idle)
 		case <-totalT.C:
-			return "", fmt.Errorf("LLM 流式输出总时长超时：超过 %s（已生成 %d 字节）", total, content.Len())
+			return "", nil, fmt.Errorf("LLM 流式输出总时长超时：超过 %s（已生成 %d 字节）", total, content.Len())
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", nil, ctx.Err()
 		}
 	}
+}
+
+// mergeToolPart 把一个 tool_calls 分片并进对应 index 的调用：
+// 首片带 id/name，后续片只带 arguments 片段（逐片累加成完整 JSON）。
+func mergeToolPart(calls map[int]*ToolCall, p toolCallPart) {
+	c, ok := calls[p.index]
+	if !ok {
+		c = &ToolCall{}
+		calls[p.index] = c
+	}
+	if p.id != "" {
+		c.ID = p.id
+	}
+	if p.name != "" {
+		c.Name = p.name
+	}
+	c.Arguments += p.args
+}
+
+// finishToolCalls 按 index 升序落成最终列表。必须排序：分片可能乱序到达，
+// 而调用方按返回顺序执行时，顺序应当稳定可复现（否则同名多调用不好断言）。
+func finishToolCalls(calls map[int]*ToolCall) []ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	idx := make([]int, 0, len(calls))
+	for i := range calls {
+		idx = append(idx, i)
+	}
+	sort.Ints(idx)
+	out := make([]ToolCall, 0, len(idx))
+	for _, i := range idx {
+		out = append(out, *calls[i])
+	}
+	return out
 }
 
 // parseOpenAILine 解析 OpenAI 兼容 SSE：形如 `data: {...}`，结束于 `data: [DONE]`。
@@ -463,16 +705,33 @@ func parseOpenAILine(line []byte) (streamDelta, bool, bool) {
 			Delta struct {
 				Content          string `json:"content"`
 				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []struct {
+					Index    int    `json:"index"`
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
 			} `json:"delta"`
 		} `json:"choices"`
 	}
 	if json.Unmarshal([]byte(payload), &ev) != nil || len(ev.Choices) == 0 {
 		return streamDelta{}, false, false
 	}
-	return streamDelta{
+	d := streamDelta{
 		content:   ev.Choices[0].Delta.Content,
 		reasoning: ev.Choices[0].Delta.ReasoningContent,
-	}, false, true
+	}
+	for _, tc := range ev.Choices[0].Delta.ToolCalls {
+		d.toolParts = append(d.toolParts, toolCallPart{
+			index: tc.Index,
+			id:    tc.ID,
+			name:  tc.Function.Name,
+			args:  tc.Function.Arguments,
+		})
+	}
+	return d, false, true
 }
 
 // parseOllamaLine 解析 Ollama 原生 NDJSON：每行一个对象，done=true 表示结束。
@@ -484,13 +743,31 @@ func parseOllamaLine(line []byte) (streamDelta, bool, bool) {
 	var ev struct {
 		Message struct {
 			Content string `json:"content"`
+			// Ollama 的 tool_calls 挂在 message 上（非流式字段，流式下一般一次性给全）。
+			ToolCalls []struct {
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"message"`
 		Done bool `json:"done"`
 	}
 	if json.Unmarshal([]byte(s), &ev) != nil {
 		return streamDelta{}, false, false
 	}
-	return streamDelta{content: ev.Message.Content}, ev.Done, true
+	d := streamDelta{content: ev.Message.Content}
+	// Ollama 不给 index，按下标补一个——保证与 OpenAI 侧一样可以按 index 归拢。
+	for i, tc := range ev.Message.ToolCalls {
+		d.toolParts = append(d.toolParts, toolCallPart{
+			index: i,
+			id:    tc.ID,
+			name:  tc.Function.Name,
+			args:  tc.Function.Arguments,
+		})
+	}
+	return d, ev.Done, true
 }
 
 // detectRepetition 判定文本尾部是否陷入「同一小段连续反复」的死循环。

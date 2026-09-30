@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"gear/internal/model"
+	"gear/internal/registry"
 )
 
 // PromoteTool 提升某 Tool 版本到目标状态（S5 灰度）。
@@ -15,7 +16,7 @@ import (
 //
 // 为什么放在引擎而非 registry：Hook 的执行（runtime 调用）是引擎职责，registry 只管持久化。
 // 这与 §8.2「运行期引用由运行侧上报」同一思路——晋升的副作用（门禁/打标/通知）交给引擎编排。
-func (e *Engine) PromoteTool(toolID, version string, target model.ToolVersionState) error {
+func (e *Engine) PromoteTool(toolID, version string, target model.ToolVersionState, opts ...registry.UpsertOption) error {
 	hooks, err := e.loadHooks()
 	if err != nil {
 		return err
@@ -26,8 +27,9 @@ func (e *Engine) PromoteTool(toolID, version string, target model.ToolVersionSta
 		"target":  string(target),
 	}
 	// before_promote Hook 不改变晋升本身，只做门禁/副作用；只看 err（critical 失败即中止）。
-	if _, _, err := e.applyHooks(context.Background(), hooks, model.StageBeforePromote, "", toolID, payload); err != nil {
+	// rc=nil：晋升是**注册期动作**（没有正在跑的执行），此处没有可继承的调用上下文。
+	if _, _, err := e.applyHooks(context.Background(), nil, hooks, model.StageBeforePromote, "", toolID, payload); err != nil {
 		return fmt.Errorf("before_promote Hook 中止晋升 %s@%s -> %s: %w", toolID, version, target, err)
 	}
-	return e.reg.PromoteToolVersion(toolID, version, target)
+	return e.reg.PromoteToolVersion(toolID, version, target, opts...)
 }

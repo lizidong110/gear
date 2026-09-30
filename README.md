@@ -37,7 +37,7 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 | **Flow** | 编排多个 Tool 的声明式 DSL |
 | **Hook** | 在指定生命周期节点插入执行逻辑的「切面」 |
 | **Runtime** | Tool 的执行环境（process / lua / go-host / wasm） |
-| **Context** | 一次执行的共享数据空间（宿主原语：受门禁的 http/call/db/secret/event/subscribe + 始终可用的纯函数原子 time/template/crypto） |
+| **Context** | 一次执行的共享数据空间（宿主原语：受门禁的 http/call/db/secret/event/subscribe/config + 始终可用的纯函数原子 time/template/crypto/id/validate） |
 
 ---
 
@@ -58,9 +58,10 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 │                       runtime 分发 / 模板 / when 表达式 /    │
 │                       版本灰度 / AI 扩展装配 / 健康检查       │
 ├──────────────────────────────────────────────────────────┤
-│  internal/cap      —— 宿主能力：受门禁 6 个原语              │
-│                       http/call/db/secret/event/subscribe      │
-│                       另有纯函数原子：time/template/crypto     │
+│  internal/cap      —— 宿主能力：受门禁 7 个原语              │
+│                  http/call/db/secret/event/subscribe/config  │
+│                       另有纯函数原子（5 个）                   │
+│                     time/template/crypto/id/validate           │
 │                       始终可用、无需声明 capabilities          │
 ├──────────────────────────────────────────────────────────┤
 │  internal/model    —— 唯一真相源：Tool/Flow/Hook/Step        │
@@ -78,7 +79,7 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 | `model` | 核心数据模型唯一真相源 + 校验规则 |
 | `registry` | SQLite 持久化 tool/flow/hook，含删除守卫与示例 YAML 多文档加载 |
 | `engine` | 编排内核：Flow 拓扑执行、Hook 装配、runtime 分发、表达式、版本灰度 |
-| `cap` | 宿主能力层：**6 个受 capability 门禁的原语**（http/call/db/secret/event/subscribe）的接口与内存实现（最小权限门禁、事件总线、订阅生命周期）。纯函数原子（time/template/crypto）刻意不进此门禁，见 `internal/engine/purefunc.go` |
+| `cap` | 宿主能力层：**7 个受 capability 门禁的原语**（http/call/db/secret/event/subscribe/config）的接口与内存实现（最小权限门禁、事件总线、订阅生命周期、键值配置库）。纯函数原子（time/template/crypto/id/validate）刻意不进此门禁，见 `internal/engine/purefunc.go` |
 | `server` | REST 执行面：路由、并发闸门、执行记录持久化、受管 app 托管 |
 | `app` | `app run` 监管器：把一个 / 多个 Flow 变成受管进程 |
 | `cli` | CLI 管理面：cobra 命令树、`gear`/`exec`/`ai`/`mcp` 客户端、extensions 装配 |
@@ -107,8 +108,16 @@ type Tool struct {
     Capabilities []string               `yaml:"capabilities" json:"capabilities"` // 声明宿主原语（最小权限）
     HealthProbe  *HealthProbe           `yaml:"health_probe,omitempty" json:"health_probe,omitempty"`
     Timeout      string                 `yaml:"timeout,omitempty" json:"timeout,omitempty"` // 单次执行超时（缺省 30s）
+    API          *APIRoute              `yaml:"api,omitempty" json:"api,omitempty"`         // 可选：声明式 REST 路由（FR-3）
 }
 ```
+
+- **`api`（声明式 REST 路由）**：`{method: GET, path: /api/orders/{id}}` 让这个 Tool **额外**成为一条
+  资源路由——`{id}` 就是 Tool 的输入字段，响应体即 Tool 输出（不包 `{output}`）。
+  `POST /api/tools/{id}/run` 照旧可用（**加挂而非替换**，AC-C4）。**不鉴权**：gear 没有用户库，
+  授权是业务的事，请给这个 Tool 挂鉴权 Hook。未声明 `api` 的 Tool 行为一字不变；
+  两个 Tool 撞同一 `method`+`path` 时 `gear_validate` / `gear_apply`（含 dry_run）整包拒绝，
+  跨 bundle 的第二个由 registry 入库前拒（同名 pattern 会 panic）。
 
 - **Runtime 实现状态**：`process` / `lua` / `go-host` 已实现；`wasm` 已知未实现。**注册期守卫**：未知 / 未实现的 runtime 注册即拒，不静默降级。
 - **ToolVersion 状态机**：`draft → testing → stable → deprecated → rejected`，非法迁移被 `CanPromote` 拒绝。
@@ -187,7 +196,7 @@ type Hook struct {
 | `run <id>` | `--input` / `--input-file` / `--arg k=v`（互斥，可管道） | 一次性执行单 Tool，触发 step 级 Hook |
 | `list` | — | 列出所有 Tool |
 | `show <id>` | — | 查看 Tool 详情 |
-| `unregister <id>` | — | 注销（被引用 / 运行中则拒） |
+| `unregister <id\|pattern> [...]` | `*` `?` `[]` 通配符 | 注销（被引用 / 运行中则拒；命中集为空则报错） |
 | `promote <id> <version> <target>` | — | 晋升版本到目标状态 |
 | `versions <id>` | — | 列出版本与状态 |
 
@@ -200,6 +209,7 @@ type Hook struct {
 | `run <id>` | `--max-parallel`(默认 4) / `--var k=v` / `--input` / `--input-file` | 执行 Flow（service step 会被拒，提示用 app run） |
 | `validate <file.yaml>` | — | 仅静态校验不落库 |
 | `inspect <id>` | — | 查看 Flow 详情 |
+| `delete <id\|pattern> [...]` | `*` `?` `[]` 通配符 | 注销 Flow（被引用 / 运行中 / **是某 App 的 entry_flow** 则拒；命中集为空则报错；**删除会留痕、可回滚**） |
 
 **`gear hook`**：`register <file.yaml>` / `list` / `show <id>` / `remove <id>`。
 
@@ -209,10 +219,13 @@ type Hook struct {
 - **共享侧车不算崩溃**：多个 app 引用同一个 service ext（如 `ext.serve`）时，后起的那个会**退让复用**已经存在的侧车（日志显示 `service 长驻启动 (pid=0)`），本进程手上没有本地进程——这是共享的正常态，不会被判成 service 退出、也不会去抢已被占用的 coord 端口。侧车挂了由 coord 看门狗重握手自愈（必要时本进程接管为 owner）。详见 `EXT_SERVICE_DESIGN.md` §12.10。
 - **registry 沿进程树继承**：`openRegistry()` 会把本次生效的 registry **绝对化**后写进 `GEAR_REGISTRY`，派生的进程（`app start` 的监管进程、`app run` 里 engine 拉起的长驻 Tool 进程）自动读同一个库。所以应用内步骤**不该**写死 `--registry`——写了也仍以显式值为准，但会因「换个 cwd 就静默指向另一个库」在注册/校验期收到 warning。传**相对路径**的 `--registry` 会在 stderr 提示（相对值按调用时 cwd 解析，cwd 是调用方的属性、不是 gear 的属性）。
 - `app start | stop | status | list`：**后台**启动器 + 台账（见下方 `gear mcp` 一节的说明）。
+- `app delete <id>`：注销 App 清单。**刻意不做引用守卫**（App 只是聚合描述，它引用的 Tool/Flow 是独立实体，要求「先拆光 Tool 才能删清单」会堵死清理路径）。它存在是为了让上一条守卫的建议可执行：`flow delete` 会因「是某 App 的 entry_flow」拒绝并提示先注销该 App，而 CLI 面原本没有这个入口（只能走 Web UI / MCP）。
 - `app prune`：`--dry-run`（只汇报，不动磁盘）、`--flow <id>`（只清该 Flow）、`--apps-dir`（台账目录）。清理台账里**确定已终止**的记录——只清 `exited` / `stopped` / `startup_failed` 三种终态，`running` 与 `unknown` **一律保留**（unknown 的双判据自相矛盾，删掉可能把「还在跑却再无人可查」的进程变成真孤儿）。**只删记录，不杀进程、不碰端口**（要停进程用 `app stop`）。`start` 失败一次就落一条台账，调试一轮下来很容易堆十几条，prune 就是为「按应用批量清干净」准备的。与 MCP `gear_app(action=prune)`、REST `POST /api/apps/prune` 共用 `internal/app` 同一份实现。
 
 **`gear serve`**
 - `serve`：`--seed <examples.yaml>`（启动时灌入示例 Tool/Flow，如 `examples/news-top10.yaml`）。启动 REST 执行面，复用 `--addr`。
+  **非回环地址默认拒绝**（与 `gear mcp` 同一份判定；REST 面当前无鉴权，`0.0.0.0` 或空 host `:8787` 会把「读写 registry 与明文 secrets、执行编排」暴露给局域网），
+  确有远程需求时显式加 `--allow-remote`（放行时 stderr 留警告）。
 
 **`gear exec`**（REST 无状态客户端）
 - `exec start <flow_id>` → `POST /api/executions`（202 + id）
@@ -227,7 +240,62 @@ type Hook struct {
 
 **`gear ai`**（内置 `ext.ai` 进程内 agent）
 - `ai gen flow` / `ai gen tool`：`--intent` / 位置参数、`--register`（自动落库）
-- `ai capabilities`：打印当前能力目录（内核原语 + 已注册 `ext.*`）。内核原语分两类：**受门禁的 builtin 6 个**（http/call/db/secret/event/subscribe，需在 Tool 里声明 `capabilities`）+ **始终可用的 pure 3 个**（time/template/crypto，无需声明）。目录由代码单一来源渲染（`allBuiltinPrimitives` + `capabilityCatalog`），不再各写一份字面量清单
+- `ai capabilities`：打印当前能力目录（内核原语 + 已注册 `ext.*`）。内核原语分两类：**受门禁的 builtin 7 个**（http/call/db/secret/event/subscribe/config，需在 Tool 里声明 `capabilities`）+ **始终可用的 pure 5 个**（time/template/crypto/id/validate，无需声明）。目录由代码单一来源渲染（`allBuiltinPrimitives` + `capabilityCatalog`），不再各写一份字面量清单
+- `ai react "任务"`：跑一个 ReAct 循环（每步思考→调工具→看结果，直到 Final Answer）。`--max-steps`（默认 6）/ `--allow`（限制可用能力）。等价于在 Tool 的 entry 里调 `ctx.ext.ai.react({ task = "..." })`——**用它打造自己的 agent 是最短路径**
+- `ai complete "prompt"`：单轮补全（无记忆、无工具）。仅做「一次问答」时用，多步任务请走 `ai react`
+  > **react 走原生 function calling**：工具声明由能力目录自动生成并随请求下发（`ToolSpec`），模型用 `tool_calls` 回调用意图，引擎不再从自由文本里抠 JSON 围栏。工具名里的「.」会被压成「_」（`http.Request` → `http_Request`，OpenAI 的 function name 字符集所限）。
+  > **`ai react` 会先灌入持久 registry 的目录**（与 `ai gen` 同一手法）：agent 看得到真实的 Tool/Flow 定义，写操作仍隔离在内存库里。库里若有声明了不存在原语的过期定义，会被跳过并在 stderr 点名（不会让整个命令失败）。
+
+**`gear config`**（持久化键值配置，落点 `<GEAR_HOME>/config.db`，`GEAR_CONFIG_DB` 可覆盖）
+- `config get <key>` / `config set <key> <value>` / `config delete <key>` / `config list [前缀]` / `config path`
+- **AI 缺省配置**：写 `ai.provider` / `ai.model` / `ai.base_url` / `ai.api_key` / `ai.max_tokens`，此后 `ext.ai` 的所有调用自动带上——**不必再给每个进程 `export GEAR_AI_*`**（MCP 客户端、app 监管进程这类「被人派生」的场景根本传不进去环境变量）。
+  优先级链：**调用参数 > 环境变量 > 配置库 > 内置默认**——环境变量仍可临时覆盖，既有行为不变。
+  ```bash
+  gear config set ai.provider siliconflow
+  gear config set ai.base_url https://api.siliconflow.cn/v1
+  gear config set ai.model deepseek-ai/DeepSeek-V4-Flash
+  gear config set ai.api_key sk-xxx
+  gear config list ai.          # api_key 等敏感键默认脱敏，--show-secrets 看明文
+  ```
+- **应用配置**：声明 `capabilities: [config]` 的 Tool 可在 Lua 里 `ctx.config.get({key="..."})` / `set` / `delete` / `list`。
+  `ctx.config.get` 对不存在的 key **平返回空串**（KV 语义，方便 `or ""` 兜底）；`delete` 不存在则报错。
+  落点由宿主决定，应用不必（也**读不到**）`GEAR_HOME`——Lua 沙箱禁 `os` 库、模板无 `${env}` 前缀，
+  这正是过去应用只能把 SQLite 绝对路径硬编码进 YAML 的原因。
+
+  **应用定义可移植性（2026-09-25 起）**：apps/ 与 examples/ 下的 YAML **禁止写机器相关绝对路径**
+  （如 `D:/gadern/gear/...`，仓库拷到别的机器即跑不起来）。内核提供相对锚点，应用直接写相对值即可：
+  - **db 的 dsn 写相对库名**：`local DSN = "mindstorm.db"` → 锚到 `GEAR_APP_DATA`（默认 `<Home>/data`），与 cwd、机器都无关；
+  - **process entry 写裸名**：`entry: "gear serve --addr 127.0.0.1:8790"` → 锚到 gear 可执行文件所在目录，起的就是本仓这一个 gear；
+  - **ext.serve 的 `dir` 写相对安装根**：`dir: apps/mindstorm/www` → 锚到 `InstallRoot`（剥掉 build/plugin 两层）。
+  违反会被 `tools/portable_audit.py`（质量闸门第⑨项）拦下，且**发布后智能体主要通过 MCP 接口（`gear_validate` / `gear_apply`）编写应用**——`gear_validate` 会在写作期直接报 `PORTABLE_PATH_HARDCODED` 并拒绝 `gear_apply` 落库，给作者即时反馈（CI 是兜底）。详见 REQ-APP-PORTABLE 与 `gear_guide("portability")`。
+
+**`gear export` / `gear import`**（产物：应用的可移植形态，2026-09-26）
+- `gear export <app-id> --out <dir> [--format dir|zip] [--root <dir>] [--no-static]`：把一个应用导出成自包含产物
+  ——`gear-artifact.yaml`（格式版本与组成）+ `app.yaml`（App 清单）+ `bundle.yaml`（名下 Tool/Flow/Hook）+ 静态资源。
+  **dir 形态（默认）可 diff 可 git 版本化**；`--format zip` 打成 `.gearapp` 便于发送。
+  `--out` 在 dir 形态下**必须是不存在的路径或空目录**（gear 不会为一个可重新生成的产物删掉内容未知的目录）。
+  静态资源按 `layout.files` 声明的路径、相对 `--root`（默认当前工作目录）去找。
+- `gear import <path> [--overwrite] [--dry-run] [--apps-dir <dir>]`：把产物导回 registry，
+  冲突语义与 `gear_apply` 一致（未传 `--overwrite` 且内容不同则整批拒绝）。
+  **静态资源默认不落地**（gear 从不持有它们）；传 `--apps-dir` 才落地到 `<dir>/<app-id>/`，
+  并重写清单里的 `layout` 指向实际位置。
+  ```bash
+  gear export mindstorm --out /tmp/mindstorm && ls /tmp/mindstorm   # gear-artifact.yaml app.yaml bundle.yaml www/
+  gear import /tmp/mindstorm --dry-run                              # 先看会动什么
+  ```
+- 为什么需要它：只有 Tool/Flow 落在 registry 里**不等于「你的产品能带走」**——静态资源不在库里、
+  App 清单过去根本不入库，换台机器只剩四处散落的状态，整拷 `GEAR_HOME` 是克隆机器而不是交付。
+  产物是「用户构建的东西能备份、能换机器、能交付给别人」的载体。
+  ⚠ 只搬**定义与静态资源**：业务数据与凭据不在产物里（`requires.secrets` 仍只是声明）。
+
+**`gear history`**（定义变更历史：留旧与回滚，2026-09-26）
+- `gear history list [--kind tool|flow|hook|app] [--id <id>] [--limit N]`：按时间倒序列出某对象的历次状态（seq / 时间 / 类别 / 主体 / 备注）。
+- 回滚走 `gear_apply(restore_from=<seq>)`（MCP 面），**CLI 只读不写**：写入口必须只有一个，两个实现各写一份回滚，迟早漂移。
+- 快照在 registry 的唯一写入口（`upsert`）里采集——**每一次 upsert 都留痕**，不靠各个调用点自觉记快照（漏一处就是一个静默的不可回滚点）。
+  一条历史的含义是「那时它是这样的」，所以想回到哪一步就把那一步的 `seq` 填进 `restore_from`；
+  回到「当时还不存在」的那条 = 撤回这次新建。回滚本身也会留痕（`note=restore from N`），链路始终线性、可连续回滚；
+  写回的内容会**重新校验**，规则收紧过的旧快照宁可原子失败，也不给你一个回滚成功却跑不起来的定义。
+- **删除也留痕**：删除走另一条路（不经过 `upsert`），所以专门把快照下沉进删除事务（`note=delete`），历史里查得到每一次删除；被引用拒绝的删除**不留痕**（守卫与留痕必须原子，否则时间线会凭空长出一格）。删除行保留被删内容，因此把 `note=delete` 那条的 `seq` 填进 `restore_from` 就是「撤销这次删除」。
 
 **`gear mcp`**（MCP 执行面，stdio / `--http`）
 - `gear mcp`：默认以 stdio transport 启动 MCP Server（客户端配置 `command: gear, args: [mcp]`）。
@@ -236,7 +304,7 @@ type Hook struct {
   确有远程需求时显式加 `--allow-remote`；带 Origin 的跨站请求一律按同源判定拒绝（与 REST 面同一判据）。
 - `gear mcp --registry <path> --apps-dir <dir>`：显式交给 MCP 面 registry 路径与台账目录。**`gear_app(start)` 依赖它**——派生出去的子进程要继承 `--registry`，否则会读默认库、可能启动另一个库里的同名 Flow（未配置时 start 直接拒绝执行，不「尽力而为」）。
 - `gear mcp --expose-flows`：把已注册 Flow 额外反向暴露为 `flow__{id}` 工具（**默认关闭**：工具数必须可预测；且是启动时快照，之后新建的 Flow 本次进程内不会出现；service 长驻 Flow 永不暴露）。
-- 暴露 13 个意图级工具（手册 / 目录 / 校验 / 落库 / 删除 / 晋升 / 能力直调 / 执行 / 执行记录 / 应用生命周期 / 环境自检），工具名统一 `gear_` 前缀；心智模型（四层模型、八条铁律、工具选路）只写在 `ServerOptions.Instructions` 里**一次**，工具描述只留「做什么 + 何时用 + 歧义消解」（单条 ≤240 字符、合计 ≤1,800 字符，有机械守卫）。
+- 暴露 **15** 个意图级工具（手册 / 目录 / 校验 / 落库 / 删除 / 晋升 / 能力直调 / 执行 / 执行记录 / 应用生命周期 / 环境自检 / **产物导出** / **产物导入**），工具名统一 `gear_` 前缀；心智模型（四层模型、八条铁律、工具选路）只写在 `ServerOptions.Instructions` 里**一次**，工具描述只留「做什么 + 何时用 + 歧义消解」（单条 ≤240 字符、合计 ≤1,800 字符，有机械守卫）。
 - `gear app start/stop/status/list/prune`：**后台**应用生命周期（与 MCP 的 `gear_app` 共用 `internal/app` 同一份实现）。`start` 派生后台进程后立即返回；`stop` 收不干净会如实报 `ORPHAN_APP` 而非谎报成功；台账落在 `<registry 同目录>/apps/`。`prune` 清理台账里**确定已终止**的记录（`running`/`unknown` 一律保留，只删记录不杀进程；`--dry-run` 先预览、`--flow` 限定单个 Flow）。
 
 > **`start` 的「跨会话存活」是有条件的，不承诺无条件成立（2026-09-21 修正）**
@@ -278,6 +346,8 @@ gear scaffold hook --help
 路由注册于 `internal/server/server.go`（`s.routes()`），使用 `http.ServeMux` 的 `METHOD /path` 模式。**无 gin/echo。**
 
 执行面特点：**异步**——`POST /api/executions` 立即返回 `202 + execution id`，结果经 `GET` 查询。
+每条执行记录带 `actor`（发起主体）：REST 带 Bearer 时是解析出的 subject，CLI 是操作系统用户名；
+**MCP 面恒为空**——拿不到传输层身份就不编一个出来。
 
 ### 端点全集
 
@@ -332,8 +402,8 @@ Gear 以「**能力原语**」为单位扩展：内核原语分两类（受门�
 
 | 类型 | kind / 标识 | 载体 | 调用协议 |
 |---|---|---|---|
-| 受门禁内核原语（builtin） | `http`/`call`/`db`/`secret`/`event`/`subscribe` | 硬编码 Go 闭包 | `http`/`call` 位置参数；`db`/`subscribe` 单 table `ctx.db.query({driver,dsn,sql,params})` / `ctx.subscribe.start({source,config,callback})`（多后端 sqlite/mysql/postgres）；`secret`/`event` 子表方法。**须声明 `capabilities` 才能用** |
-| 纯函数内核原语（pure） | `time`/`template`/`crypto` | 硬编码 Go 闭包（`internal/engine/purefunc.go`） | 单具名 table，如 `ctx.time.now({format,tz})` / `ctx.crypto.hash({algo,data})` / `ctx.template.render({text,vars})`。**始终可用、无需声明 capabilities**；也可作 Flow step 直调目标（`call: crypto.hash`） |
+| 受门禁内核原语（builtin） | `http`/`call`/`db`/`secret`/`event`/`subscribe`/`config` | 硬编码 Go 闭包 | `http`/`call` 位置参数；`db`/`subscribe`/`config` 单 table `ctx.db.query({driver,dsn,sql,params})` / `ctx.subscribe.start({source,config,callback})` / `ctx.config.get({key})`（db 多后端 sqlite/mysql/postgres；config 落点由宿主决定）；`secret`/`event` 子表方法。**须声明 `capabilities` 才能用** |
+| 纯函数内核原语（pure） | `time`/`template`/`crypto`/`id`/`validate` | 硬编码 Go 闭包（`internal/engine/purefunc.go`） | 单具名 table，如 `ctx.time.now({format,tz})` / `ctx.crypto.hash({algo,data})` / `ctx.crypto.jwt_verify({token,alg,key})` / `ctx.id.uuid()` / `ctx.validate.json_schema({schema,data})` / `ctx.template.render({text,vars})`。**始终可用、无需声明 capabilities**；也可作 Flow step 直调目标（`call: crypto.hash`） |
 | sidecar 子进程 | `kind=sidecar`（默认 `""`） | `CommandTransport` 起子进程 | stdin `{method,args}` → stdout 末行 `{result}`/`{error}` |
 | 进程内 Go agent | `kind=agent`（目前仅 `ext.ai`） | `InProcessExtension` 闭包 | 直接 Go 函数调用 |
 | ext.registry | 始终进程内 | `RegistryExtension` | `ctx.ext.registry.tools/flows/capabilities` |
@@ -357,10 +427,233 @@ stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error
 
 完整 sidecar 协议示例见 `plugin/mqtt-sidecar/main.go`（任意语言可充当 sidecar，现存）。`ext.db` / `slack-sidecar` 等旧 sidecar 示例的源码 **已移除**（ext.db 能力由内置 `db` 原语覆盖，见下），`extensions.example.yaml` 的 `ext.db` 段默认**注释**，仅作「用自定义 sidecar 承载 DB」的形态参考。
 
-> **内置 `db` 已原生支持多后端（sqlite / mysql / postgres）**：`ctx.db.query/exec/ping` 接收
+### `ext.filestore`（附件存取，2026-09-28 交付）
+
+`plugin/filestore-sidecar` 是 service ext 的常驻侧车：`put` / `get` / `stat` / `list` / `delete` / `url`
+（`listen` 默认 `127.0.0.1:8096`）。四条口径（见 `internal/mcp/guide/atoms.md` §4 与 PRD §4.3）：
+
+- **root 不硬编码**：省略 `root` 参数时读配置库的 `filestore.root`（`gear config set filestore.root <目录>`，
+  与 `ctx.config` 同源）；调用也没传且库里没配 → **fail-closed**（不会退化成「写到当前目录」）。
+- **不跟随符号链接**：key 里的空段 / `.` / `..` / 反斜杠一律拒，拼接后必须仍在 root 内；
+  路径上任何一级是指向 root 外的符号链接即拒（`delete` 顺链接删会删到 root 外的文件）。
+- **大小上限默认 32 MiB**（配置库 `filestore.max_bytes` 可放宽），超限在**落盘之前**拒，不留半截文件。
+- **二进制走 base64**（Lua 侧没有字节类型）；不做 MIME 嗅探；`url()` 只回相对路径 `/_filestore/<key>`，
+  由应用自己挂反代——内核 REST 面因此是 +0。
+
+真机判据：`plugin/verify.py` 的 P1b 三项（往返 / 越界 fail-closed 无残留 / 超限 fail-closed）。
+
+### `ext.oidc`（单点登录握手，2026-09-28 交付）
+
+`plugin/oidc-sidecar` 是 service ext 的常驻侧车：`discovery` / `code_exchange` / `jwks`
+（`listen` 默认 `127.0.0.1:8098`，入站回调 `127.0.0.1:8099`）。五条口径（PRD §4.2）：
+
+- **只做握手，不验签、不做会话**：它负责把「授权码换成令牌」「把 JWKS 拿回来」这两件事做对，
+  **令牌真伪归 `crypto.jwt_verify`**（纯算法族，不受门禁），会话归业务。因此样例 Tool
+  `plugin/oidc_demo.yaml` 把两截接起来跑通：`discovery → code_exchange → jwks → jwt_verify`
+  （输出 `subject` / `alg`），证明「吐出的 id_token 确实能被验」而不是各跑各的。
+- **issuer 混淆两道防线**：① discovery 返回的 `issuer` 必须与入参一致；② `token_endpoint`
+  的 host 必须与 issuer 同主机——挡的是「凭据被送到另一台机器」，那台机器能收到
+  `client_secret` 与授权码就等于能全记下来。
+- **JWKS 长驻缓存**：命中不发 HTTP；`jwks` 给 `kid` 且缓存里没有则**强制刷新一次**；
+  刷新失败退回旧缓存并置 `stale: true`（fail-soft 但不静默）。**必须把 id_token 头里的
+  `kid` 交回去**：不给的话拿回的是上次抓的那份，IdP 换过钥匙也照样返回旧的——缓存行为完全
+  正确，可校验却发生在旧钥匙上，表现为「签名不对」，是最难查的一类假故障。
+- **拒收不吐令牌**：授权服务器拒绝该授权码时，只回结构化错误，**绝不回吐任何令牌字段**；
+  `redirect_uri` 就算 IdP 允许省略也要求显式给（省略了，换到的令牌可能是拿另一个回调地址
+  换来的，这种「悄悄 succeed」的歧义比少一个参数危险得多）。
+- **入站只回报**：浏览器从 IdP 弹到 `/in/oidc/{label}?code=&state=` 时，侧车只回「收到了什么」，
+  不换令牌、不建会话、不记状态。
+
+真机判据：`plugin/verify.py` 的 P1d 段（混淆两道 / PKCE / JWKS 缓存与刷新 / 链路打通 /
+**反向验证**：IdP 把 `aud` 写错即 fail-closed，换成假钥匙则报 `crypto/rsa: verification error`
+——没这两条反向，「验签通过」可能只是「压根没验」）。
+
+### `ext.cron`（定时触发，2026-09-28 交付）
+
+`plugin/cron-sidecar` 是 service ext 的常驻侧车：`add` / `at` / `list` / `cancel`（`listen` 默认
+`127.0.0.1:8097`）。到点把事件 POST 回 `callback_url`，与 webhook / mqtt / kafka 同一条回推线，
+因此它可以作为事件源被 `ctx.subscribe` 订阅（`extensions.yaml` 里声明了 `source: cron`）。
+四条口径（PRD §4.1 / §4.2）：
+
+- **生命周期硬绑定（2026-09-28 拍板）**：侧车随应用起、随进程死而亡——**进程一停调度立即停止且
+  不接管**，重启后不会接回间隔期内错过的触发。系统只有「有进程在跑」与「没进程」两态，不存在
+  「表在、进程没了、谁在跑」的第三态。cron 表落盘的唯一用途是让重启后的新进程**重建同一张时间表**，
+  **它不是跨进程任务队列**，不搬运没跑完的触发。
+- **幂等**：去重键 = `name` + 触发时刻（分钟粒度），同一分钟内的重复触发静默丢弃。
+- **misfire 默认不补**；显式 `catch_up` 也**只补最近一次**——补一整个窗口会让停三天的进程一启动
+  就打出几千次触发，那叫风暴不叫补偿。
+- **overlap 默认跳过**：上一轮没跑完又到点就跳过并点名日志，只有显式 `open` 才并发。
+- 表达式自己解析（5 段标准 cron + `@daily` 等五个宏），**零新增依赖**；非法表达式在 `add`/`at`
+  **注册期**就拒——等到点才炸的调度器没人敢用。
+
+真机判据：`plugin/verify.py` 的 P1c 段（注册期 fail-closed / `list` 不摊开 payload 与回调地址 /
+**硬绑定**：真 kill 侧车进程后等到触发时刻，断言零回推；再起新进程读同一张表，断言仍不接管）。
+
+### `ext.excel`（零依赖 Excel 写出，2026-09-29 交付）
+
+`plugin/xlsx-sidecar` 是 service ext 的常驻侧车：`write`（`listen` 默认 `127.0.0.1:8100`）。
+零第三方依赖——只用手写最小 OOXML（`archive/zip` + XML），因此 **零 go.mod / go.sum 变动**（AC-E4-4，`git diff` 可机械验证）。
+接口（`ctx.ext.excel.write`）：
+
+```
+ctx.ext.excel.write({path, sheets:[{name, rows:[[cell]]}], root?}) → {path, size}
+```
+
+口径（PRD §4.5）：
+
+- **cell 多类型**：字符串 / 数字 / 布尔 / 空（`nil`）四类，分别落为 inlineStr / number / boolean / 空单元格；类型由值自身决定，不靠调用方标注。
+- **root 不硬编码**：省略 `root` 时取调用参数或配置库；越界（含 `..` / 盘符 / 反斜杠）一律拒，**fail-closed 无残留**（与 filestore 同一条 outpath 囚禁）。
+- **不自己验自己**：写出后由 Python openpyxl **独立读回**交叉验证（verify.py P1e），值一致才算数（AC-E4-1）。
+- **万行不爆**：顺序流式写 zip，不把全表读进内存，不超 Tool 超时（AC-E4-3）。
+
+真机判据：`plugin/verify.py` 的 P1e 段（多 sheet 混合类型写出 → openpyxl 读回一致 / 路径越界 fail-closed）。
+样例 Tool `plugin/report_demo.yaml` 把 excel / pdf 两条链路接起来跑通（`gear tool register` +
+`gear tool run report.export`），**走的是内核门禁 + 能力目录 + 侧车拉起的全链路**。
+
+### `ext.pdf`（零依赖 PDF 写出 + CJK 子集，2026-09-29 交付）
+
+`plugin/pdf-sidecar` 是 service ext 的常驻侧车：`write`（`listen` 默认 `127.0.0.1:8101`）。
+同样零第三方依赖——手写最小 PDF 写出器 + **手写 TTF 子集化**（AC-E4-2 的 CJK 嵌入要求）。
+接口（`ctx.ext.pdf.write`）：
+
+```
+ctx.ext.pdf.write({path, pages:[{text}], root?}) → {path, size}
+```
+
+口径（PRD §4.5 + §6 Q6 字体方案）：
+
+- **CJK 嵌入字体子集**：运行时读取系统 TTF（候选首推 `simhei.ttf`），按页面实际用到的字符做**最小子集**嵌入（只搬用到的字形，复合字形算依赖闭包），用 CIDFontType2 + ToUnicode + Identity-H——阅读器能正确选字、文本可复制（AC-E4-2）。
+- **缺字即报错，绝不画方框**：字体里没有的字符（如 `𝄞` U+1D11E）直接 `font_no_glyph` 报结构化错误，**不静默降级**（fail-closed，见 verify.py P1e）。
+- **字体方案已拍板（替代 §4.5 登记的降级方案）**：运行时读系统 TTF + 按字符最小子集嵌入，而不是内嵌固定字体；TTC / OTF 直接报错（不假装支持）。
+- **路径囚禁同出path**：越界 `..` / 盘符 / 反斜杠拒写，fail-closed 无残留。
+- A4 几何、贪心折行（CJK 间可断）、页码溢出即 `pageOverflowErr`、不写时间戳（可复现）。
+
+真机判据：`plugin/verify.py` 的 P1e 段（A4 + CJK 子集写出 → 结构合法 / 缺字 fail-closed / 越界 fail-closed）。
+两条链路都**经内核再跑一遍**（样例 Tool `plugin/report_demo.yaml`）——只直连侧车 HTTP 不算数：
+那只能证明侧车写对了，证明不了 `ctx.ext.*` 真接进了能力目录（2026-09-30 就在这里漏过一次）。
+
+### `ext.oss`（S3 兼容对象存储，2026-09-30 交付）
+
+`plugin/oss-sidecar` 是 service ext 的常驻侧车：`put` / `get` / `stat` / `list` / `delete` / `presign`
+（`listen` 默认 `127.0.0.1:8102`）。同样零第三方依赖——**手写 AWS Signature V4**
+（`crypto/hmac` + `crypto/sha256`），不引 `aws-sdk-go`。接口：
+
+```
+ctx.ext.oss.put({key*, data_base64*, endpoint*, region*, bucket*, access_key_id*,
+                 access_key_secret*, content_type?, session_token?, path_style?, max_bytes?})
+                                                       → {key, bucket, size, etag}
+ctx.ext.oss.get({key*, …连接参数})     → {key, size, content_type, mod_time, etag, data_base64}
+ctx.ext.oss.stat({key*, …})            → {key, size, content_type, mod_time, etag}
+ctx.ext.oss.list({prefix?, limit?, …}) → {bucket, objects:[{key,size,etag,mod_time}], count, truncated}
+ctx.ext.oss.delete({key*, …})          → {key, deleted}
+ctx.ext.oss.presign({key*, method?, expires?, …}) → {key, url, expires, method}
+```
+
+口径（PRD §8 第三批 / E5）：
+
+- **只做 S3 协议一套**：阿里云 OSS / 腾讯云 COS / MinIO / R2 / Ceph 都兼容 S3，靠 `endpoint` 区分；
+  不做第二套协议——每多一套就要多引一个 SDK，一引就破「`go.mod` / `go.sum` 零变动」这条红线。
+- **凭据只从入参进**：`access_key_id` / `access_key_secret` 每次传（应用侧写 `${secrets.oss_ak}`，
+  内核执行前展开成明文注入）；侧车不读环境变量、不落库。`endpoint` / `bucket` / `region` 同理，
+  **没有配置库回退**——与 `ext.filestore` 不同，是有意的选择：省掉「配置与入参不一致时听谁的」
+  这个歧义源，侧车也就成了无状态进程。
+- **key 校验**：禁 `..` / 空段 / 前导 `/` / 反斜杠，长度 ≤1024。远端没有符号链接语义，
+  所以**不走** `internal/sidecar/outpath`（别照抄 filestore 那份本地囚禁）。
+- **大对象走 `presign` 直传**：内核调侧车的硬超时是 10s（`internal/engine/extensions.go:212`），
+  `put` / `get` 另有 32 MiB 上限（可调 `max_bytes`），再大只能 `presign` 让客户端直连对象存储。
+- **`path_style` 自动判**：`endpoint` 是 IP 时自动走 path-style（MinIO / 自建 Ceph 的默认形态），
+  否则 virtual-host（bucket 打进 host，AWS / 阿里云的默认形态）；可显式指定。
+- **32 MiB 上限在解码之前判**：先按 base64 长度估算，超限立刻拒——先解进内存再判等于允许打满内存。
+
+真机判据：`plugin/verify.py` 的 P1f 段（六方法真实往返 / 坏 key 与连不上都 fail-closed /
+样例 Tool `plugin/oss_demo.yaml` 经内核再跑一遍）。签名正确性另由 Go 单测把关：
+假 S3 端点**从收到的原始请求反推 canonical request 重算签名**再比对，且 SigV4 的黄金向量来自
+botocore 与 aws4 **两个独立实现**（对同一请求给出同一签名，不是凭记忆写的常量）。
+
+### `ext.redis`（Redis 数据结构 + 分布式锁 + 延迟队列，2026-09-30 交付）
+
+`plugin/redis-sidecar` 是 service ext 的常驻侧车：KV / Hash / List / Set / ZSet 全数据结构 +
+分布式锁 + 延迟队列（`listen` 默认 `127.0.0.1:8103`）。**零第三方依赖——手写 RESP2 协议**
+（`plugin/redis-sidecar/resp.go` 自编自解码 `+ - : $ *` 五种类型，不引 `go-redis`）。接口（每个方法
+都带 `host` / `port` / `db` / `password` 连接参数；`host` 不含端口、`password` 无则不带 AUTH）：
+
+```
+ctx.ext.redis.set({key*, value*, ex?, host*, port?, db?, password?})        → {ok}
+ctx.ext.redis.get({key*, …})                                               → {value}
+ctx.ext.redis.del({keys* | key*, …})                                       → {deleted}
+ctx.ext.redis.expire({key*, seconds*, …})                                  → {set}
+ctx.ext.redis.ttl({key*, …})                                               → {ttl}
+ctx.ext.redis.exists({keys* | key*, …})                                    → {exists}
+ctx.ext.redis.incr({key*, by?, …})                                         → {value}
+ctx.ext.redis.hset({key*, fields? | field*, value*, …})                    → {added}
+ctx.ext.redis.hget({key*, field*, …})                                      → {value}
+ctx.ext.redis.hgetall({key*, …})                                           → {fields:[{field,value}]}
+ctx.ext.redis.hdel({key*, fields* | field*, …})                            → {deleted}
+ctx.ext.redis.lpush/rpush({key*, values* | value*, …})                     → {length}
+ctx.ext.redis.lpop/rpop({key*, count?, …})                                 → {value | values}
+ctx.ext.redis.llen({key*, …})                                              → {length}
+ctx.ext.redis.lrange({key*, start?, stop?, …})                             → {values}
+ctx.ext.redis.sadd({key*, members* | member*, …})                          → {added}
+ctx.ext.redis.smembers({key*, …})                                          → {members}
+ctx.ext.redis.srem({key*, members* | member*, …})                          → {deleted}
+ctx.ext.redis.scard({key*, …})                                             → {cardinality}
+ctx.ext.redis.zadd({key*, members*:[{score,value}], …})                    → {added}
+ctx.ext.redis.zrange({key*, start?, stop?, with_scores?, …})               → {values | items:[{value,score}]}
+ctx.ext.redis.zscore({key*, member*, …})                                   → {score}
+ctx.ext.redis.zrem({key*, members* | member*, …})                          → {deleted}
+ctx.ext.redis.lock({key*, token*, ttl_seconds*, …})                        → {acquired}
+ctx.ext.redis.unlock({key*, token*, …})                                    → {released}
+ctx.ext.redis.enqueue({key*, items*:[{payload,delay_seconds}], …})         → {enqueued}
+ctx.ext.redis.dequeue({key*, batch?, …})                                   → {items:[{payload}]}
+```
+
+口径（PRD §8 第三批 / E5）：
+
+- **只做 Redis 协议一套**：不引 `go-redis` / `redis-py`——service 侧车虽是独立 binary，但 `import`
+  了 `gear/internal/sidecar/coord`，Go 的 `internal` 规则把它绑死在根 module，**任何侧车加第三方依赖
+  都等于写进根 `go.mod`**，一引就破「`go.mod` / `go.sum` 零变动」这条红线。RESP2 比 oss 的 SigV4 还简单
+  一个量级（纯文本协议），手写代价可接受。
+- **凭据只从入参进**：`host` / `port` / `db` / `password` 每次传（应用侧写 `${secrets.redis_pw}` 等）；
+  侧车不读环境变量（唯一例外 `COORD_ADDR`）、不落库，是无状态常驻进程。
+- **单连接串行 = 原子**：redis 单线程，侧车借一个连接、连发多条命令再归还（`Pool.With`），故锁的
+  `GET+DEL`、延迟队列的 `ZRANGEBYSCORE+ZREM` **不用 Lua** 也天然原子——假端点同样成立。
+- **key 校验**：redis key 不是文件路径（与 oss 的 S3 key 不同），不做 `..`/前导`/`/反斜杠那套路径语义
+  拒绝，但挡掉 `\0` / `\n` / `\r` 并限长 2048（这些字符会在 RESP 边界处理上出错）；`field` / `member` /
+  `payload` 同此规矩。
+- **内核调侧车硬超时 10s**（`internal/engine/extensions.go:212`）：单条命令 deadline 与 `With` 总时长都
+  钳在 10s，超时即 `redis_unreachable` fail-closed。
+
+真机判据：`plugin/verify.py` 的 P1g 段（全数据结构 + 锁 + 队列真实往返 / 坏 key fail-closed /
+样例 Tool `plugin/redis_demo.yaml` 经内核再跑一遍）；协议正确性另由 Go 单测把关（`main_test.go` 里的
+内存假 Redis 覆盖全部数据结构、锁、延迟队列、fail-closed）。
+
+> **内置 `db` 已原生支持多后端（sqlite / mysql / postgres）**：`ctx.db.query/exec/batch/ping` 接收
 > `{driver, dsn, sql, params}`，`dsn` 缺省回退引擎内存 scratch 库；mysql/postgres 需显式 `dsn`
 > （含口令优先 `${secrets.*}`）。因此「连各种数据库」**不再需要 `ext.db` 侧车**——`ext.db`
 > 仅作为「想用完全自定义 sidecar 承载 DB」时的参考实现保留。
+>
+> **`ctx.db.batch({driver, dsn, statements})` 是「一次调用多条语句」的原子写法**：多条语句落在
+> 同一个事务里，全或无——任一条失败整批回滚（DDL 效果同样不残留），返回 `{results, rows_affected, committed}`
+> 指明第几条、什么错。适合「扣库存 + 写订单」这类必须同生共死的写入。`db` 只在这一批内保证原子，
+> 跨多次 `db.exec` 的共享事务本批不做。
+>
+> **库演进声明在 bundle 里的 `kind: Migrations`（不用每个应用自己 `CREATE TABLE IF NOT EXISTS`）**：
+>
+> ```yaml
+> kind: Migrations
+> app_id: myapp
+> driver: sqlite          # 整份的默认目标，单条可用 driver/dsn 覆盖
+> dsn: myapp.db           # 相对库名锚 GEAR_APP_DATA，与 ctx.db.* 同口径
+> migrations:
+>   - {version: 1, name: init-orders, sql: "CREATE TABLE orders(...);"}
+>   - {version: 2, name: add-index,   sql: "CREATE INDEX ...;"}
+> ```
+>
+> `gear_apply` / `gear_import` 会**先改库、再落定义**：已应用的版本不重跑（台账表
+> `gear_migrations` 建在目标库里），每条迁移单事务执行、失败即整条回滚，并且**一个定义都不落库**
+> ——绝不以「上一代 schema」启动应用。`version` 从 1 起严格递增，重复或断号在 `gear_validate`
+> 就报（错误码 `MIGRATE_INVALID` / `MIGRATE_VERSION_GAP`）。`--dry-run` 是真跑 + 全回滚，
+> 所以 SQL 写错在写作期就会被抓出来（MySQL 的 DDL 会隐式提交，那条路上 dry run 兜不住）。
 
 ---
 
@@ -397,7 +690,7 @@ stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error
 | `health_probe` | object | 否 | service 模式健康检查（`kind` http/tcp/cmd） |
 | `timeout` | string | 否 | 单次执行超时（Go duration，如 `5m`），缺省引擎默认 30s；长耗时（AI/长任务）Tool 需显式声明 |
 
-> **`runtime` 补充说明**：`process`=外部命令（stdin 进 JSON、stdout 末行出 JSON）；`lua`=嵌入式 Lua 脚本（`entry` 即脚本本体，沙箱，不支持 service）；`go-host`=进程内 Go 函数（`entry` 为函数名，须在 Go 代码 `engine.RegisterHostFunc("myFunc", ...)` 登记，否则注册期即拒；不支持 service）；`wasm` 已知未实现，注册期即拒。`capabilities` 合法值见上「通用写法」一节：受门禁 7 原语须声明才可用、纯函数 3 原子无需声明、`ext.*` 须 `extensions.yaml` 登记。
+> **`runtime` 补充说明**：`process`=外部命令（stdin 进 JSON、stdout 末行出 JSON）；`lua`=嵌入式 Lua 脚本（`entry` 即脚本本体，沙箱，不支持 service）；`go-host`=进程内 Go 函数（`entry` 为函数名，须在 Go 代码 `engine.RegisterHostFunc("myFunc", ...)` 登记，否则注册期即拒；不支持 service）；`wasm` 已知未实现，注册期即拒。`capabilities` 合法值见上「通用写法」一节：受门禁 7 原语须声明才可用、纯函数 5 原子无需声明、`ext.*` 须 `extensions.yaml` 登记。
 
 ### Flow / Step
 
@@ -433,8 +726,8 @@ stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error
 2. 原子能力直调「能力.方法」（如 `crypto.hash` / `http.Request` / `db.exec` / `db.query` / `ext.ai.complete` / `call.Call`）——免去为用一次原语先注册一层 Tool 包装；此时 `input` 即该方法的参数表，输出统一为 `{result: <返回值>}`。
 
    直调原子分三类（与方法级 schema 共用同一份静态校验，见 `builtinCapabilitySchemas`）：
-   - 受门禁内核原语（http/call/db/secret/event/subscribe）：须 Tool 声明 `capabilities` 才可用；
-   - 纯函数原子（time/template/crypto）：始终可用、无需声明；
+   - 受门禁内核原语（http/call/db/secret/event/subscribe/config）：须 Tool 声明 `capabilities` 才可用；
+   - 纯函数原子（time/template/crypto/id/validate）：始终可用、无需声明；
    - 扩展原语 `ext.*`：须 `extensions.yaml` 登记，方法名/参数写错**注册期即拒**（不拖到运行期）。
 
 **模板引用**（只出现在 `step.input` 的值里；合法前缀仅 `vars`/`steps`/`secrets`，注册期校验）：
@@ -455,6 +748,7 @@ stdin 读 `{"method","args"}` → stdout 末行写 `{"result":...}` 或 `{"error
 | `GEAR_EXT_CONFIG` | 未显式设置时按 **exe 锚优先**自动定位：`<exeDir>/extensions.yaml` → `<exeDir>/plugin/extensions.yaml` → `<repo>/plugin/extensions.yaml` → `<repo>/extensions.yaml` → `<cwd>/…`（详见 `internal/engine/extensionpath.go`） | 扩展配置文件路径。**显式指定却读不到会报错**（fail-closed），不静默退回「无扩展」 |
 | `GEAR_AI_RECIPES` | `examples/ai/recipes` | AI 配方**覆盖目录**（可选）：存在同名 `flow/tool/hook.yaml` 时优先于内嵌默认 `internal/engine/recipes/`；目录不存在则自动回退内嵌 |
 | `GEAR_EXEC_DB` | `<GEAR_HOME>/exec.db` | 执行记录 SQLite 库。**不随 cwd 变化**（2026-09-21 前为相对 cwd 的 `build/gear.db`，已废） |
+| `GEAR_CONFIG_DB` | `<GEAR_HOME>/config.db` | 键值配置库（`gear config` 与 `ctx.config.*` 的落点）。AI 缺省配置（`ai.*`）也存这里，与 CLI/REST 同源 |
 | `GEAR_DB_DRIVER` / `GEAR_DB_DSN` | 空 | `ext.db` 驱动 / 连接串回退 |
 | `GEAR_API` | `http://127.0.0.1:8787` | web-ui 开发期 Vite 反代目标 |
 
@@ -561,7 +855,13 @@ gear mcp
   ```bash
   go build -o build/gear.exe ./cmd/gear
   ```
-- **质量闸门**（`scripts/gate.sh`）：封装 `go test -race -cover -p 1 -v ./...`，日志落盘 `build/testlogs/gate-<时间戳>.log`，退出码即闸门结果（0 = PASS，CI 红 = 不可合并）。
+- **质量闸门**（`scripts/gate.sh`）：一次跑完①–⑩（编译 / vet / gofmt / staticcheck / `go test -race -cover` / 覆盖率门槛 / 四项机械审计），日志落盘 `build/testlogs/gate-<时间戳>.log`，退出码即闸门结果（0 = PASS，CI 红 = 不可合并）。
+  ```bash
+  bash scripts/gate.sh              # 全套：提交前 / CI 用这档
+  bash scripts/gate.sh --fast       # 只跑本次改动影响到的包（迭代中用）
+  bash scripts/gate.sh --serial     # 测试强制 -p 1 串行
+  ```
+  测试默认并行（失败自动回退串行重跑确认）；`--fast` 用依赖闭包算影响面，拿不准时自动升级为全套。详见 `GEAR_工程方法_v1.md §5.3`。
 - **查看日志**（`scripts/gatelog.sh`）：`gatelog.sh latest`（最近一次）或 `gatelog.sh list`（历史 20 份）。
 - **覆盖率门槛**：engine/model/registry/app/server ≥ 80%（实测 engine 87.7% / model 98.6% / registry 83.4% / server 83.9% / cli 76.5%）。
 - **贡献代码前必读**：`GEAR_工程方法_v1.md`（17 条不可绕过的红线：需求可追溯、红—绿节奏、质量闸门不可跳过、单一真相源、控制流三态不可混淆、`${}` 模板与表达式分离、能静态校验的不留到运行期、枚举式声明必须逐项登记等）。
@@ -617,7 +917,7 @@ gear mcp --http 127.0.0.1:8788
 | 读 | `gear_guide` | `internal/mcp/guide`（embed） | 按主题取手册。**可用主题以返回体里的 `topics` 字段为准**（单一真相源是磁盘上的 `guide/*.md`，schema 文案刻意不枚举，见评审 I-5）。与 `Instructions`、`gear://guide/{topic}` 资源**同源**，杜绝「三处说法不一致」 |
 | 读 | `gear_catalog` | `reg.List*` | **摘要**（id/name/description/runtime/版本状态/是否长驻），不返回 schema 与脚本源码——成熟目录一次能吃掉数万 token，其中 95% 当场无用。支持 `offset`/`limit` 翻页（`truncated` 为 true 时用 `next_offset` 续取） |
 | 读 | `gear_describe` | `reg.Get*`、`app.Status` | 单个对象的完整定义（按需取，替代旧 `list_*` 的批量吐全量） |
-| 读 | `gear_capabilities` | `agent.CapabilitiesMethod` | 能力目录（内核 **6** 个受门禁原语 + 3 个 pure 纯函数原子 + 已注册 `ext.*`），含方法级参数 schema；支持 `name`/`kind` 过滤以减小返回 |
+| 读 | `gear_capabilities` | `agent.CapabilitiesMethod` | 能力目录（内核 **7** 个受门禁原语 + 5 个 pure 纯函数原子 + 已注册 `ext.*`），含方法级参数 schema；支持 `name`/`kind` 过滤以减小返回 |
 | 读 | `gear_doctor` | `app.List` + 侧车/扩展探测 | 环境自检：registry 计数、扩展与侧车就绪、台账与遗留应用、端口占用。用于区分「YAML 写错」与「环境没准备好」 |
 | 写 | `gear_validate` | `parseBundle` + `ValidateFlowStaticDiagsWith` | **不落库**的编译器：收 bundle YAML、一次报出**全部**字段级诊断（`code`/`step`/`field`/`hint`/`docs`），可无限次重试 |
 | 写 | `gear_apply` | `reg.Upsert*`（Tool→Flow→Hook） | **唯一写入口**：原子（任一非法则一个字节都不写）、幂等（二次 apply 报 `updated`）、`dry_run`、`overwrite`（默认 false：已存在且内容不同即拒，防覆盖人工维护的定义）。**不支持密钥写入**（见 `gear_guide("security")`） |

@@ -188,3 +188,108 @@ func TestValidateFlowStaticReturnsFirstDiagOnly(t *testing.T) {
 		t.Errorf("Error() 必须等于诊断 message（对外可见文本不变），got %q want %q", err.Error(), de.Diag.Message)
 	}
 }
+
+// ───────── ext.serve 侧车持有步（REQ-MCP-GUIDE-ATOMS） ─────────
+
+// flowWithoutServeHolder 是一条「站点步要用到侧车，却没有步去持有它」的 Flow——
+// 正是 2026-09-26 垂直切片与 2026-09-27 agent 范例两次实测踩到的形态：
+// 写入能过、apply 能过，只在 gear_app(start) 时炸 connection refused。
+func flowWithoutServeHolder(siteCall string) *model.Flow {
+	return &model.Flow{
+		ID: "hold.up",
+		Steps: []model.Step{
+			{ID: "anchor", Call: "hold__config", Mode: "once"},
+			{ID: "site", Call: siteCall, DependsOn: []string{"anchor"},
+				Input: map[string]interface{}{"port": 8100, "dir": "www"}},
+		},
+	}
+}
+
+func TestValidateFlowStaticDiagsRequiresServeHolder(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	e := New(reg)
+
+	// extra 里放一个**声明了 ext.serve capability 的 Tool**：站点步调它就算「用到侧车」。
+	site := &model.Tool{ID: "hold__site", Runtime: model.RuntimeLua,
+		Capabilities: []string{"ext.serve"}}
+
+	// ① 负向：没有持有步 → 必须报 MISSING_SERVE_HOLDER，且定位在 steps。
+	diags := e.ValidateFlowStaticDiagsWith(flowWithoutServeHolder("hold__site"),
+		[]*model.Tool{site})
+	var got *Diagnostic
+	for i := range diags {
+		if diags[i].Code == CodeMissingServeHolder {
+			got = &diags[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("缺持有步必须报 %s，实际诊断码：%v", CodeMissingServeHolder, diagCodes(diags))
+	}
+	if got.Step != "" || got.Field != "steps" {
+		t.Errorf("定位应落在 steps 上，got step=%q field=%q", got.Step, got.Field)
+	}
+	if got.Hint == "" {
+		t.Error("必须给「怎么修」，否则智能体只能猜")
+	}
+
+	// ② 正向：Flow 里补一条 `mode: service` 的 ext.serve 步 → 不该再报这一条。
+	f := flowWithoutServeHolder("hold__site")
+	withHolder := f.Steps[:1]
+	withHolder = append(withHolder, model.Step{ID: "serve", Call: "ext.serve", Mode: "service"})
+	withHolder = append(withHolder, f.Steps[1])
+	diags = e.ValidateFlowStaticDiagsWith(&model.Flow{ID: f.ID, Steps: withHolder},
+		[]*model.Tool{site})
+	for _, d := range diags {
+		if d.Code == CodeMissingServeHolder {
+			t.Fatalf("已持有侧车却仍报 %s（codes=%v）", CodeMissingServeHolder, diagCodes(diags))
+		}
+	}
+}
+
+// 直调 `ext.serve` 也应算「用到侧车」——这是最直观的写法，不能漏。
+func TestValidateFlowStaticDiagsFlagsDirectServeCall(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	e := New(reg)
+
+	f := &model.Flow{ID: "direct.up", Steps: []model.Step{
+		{ID: "site", Call: "ext.serve.start", Input: map[string]interface{}{"port": 8100}},
+	}}
+	diags := e.ValidateFlowStaticDiags(f)
+	want := CodeMissingServeHolder
+	found := false
+	for _, d := range diags {
+		if d.Code == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("直调 ext.serve.* 必须报 %s，实际 codes=%v", want, diagCodes(diags))
+	}
+}
+
+// 一条**根本不用侧车**的 Flow 不该被这条规则打扰（否则就是噪声诊断）。
+func TestValidateFlowStaticDiagsIgnoresFlowWithoutServe(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	e := New(reg)
+
+	f := &model.Flow{ID: "plain.up", Steps: []model.Step{
+		{ID: "db", Call: "db.exec", Input: map[string]interface{}{"sql": "SELECT 1"}},
+	}}
+	diags := e.ValidateFlowStaticDiags(f)
+	for _, d := range diags {
+		if d.Code == CodeMissingServeHolder {
+			t.Fatalf("不用侧车的 Flow 不该报 %s（codes=%v）", CodeMissingServeHolder, diagCodes(diags))
+		}
+	}
+}
+
+func diagCodes(diags []Diagnostic) []string {
+	out := make([]string, 0, len(diags))
+	for _, d := range diags {
+		out = append(out, d.Code)
+	}
+	return out
+}

@@ -16,6 +16,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"gear/internal/artifact"
 	"gear/internal/cap"
 	"gear/internal/engine"
 	"gear/internal/gearhome"
@@ -298,15 +299,16 @@ func TestMCPAgentClosedLoop(t *testing.T) {
 	}
 
 	// 3) apply 落库（原子、幂等），返回 created 清单。
-	//    顺序是**依赖顺序**（Tool → Flow → Hook），不是字母序：先落被引用者，
-	//    中途失败时「已写入什么」才是可解释的（见 persistBundle）。
+	//    顺序是**依赖顺序**（App → Tool → Flow → Hook），不是字母序：App 是聚合根先落，
+	//    然后先落被引用者，中途失败时「已写入什么」才是可解释的（见 persistBundle）。
 	var applied map[string]any
 	callTool(t, session, "gear_apply", map[string]any{"bundle": smokeBundleYAML}, &applied)
 	if applied["valid"] != true {
 		t.Fatalf("apply 应成功: %v", applied)
 	}
-	if fmt.Sprint(applied["created"]) != "[tool:smoke__hello flow:smoke.up]" {
-		t.Fatalf("created 清单不符（应为依赖顺序 tool→flow）: %v", applied["created"])
+	// app: 前缀是 2026-09-26 起的变更（App 清单入 registry，此前只校验后丢弃）。
+	if fmt.Sprint(applied["created"]) != "[app:smoke tool:smoke__hello flow:smoke.up]" {
+		t.Fatalf("created 清单不符（应为依赖顺序 app→tool→flow）: %v", applied["created"])
 	}
 
 	// 4) 幂等：二次 apply 变成 updated，不产生重复。
@@ -386,7 +388,15 @@ func TestMCPAgentClosedLoop(t *testing.T) {
 	// 10) 删除守卫：Tool 被 Flow 引用 → 拒绝（错误必须带码）。
 	expectToolError(t, session, "gear_delete", map[string]any{"kind": "tool", "id": "smoke__hello"}, "in use")
 
-	// 11) 先删 Flow 再删 Tool，均应成功。
+	// 11) 删除守卫（第 4 条）：Flow 是某 App 的 entry_flow → 拒绝。
+	//
+	// 与第 1/2/3 条形质不同：这条不是「谁在引用我」，而是「删了我之后 App 会悬空」——
+	// App.EntryFlow 只是个字符串，两表之间没有外键，注销 Flow 不留任何痕迹。
+	expectToolError(t, session, "gear_delete", map[string]any{"kind": "flow", "id": "smoke.up"}, "in use")
+
+	// 12) 清理顺序：App → Flow → Tool。**顺序本身是语义**：App 只是聚合描述（删它不带守卫），
+	// 摘掉它之后 entry_flow 才允许注销，最后才是被它引用的 Tool。
+	callTool(t, session, "gear_delete", map[string]any{"kind": "app", "id": "smoke"}, nil)
 	callTool(t, session, "gear_delete", map[string]any{"kind": "flow", "id": "smoke.up"}, nil)
 	callTool(t, session, "gear_delete", map[string]any{"kind": "tool", "id": "smoke__hello"}, nil)
 }
@@ -672,9 +682,11 @@ func TestMCPCapabilitiesTool(t *testing.T) {
 			t.Fatalf("能力目录应含内核门禁原语 %s: %v", want, names)
 		}
 	}
-	// 纯函数原子（time/template/crypto）：始终可用、无需声明，但必须出现在目录里
+	// 纯函数原子（time/template/crypto/id/validate）：始终可用、无需声明，但必须出现在目录里
 	//（否则 agent 根本不知道它们存在——这正是补它们时要顺手堵的缺口）。
-	for _, want := range []string{"time", "template", "crypto"} {
+	// 2026-09-28 新增 id（uuid/nanoid/code）与 validate（json_schema）：每个新族都必须同步这里，
+	// 否则「目录里看得到但这里没锁」= 新族可能悄悄从能力目录掉出去。
+	for _, want := range []string{"time", "template", "crypto", "id", "validate"} {
 		if kinds[want] != "pure" {
 			t.Fatalf("能力目录应含纯函数原子 %s（kind=pure），实际 kind=%q: %v", want, kinds[want], names)
 		}
@@ -1079,6 +1091,19 @@ func TestMCPToolSurfaceMatchesRegistry(t *testing.T) {
 	}
 }
 
+// TestArtifactGearVersionMatchesMCP 版本常量的**漂移锁**。
+//
+// internal/artifact 不能 import 本包（本包 import 它，反向会成环），于是它自己声明了一份
+// `GearVersion` 写进产物元信息。同一个值两份声明正是漂移的起点，故用测试钉死：
+// 升版本时忘了改另一处，这里立刻红。
+func TestArtifactGearVersionMatchesMCP(t *testing.T) {
+	if artifact.GearVersion != Version {
+		t.Fatalf("internal/artifact.GearVersion=%q 与 mcp.Version=%q 不一致——"+
+			"升版本必须两处同改（产物元信息与 MCP Implementation 报的是同一个 gear）",
+			artifact.GearVersion, Version)
+	}
+}
+
 // TestMCPArgTagsAvoidReservedPrefix 机械守卫：jsonschema 标签**不得以 `WORD=` 开头**。
 //
 // 踩过的坑：`jsonschema:"kind=tool 时的入参"` 让 AddTool 在**注册期直接 panic**
@@ -1093,6 +1118,7 @@ func TestMCPArgTagsAvoidReservedPrefix(t *testing.T) {
 		reflect.TypeOf(ApplyArgs{}), reflect.TypeOf(DeleteArgs{}), reflect.TypeOf(PromoteArgs{}),
 		reflect.TypeOf(InvokeArgs{}), reflect.TypeOf(RunArgs{}),
 		reflect.TypeOf(ExecutionArgs{}), reflect.TypeOf(AppArgs{}), reflect.TypeOf(FlowExposeArgs{}),
+		reflect.TypeOf(ExportArgs{}), reflect.TypeOf(ImportArgs{}),
 	}
 	for _, rt := range types {
 		for i := 0; i < rt.NumField(); i++ {
@@ -1168,6 +1194,9 @@ func TestMCPAllToolsReturnObjectStructuredContent(t *testing.T) {
 	}
 
 	// 列表类工具的调用表与期望具名键（与 mcpToolRegistry 的 true 项一一对应）。
+	// 2026-09-26：补两个产物工具。export 落到临时目录（须不存在），import 用 dry_run
+	// 读回来——同一个路径前后两次用，正好顺带验「导出的产物能被导回」。
+	artifactDir := filepath.Join(t.TempDir(), "artifact")
 	calls := []struct {
 		name string
 		args map[string]any
@@ -1178,6 +1207,8 @@ func TestMCPAllToolsReturnObjectStructuredContent(t *testing.T) {
 		{"gear_execution", nil, "executions"},
 		{"gear_execution", map[string]any{"id": execID, "with_logs": true}, "logs"},
 		{"gear_app", map[string]any{"action": "list"}, "items"},
+		{"gear_export", map[string]any{"app_id": "smoke", "out_dir": artifactDir}, "files"},
+		{"gear_import", map[string]any{"source": artifactDir, "dry_run": true}, "created"},
 	}
 	covered := map[string]bool{}
 	for _, c := range calls {

@@ -13,7 +13,10 @@
   <aside id="left" class="pane">
     <div class="pane-head">
       <span>思维树</span>
-      <button class="tiny primary" id="newTree">＋</button>
+      <span class="left-head-actions">
+        <button class="tiny" id="aiCfgBtn" title="AI 配置">⚙</button>
+        <button class="tiny primary" id="newTree">＋</button>
+      </span>
     </div>
     <div class="left-top">
       <input id="searchBox" class="search-box" type="search" placeholder="搜索节点（标题/摘要/正文）…" />
@@ -51,6 +54,7 @@
   </aside>
 
   <div id="toast"></div>
+  <script src="api.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

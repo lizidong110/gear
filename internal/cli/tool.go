@@ -78,7 +78,7 @@ func toolRegisterCmd() *cobra.Command {
 			}
 			registered := make([]string, 0, len(tools))
 			for _, t := range tools {
-				if err := reg.UpsertTool(t); err != nil {
+				if err := reg.UpsertTool(t, act()); err != nil {
 					return fmt.Errorf("注册 Tool %s 失败（已成功写入 %v，请先处理再重试）: %w", t.ID, registered, err)
 				}
 				registered = append(registered, t.ID)
@@ -189,22 +189,35 @@ func toolShowCmd() *cobra.Command {
 
 // toolUnregisterCmd 注销 Tool，复用 registry.DeleteTool 的 §8.2 守卫
 // （被 Flow step / Hook action 引用、运行中引用均拒，错误经 ErrInUse/ErrNotFound 向上传递）。
+// toolUnregisterCmd 注销 Tool（§8.2 守卫：被引用 / 运行中则拒）。
+//
+// id 支持通配符（* ? [...]），是为了「删完 Flow 后回收它留下的孤儿 Tool」这类批量清理。
+// 展开、去重、fail-closed 的全部规则见 globid.go 的 globMatch / expandDeleteTargets /
+// deleteAll —— 与 `gear flow delete` 共用同一份，避免两个入口的口径分叉。
 func toolUnregisterCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "unregister <id>",
-		Short: "注销一个 Tool（§8.2 守卫：被引用 / 运行中则拒）",
-		Args:  cobra.ExactArgs(1),
+		Use:   "unregister <id|pattern> [...]",
+		Short: "注销 Tool（id 支持 * ? [...] 通配符；被引用 / 运行中则拒）",
+		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			reg, err := openRegistry()
 			if err != nil {
 				return err
 			}
 			defer reg.Close()
-			if err := reg.DeleteTool(args[0]); err != nil {
+			ids, err := expandDeleteTargets(args, func(p string) ([]string, error) {
+				all, e := toolIDs(reg)
+				if e != nil {
+					return nil, e
+				}
+				return globMatch(p, all)
+			})
+			if err != nil {
 				return err
 			}
-			fmt.Printf("✓ 已注销 Tool: %s\n", args[0])
-			return nil
+			return deleteAll("Tool", ids, func(id string) error {
+				return reg.DeleteTool(id, act())
+			})
 		},
 	}
 }
@@ -231,7 +244,7 @@ func toolPromoteCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := eng.PromoteTool(args[0], args[1], target); err != nil {
+			if err := eng.PromoteTool(args[0], args[1], target, act()); err != nil {
 				return err
 			}
 			fmt.Printf("✓ Tool %s 版本 %s 已晋升为 %s\n", args[0], args[1], target)

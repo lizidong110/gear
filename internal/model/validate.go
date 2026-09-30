@@ -107,6 +107,13 @@ func (t Tool) Validate() error {
 	if _, err := t.ExecTimeout(); err != nil {
 		return fmt.Errorf("tool %s 的 timeout: %w", t.ID, err)
 	}
+	// 声明式 REST 路由（FR-3）：形状非法即拒绝注册——它能让人起服时 panic，
+	// 而「一个 YAML 字段能打不开服务」必须在写作期就被挡住。
+	if t.API != nil {
+		if err := t.API.Validate(); err != nil {
+			return fmt.Errorf("tool %s 的 api: %w", t.ID, err)
+		}
+	}
 	return nil
 }
 

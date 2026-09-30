@@ -133,7 +133,8 @@ steps:
 
 | 想做什么 | 改哪里 |
 |---|---|
-| 换端口 | Flow 里 `site` 的 `input.port` **与** `App.start.ports` 两处一起改 |
+| 换端口（临时） | 起服时 `gear_app(start, ports=[新端口])`，入参优先于清单，不用改 bundle |
+| 换端口（长期） | Flow 里 `site` 的 `input.port` **与** `App.start.ports` 两处一起改（前者是实际监听端口，后者是探活声明） |
 | 绑定到所有网卡 | `input.host` 从 `127.0.0.1` 改为 `0.0.0.0`（注意安全边界，默认只绑本机） |
 | 加反向代理 | `site` 的 `input.proxy: [{path: /api, target: http://127.0.0.1:8787}]` |
 | 让应用崩溃后不重启 | `App.start.restart: never` |

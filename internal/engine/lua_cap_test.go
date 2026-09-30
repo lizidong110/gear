@@ -43,7 +43,7 @@ func TestLuaCapUngranted(t *testing.T) {
 
 // M5-lua-2：声明 db 后，exec/query 正常往返（宿主侧 MultiDB 实现）。
 func TestLuaCapDB(t *testing.T) {
-	db := cap.NewMultiDB(filepath.Join(t.TempDir(), "lua.db"))
+	db := cap.NewMultiDB(filepath.Join(t.TempDir(), "lua.db"), t.TempDir())
 	t.Cleanup(func() { _ = db.Close() })
 	prov := &cap.Providers{DB: db}
 	host := luaHost(t, []string{"db"}, prov)
@@ -151,7 +151,7 @@ func TestLuaCapDBUnavailable(t *testing.T) {
 
 // M5-lua-8：声明隔离——仅声明 db 时访问 ctx.http 报错（不暴露未声明原语）。
 func TestLuaCapIsolation(t *testing.T) {
-	db := cap.NewMultiDB(filepath.Join(t.TempDir(), "iso.db"))
+	db := cap.NewMultiDB(filepath.Join(t.TempDir(), "iso.db"), t.TempDir())
 	t.Cleanup(func() { _ = db.Close() })
 	prov := &cap.Providers{DB: db}
 	host := luaHost(t, []string{"db"}, prov) // 仅 db

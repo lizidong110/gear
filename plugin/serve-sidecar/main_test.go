@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -75,16 +76,65 @@ func TestCapsListsImplementedMethods(t *testing.T) {
 	}
 }
 
-// TestStartRejectsMissingPort：缺 port 必须 fail-closed。
-func TestStartRejectsMissingPort(t *testing.T) {
-	svc := newServiceForTest(t)
-	dir := t.TempDir()
-	out := callHandler(t, svc.handleStart, map[string]interface{}{"dir": dir})
-	if out["error"] == nil {
-		t.Fatalf("缺 port 应报错，实际 %v", out)
+// TestStartAutoAssignsPort：省略 port 或填 0 都表示自动分配，返回值必须带回**真实**非零端口。
+//
+// 这条断言的靶心是「把 0 回给调用方」：那样反代 target 会拼成 http://127.0.0.1:0/、台账记个
+// 死数、用户拿着 url 打不开——全程不报错，纯粹骗人。所以除了查数值非零，还要查
+// url 与 port 字段同源、以及那个端口真的能服务（内核挑的端口必须是活的）。
+func TestStartAutoAssignsPort(t *testing.T) {
+	cases := []struct {
+		name string
+		args map[string]interface{}
+	}{
+		{"省略 port", map[string]interface{}{"dir": t.TempDir()}},
+		{"port 显式为 0", map[string]interface{}{"port": 0, "dir": t.TempDir()}},
 	}
-	if !containsStr(out["error"].(string), "port 必填") {
-		t.Fatalf("错误文案应点名 port 必填，实际 %v", out["error"])
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newServiceForTest(t)
+			dir := tc.args["dir"].(string)
+			if err := os.WriteFile(filepath.Join(dir, "index.html"),
+				[]byte("<h1>auto</h1>"), 0o644); err != nil {
+				t.Fatalf("写测试页失败: %v", err)
+			}
+			out := callHandler(t, svc.handleStart, tc.args)
+			res, ok := out["result"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("/start 应返回 result，实际 %v", out)
+			}
+			realPort, ok := res["port"].(float64)
+			if !ok || realPort <= 0 || realPort >= 65536 {
+				t.Fatalf("自动分配必须带回真实非零端口，实际 %v", res["port"])
+			}
+			// url 与 port 必须同源于同一个真实端口，否则调用方照 url 访问会打空。
+			if want := fmt.Sprintf("http://0.0.0.0:%d/", int(realPort)); res["url"] != want {
+				t.Fatalf("url 与 port 字段不一致: url=%v want=%s", res["url"], want)
+			}
+			resp, err := http.Get("http://127.0.0.1:" + strconv.Itoa(int(realPort)) + "/index.html")
+			if err != nil {
+				t.Fatalf("GET 真实端口失败: %v", err)
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if string(body) != "<h1>auto</h1>" {
+				t.Fatalf("静态页内容不符，实际 %q", string(body))
+			}
+			if stop := callHandler(t, svc.handleStop, map[string]interface{}{}); stop["error"] != nil {
+				t.Fatalf("/stop 不应报错，实际 %v", stop)
+			}
+		})
+	}
+}
+
+// TestStartRejectsNegativePort：负 port 是笔误，不能悄悄当成「自动」处理。
+func TestStartRejectsNegativePort(t *testing.T) {
+	svc := newServiceForTest(t)
+	out := callHandler(t, svc.handleStart, map[string]interface{}{"port": -1, "dir": t.TempDir()})
+	if out["error"] == nil {
+		t.Fatalf("port 为负应报错，实际 %v", out)
+	}
+	if !containsStr(out["error"].(string), "port 不能为负") {
+		t.Fatalf("错误文案应点名 port 不能为负，实际 %v", out["error"])
 	}
 }
 
@@ -291,4 +341,59 @@ func TestStopWithoutPortStopsAll(t *testing.T) {
 			t.Fatalf("端口 %d 全停后不应再可访问", p)
 		}
 	}
+}
+
+// TestResolveSiteDir 锁死「dir 相对路径解析」规则：相对 installRoot / cwd 都能命中，
+// 绝对路径原样校验，两者都不存在则 fail-closed 返回 false。
+func TestResolveSiteDir(t *testing.T) {
+	root := t.TempDir()
+	appDir := filepath.Join(root, "apps", "mindstorm", "www")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cwd := t.TempDir()
+	cwdDir := filepath.Join(cwd, "assets")
+	if err := os.MkdirAll(cwdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("相对 installRoot 命中", func(t *testing.T) {
+		got, ok := resolveSiteDir("apps/mindstorm/www", cwd, root)
+		if !ok || got != appDir {
+			t.Fatalf("应解析到 %s，实际 ok=%v got=%s", appDir, ok, got)
+		}
+	})
+	t.Run("相对 cwd 命中", func(t *testing.T) {
+		got, ok := resolveSiteDir("assets", cwd, "")
+		if !ok || got != cwdDir {
+			t.Fatalf("应解析到 %s，实际 ok=%v got=%s", cwdDir, ok, got)
+		}
+	})
+	t.Run("绝对路径原样校验", func(t *testing.T) {
+		got, ok := resolveSiteDir(appDir, cwd, root)
+		if !ok || got != appDir {
+			t.Fatalf("绝对路径应原样返回且存在，实际 ok=%v got=%s", ok, got)
+		}
+	})
+	t.Run("都不存在则 fail-closed", func(t *testing.T) {
+		_, ok := resolveSiteDir("nope/missing", cwd, root)
+		if ok {
+			t.Fatalf("不存在的 dir 必须返回 false（fail-closed）")
+		}
+	})
+	t.Run("installRoot 优先于 cwd 同名歧义", func(t *testing.T) {
+		// cwd 与 installRoot 下都放一个同名目录，必须取 installRoot（可移植锚）。
+		conflict := filepath.Join(root, "site")
+		cwdConflict := filepath.Join(cwd, "site")
+		if err := os.MkdirAll(conflict, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(cwdConflict, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		got, ok := resolveSiteDir("site", cwd, root)
+		if !ok || got != conflict {
+			t.Fatalf("应优先 installRoot 的 %s，实际 %s", conflict, got)
+		}
+	})
 }

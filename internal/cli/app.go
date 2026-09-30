@@ -24,6 +24,7 @@ func appCmd() *cobra.Command {
 			"  status 单个应用的状态快照（pid + 端口双判据）\n" +
 			"  list   全部台账与遗留（orphan）项\n" +
 			"  prune  清理台账里确定已终止的项（running/unknown 一律保留；--dry-run 先预览）\n" +
+			"  delete 注销 App 清单（不做引用守卫：App 只是聚合描述，删清单不等于删应用）\n" +
 			"台账落在 <registry 同目录>/apps/（默认 ~/.gear/apps/），--apps-dir 可覆盖。",
 		// 台账目录是「路径类 flag」，与 --registry 一样要做 POSIX 路径误用提示：
 		// 从 Git Bash 传 `/d/...` 会被 Windows 当成「当前盘符根下的绝对路径」，
@@ -37,7 +38,7 @@ func appCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.AddCommand(appRunCmd(), appStartCmd(), appStopCmd(), appStatusCmd(), appListCmd(), appPruneCmd())
+	c.AddCommand(appRunCmd(), appStartCmd(), appStopCmd(), appStatusCmd(), appListCmd(), appPruneCmd(), appDeleteCmd())
 	return c
 }
 
@@ -113,12 +114,22 @@ func appStartCmd() *cobra.Command {
 				Ports:        ports,
 				WaitSeconds:  waitSeconds,
 				Replace:      replace,
+				// 作用域必须传给派生进程（它才是跑 Flow 的那个），见 StartOptions.Scope 的注释。
+				Scope: cliScope,
+				// 入参没传 --port 时回退 App 清单的 start.ports（REQ-MCP-PORTS-ONE-TRUTH）。
+				// launch 层不直接读 registry，由这里注入查询；生效来源在 res.PortsSource。
+				AppLookup: func(flowID string) ([]int, bool, error) {
+					return app.AppPortsFromRegistry(registryPath, flowID)
+				},
 			})
 			if err != nil {
 				return err
 			}
 			fmt.Printf("%s  %s  pid=%d\n", res.State, res.AppID, res.PID)
 			fmt.Printf("  flow: %s\n  log:  %s\n", res.FlowID, res.LogPath)
+			// 端口来源如实上报：explicit=本次入参 / bundle=App 清单 start.ports 回退 /
+			// none=没声明（探活退化为只看 pid，半死状态测不出来）。
+			fmt.Printf("  ports_source: %s\n", res.PortsSource)
 			for _, p := range res.Ports {
 				fmt.Printf("  port %-6d listening=%v\n", p.Port, p.Listening)
 			}
@@ -131,8 +142,12 @@ func appStartCmd() *cobra.Command {
 			if res.State == string(app.StateAlreadyRunning) {
 				fmt.Println("  （同 flow 已有活跃实例；要换新实例加 --replace）")
 			} else if res.State == string(app.StateStartupFailed) {
-				return fmt.Errorf("应用启动即退出（pid=%d）——上面是日志尾部，常见原因：端口被占、侧车未构建、registry 路径不符",
-					res.PID)
+				// 根因（res.Reason）由内核从监管进程日志里挑出，认不出时退回 last_logs。
+				// 之前这里印的是一句对所有故障都成立的泛化文案，等于没说。
+				if res.Reason != "" {
+					return fmt.Errorf("应用启动即退出（pid=%d）——%s", res.PID, res.Reason)
+				}
+				return fmt.Errorf("应用启动即退出（pid=%d）——上面是日志尾部", res.PID)
 			}
 			return nil
 		},
@@ -281,6 +296,34 @@ func appPruneCmd() *cobra.Command {
 	c.Flags().StringVar(&flowID, "flow", "", "只清该 Flow 的台账项（留空=全部）")
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "只汇报将清理哪些，不实际删除")
 	return c
+}
+
+// appDeleteCmd 注销 App 清单。
+//
+// 为什么必须有这条命令（2026-09-27）：`registry.DeleteFlow` 的第 4 条守卫会拒绝注销
+// 「某个 App 的 entry_flow」，而它给出的处置办法正是「先注销该 App」。CLI 面没有入口的话，
+// 那条建议就是句空话——被拦住的人手上是 `gear flow delete`，他能走的只有 Web UI / MCP。
+//
+// 与 §8.2 的其它注销不同，这里**不做引用守卫**（见 registry.DeleteApp 的注释）：App 只是
+// 聚合描述，它引用的 Tool/Flow 是独立实体，要求「先拆掉所有 Tool 才能删清单」会堵死清理路径。
+func appDeleteCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "delete <id>",
+		Short: "注销 App 清单（不做引用守卫：删清单不等于删应用；删除留痕可回滚）",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			reg, err := openRegistry()
+			if err != nil {
+				return err
+			}
+			defer reg.Close()
+			if err := reg.DeleteApp(args[0], act()); err != nil {
+				return err
+			}
+			fmt.Printf("✓ 已注销 App: %s\n", args[0])
+			return nil
+		},
+	}
 }
 
 // printAppStatus 以统一格式打印一条状态（status 与 list 共用，避免两处格式漂移）。

@@ -123,7 +123,7 @@ func TestDBNilUnavailable(t *testing.T) {
 // TestMultiDBImpl 直接锁死 db 原语多后端实现（#69 升级）：建表/插入/查询/类型归一。
 // 用临时文件 DSN 走 sqlite 后端，顺带验证「dsn 缺省回退 defaultSQLiteDSN」之外的文件形态。
 func TestMultiDBImpl(t *testing.T) {
-	db := NewMultiDB(filepath.Join(t.TempDir(), "cap.db"))
+	db := NewMultiDB(filepath.Join(t.TempDir(), "cap.db"), t.TempDir())
 	defer db.Close()
 
 	if err := db.Exec("sqlite", "", "CREATE TABLE t(id INTEGER, name TEXT, blob BLOB)"); err != nil {
@@ -180,7 +180,7 @@ func TestMultiDBBackendsRouting(t *testing.T) {
 	fileDSN := filepath.Join(t.TempDir(), "real.db")
 
 	// 实例 A：建表 + 写一行到真实文件。
-	a := NewMultiDB("")
+	a := NewMultiDB("", "")
 	defer a.Close()
 	if err := a.Exec("sqlite", fileDSN, "CREATE TABLE t(id INTEGER, v TEXT)"); err != nil {
 		t.Fatalf("sqlite 建表失败: %v", err)
@@ -190,7 +190,7 @@ func TestMultiDBBackendsRouting(t *testing.T) {
 	}
 
 	// 实例 B：另起一个 MultiDB，读同一文件，证明真实持久化（非内存）。
-	b := NewMultiDB("")
+	b := NewMultiDB("", "")
 	defer b.Close()
 	rows, err := b.Query("sqlite", fileDSN, "SELECT id, v FROM t")
 	if err != nil {

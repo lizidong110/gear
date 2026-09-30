@@ -394,6 +394,81 @@ func TestRegistryCapabilities(t *testing.T) {
 	}
 }
 
+// TestRegistryToolsPaginates 目录类观察的可选分页参数（2026-09-27）。
+//
+// 背景：ext.registry.tools() 全量吐出会把观察顶过截断线，模型只数得到看得见的那部分就下
+// 结论（实测答 12，真实 34）。prefix/limit 是「让它能分次看」的唯一手段——光在提示里写
+// 「请缩小范围」而没有参数可传，等于一句空话。
+func TestRegistryToolsPaginates(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	call := func(args map[string]interface{}) []map[string]interface{} {
+		t.Helper()
+		ext := RegistryExtension(reg, nil)
+		prov, err := ext.Provider(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := prov.(*inProcessProvider).Call("tools", args)
+		if err != nil {
+			t.Fatalf("调用 ext.registry.tools(%v) 失败: %v", args, err)
+		}
+		arr, ok := res.([]map[string]interface{})
+		if !ok {
+			t.Fatalf("返回值必须是数组（examples/ai-create-flow.yaml 用 ipairs 消费），实际 %T", res)
+		}
+		return arr
+	}
+	for _, id := range []string{"alpha__a", "alpha__b", "beta__c"} {
+		if err := reg.UpsertTool(&model.Tool{ID: id, Runtime: model.RuntimeLua, Entry: "return {}",
+			InputSchema:  map[string]interface{}{"type": "object"},
+			OutputSchema: map[string]interface{}{"type": "object"},
+			Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := call(nil); len(got) != 3 {
+		t.Fatalf("不传参数应返回全部 3 条，实际 %d", len(got))
+	}
+	if got := call(map[string]interface{}{"prefix": "alpha__"}); len(got) != 2 {
+		t.Fatalf("prefix 过滤应得 2 条，实际 %d", len(got))
+	}
+	if got := call(map[string]interface{}{"prefix": "zzz__"}); len(got) != 0 {
+		t.Fatalf("无匹配的 prefix 应得 0 条，实际 %d", len(got))
+	}
+	// limit 小于条数：截断要发生在「条数」上，而不是让观察被 rune 截断后模型数不准
+	if got := call(map[string]interface{}{"limit": float64(2)}); len(got) != 2 {
+		t.Fatalf("limit=2 应得 2 条，实际 %d", len(got))
+	}
+	// limit 大于条数不应报错，也不会在列表里造出行
+	if got := call(map[string]interface{}{"limit": float64(99)}); len(got) != 3 {
+		t.Fatalf("limit 大于总数应得全部 3 条，实际 %d", len(got))
+	}
+	// 负向：limit=0 / 负数 = 「没传」（默认上限），不能当成「要 0 条」
+	if got := call(map[string]interface{}{"limit": float64(0)}); len(got) != 3 {
+		t.Fatalf("limit=0 应回落到默认（3 条），实际 %d", len(got))
+	}
+	if got := call(map[string]interface{}{"limit": float64(-5)}); len(got) != 3 {
+		t.Fatalf("limit 负数应回落到默认（3 条），实际 %d", len(got))
+	}
+}
+
+// TestRegistrySchemasDeclareListParams 参数 schema 必须与实际接受的参数一致。
+// 少声明了，模型就不知道有 prefix/limit 可用，分页形同虚设。
+func TestRegistrySchemasDeclareListParams(t *testing.T) {
+	sch := registrySchemas()
+	for _, m := range []string{"tools", "flows"} {
+		params := sch[m].Parameters
+		if params["prefix"].Type != "string" || params["limit"].Type != "number" {
+			t.Fatalf("ext.registry.%s 应声明 prefix(string) 与 limit(number)，实际 %v", m, params)
+		}
+	}
+	if len(sch["capabilities"].Parameters) != 0 {
+		t.Fatalf("capabilities 无参数，不该被塞参数 schema: %v", sch["capabilities"].Parameters)
+	}
+}
+
 // ───────── service ext：协调地址的唯一真相源（extensions.yaml 的 listen） ─────────
 
 // serviceExtYAML 生成一段最小可用的 service ext 配置（schemas 必填是红线，不能省）。

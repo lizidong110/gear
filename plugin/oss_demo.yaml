@@ -1,0 +1,89 @@
+# 演示 Tool：一次调用走通 ext.oss 的六条方法（put/stat/presign/get/list/delete）。
+#
+# 这个文件的存在意义：verify 的 P1f 若只直连侧车 HTTP 端点，只证明「侧车二进制写对了」，
+# 证明不了「能力接进引擎了」（2026-09-30 刚在 ext.excel / ext.pdf 上栽过一次：
+# extensions.yaml 里没有声明，71/71 全绿照样放过）。
+# 本样例经 `gear tool register` + `gear tool run` 走内核的门禁与能力目录，
+# 补上「ctx.ext.oss.* 真的存在、应用里真能调」这一层证据。
+#
+# 注册：gear tool register --registry <db> -   （stdin 喂本文件）
+# 运行：gear tool run oss.demo --registry <db> --input '{"endpoint":"http://127.0.0.1:PORT", ...}'
+#
+# 注：capabilities 声明 [ext.oss] —— service ext，侧车由内核按 extensions.yaml 的
+#     listen 端口拉起；MCP 工具数 +0。
+id: oss.demo
+name: 对象存储往返（ext.oss 六方法）
+runtime: lua
+capabilities: [ext.oss]
+input_schema:
+  type: object
+  properties:
+    endpoint: {type: string, description: "服务地址（host[:port] 或 scheme://host[:port]）"}
+    region: {type: string, description: "签名区域"}
+    bucket: {type: string, description: "桶名"}
+    access_key_id: {type: string, description: "AK（生产环境写 ${secrets.oss_ak}）"}
+    access_key_secret: {type: string, description: "SK（生产环境写 ${secrets.oss_sk}）"}
+    key: {type: string, description: "对象 key（缺省 demo/hello.txt）；给 ../x 可触发 bad_key，供反向验证"}
+  required: [endpoint, region, bucket, access_key_id, access_key_secret]
+output_schema:
+  type: object
+  properties:
+    put_size: {type: number, description: "上传字节数"}
+    stat_size: {type: number, description: "stat 报的字节数"}
+    get_size: {type: number, description: "下载字节数"}
+    list_count: {type: number, description: "列出对象数"}
+    presign_ok: {type: string, description: "预签名 URL 是否带 X-Amz-Signature（yes/no）"}
+    deleted: {type: string, description: "删除结果"}
+    error: {type: string, description: "出错时的原因（正常路径不出现）"}
+versions:
+  - version: 1.0.0
+    state: stable
+entry: |
+  local out = {}
+  local ok, r = pcall(function()
+    -- 连接参数每个方法都要带（侧车刻意不做配置库回退），这里拼一次复用
+    local conn = {
+      endpoint = ctx.input.endpoint,
+      region = ctx.input.region,
+      bucket = ctx.input.bucket,
+      access_key_id = ctx.input.access_key_id,
+      access_key_secret = ctx.input.access_key_secret,
+    }
+    local function args(extra)
+      local t = {}
+      for k, v in pairs(conn) do t[k] = v end
+      for k, v in pairs(extra or {}) do t[k] = v end
+      return t
+    end
+
+    local key = ctx.input.key or "demo/hello.txt"
+
+    -- ① put：内容走 base64（"hello oss"）
+    local put = ctx.ext.oss.put(args({key = key, data_base64 = "aGVsbG8gb3Nz", content_type = "text/plain"}))
+    out.put_size = put.size
+
+    -- ② stat：只取元数据，不取内容
+    local st = ctx.ext.oss.stat(args({key = key}))
+    out.stat_size = st.size
+
+    -- ③ presign：签一个 URL 给客户端直连（大对象走这条，不过侧车）
+    local ps = ctx.ext.oss.presign(args({key = key, expires = 600}))
+    out.presign_ok = (tostring(ps.url):find("X-Amz-Signature", 1, true) and "yes" or "no")
+
+    -- ④ get：读回来
+    local g = ctx.ext.oss.get(args({key = key}))
+    out.get_size = g.size
+
+    -- ⑤ list
+    local ls = ctx.ext.oss.list(args({prefix = "demo/"}))
+    out.list_count = ls.count
+
+    -- ⑥ delete
+    local d = ctx.ext.oss.delete(args({key = key}))
+    out.deleted = tostring(d.deleted)
+    return true
+  end)
+  if not ok then
+    out.error = tostring(r)
+  end
+  return out

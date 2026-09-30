@@ -16,11 +16,68 @@ versions:
     state: stable
 ---
 kind: Tool
+id: mindstorm__ui_set
+name: 存 UI 状态
+description: 把一串键值写进应用配置库，供前端回读（UI 状态持久化）。
+runtime: lua
+entry: |
+  ctx.config.set({ key = ctx.input.key, value = ctx.input.value })
+  return { ok = true }
+input_schema:
+  type: object
+  properties:
+    key:
+      type: string
+    value:
+      type: string
+  required:
+    - key
+    - value
+output_schema:
+  type: object
+  properties:
+    ok:
+      type: boolean
+versions:
+  - version: "1.0.0"
+    state: stable
+capabilities:
+  - config
+---
+kind: Tool
+id: mindstorm__ui_get
+name: 取 UI 状态
+description: 从应用配置库回读一串键值；key 不存在时 value 为空串（config 原语的 KV 语义）。
+runtime: lua
+entry: |
+  local v = ctx.config.get({ key = ctx.input.key })
+  return { key = ctx.input.key, value = v }
+input_schema:
+  type: object
+  properties:
+    key:
+      type: string
+  required:
+    - key
+output_schema:
+  type: object
+  properties:
+    key:
+      type: string
+    value:
+      type: string
+versions:
+  - version: "1.0.0"
+    state: stable
+capabilities:
+  - config
+---
+kind: Tool
 id: mindstorm__api
 name: mindstorm REST 后端
 description: 用 process 长驻起 gear REST 执行面，作为 mindstorm 的后台（默认 127.0.0.1:8790）。
 runtime: process
-entry: "D:/gadern/gear/build/gear.exe serve --addr 127.0.0.1:8790"
+entry: "gear serve --addr 127.0.0.1:8790"
 input_schema:
   type: object
 output_schema:

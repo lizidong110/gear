@@ -123,7 +123,7 @@
 │    心智模型四层 + 八条铁律 + 标准工作流 + 工具选择表
 ├─ L1 上下文层 ─ gear_guide(topic) / gear://guide/* / gear://schema/* ── 按需
 │    同一份 go:embed 文本，三处引用（instructions 摘要 / 工具全文 / resources）
-├─ L2 工具层 ── 意图级工具（gear_ 前缀，共 13 个）─────────── 调用面
+├─ L2 工具层 ── 意图级工具（gear_ 前缀，共 15 个）─────────── 调用面
 │    guide · catalog · describe · capabilities · validate · apply
 │    delete · promote · invoke · run · execution · app · doctor
 ├─ L3 交付物层 ─ Gear App Bundle（多文档 YAML，kind: App + Tool/Flow/Hook）─ 交付形态
@@ -221,7 +221,7 @@
 | `overview` | 四层模型 + 关系图 + CLI/REST/MCP 关系 | 首次接触 |
 | `authoring` | Tool / Flow / Hook 的**全字段**语义 + 静态校验规则表 + 正反例 | 写 YAML 前 |
 | `service-app` | service 长驻模型、anchor 排序、侧车与端口、`gear_app` 生命周期（start/stop/status/list） | 做应用时 |
-| `atoms` | 7 门禁原语 + 3 纯函数 + `ext.*` 的**用法约定**（参数 schema 走 `gear_capabilities`，避免静态文本过期） | 写 step.call 前 |
+| `atoms` | 7 门禁原语 + 5 纯函数 + `ext.*` 的**用法约定**（参数 schema 走 `gear_capabilities`，避免静态文本过期） | 写 step.call 前 |
 | `errors` | 错误码表 + 常见报错 → 修法（附录 D） | 报错后 |
 | `primitive-gap` | **原语准入六条判据 + 四类形态归属 + 报告模板**（附录 G） | 发现能力不足时 |
 | `examples` | 3 个可直接改的最小骨架（hello / service / 静态站） | 起步 |
@@ -242,7 +242,7 @@ var files embed.FS
 
 ---
 
-## 6. L2：工具层 —— 19 → 13（v1.2 收敛为 12，v1.3 因评审 I-8 补 `gear_invoke` 至 13）
+## 6. L2：工具层 —— 19 → 15（v1.2 收敛为 12，v1.3 因评审 I-8 补 `gear_invoke` 至 13，v1.4 补 `gear_export`/`gear_import` 至 15）
 
 ### 6.1 迁移对照
 
@@ -262,10 +262,18 @@ var files embed.FS
 | — | **`gear_app`**（`action`: start\|stop\|status\|list）**默认开启**（v1.2 由「可选」升为「必需」，见 §6.2⑤） | 新增（C′） |
 | — | **`gear_doctor`** | 新增（问题 P7） |
 | — | **`gear_invoke`**（`name`/`method`/`args`，能力直调；禁 `secret.*`） | 新增（v1.3，评审 I-8：等价 REST 的 `POST /api/capabilities/invoke`） |
+| — | **`gear_export`**（`app_id`/`out_dir`/`format`，导出可移植产物） | 新增（v1.4，产物可交付性，见下） |
+| — | **`gear_import`**（`source`/`overwrite`/`dry_run`/`apps_dir`，导回产物） | 新增（v1.4，产物可交付性，见下） |
 
-**13 个 = 1 guide + 6 目录/写入/直调 + 2 执行/观察 + 1 app + 1 doctor + 1 promote + 1 invoke。**
+**15 个 = 1 guide + 6 目录/写入/直调 + 2 执行/观察 + 1 app + 1 doctor + 1 promote + 1 invoke + 2 产物。**
 
-> **工具数硬预算 13**（v1.2 为 12，v1.3 因评审 I-8 补 `gear_invoke` 而上调一位）：新增必须合并或先删一个。原语缺口上报（§9.6）**刻意不新增工具**，走输出契约，就是为了守住这个预算。
+> **工具数硬预算 15**（v1.2 为 12 → v1.3 补 `gear_invoke` 至 13 → v1.4 补 `gear_export`/`gear_import` 至 15）：
+> 新增必须合并或先删一个。原语缺口上报（§9.6）**刻意不新增工具**，走输出契约，就是为了守住这个预算。
+>
+> **v1.4 这次放宽两位，理由与 I-8 同型**：它们不是「又一个操作」，而是把 L3 的必经路径接上——
+> 在此之前「用户构建的产品」在 gear 里**没有可搬运的形态**（定义散在 registry、静态资源游离在
+> 文件系统、App 清单此前根本不入库），换台机器只能整拷 `GEAR_HOME`（克隆机器，不是交付）。
+> 没有它们，「在 gear 上构建」会退化成「在这台机器上配置」。详见 `APP_ARTIFACT_DESIGN.md`。
 
 ### 6.2 关键设计点
 
@@ -307,7 +315,7 @@ gear_app(action: start|stop|status|list,
 
 | action | 行为 | 返回 |
 |---|---|---|
-| `start` | 幂等检查 → 派生 detach 进程 → 可选短等 → 返回 | `{app_id, flow_id, pid, state: starting\|running\|startup_failed, log_path, ports:[{port,listening}]}` |
+| `start` | 幂等检查 → 派生 detach 进程 → 可选短等 → 返回 | `{app_id, flow_id, pid, state: starting\|running\|startup_failed, log_path, ports:[{port,listening}], ports_source: explicit\|bundle\|none}`；入参 ports 缺省时回退 App 清单 `start.ports`（REQ-MCP-PORTS-ONE-TRUTH） |
 | `status` | 台账 + 存活判定 + 端口探活 | `{app_id, flow_id, pid, state: running\|exited\|failed\|unknown, started_at, uptime_s, ports, log_path, last_logs?}` |
 | `stop` | 发终止信号 → **端口复检** | `{app_id, state: stopped, ports_released: true}`；收不干净则 `ORPHAN_APP` + pid，**不谎报成功** |
 | `list` | 全部台账（含已退出的历史记录） | `{items:[…], orphan: [app_id…]}` |
@@ -471,8 +479,8 @@ steps:
 
 | 类别 | 成员 | 是否受 capability 门禁 | 能否被 Flow step 直调 | 说明 |
 |---|---|---|---|---|
-| 受门禁原语 | `http` `call` `db` `secret` `event` `subscribe`（6 个） | **是**（Tool 必须声明） | 能（如 `http.Request`） | 单一真相源 `internal/cap/cap.go` 的 `KnownPrimitives` |
-| 纯函数原子 | `time` `template` `crypto`（3 个） | **否**（始终可用，声明了反而被拒） | 能（如 `crypto.hash`） | 单具名 table 入参，`internal/engine/purefunc.go` |
+| 受门禁原语 | `http` `call` `db` `secret` `event` `subscribe` `config`（7 个） | **是**（Tool 必须声明） | 能（如 `http.Request`） | 单一真相源 `internal/cap/cap.go` 的 `KnownPrimitives` |
+| 纯函数原子 | `time` `template` `crypto` `id` `validate`（5 个） | **否**（始终可用，声明了反而被拒） | 能（如 `crypto.hash`、`id.uuid`、`validate.json_schema`） | 单具名 table 入参，`internal/engine/purefunc.go` |
 | Lua 便利绑定 | `json`（`ctx.json.encode/decode`） | — | **不能** | **不是能力**，不在能力目录；`ATOM_ROADMAP.md:21-27` 刻意如此 |
 | 可扩展原子 | `ext.email` `ext.serve` `ext.kafka` … | **是**（`ext.` 前缀 + 必须在 `extensions.yaml` 注册） | 能（如 `ext.ai.complete`） | 含 once 与 `service: true` 两种载体 |
 
@@ -509,7 +517,8 @@ steps:
 - registry 默认落在 `gearhome.RegistryPath()` = `<GEAR_HOME>/registry.db`（`GEAR_HOME` 未设时 `<HOME>/.gear/registry.db`；单一真相源见 `internal/gearhome/gearhome.go`），MCP 与 CLI/REST **共享同一份**——智能体的改动会与人的改动**互相可见**，所以命名空间约束（§7）是必须的。
   （2026-09-21 前默认值写在 `internal/cli/root.go` 里且与另外几处各自维护；现在 registry / exec.db / doctor 产物查找三处默认值统一从 `gearhome` 取，**且一律不随 cwd 变化**。）
 - **应用台账目录默认 `<registry 同目录>/apps/`**（即 `~/.gear/apps/`），`--apps-dir` 可覆盖；台账与日志均由 gear 自己管理，不是用户文件。
-- 相对路径依赖 cwd：`web_ui.up` 的 `dir: build/dist` 要求从仓库根运行。bundle 应尽量用**绝对路径或 `layout.workdir` 下的相对路径**，`gear_validate` 对「相对路径 + cwd 不明」给 warning。
+- **应用 YAML 不得写机器相关绝对路径**（如 `D:/gadern/gear/...`、`/Users/...`、`/d/gadern/...`）：`dir` 写**相对安装根**的路径（如 `apps/myapp/www`、`build/dist`），由 `InstallRoot` 锚定；`entry` 写裸名（如 `gear serve ...`）锚到可执行文件目录；`db` 的 dsn 写相对库名（如 `mindstorm.db`）锚到 `GEAR_APP_DATA`。`gear_validate` 对机器绝对路径直接报 `PORTABLE_PATH_HARDCODED`（fatal，会让 `valid` 变 `false`、`gear_apply` 据此拒绝落库），与 CI 闸门 `tools/portable_audit.py` 第⑨项**同口径**——CI 是兜底，MCP 是即时反馈（见下条）。
+- **发布后智能体主要通过 MCP 接口编写应用**：`gear_validate`（编译器，不落库、字段级诊断）+ `gear_apply`（唯一写入口，声明式原子幂等）是智能体落地应用定义的标准路径，而非手写 YAML 文件。因此「可移植性 / 命名空间 / 结构合法性」等校验都发生在 MCP 写作期，作者能立刻拿到 `code`+`hint` 去改 YAML；任何想加的硬约束都应挂进 `validateBundle`，让智能体在写作期自愈，而不是等到发布后拷贝到别的机器才炸。
 - **派生的 app 进程继承的是 MCP 服务端的 cwd**（`cmd.Dir` 显式设为其值）——这条要写进 guide，否则 `dir: build/dist` 在 WorkBuddy 里会解析到别处。
 
 ### 9.5 交付纪律（写进 instructions 的铁律）
@@ -549,12 +558,12 @@ steps:
 
 | 形态 | 判据 | 落点 | 是否进门禁 |
 |---|---|---|---|
-| 纯函数原语 | 无 IO、无凭据、确定性（`hash`/`base64`/`parse`） | `internal/cap`，单具名 table 入参 | 否（声明了反而被拒） |
+| 纯函数原语 | **不碰需授权的资源**（无 IO、无凭据、不读密钥库/env）+ **不持跨调用状态**（`hash`/`base64`/`jwt_verify`/`uuid`；读时钟与熵算环境事实，不算资源，故 `time.now`/`crypto.random` 仍属此列） | `internal/engine/purefunc.go`，单具名 table 入参 | 否（声明了反而被拒） |
 | 受门禁原语 | 有外发 IO 或副作用（网络/DB/事件/密钥） | `internal/cap` 的 `KnownPrimitives` | **是** |
 | 扩展原子 `ext.*` | 需握手/配置/第三方 SDK/侧车，或需长驻 | `plugin/extensions.yaml` 注册，可选 `service: true` | **是** |
 | **不申请原语** | 只在某一个应用里复用 | 直接建 Tool（Lua/process），或 step 直调已有能力 | —（这才是大多数情况的答案） |
 
-**交付方式**：报告写在**给用户的答复里**（人能看到并决定是否加原语），**不新增 MCP 工具**——守住 §6.1 的工具硬预算（13）。模板见**附录 G**。
+**交付方式**：报告写在**给用户的答复里**（人能看到并决定是否加原语），**不新增 MCP 工具**——守住 §6.1 的工具硬预算（15）。模板见**附录 G**。
 
 ---
 
@@ -655,7 +664,7 @@ steps:
 | R4 | `gear_apply` 幂等的边界 | 人工改过的 Flow 被智能体覆盖 | 响应区分 created/updated；`force` 默认 false，覆盖已存在且内容不同者需显式 `overwrite: true` |
 | R5 | 异步 `gear_run` 带来的轮询成本 | 智能体可能空转 | `wait_seconds` 折中（默认 0，建议 agent 用 15–30s 短等）+ `gear_execution` 一次返回 `with_logs` |
 | R6 | ~~是否开放密钥写入~~ | 已拍板 | **不开放**（§13.1 决策 3）；bundle 声明 `requires.secrets`，人用 CLI 播种 |
-| R7 | 工具数继续膨胀 | 准确率再次下降 | 「工具数 ≤ 12」写成 MCP 面硬预算；原语缺口上报刻意不新增工具（§9.6） |
+| R7 | 工具数继续膨胀 | 准确率再次下降 | 「工具数 ≤ 15」（v1.4）写成 MCP 面硬预算；原语缺口上报刻意不新增工具（§9.6） |
 | R8 | 原语缺口报告可能被淹没在长对话里 | 人看不到 → 无法补原语 | 契约要求放在答复**固定小节**；若实践中确有丢失，P2 再加持久化 sink（§11 P2） |
 
 ### 13.1 三项拍板结果（v1.2 已定）
@@ -689,8 +698,8 @@ Gear 是一个「机制内核」：只提供能力原语 + Tool（执行单元�
 一个「应用」= 一个含 mode: service 长驻 step 的 Flow，用 gear_app(start) 以后台进程方式运行。
 
 四层模型
-· 能力原语（底座，宿主提供）：受门禁 6 个 http/call/db/secret/event/subscribe（Tool 必须声明才可用）、
-  免门禁 3 个纯函数 time/template/crypto（始终可用，声明了反而被拒）、扩展原子 ext.*（须在 extensions.yaml 注册且必须声明）。
+· 能力原语（底座，宿主提供）：受门禁 7 个 http/call/db/secret/event/subscribe/config（Tool 必须声明才可用）、
+  免门禁 5 个纯函数 time/template/crypto/id/validate（始终可用，声明了反而被拒）、扩展原子 ext.*（须在 extensions.yaml 注册且必须声明）。
   json 不是能力（只是 Lua 里的 ctx.json 便利绑定，Flow 不能直调）。
 · Tool = 能力 + 业务逻辑，注册后可复用的执行单元。可复用的才建 Tool；一次性的直接在 step.call 写「能力.方法」。
 · Flow = 编排执行单元形成业务（谁先谁后 / 何时跑 / 是否长驻）。
@@ -709,7 +718,7 @@ Gear 是一个「机制内核」：只提供能力原语 + Tool（执行单元�
 
 八条铁律
 1. 写 step.call 的「能力.方法」直调前，必须先 gear_capabilities，不许凭记忆猜方法名或参数；
-   crypto/time/template 是免门禁纯函数、json 不是能力、ext.* 必须声明——这三条最容易写错。
+   crypto/time/template/id/validate 是免门禁纯函数、json 不是能力、ext.* 必须声明——这三条最容易写错。
 2. 任何 YAML 先 gear_validate，再 gear_apply；不要「先写进去再改」。
 3. 起长驻应用只能用 gear_app(action=start)：它派生后台进程并立即返回；gear_run 对 service Flow 一定被拒（这是设计，不是 bug）。
    不要等待一个长驻目标返回，也不要把长驻进程挂在你自己这一侧。
@@ -828,6 +837,7 @@ steps:
 | `MISSING_SECRET` | `${secrets.X}` 对应密钥未播种 | 请人在 CLI 播种（MCP 不写密钥）；这是 `warnings` 提示，不影响 `valid` |
 | `IN_USE` | 删除被引用对象 | 错误信息会指出被谁引用，先解引用 |
 | `ENTRY_EXE_UNRESOLVED` | process 型 Tool 的 entry 首 token 指向的可执行文件不存在（**校验期**即拦） | 改路径；Windows 下正/反斜杠都可。只有绝对路径报此码——相对路径与裸名字只给告警 |
+| `PORTABLE_PATH_HARDCODED` | 应用定义里出现机器相关绝对路径（`C:\...`/`/Users/...`/`/d/gadern/...`，含 Lua 脚本体内的 dsn） | 改用相对锚点：dsn 用相对库名（`mindstorm.db`→GEAR_APP_DATA）、entry 用裸名（`gear serve ...`→exe 目录）、dir 用相对安装根（`apps/<app>/www`→InstallRoot）；详见 `gear_guide("portability")` 与 REQ-APP-PORTABLE |
 | `NOT_FOUND` | 对象 id 不存在（Tool/Flow/Hook/执行记录） | 先用 `gear_catalog` / `gear_execution` 确认 id（注意应用前缀） |
 | `BAD_ARGUMENT` | 必填参数为空 / 枚举值非法 | 按工具描述的取值改写；先用 `gear_catalog` 确认对象 id |
 
@@ -841,7 +851,7 @@ steps:
 | 应用会随会话结束而停止 | 不一定。它是独立进程，**原则上跨会话存活**；但 Windows 下未脱离调用方 Job Object 时会给 `escaped_job:false`，表示它随发起启动的那次会话结束被回收——此时须如实告知用户，别报「已在后台常驻」。无论如何都要给出如何 stop |
 | MCP 内部托管着这个应用 | 没有。MCP 只派生进程 + 记账；持有者是那个 `app run` 进程自身 |
 | `stop` 返回 stopped 就一定收干净了 | 不一定。以 `ports_released` 与端口复检为准；不一致会返回 `ORPHAN_APP` |
-| `crypto` / `time` / `template` 要在 `capabilities` 里声明 | 不用，它们是免门禁纯函数；声明了反而被 `GrantsFromStrings` 拒 |
+| `crypto` / `time` / `template` / `id` / `validate` 要在 `capabilities` 里声明 | 不用，它们是免门禁纯函数；声明了反而被 `GrantsFromStrings` 拒 |
 | `json` 是一种原子能力，可以在 step 里直调 | 不是。`json` 只是 Lua 沙箱里的 `ctx.json.encode/decode`，不在能力目录、Flow 不能直调 |
 | `ext.*` 不用声明就能在 Tool 里用 | 不行，`ext.` 前缀同样受门禁，必须在 `capabilities` 里声明，且该 ext 要在 `extensions.yaml` 注册 |
 | 能力不够就用 process runtime 跑个脚本调外部程序 | 不行，那是绕过能力门禁。必须走 §9.6 的原语缺口上报 |
@@ -857,6 +867,7 @@ steps:
 | 新建 Flow 立刻能作为 `flow__{id}` 调 | 那是启动时快照；且该暴露面默认将关闭，用 `gear_run` |
 | 应用自己起的 REST 面 `/api/flows` 返回 `[]`，说明 REST 有 bug | **不是**。那个进程读的是**另一个 registry**——几乎总是 entry 里写死了相对 `--registry`，子进程按自己的 cwd 解析到了别的库。判据：`gear serve` 的 banner 会打 `flows=N, tools=N`（`flows=0` 即空库/错库）。修法：**删掉 entry 里的 `--registry`**，起服方会把生效的 registry 经 `GEAR_REGISTRY` 注入应用内的一切步骤（含长驻 Tool），于是与 CLI 必然同源；要固定就写绝对路径（显式值优先） |
 | 相对路径随便写 | 依赖进程 cwd；用绝对路径或 `layout.workdir` 下的路径（派生进程继承 MCP 服务端的 cwd）。entry 里给 `--registry` / `--apps-dir` 传相对值会在 `gear_validate` 的 `warnings` 里被点出来；CLI 传相对 `--registry` 会在 stderr 提示 |
+| 应用定义里写 `C:/...` / `/Users/...` 这种机器绝对路径 | 换台机器即跑不起来（2026-09-25 实测 mindstorm 共 25 处）。`gear_validate` 会报 `PORTABLE_PATH_HARDCODED` 并据此拒绝 `gear_apply`；CI 闸门 `tools/portable_audit.py` 第⑨项也会拦 | 只用相对锚点：`dsn: mindstorm.db`、`entry: "gear serve ..."`、`dir: apps/<app>/www`（分别锚到 GEAR_APP_DATA / 可执行文件目录 / 安装根）；详见 `gear_guide("portability")` |
 
 ## 附录 F：版本修正记录
 

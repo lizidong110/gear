@@ -20,7 +20,7 @@
 # 然后 Tool 声明 capabilities: [ext.tls]，Lua 里即可 local c = ctx.ext.tls.issue({ domain = "x.com" })。
 # 注意：ext.registry 是 gear 内建进程内扩展（读引擎 registry，供 agent 自我锚定），无需在此声明。
 #
-# 同理无需在此声明的是**内核原语**：受门禁的 6 个（http/call/db/secret/event/subscribe，
+# 同理无需在此声明的是**内核原语**：受门禁的 7 个（http/call/db/secret/event/subscribe/config，
 # 由 Tool 的 capabilities 声明后使用）与始终可用的 3 个纯函数原子（time/template/crypto，
 # 无需任何声明即可用，如 Flow 直调 call: crypto.hash、Lua 里 ctx.time.now({})）。
 # 它们不是 ext.*，不进本文件；能力目录见 `gear ai capabilities`。
@@ -338,7 +338,7 @@ ext.serve:
     start:
       description: 起一个「静态网站 + 可选反向代理」服务（类似 nginx：给定端口 + 静态目录，可把某些前缀反代到后端）
       parameters:
-        port: {type: number, description: "对外服务的监听端口", required: true}
+        port: {type: number, description: "对外服务的监听端口（可选；省略或填 0 由内核自动分配空闲端口，返回值带回真实 port，供拼反代 target）"}
         dir: {type: string, description: "静态网站根目录（本地路径，必填参数，传给 ext.serve）", required: true}
         host: {type: string, description: "绑定地址（默认 0.0.0.0，即所有网卡；可改 127.0.0.1 仅本机）"}
         proxy: {type: array, description: "反向代理规则（类 nginx location + proxy_pass）：元素 {path,target,strip_prefix}。命中 path 前缀的请求转发到 target（多条取最长前缀），未命中回落静态文件；path 须以 / 开头、target 须为 http(s)://host[:port]，strip_prefix 默认 false（转发时去掉该前缀）。规则非法即报错（不静默丢弃）、后端不可达返回 502"}
@@ -346,3 +346,307 @@ ext.serve:
       description: 停止当前静态网站服务（释放端口）
       parameters: {}
 
+
+# ───────── P3 文件类：ext.filestore（附件存取，2026-09-28 第二批 E2）─────────
+#
+# 语义要点（PRD §4.3）：
+#   · root 不硬编码：省略 root 参数时读配置库的 `filestore.root`
+#     （`gear config set filestore.root <目录>`，与 ctx.config 同源）；两者都没有即 fail-closed。
+#   · 路径穿越防护：key 里的空段 / "." / ".." / 反斜杠一律拒，拼接后必须仍在 root 内，
+#     **不跟随符号链接**（任何一级是符号链接且指向 root 外即拒）。
+#   · 大小上限默认 32 MiB（配置库的 `filestore.max_bytes` 可放宽），超限在落盘前拒。
+#   · 二进制走 base64（Lua 侧无字节类型）；不做 MIME 嗅探，content_type 信任调用方声明。
+#   · url() 只返回相对路径 /_filestore/<key>——内核 REST 面 +0，绝对 URL 由应用自己挂。
+ext.filestore:
+  cmd: ["plugin/filestore-sidecar.exe"]   # 真实侧车（plugin/filestore-sidecar）
+  methods: [put, get, stat, list, delete, url]
+  service: true
+  listen: "127.0.0.1:8096"               # coord + RPC 端口（本地 HTTP 调其方法）
+  health_probe:
+    kind: tcp
+    interval: 5s
+    threshold: 3
+  schemas:
+    put:
+      description: 写入一个对象（key 为 root 内的相对路径，支持多级目录）
+      parameters:
+        key: {type: string, description: "root 内的相对路径（如 contracts/2026/a.pdf）", required: true}
+        data_base64: {type: string, description: "对象二进制内容（base64 编码，Lua 侧无字节类型）", required: true}
+        content_type: {type: string, description: "内容类型（不做嗅探，缺省 application/octet-stream）"}
+        root: {type: string, description: "存储根目录（省略取配置库 filestore.root）"}
+        max_bytes: {type: number, description: "本次写入的大小上限（省略取配置库 filestore.max_bytes，默认 33554432）"}
+    get:
+      description: 读取一个对象为 base64
+      parameters:
+        key: {type: string, description: "对象 key", required: true}
+        root: {type: string, description: "存储根目录（省略取配置库 filestore.root）"}
+    stat:
+      description: 查看对象元信息（不返回内容）
+      parameters:
+        key: {type: string, description: "对象 key", required: true}
+        root: {type: string, description: "存储根目录（省略取配置库 filestore.root）"}
+    list:
+      description: 列出 key（默认全量）
+      parameters:
+        prefix: {type: string, description: "只列该前缀下的 key"}
+        root: {type: string, description: "存储根目录（省略取配置库 filestore.root）"}
+    delete:
+      description: 删除对象
+      parameters:
+        key: {type: string, description: "对象 key", required: true}
+        root: {type: string, description: "存储根目录（省略取配置库 filestore.root）"}
+    url:
+      description: 取对象的相对访问路径（由应用自己挂反代/前端路由，内核不新增 REST 端点）
+      parameters:
+        key: {type: string, description: "对象 key", required: true}
+        root: {type: string, description: "存储根目录（省略取配置库 filestore.root）"}
+
+
+# ───────── P3 调度类：ext.cron（定时触发，2026-09-28 第二批 E3）─────────
+#
+# 语义要点（PRD §4.1 / §4.2）：
+#   · **硬绑定**：侧车随应用起、随进程死而亡——进程一停调度立即停止且**不接管**，
+#     重启后不会接回间隔期内错过的触发。系统只有「有进程在跑」与「没进程」两态，
+#     不存在「表在、进程没了、谁在跑」的第三态。cron 表落盘只用于「重启后重建同一张时间表」。
+#   · 幂等：去重键 = name + 触发时刻（分钟粒度），同一分钟内的重复触发静默丢弃。
+#   · misfire：默认不补；显式 catch_up 也**只补最近一次**（补一整个窗口＝启动风暴）。
+#   · overlap：默认跳过（上一轮没跑完又到点就跳过并点名日志），显式才并发。
+#   · 表达式自己解析（5 段标准 cron + @ 宏），零新增依赖；非法表达式在 add/at 期就拒。
+#   · **持久化表 ≠ 跨进程任务队列**：它不搬运没跑完的触发，只让重启后的新进程重建时间表。
+ext.cron:
+  cmd: ["plugin/cron-sidecar.exe"]       # 真实侧车（plugin/cron-sidecar）
+  methods: [add, at, list, cancel]
+  service: true                          # 常驻能力：侧车长驻，按 cron 表到点回推
+  source: cron                           # 声明承载「cron」事件源（供 ctx.subscribe 使用）
+  listen: "127.0.0.1:8097"               # coord + RPC 端口（本地 HTTP 调其方法）
+  health_probe:
+    kind: tcp
+    interval: 5s
+    threshold: 3
+  schemas:
+    add:
+      description: 注册一条周期性任务（5 段 cron 表达式，非法即拒）
+      parameters:
+        name: {type: string, description: "任务名（唯一，去掉重与取消的键）", required: true}
+        expr: {type: string, description: "5 段 cron：分 时 日 月 周（如 */5 * * * *、0 9 * * 1-5）"}
+        at: {type: string, description: "一次性任务的时刻（与 expr 二选一；形如 2026-09-28 18:00）"}
+        timezone: {type: string, description: "时区名（如 Asia/Shanghai；缺省 Local）"}
+        callback_url: {type: string, description: "到点 POST 的地址（不给默认值，缺即拒）", required: true}
+        payload: {type: object, description: "随触发一起 POST 的业务载荷（会明文落盘，别放密钥）"}
+        catch_up: {type: boolean, description: "进程重启后是否补跑最近一次（默认 false）"}
+        overlap: {type: boolean, description: "上一轮未结束时是否并发（默认 false＝跳过）"}
+    at:
+      description: 注册一次性任务（到点触发一次即消失）
+      parameters:
+        name: {type: string, description: "任务名（唯一）", required: true}
+        at: {type: string, description: "时刻（形如 2026-09-28 18:00 或 RFC3339）", required: true}
+        timezone: {type: string, description: "时区名（缺省 Local）"}
+        callback_url: {type: string, description: "到点 POST 的地址", required: true}
+        payload: {type: object, description: "业务载荷"}
+        catch_up: {type: boolean, description: "at 已过时是否补跑最近一次（默认 false＝标记 expired）"}
+    list:
+      description: 列出任务（不回显 payload / callback_url）
+      parameters: {}
+    cancel:
+      description: 按名字取消任务（不存在即报错）
+      parameters:
+        name: {type: string, description: "任务名", required: true}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ext.oidc（2026-09-28）: SSO 握手 —— 发现元数据 / 授权码换令牌（含 PKCE）/ JWKS 长驻缓存
+#
+#   · **只做「拿令牌」的握手**：不验签（验签归 `crypto.jwt_verify`）、不做会话
+#     （state/nonce 由调用方自生成自校验，侧车只原样带回、不记任何登录态）。
+#   · **issuer 混淆防线两道**：discovery 文档里的 issuer 必须与入参一致，
+#     且 token_endpoint 的 host 必须与 issuer 同 host——否则「client_secret + 授权码」
+#     会被送到攻击者自己的令牌端点，这是 OIDC 最经典的劫持面。换令牌这一步同样复查。
+#   · **JWKS 长驻缓存**：命中缓存**一次 HTTP 都不发**；未知 kid 自动刷新一次；
+#     刷新失败退回旧缓存并置 `stale:true`（fail-soft，但不静默）。
+#   · 出网超时**统一 10s**（PRD §4.2 把仓库里 3s/5s/10s 三处约定拉齐）。
+#   · 入站回调复用 /in/{path} 形态（浏览器从 IdP 弹回 ?code=&state=），
+#     侧车只回报收到了什么，不换令牌、不建会话。
+ext.oidc:
+  cmd: ["plugin/oidc-sidecar.exe"]       # 真实侧车（plugin/oidc-sidecar）
+  methods: [discovery, code_exchange, jwks]
+  service: true                          # 常驻能力：侧车长驻并长驻缓存 JWKS
+  listen: "127.0.0.1:8098"               # coord + RPC 端口
+  health_probe:
+    kind: tcp
+    interval: 5s
+    threshold: 3
+  schemas:
+    discovery:
+      description: 取 issuer 的 OpenID 发现文档（issuer 混淆检查在此生效）
+      parameters:
+        issuer: {type: string, description: "Issuer 的绝对 URL（不给默认值，缺即拒）", required: true}
+    code_exchange:
+      description: 用授权码换令牌（支持 PKCE；client_secret 可选以兼容公开客户端）
+      parameters:
+        issuer: {type: string, description: "Issuer 的绝对 URL", required: true}
+        code: {type: string, description: "授权码", required: true}
+        client_id: {type: string, description: "客户端 ID", required: true}
+        redirect_uri: {type: string, description: "回调地址（即使 IdP 允许省略也要求显式给）", required: true}
+        client_secret: {type: string, description: "客户端密钥（公开客户端可不给；给了才随表单发出）"}
+        code_verifier: {type: string, description: "PKCE 验证器（给了才随表单发出，不给就不带）"}
+    jwks:
+      description: 取 JWKS 长驻缓存（命中不发 HTTP；刷新失败退回旧缓存并置 stale）
+      parameters:
+        issuer: {type: string, description: "Issuer 的绝对 URL", required: true}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ext.excel（2026-09-29）: 零依赖 Excel 写出 —— 手写最小 OOXML（archive/zip + XML）
+#
+#   · **零第三方依赖**：`go.mod` / `go.sum` 零变动（AC-E4-4，可 `git diff` 机械验证）。
+#   · **只做写出，不做读回**：读回留后批（PRD §4.5 已如实登记该副作用）。
+#   · **cell 类型由值自身决定**：字符串 / 数字 / 布尔 / 空（nil）四类，
+#     分别落为 inlineStr / number / boolean / 空单元格，不靠调用方标注 kind。
+#   · **路径囚禁**：path 必须是 root 内的相对路径，`..` / 盘符 / 反斜杠一律拒
+#     （fail-closed，不留半截文件）；判定统一走 internal/sidecar/outpath，不在此重写。
+#   · root 缺省取进程 CWD（＝应用的 layout.workdir），**不是**硬编码「写到当前目录」。
+ext.excel:
+  cmd: ["plugin/xlsx-sidecar.exe"]       # 真实侧车（plugin/xlsx-sidecar）
+  methods: [write]
+  service: true                          # 常驻能力：侧车长驻，按调用写出
+  listen: "127.0.0.1:8100"               # coord + RPC 端口
+  health_probe:
+    kind: tcp
+    interval: 5s
+    threshold: 3
+  schemas:
+    write:
+      description: 写出一个 .xlsx（多 sheet；cell 支持 字符串/数字/布尔/空 四类）
+      parameters:
+        path: {type: string, description: "相对 root 的文件名（如 reports/2026.xlsx）", required: true}
+        sheets: {type: array, description: "工作表数组：元素 {name, rows}；rows 是二维数组（每行一个数组）。name 不可重名（Excel 不区分大小写）；cell 支持 字符串/数字/布尔/空，类型由值自身决定", required: true}
+        root: {type: string, description: "产物根目录（缺省取进程 CWD＝应用 workdir）；path 必须落在其内，越界即拒"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ext.pdf（2026-09-29）: 零依赖 PDF 写出 + CJK 字体子集嵌入 —— 手写最小 PDF 写出器
+#
+#   · **CJK 嵌入字体子集**：运行时读系统 TTF（候选首推 simhei.ttf），按页面实际用到的
+#     字符做最小子集嵌入（复合字形算依赖闭包），CIDFontType2 + ToUnicode + Identity-H
+#     ——阅读器能正确选字、文本可复制（AC-E4-2）。
+#   · **缺字即报错（`font_no_glyph`），绝不画方框**：换字体（用 font 参数）或先替换掉
+#     该字符；不许静默降级成方框（verify P1e 有反向断言）。TTC / OTF 直接报错。
+#   · **零第三方依赖**：`go.mod` / `go.sum` 零变动（AC-E4-4）。
+#   · pages 同时接受 [{text="..."}] 与 ["..."] 两种写法（后者是 Lua 侧最自然的写法）。
+#   · A4 几何、贪心折行（CJK 间可断）、页码溢出即报错、不写时间戳（可复现）。
+ext.pdf:
+  cmd: ["plugin/pdf-sidecar.exe"]        # 真实侧车（plugin/pdf-sidecar）
+  methods: [write]
+  service: true                          # 常驻能力：侧车长驻，按调用写出
+  listen: "127.0.0.1:8101"               # coord + RPC 端口
+  health_probe:
+    kind: tcp
+    interval: 5s
+    threshold: 3
+  schemas:
+    write:
+      description: 写出一份 PDF（A4；CJK 自动嵌入字体子集）
+      parameters:
+        path: {type: string, description: "相对 root 的文件名（如 reports/2026.pdf）", required: true}
+        pages: {type: array, description: "页数组：元素 {text}（也接受每页一个裸字符串的写法）；text 内 \\n 换行，超出一页自动分页", required: true}
+        root: {type: string, description: "产物根目录（缺省取进程 CWD＝应用 workdir）；path 必须落在其内，越界即拒"}
+        font: {type: string, description: "显式指定字体文件路径（不给则走系统字体候选，首推 simhei.ttf）；TTC / OTF 直接报错"}
+        font_size: {type: number, description: "字号（默认 12，可用区间 4~72，超出即拒）"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ext.oss（2026-09-30）: S3 兼容对象存储 —— 手写 AWS Signature V4，零第三方依赖
+#
+#   · **只做 S3 协议一套**：阿里云 OSS / 腾讯云 COS / MinIO / R2 / Ceph 都兼容 S3，
+#     靠 endpoint 区分；不做第二套协议（每多一套协议就要多引一个 SDK，
+#     一引就破「go.mod / go.sum 零变动」这条红线）。
+#   · **凭据只从入参进**：access_key_id / access_key_secret 每次传（应用侧写 ${secrets.*}，
+#     内核执行前展开成明文注入）；侧车不读环境变量、不落库。endpoint / bucket / region
+#     同理，**没有配置库回退** —— 与 ext.filestore 不同，是有意的选择：
+#     省掉「配置与入参不一致时听谁的」这个歧义源，侧车也就成了无状态进程。
+#   · **key 校验**：禁 `..` / 空段 / 前导 `/` / 反斜杠，长度 ≤1024。
+#     远端没有符号链接语义，所以**不走** internal/sidecar/outpath。
+#   · **大对象走 presign 直传**：内核调侧车的硬超时是 10s
+#     （internal/engine/extensions.go:212），put/get 另有 32MiB 上限（可调 max_bytes），
+#     再大只能 presign 让客户端直连对象存储，别指望 put 扛得住。
+#   · **path_style 自动判**：endpoint 是 IP 时自动走 path-style（MinIO / 自建 Ceph 的默认
+#     形态），否则 virtual-host（bucket 打进 host，AWS / 阿里云的默认形态）。可显式指定。
+ext.oss:
+  cmd: ["plugin/oss-sidecar.exe"]         # 真实侧车（plugin/oss-sidecar）
+  methods: [put, get, stat, list, delete, presign]
+  service: true                           # 常驻能力：侧车长驻，按调用读写
+  listen: "127.0.0.1:8102"                # coord + RPC 端口
+  health_probe:
+    kind: tcp
+    interval: 5s
+    threshold: 3
+  schemas:
+    put:
+      description: 上传一个对象（内容走 base64）
+      parameters:
+        key: {type: string, description: "对象 key（如 reports/2026.xlsx）；禁 .. / 空段 / 前导 / / 反斜杠，长度 ≤1024", required: true}
+        data_base64: {type: string, description: "对象内容的 base64", required: true}
+        endpoint: {type: string, description: "服务地址，只认 host[:port] 或 scheme://host[:port]（**不带路径**）；不给 scheme 默认 https", required: true}
+        region: {type: string, description: "签名区域：AWS/MinIO 通常 us-east-1；阿里云 oss-cn-hangzhou；腾讯云 ap-guangzhou", required: true}
+        bucket: {type: string, description: "桶名", required: true}
+        access_key_id: {type: string, description: "AK（建议写 ${secrets.oss_ak}）", required: true}
+        access_key_secret: {type: string, description: "SK（建议写 ${secrets.oss_sk}）", required: true}
+        content_type: {type: string, description: "内容类型（默认 application/octet-stream）"}
+        session_token: {type: string, description: "STS 临时凭据的 security token"}
+        path_style: {type: boolean, description: "寻址形态；不给则自动判（endpoint 是 IP 时为 true）"}
+        max_bytes: {type: number, description: "大小上限（默认 32MiB）；超限在解码前就拒，不会先解进内存"}
+    get:
+      description: 下载一个对象（返回 base64；大对象请用 presign）
+      parameters:
+        key: {type: string, description: "同 put 的 key", required: true}
+        endpoint: {type: string, description: "同 put 的 endpoint", required: true}
+        region: {type: string, description: "同 put 的 region", required: true}
+        bucket: {type: string, description: "同 put 的 bucket", required: true}
+        access_key_id: {type: string, description: "同 put 的 access_key_id", required: true}
+        access_key_secret: {type: string, description: "同 put 的 access_key_secret", required: true}
+        session_token: {type: string, description: "同 put 的 session_token"}
+        path_style: {type: boolean, description: "同 put 的 path_style"}
+        max_bytes: {type: number, description: "读回上限（默认 32MiB），超出即拒"}
+    stat:
+      description: 取对象元数据（size / content_type / mod_time / etag），不取内容
+      parameters:
+        key: {type: string, description: "同 put 的 key", required: true}
+        endpoint: {type: string, description: "同 put 的 endpoint", required: true}
+        region: {type: string, description: "同 put 的 region", required: true}
+        bucket: {type: string, description: "同 put 的 bucket", required: true}
+        access_key_id: {type: string, description: "同 put 的 access_key_id", required: true}
+        access_key_secret: {type: string, description: "同 put 的 access_key_secret", required: true}
+        session_token: {type: string, description: "同 put 的 session_token"}
+        path_style: {type: boolean, description: "同 put 的 path_style"}
+    delete:
+      description: 删除一个对象（不存在即 not_found）
+      parameters:
+        key: {type: string, description: "同 put 的 key", required: true}
+        endpoint: {type: string, description: "同 put 的 endpoint", required: true}
+        region: {type: string, description: "同 put 的 region", required: true}
+        bucket: {type: string, description: "同 put 的 bucket", required: true}
+        access_key_id: {type: string, description: "同 put 的 access_key_id", required: true}
+        access_key_secret: {type: string, description: "同 put 的 access_key_secret", required: true}
+        session_token: {type: string, description: "同 put 的 session_token"}
+        path_style: {type: boolean, description: "同 put 的 path_style"}
+    list:
+      description: 列出对象（ListObjectsV2；prefix 过同一套 key 规矩）
+      parameters:
+        endpoint: {type: string, description: "同 put 的 endpoint", required: true}
+        region: {type: string, description: "同 put 的 region", required: true}
+        bucket: {type: string, description: "同 put 的 bucket", required: true}
+        access_key_id: {type: string, description: "同 put 的 access_key_id", required: true}
+        access_key_secret: {type: string, description: "同 put 的 access_key_secret", required: true}
+        prefix: {type: string, description: "只列该前缀下的对象"}
+        limit: {type: number, description: "每页条数（默认 1000，上限 1000）"}
+        session_token: {type: string, description: "同 put 的 session_token"}
+        path_style: {type: boolean, description: "同 put 的 path_style"}
+    presign:
+      description: 签一个预签名 URL 给客户端直连（大对象上传/下载都走这条，不过侧车）
+      parameters:
+        key: {type: string, description: "同 put 的 key", required: true}
+        endpoint: {type: string, description: "同 put 的 endpoint", required: true}
+        region: {type: string, description: "同 put 的 region", required: true}
+        bucket: {type: string, description: "同 put 的 bucket", required: true}
+        access_key_id: {type: string, description: "同 put 的 access_key_id", required: true}
+        access_key_secret: {type: string, description: "同 put 的 access_key_secret", required: true}
+        method: {type: string, description: "GET（下载，默认）或 PUT（直传）", enum: [GET, PUT]}
+        expires: {type: number, description: "有效期秒数（默认 900，上限 604800＝7 天）"}
+        session_token: {type: string, description: "同 put 的 session_token"}
+        path_style: {type: boolean, description: "同 put 的 path_style"}

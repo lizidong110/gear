@@ -581,3 +581,85 @@ func diagsContain(out map[string]any, code string) bool {
 func replaceFirst(s, old, new string) string {
 	return strings.Replace(s, old, new, 1)
 }
+
+// TestMCPDescribeAppReturnsManifestAndComposition 「这个应用由什么组成」必须一次答全。
+//
+// 2026-09-25 的缺口原文：「没有任何端点能回答一个 App 由哪些 Tool/Flow/静态资源/数据表组成」。
+// 这条是它的回归锁——只给运行态（pid/端口）等于没答，智能体仍然要猜。
+// 组成判定与 `gear_export` 共用 `artifact.Composition`（此处锁的是「同一份判定」这件事）。
+func TestMCPDescribeAppReturnsManifestAndComposition(t *testing.T) {
+	f := newSmokeFixture(t)
+	callTool(t, f.session, "gear_apply", map[string]any{"bundle": smokeBundleYAML}, nil)
+
+	var out map[string]any
+	callTool(t, f.session, "gear_describe", map[string]any{"kind": "app", "id": "smoke"}, &out)
+	if out["kind"] != "app" {
+		t.Fatalf("kind 不符: %v", out)
+	}
+	manifest, _ := out["manifest"].(map[string]any)
+	if manifest == nil {
+		t.Fatalf("manifest 不应为 null（已 apply 过 App 清单）: %v", out)
+	}
+	if manifest["entry_flow"] != "smoke.up" {
+		t.Fatalf("manifest 缺 entry_flow: %v", manifest)
+	}
+	comp, _ := out["composition"].(map[string]any)
+	if comp == nil {
+		t.Fatalf("composition 不应为 null: %v", out)
+	}
+	if comp["entry_flow"] != "smoke.up" {
+		t.Fatalf("composition 缺 entry_flow: %v", comp)
+	}
+	tools, _ := comp["tools"].([]any)
+	if len(tools) != 1 || tools[0] != "smoke__hello" {
+		t.Fatalf("composition.tools 应为名下 Tool（按 namespace 前缀反查）: %v", comp["tools"])
+	}
+	flows, _ := comp["flows"].([]any)
+	if len(flows) != 1 || flows[0] != "smoke.up" {
+		t.Fatalf("composition.flows 应含 entry_flow: %v", comp["flows"])
+	}
+	// 静态资源是「清单里声明的路径」，不是「磁盘上有哪些」——后者归 gear_doctor。
+	if _, ok := comp["static_files"]; !ok {
+		t.Fatalf("composition 缺 static_files: %v", comp)
+	}
+}
+
+// TestMCPDescribeAppReportsNotFoundOnlyWhenBothMissing 三份信息互不包含，缺的那份如实为 null。
+//
+// 「只起过没清单」与「有清单没起过」都是合法状态：**任一份存在就不报 NOT_FOUND**。
+// 反过来，两者皆无才是真的没有——这条同时是「不要因为查不到台账就把应用判成不存在」的守卫。
+func TestMCPDescribeAppReportsNotFoundOnlyWhenBothMissing(t *testing.T) {
+	f := newSmokeFixture(t)
+
+	// ① 只有台账（手工塞一条），没有清单 → object 可用、manifest 为 null、不报 NOT_FOUND。
+	appsDir := filepath.Join(filepath.Dir(f.regPath), "apps")
+	if err := os.MkdirAll(appsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appsDir, "app_fake.json"),
+		[]byte(`{"app_id":"app_fake","flow_id":"smoke.up","pid":0,"started_at":"2026-01-01T00:00:00Z"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var onlyLedger map[string]any
+	callTool(t, f.session, "gear_describe", map[string]any{"kind": "app", "id": "app_fake"}, &onlyLedger)
+	if onlyLedger["object"] == nil {
+		t.Fatalf("仅台账存在时 object 应可用: %v", onlyLedger)
+	}
+	if onlyLedger["manifest"] != nil {
+		t.Fatalf("没有清单时 manifest 应为 null（如实，不编）: %v", onlyLedger)
+	}
+
+	// ② 只有清单（apply 一份 App），没起过 → manifest/composition 可用、object 为 null。
+	callTool(t, f.session, "gear_apply", map[string]any{"bundle": smokeBundleYAML}, nil)
+	var onlyManifest map[string]any
+	callTool(t, f.session, "gear_describe", map[string]any{"kind": "app", "id": "smoke"}, &onlyManifest)
+	if onlyManifest["manifest"] == nil || onlyManifest["composition"] == nil {
+		t.Fatalf("有清单时 manifest/composition 应可用: %v", onlyManifest)
+	}
+
+	// ③ 两者皆无 → APP_NOT_FOUND（不是空结果，也不是 200 + 全 null）。
+	text := expectToolError(t, f.session, "gear_describe", map[string]any{"kind": "app", "id": "nope"}, "APP_NOT_FOUND")
+	if !strings.Contains(text, "APP_NOT_FOUND") {
+		t.Fatalf("两者皆无时应报 APP_NOT_FOUND: %s", text)
+	}
+}

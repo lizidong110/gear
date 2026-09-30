@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"gear/internal/procalive"
 )
 
 // StartOptions 是后台启动一个应用的入参。
@@ -31,8 +33,18 @@ type StartOptions struct {
 	FlowID string
 	// Restart 重启策略 always | never；留空 = always。
 	Restart string
-	// Ports 是 bundle 声明的端口，用于台账探活与 stop 后复检。留空则只按 pid 判存活。
+	// Ports 是显式传入的声明端口（CLI --port / gear_app ports），用于台账探活与 stop 后
+	// 复检。留空时**回退**到 App 清单的 start.ports（经 AppLookup 反查，见 REQ-MCP-PORTS-
+	// ONE-TRUTH）；两处都没有则只按 pid 判存活。实际生效来源见 StartResult.PortsSource。
 	Ports []int
+	// AppLookup（可选）：按入口 FlowID 反查 App 清单的声明端口，Ports 为空时的回退来源。
+	//
+	// 由调用方注入（CLI / MCP 各自持 registry），launch 层保持零 registry 依赖——Start 的
+	// 执行路径仍只吃入参，「起服失败因 registry 读不到」不会成为新故障模式。
+	// 约定：(ports, matched, err)。matched=false 表示**没有唯一命中的 App**（没有 App、
+	// 或多个 App 共用同一 entry_flow、或清单没声明端口）——此时不回退。歧义即放弃：
+	// 多个 App 共用 entry_flow 时猜一个，比让调用方显式传更危险。
+	AppLookup func(flowID string) (ports []int, matched bool, err error)
 	// CWD 是派生进程的工作目录；留空 = 当前进程 cwd（相对路径依赖它，见 guide §环境）。
 	CWD string
 	// WaitSeconds > 0 时短等这么多秒确认启动结果；0 = 立即返回（默认）。
@@ -41,17 +53,44 @@ type StartOptions struct {
 	Replace bool
 	// Self 是 gear 可执行文件路径；留空 = os.Executable()。
 	Self string
+	// Scope 是运行期命名空间守卫的作用域（App.ID），原样传给被派生的监管进程。
+	//
+	// 留空 = 不启用。它**必须**进派生 argv：否则 `gear app start --scope x` 只在父进程守住了，
+	// 监管进程（真正跑 Flow 的那个）照旧能引用别的应用——守卫在最该生效的那一层失效，
+	// 比完全不守卫更难发现（表面上看加过 --scope）。
+	Scope string
+}
+
+// deriveRunArgs 拼出派生监管进程的命令行。
+//
+// 抽出来的理由：argv 里少一个 flag 就是「守卫在最该生效的那一层失效」，
+// 而这类漏传不会报错——父进程照常返回「已启动」。把它变成可单测的小函数，
+// 「--scope 必须跟到派生进程」就成了被测试盯住的约定，而不是靠人记得。
+//
+// --registry 放在最前（必须被显式继承，见 StartOptions.RegistryPath 的说明）；
+// --scope 仅在非空时追加：空 scope 是默认（不启用守卫），不该在命令行上留下痕迹。
+func deriveRunArgs(regPath, flowID, policy, scope string) []string {
+	args := []string{"--registry", regPath, "app", "run", flowID, "--restart", policy}
+	if scope != "" {
+		args = append(args, "--scope", scope)
+	}
+	return args
 }
 
 // StartResult 是 start 的返回。
 type StartResult struct {
-	AppID    string      `json:"app_id"`
-	FlowID   string      `json:"flow_id"`
-	PID      int         `json:"pid"`
-	State    string      `json:"state"`
-	LogPath  string      `json:"log_path"`
-	Ports    []PortState `json:"ports"`
-	LastLogs []string    `json:"last_logs,omitempty"`
+	AppID   string      `json:"app_id"`
+	FlowID  string      `json:"flow_id"`
+	PID     int         `json:"pid"`
+	State   string      `json:"state"`
+	LogPath string      `json:"log_path"`
+	Ports   []PortState `json:"ports"`
+	// Reason 是启动即退出时的**根因**（从日志尾部里挑出），仅当 State==startup_failed 时非空。
+	//
+	// 它的存在理由：此前这一句只有 last_logs，而 CLI / MCP 又各印一句硬编码的泛化文案，
+	// 三种常见故障共用一句话——等于没说。见 launch_reason.go 的口径（只收录实测见过的模式）。
+	Reason   string   `json:"reason,omitempty"`
+	LastLogs []string `json:"last_logs,omitempty"`
 	// EscapedJob 说明派生进程是否**真的**脱离了调用方的进程沙箱（Windows Job Object）。
 	//
 	// 为什么必须报出来：`CREATE_BREAKAWAY_FROM_JOB` 失败时会退化为普通派生，进程仍在调用方
@@ -61,6 +100,10 @@ type StartResult struct {
 	EscapedJob *bool `json:"escaped_job,omitempty"`
 	// Warning 是「本次启动虽然成功、但有个已知隐患」的一句话（目前只有未脱离 Job 这一种）。
 	Warning string `json:"warning,omitempty"`
+	// PortsSource 如实说明本次生效的声明端口来自哪里：explicit（入参）/ bundle（App 清单
+	// 的 start.ports 回退）/ none。三级来源若不报出来，「这次到底用了哪份」就成了暗口径
+	// ——排查「为什么探活没生效」时第一个要回答的就是它。
+	PortsSource string `json:"ports_source,omitempty"`
 }
 
 // StopOptions 是停止一个应用的入参。
@@ -154,6 +197,14 @@ func Start(opts StartOptions) (*StartResult, error) {
 		return nil, fmt.Errorf("非法的 restart=%q（应为 always 或 never）", policy)
 	}
 
+	// 解析声明端口（入参 > App 清单 start.ports > 无，见 ports_lookup.go）。
+	// 后面所有用到 opts.Ports 的地方（preBusy、台账、探活）一律吃这份解析结果，
+	// 否则回退来的端口只报不探，等于又造半个暗口径。
+	ports, portsSource, err := ResolveStartPorts(opts)
+	if err != nil {
+		return nil, err
+	}
+
 	// 幂等检查：同 Flow 的活跃实例（未被 stop 且探活为 running）。
 	recs, err := ListRecords(dir)
 	if err != nil {
@@ -210,15 +261,14 @@ func Start(opts StartOptions) (*StartResult, error) {
 	// 「client 退让、本 gear 手上没有本地进程」误判成 service 退出并无限重启。现在共享实例
 	// 不再触发重启（见 EXT_SERVICE_DESIGN.md §12.10），但**探活归因**这条理由依然成立：
 	// 端口在听不能证明是本次派生的进程把它拉起来的，preBusy 的排除逻辑照旧。
-	preBusy := make(map[int]bool, len(opts.Ports))
-	for _, p := range opts.Ports {
+	preBusy := make(map[int]bool, len(ports))
+	for _, p := range ports {
 		if PortListening(p) {
 			preBusy[p] = true
 		}
 	}
 
-	// --registry 放在最前：它必须被显式继承，见 StartOptions.RegistryPath 的说明。
-	args := []string{"--registry", absReg, "app", "run", opts.FlowID, "--restart", policy}
+	args := deriveRunArgs(absReg, opts.FlowID, policy, opts.Scope)
 	proc, escaped, err := launchDetached(self, args, cwd, logFile)
 	if err != nil {
 		return nil, fmt.Errorf("派生后台进程失败: %w", err)
@@ -226,7 +276,7 @@ func Start(opts StartOptions) (*StartResult, error) {
 
 	rec := &Record{
 		AppID: appID, FlowID: opts.FlowID, Registry: absReg, PID: proc.Pid,
-		Restart: policy, StartedAt: now, CWD: cwd, LogPath: logPath, Ports: opts.Ports,
+		Restart: policy, StartedAt: now, CWD: cwd, LogPath: logPath, Ports: ports,
 		EscapedJob: &escaped,
 	}
 	if err := SaveRecord(dir, rec); err != nil {
@@ -236,7 +286,7 @@ func Start(opts StartOptions) (*StartResult, error) {
 			"请用 `gear app stop` / 手动结束该 pid 处理", proc.Pid, logPath, err)
 	}
 
-	res := &StartResult{AppID: appID, FlowID: opts.FlowID, PID: proc.Pid, State: string(StateStarting), LogPath: logPath}
+	res := &StartResult{AppID: appID, FlowID: opts.FlowID, PID: proc.Pid, State: string(StateStarting), LogPath: logPath, PortsSource: portsSource}
 	res.EscapedJob = &escaped
 	if !escaped {
 		// 退化派生：进程仍在调用方的 Job Object 里，调用方退出即被回收。
@@ -247,6 +297,13 @@ func Start(opts StartOptions) (*StartResult, error) {
 			"若要长期托管，请让 gear 由一个不受该 Job 约束的进程发起（如在独立终端里执行 app start）。"
 	}
 	res.State, res.Ports, res.LastLogs = waitReady(rec, opts.WaitSeconds, preBusy)
+	if res.State == string(StateStartupFailed) {
+		// 根因只在监管进程的日志里（派生进程是 detached 的，取不到退出码），挑出来挂在
+		// StartResult 上，好让 CLI / MCP 不必各自印那句对所有故障都成立的泛化文案。
+		res.Reason = classifyStartupFailure(startupFailureReason(res.LastLogs))
+	} else {
+		res.Reason = ""
+	}
 	if res.State == string(StateStartupFailed) {
 		// 短等窗口内进程就退出了：**我们已经知道**它不在跑，就不该让它以「遗留应用」的身份
 		// 永远挂在 doctor 的 orphan 列表里（遗留项的语义是「pid 没了却从未被 stop，得有人过目」）。
@@ -406,10 +463,14 @@ func freeWord(portsFree bool) string {
 
 // ProcessAlive 报告 pid 是否仍存活（导出给 MCP 层的「孤儿执行」识别用，评审 I-1④）。
 //
-// 平台差异收在未导出的 processAlive 里（Windows 走 OpenProcess、Unix 走 signal 0）。
-// 单独导出而不让调用方自己 FindProcess：Windows 与 Unix 的「进程不存在」判据不同，
-// 各写一份必然漂移（本包已经踩过一次，见 launch_windows.go 的注释）。
-func ProcessAlive(pid int) bool { return processAlive(pid) }
+// 平台差异收在 internal/procalive，不在本包各平台文件里各写一份：Windows 的判据是
+// 「OpenProcess + 退出码 == STILL_ACTIVE」，Unix 是 signal 0，两者在「已退出但句柄未释放」
+// 这种形态下结论相反——各写一份必然漂移（本包已经踩过一次）。
+func ProcessAlive(pid int) bool { return procalive.Alive(pid) }
+
+// processAlive 是包内判据，与 ProcessAlive 同源（不导出是为了让「判存活」这件事只有一个
+// 实现可改，Windows / Unix 两个平台文件都不再自带 processAlive）。
+func processAlive(pid int) bool { return procalive.Alive(pid) }
 
 // Status 返回单个应用的状态快照。
 func Status(opts StatusOptions) (*StatusResult, error) {

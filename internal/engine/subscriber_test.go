@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -92,7 +93,7 @@ func TestSubscribeDeliverRunsTarget(t *testing.T) {
 		ctx.output = { handle = h }
 	`))
 
-	out, err := eng.RunToolExec("sub_tool", nil, "")
+	out, err := eng.RunToolExec(context.Background(), "sub_tool", nil, "")
 	if err != nil {
 		t.Fatalf("发起订阅失败: %v", err)
 	}
@@ -151,7 +152,7 @@ func TestSubscribeStartGatesOnCallbackBase(t *testing.T) {
 		ctx.output = { handle = h }
 	`))
 
-	if _, err := eng.RunToolExec("sub_tool", nil, ""); err == nil || !strings.Contains(err.Error(), "需引擎监听") {
+	if _, err := eng.RunToolExec(context.Background(), "sub_tool", nil, ""); err == nil || !strings.Contains(err.Error(), "需引擎监听") {
 		t.Fatalf("无回推基址时 subscribe.start 应报「需引擎监听」，实际 %v", err)
 	}
 }
@@ -168,7 +169,7 @@ func TestSubscribeUnknownSource(t *testing.T) {
 		ctx.output = { handle = h }
 	`))
 
-	if _, err := eng.RunToolExec("sub_tool", nil, ""); err == nil || !strings.Contains(err.Error(), "未知的事件源") {
+	if _, err := eng.RunToolExec(context.Background(), "sub_tool", nil, ""); err == nil || !strings.Contains(err.Error(), "未知的事件源") {
 		t.Fatalf("未登记源应报「未知的事件源」，实际 %v", err)
 	}
 }

@@ -281,6 +281,7 @@ hooks:
 | secret | `ctx.secret.get(name)` | 密钥读取（只读，框架负责解密与审计） |
 | event | `ctx.event.notify / wait` | 异步事件通知 / 等待 |
 | subscribe | `ctx.subscribe.start(req) / stop(handle)` | 通用订阅（事件源回调 → 重调度 Tool/Flow），长驻订阅可按归属回收 |
+| config | `ctx.config.get / set / delete / list` | 持久化键值配置（落点由宿主决定，应用不必知道库在哪）；内核 AI 缺省配置 `ai.*` 也读同一个库 |
 
 > 另有 **time / template / crypto 三个纯函数原子**（内核内建、始终可用、纯计算无外部依赖）：它们刻意**不进** capability 门禁（要求声明才可用的纯函数违背直觉），故不列在上表；分类口径与实现见 `ATOM_ROADMAP.md` §0 与 `internal/engine/purefunc.go`（REQ-PURE-FUNC）。
 
@@ -290,9 +291,9 @@ hooks:
 - **capability 精确放行**：未声明的调用一律拒绝，权限遵循最小权限原则。
 - **secret 只读**：插件看不到明文存储位置，只能通过 `ctx.secret.get` 获取。
 - **未声明的原语不出现在 `ctx` 上**（lua）/ 不被注入 `ctx.capabilities`（process）：防御纵深——脚本连该字段都读不到，无法探测宿主能力边界；已声明但宿主未提供实现的调用时返回明确错误，而非静默成功。
-- **调用形态（M5 落地）**：lua 侧 `ctx.{http,call,db,secret,event,subscribe}`（http/db 为对象方法 `ctx.http.Request` / `ctx.db.query`；secret/event/subscribe 为子表方法 `ctx.secret.get` / `ctx.event.notify` / `ctx.subscribe.start`；call 是**裸函数** `ctx.call(target, input)`）；process 侧运行期以 `input.ctx.capabilities`（字符串数组）与 `input.ctx.sandbox`（bool）透传声明，供进程自检。
+- **调用形态（M5 落地）**：lua 侧 `ctx.{http,call,db,secret,event,subscribe,config}`（http/db 为对象方法 `ctx.http.Request` / `ctx.db.query`；secret/event/subscribe/config 为子表方法 `ctx.secret.get` / `ctx.event.notify` / `ctx.subscribe.start` / `ctx.config.get`；call 是**裸函数** `ctx.call(target, input)`）；process 侧运行期以 `input.ctx.capabilities`（字符串数组）与 `input.ctx.sandbox`（bool）透传声明，供进程自检。
 
-- **引擎默认宿主装配（#69）**：`engine.New` 未显式 `WithHost` 时自动注入 HTTP/Event/DB 原语实现与 `call` 解析器；声明了对应 capability 的 Tool 在生产环境直接可用（不再恒 `ErrCapabilityUnavailable`）。secret 默认仍无密钥源（fail-closed）；Server 经 `WithSecret` 注入 `SecretStore`（REQ-API-SECRETS）。
+- **引擎默认宿主装配（#69）**：`engine.New` 未显式 `WithHost` 时自动注入 HTTP/Event/DB 原语实现与 `call` 解析器；声明了对应 capability 的 Tool 在生产环境直接可用（不再恒 `ErrCapabilityUnavailable`）。secret 默认仍无密钥源（fail-closed）；Server 经 `WithSecret` 注入 `SecretStore`（REQ-API-SECRETS）。**config 也默认不装配**（`engine.WithConfigStore`，落点 `gearhome.ConfigDBPath()`）——与 secret 同口径的 fail-closed：装配后既让 `ctx.config.*` 可用，也让 `ext.ai` 的缺省配置回退到同一个库，避免「两个入口各装配一份」导致落点漂移。
 
 ### 6.2 call 与 event 的边界
 
@@ -510,8 +511,8 @@ local r = ctx.ext.db.query({ driver = "postgres", dsn = ctx.input.dsn,
 │  Tool Registry                    │
 │  Schema / 版本 / 依赖图 / Lock    │
 ├─────────────────────────────────┤
-│  宿主能力层（6 个原语）            │
-│  http / call / db / secret / event / subscribe
+│  宿主能力层（7 个原语）            │
+│  http / call / db / secret / event / subscribe / config
 │  （另有纯函数原子 time / template / crypto，始终可用）
 ├─────────────────────────────────┤
 │  Runtime 层                       │

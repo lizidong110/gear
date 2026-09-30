@@ -220,6 +220,49 @@ func TestInvokeCapabilityEndpoint(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("缺 method 应 400，实际 %d", rec.Code)
 	}
+
+	// 5) AC-B6：db.batch 经同一条 gear_invoke 通道可用（禁的是 secret.*，db 不在禁列），
+	//    且失败批在这条路径上也是「返回结构」而非抛断——回滚必须可观测。
+	rec, _ = do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{
+		"name": "db", "method": "exec", "args": map[string]interface{}{
+			"sql": "CREATE TABLE IF NOT EXISTS batch_demo(k TEXT PRIMARY KEY)",
+		},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("db.exec(建表) 应 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	rec, out = do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{
+		"name": "db", "method": "batch", "args": map[string]interface{}{
+			"statements": []interface{}{
+				map[string]interface{}{"sql": "INSERT INTO batch_demo VALUES('a')"},
+				map[string]interface{}{"sql": "INSERT INTO no_such_table VALUES(1)"},
+			},
+		},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("db.batch 应 200（失败走返回结构），实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	res, ok := out["result"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("db.batch result 应为对象: %v", out)
+	}
+	if res["committed"] != false {
+		t.Fatalf("含失败语句的批应 committed=false，实际 %v", res["committed"])
+	}
+	results, ok := res["results"].([]interface{})
+	if !ok || len(results) != 2 {
+		t.Fatalf("results 应有 2 条，实际 %v", res["results"])
+	}
+	// 部分写入必须查不到（同一条通道再查一次）。
+	_, out = do(t, h, "POST", "/api/capabilities/invoke", map[string]interface{}{
+		"name": "db", "method": "query", "args": map[string]interface{}{
+			"sql": "SELECT k FROM batch_demo",
+		},
+	})
+	rows, ok = out["result"].([]interface{})
+	if !ok || len(rows) != 0 {
+		t.Fatalf("回滚后应查不到写入，实际 %v", out["result"])
+	}
 }
 
 // A-2：tools CRUD + 注销。

@@ -116,8 +116,11 @@ export function generate() {
   const flowLevelStages = resolveNames(boolMapKeys(model, 'var FlowLevelStages = map[string]bool'), mc, 'FlowLevelStages')
   const probeKinds = resolveNames(boolMapKeys(model, 'var KnownProbeKinds = map[string]bool'), mc, 'KnownProbeKinds')
   const stepModes = resolveNames(['ModeOnce', 'ModeService'], mc, 'StepMode')
+  // 从 `KnownPrimitives` 解析，而不是手写常量名清单：
+  // 手写清单每加一个原语就会漂移一次（2026-09-25 加 config 时正是如此——脚本照旧生成 6 个，
+  // 直到 check:contract 才会红）。内核的 map 才是唯一真相源。
   const capabilities = resolveNames(
-    ['PrimHTTP', 'PrimCall', 'PrimDB', 'PrimSecret', 'PrimEvent', 'PrimSubscribe'],
+    boolMapKeys(capSrc, 'var KnownPrimitives = map[Primitive]bool'),
     cc,
     'cap.Primitive',
   )

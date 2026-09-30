@@ -36,7 +36,7 @@ id: mindstorm__expand
 name: AI 续写 / 大纲生成（生成子节点并落库）
 description: 给定节点，调 ext.ai 生成子节点并落库；depth=1 续写一层（≤12 个），depth>1 一次性生成分层大纲（建整棵轮廓）。instruction 可传用户自定义要求。demo=true 无 key 也返回样例。
 runtime: lua
-capabilities: [db, ext.ai]
+capabilities: [db, ext.ai, config]
 timeout: "15m"
 input_schema:
   type: object
@@ -49,6 +49,7 @@ input_schema:
     demo: {type: boolean}
     dry_run: {type: boolean}
     items_json: {type: string}
+    web_context: {type: string}
   required: [node_id]
 output_schema:
   type: object
@@ -80,7 +81,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local EXPAND_BATCH_MAX = 12
   local OUTLINE_MAX = 200
   local MAX_DEPTH = 4
@@ -117,6 +118,17 @@ entry: |
   local instruction = ctx.input.instruction or ""
   if type(instruction) ~= "string" then instruction = "" end
   instruction = instruction:gsub("^%s+", ""):gsub("%s+$", "")
+  -- web_context：前端勾选「联网检索」后由 mindstorm__web_search 抓来的资料段（纯文本）。
+  -- 放这里而不是在 Tool 内自己搜：流式路径的 prompt 由 dry_run 返回给前端复用，
+  -- 检索放前端则同步/流式两条路径天然共享同一份资料（且检索失败前端可自行降级）。
+  local web_context = ctx.input.web_context or ""
+  if type(web_context) ~= "string" then web_context = "" end
+  local webseg = ""
+  if web_context:gsub("%s+", "") ~= "" then
+    webseg = "\n联网检索参考资料（来自搜索引擎，请优先依据其中权威来源的结构组织内容，"
+      .. "如官方考纲/标准/教材章节；资料可能过时或有噪声，明显不合常识的忽略）:\n"
+      .. web_context .. "\n"
+  end
 
   -- 单次生成的总硬上限（**安全护栏**，不是目标值）：
   --   - 分层大纲：OUTLINE_MAX（防一次生成上千节点）
@@ -174,6 +186,26 @@ entry: |
     return "c_" .. tostring(ts) .. "_" .. tostring(i) .. "_" .. tostring(math.random(99999))
   end
 
+  -- 从内核配置库读用户在界面里保存的 AI 配置（2026-09-25 起与 settings_get/set 统一到
+  -- ctx.config / config.db，不再读自建 settings 表）。设置了哪项就带哪项，没设的交给引擎
+  -- 回退链（调用参数 → 环境变量 → 配置库 → 默认）。
+  local function aiCfg()
+    local MAP = {ai_provider="ai.provider", ai_base_url="ai.base_url", ai_model="ai.model", ai_api_key="ai.api_key"}
+    local cfg = {}
+    local v
+    v = ctx.config.get({key = MAP.ai_provider}); if v and v ~= "" then cfg.provider = v end
+    v = ctx.config.get({key = MAP.ai_base_url}); if v and v ~= "" then cfg.base_url = v end
+    v = ctx.config.get({key = MAP.ai_model}); if v and v ~= "" then cfg.model = v end
+    v = ctx.config.get({key = MAP.ai_api_key}); if v and v ~= "" then cfg.api_key = v end
+    return cfg
+  end
+  -- 把配置合并进一次 ext.ai.complete 的调用参数（Lua 5.1 无展开语法，逐 key 拷贝）
+  local function aiCall(system, prompt)
+    local t = {system = system, prompt = prompt, format = "json"}
+    for k, v in pairs(aiCfg()) do t[k] = v end
+    return t
+  end
+
   -- 用户指令段：空则整段不出现，避免往 prompt 里塞「额外要求: (无)」这类噪音
   local instr_line = ""
   if instruction ~= "" then
@@ -195,7 +227,7 @@ entry: |
 
   -- 调 AI 并解析成 Lua table。失败一律给出可操作错误（不静默返回空）。
   local function askAI(system, prompt)
-    local res = ctx.ext.ai.complete({system = system, prompt = prompt, format = "json"})
+    local res = ctx.ext.ai.complete(aiCall(system, prompt))
     local raw = res
     if type(res) == "table" then
       -- 有的通路会把结构化结果直接给回来；统一降到 JSON 串再解析，保证后续口径一致。
@@ -284,7 +316,7 @@ entry: |
     local function genDemo(lst, n, levels)
       for i = 1, n do
         local node0 = {title = string.format("样例分支 %d", i),
-          body = "（demo 模式生成的占位想法；配置 GEAR_AI_API_KEY 后即为真实 AI 大纲）", children = {}}
+          body = "（demo 模式生成的占位想法；点左栏 ⚙ 配好 AI Key 后即为真实 AI 大纲）", children = {}}
         if levels > 1 then genDemo(node0.children, math.min(n, 4), levels - 1) end
         table.insert(lst, node0)
       end
@@ -292,15 +324,22 @@ entry: |
     genDemo(topList, autoCount and 5 or count, depth)
   else
     if depth > 1 then
-      local system = "你是思维导图大纲助手。给定一个节点及其上下文，生成一个分层大纲。"
+      local system = "你是资深领域专家兼大纲设计师。给定一个节点及其上下文，生成一个分层大纲。"
         .. "严格只输出 JSON 数组，每个元素为对象 {title:string, summary:string, body:string, children:array}，"
         .. "children 是该节点的子节点列表（结构相同、可递归嵌套）。不要任何额外文字或 markdown 代码块。"
       local prompt = string.format(
         "上下文路径: %s\n根节点标题: %s\n根节点详情: %s\n已有子节点: %s\n"
-        .. "请生成深度 %d 的分层大纲：每层每个节点至多 %d 个子节点，第 1 层正好 %d 个；"
-        .. "子节点要有信息量、互不重复、层层细化；每项的 summary 是一句话（不超过 50 字）作上下文索引，"
-        .. "body 用 1~2 句说清该分支要解决什么。%s",
+        .. "请生成深度 %d 的分层大纲：每层每个节点至多 %d 个子节点，第 1 层正好 %d 个。%s\n"
+        .. "质量要求（重要）：\n"
+        .. "- 充分调用你掌握的领域知识：顶层划分要贴合该主题的**真实知识结构**"
+        .. "（学科体系 / 官方考纲 / 行业标准的章节划分），不要拍脑袋平均分；\n"
+        .. "- 标题必须具体，直接写出真实的考点、技术、方法、标准名称；"
+        .. "禁止「基础知识」「相关技术」「其他」这类空泛标题；\n"
+        .. "- summary 是一句话索引（不超过 50 字），点明这一支具体覆盖什么；\n"
+        .. "- body 用 2~6 句列出该分支下的**具体**考点/要点名称，让读者一眼看出要学什么；\n"
+        .. "- 各项互不重复、粒度相当，合起来能完整覆盖该主题。",
         (context ~= "" and context or "(根)"), node.title, (node.body or ""), exstr, depth, count, count, instr_line)
+      prompt = prompt .. webseg
       if dry_run then
         return {system = system, prompt = prompt, requested = count, depth = depth, mode = mode,
                 auto_count = autoCount, created = emptyArr(), extras = emptyArr(),
@@ -308,14 +347,16 @@ entry: |
       end
       topList = askAI(system, prompt)
     else
-      local system = "你是思维导图发散助手。给定一个节点及其上下文，生成若干不重复、有信息量、"
+      local system = "你是资深领域专家。给定一个节点及其上下文，生成若干不重复、有信息量、"
         .. "彼此差异明显的子主题。严格只输出 JSON 数组，每个元素为对象 {title:string, summary:string, body:string}，"
         .. "不要任何额外文字，不要 markdown 代码块。"
       local ask_spec = "每项都要给全三样："
-        .. "title 不超过 20 字；"
+        .. "title 要具体，直接写出真实的考点/技术/方法名称（不超过 20 字），"
+        .. "禁止「基础知识」「相关技术」这类空泛标题；"
         .. "summary 是一句话概括（不超过 50 字，将作为上级与相邻节点的上下文索引，"
         .. "不要写「本节点将介绍…」这类元话术）；"
-        .. "body 写 2~4 句把要点讲清楚，让读者即使不点开子节点也能明白这一项的范围与典型例子。"
+        .. "body 写 3~6 句，具体列出这一项覆盖的要点/考点/典型例子的**名称**，"
+        .. "让读者不点开子节点也知道它的范围与内容；不要空泛的笼统描述。"
       local head = string.format(
         "上下文路径: %s\n当前节点标题: %s\n当前节点详情: %s\n已有子节点:\n%s\n",
         (context ~= "" and context or "(根)"), node.title, (node.body or ""), exstr)
@@ -330,13 +371,15 @@ entry: |
       elseif autoCount then
         prompt = head
           .. "请判断这个主题自然应该分成几个子项（通常 3~9 个，视内容复杂度而定），"
-          .. "不要为了凑数硬凑，也不要遗漏显而易见的大类。"
+          .. "不要为了凑数硬凑，也不要遗漏显而易见的大类；划分要贴合该主题的真实知识结构，"
+          .. "宁可少而准，不要凑出空泛的「其他」类。"
           .. ask_spec .. instr_line
       else
         prompt = head
           .. string.format("请生成 %d 个新子主题（不要与已有重复）。", count)
           .. ask_spec .. instr_line
       end
+      prompt = prompt .. webseg
       if dry_run then
         return {system = system, prompt = prompt, requested = count, depth = depth, mode = mode,
                 auto_count = autoCount, created = emptyArr(), extras = emptyArr(),
@@ -396,7 +439,7 @@ id: mindstorm__enrich
 name: AI 展开本节点（写摘要 + 正文）
 description: 读取节点标题与上下文，调 ext.ai 为该节点写 summary（上下文索引用的一句话）与 body（Markdown 正文），并落库。用于「让 AI 把这一节讲清楚」；instruction 可指定受众与详略。demo=true 无 key 也返回样例。
 runtime: lua
-capabilities: [db, ext.ai]
+capabilities: [db, ext.ai, config]
 timeout: "15m"
 input_schema:
   type: object
@@ -406,6 +449,7 @@ input_schema:
     demo: {type: boolean}
     dry_run: {type: boolean}
     result_json: {type: string}
+    web_context: {type: string}
   required: [node_id]
 output_schema:
   type: object
@@ -429,13 +473,38 @@ entry: |
   -- timeout 同 expand：>= AI 层 GEAR_AI_TOTAL_TIMEOUT(900s)，只作兜底上限；
   -- 「是否卡死」由 AI 层的 Idle（GEAR_AI_IDLE_TIMEOUT，默认 60s 无新增输出即判死）负责 ——
   -- 只要还在持续出内容就不该被掐断（2026-09-23 修正，此前 5m 会误杀正在正常生成的调用）。
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local MAX_CRUMB = 6
+
+  -- 从内核配置库读 AI 配置（与 expand 的 aiCfg 同口径，2026-09-25 起统一到 ctx.config / config.db）
+  local function aiCfg()
+    local MAP = {ai_provider="ai.provider", ai_base_url="ai.base_url", ai_model="ai.model", ai_api_key="ai.api_key"}
+    local cfg = {}
+    local v
+    v = ctx.config.get({key = MAP.ai_provider}); if v and v ~= "" then cfg.provider = v end
+    v = ctx.config.get({key = MAP.ai_base_url}); if v and v ~= "" then cfg.base_url = v end
+    v = ctx.config.get({key = MAP.ai_model}); if v and v ~= "" then cfg.model = v end
+    v = ctx.config.get({key = MAP.ai_api_key}); if v and v ~= "" then cfg.api_key = v end
+    return cfg
+  end
+  local function aiCall(system, prompt)
+    local t = {system = system, prompt = prompt, format = "json"}
+    for k, v in pairs(aiCfg()) do t[k] = v end
+    return t
+  end
 
   local node_id = ctx.input.node_id
   local instruction = ctx.input.instruction or ""
   if type(instruction) ~= "string" then instruction = "" end
   instruction = instruction:gsub("^%s+", ""):gsub("%s+$", "")
+  -- web_context：与 expand 同口径（前端检索后传入；见 expand 里的注释）
+  local web_context = ctx.input.web_context or ""
+  if type(web_context) ~= "string" then web_context = "" end
+  local webseg = ""
+  if web_context:gsub("%s+", "") ~= "" then
+    webseg = "\n联网检索参考资料（来自搜索引擎，请优先依据其中权威来源的内容撰写，"
+      .. "资料可能过时或有噪声，明显不合常识的忽略）:\n" .. web_context .. "\n"
+  end
   local demo = ctx.input.demo or false
   -- dry_run：只组装 prompt 并返回（不调 AI、不写库），供前端走 REST SSE 流式路径
   local dry_run = ctx.input.dry_run or false
@@ -478,26 +547,29 @@ entry: |
     end
   elseif demo then
     summary = "（demo）" .. node.title .. " 的一句话摘要"
-    body = "## " .. node.title .. "\n\n（demo 模式占位正文；配置 GEAR_AI_API_KEY 后即为真实 AI 讲解）\n\n- 要点一：范围与定义\n- 要点二：典型例子\n- 要点三：常见误区"
+    body = "## " .. node.title .. "\n\n（demo 模式占位正文；点左栏 ⚙ 配好 AI Key 后即为真实 AI 讲解）\n\n- 要点一：范围与定义\n- 要点二：典型例子\n- 要点三：常见误区"
   else
-    local system = "你是内容编辑助手。给定思维导图里的一个节点及其上下文，为它写摘要与正文。"
+    local system = "你是资深领域专家兼内容作者。给定思维导图里的一个节点及其上下文，为它写摘要与正文。"
       .. "summary 是一句话概括（不超过 60 字），将作为上级与相邻节点的上下文索引，"
       .. "不要写「本节点将介绍…」这类元话术，直接说内容。"
-      .. "body 是 Markdown 正文，要把这一节真正讲清楚：用二级标题分成几个小块、用列表列要点、"
-      .. "必要时给例子（学科内容请给具体例题/例词）；不要复述标题，不要写「本节点」「此节点」这类指代自己的话。"
-      .. "受众与详略程度以「额外要求」为准；未指定时面向普通读者、中等详略。"
+      .. "body 是 Markdown 正文，目标是把这一节**真正讲透**："
+      .. "用二级标题分成几个小块，用列表列出**具体的**考点/要点/技术/标准/例子的名称，"
+      .. "必要时给定义、对比、例子和常见误区；默认篇幅 300~800 字（可用「额外要求」调整）；"
+      .. "不要复述标题，不要写「本节点」「此节点」这类指代自己的话，不要写空泛的套话。"
+      .. "受众与详略程度以「额外要求」为准；未指定时默认面向正在学习/备考该主题的读者。"
       .. "严格只输出 JSON 对象 {\"summary\":\"...\",\"body\":\"...\"}，不要任何额外文字。"
     local prompt = string.format(
       "上下文路径: %s\n节点标题: %s\n节点现有摘要: %s\n节点现有正文: %s\n",
       (context ~= "" and context or "(根)"), node.title, (node.summary or ""), (node.body or ""))
       .. "额外要求（用户指定，优先级最高）: "
-      .. (instruction ~= "" and instruction or "(无，按默认：面向普通读者、中等详略)")
+      .. (instruction ~= "" and instruction or "(无，按默认：面向学习/备考读者，300~800 字，讲透具体考点)")
       .. "\n请输出该节点的 summary 与 body。"
+    prompt = prompt .. webseg
     -- 流式路径第一段：只把 prompt 交回前端，由它去打 REST SSE（**不调 AI、不写库**）
     if dry_run then
       return {id = node_id, system = system, prompt = prompt, summary = "", body = "", model = ""}
     end
-    local res = ctx.ext.ai.complete({system = system, prompt = prompt, format = "json"})
+    local res = ctx.ext.ai.complete(aiCall(system, prompt))
     local raw = res
     if type(res) == "table" then raw = ctx.json.encode(res) end
     if type(raw) ~= "string" then raw = tostring(raw) end

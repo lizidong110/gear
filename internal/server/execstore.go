@@ -40,6 +40,14 @@ type Execution struct {
 	Result     *engine.RunResult `json:"result,omitempty"`
 	StartedAt  time.Time         `json:"started_at"`
 	FinishedAt *time.Time        `json:"finished_at,omitempty"`
+	// Actor 是**发起这次执行的调用主体**（③ 审计，2026-09-26）。与 registry 的
+	// definition_history.actor 同一套语义：REST 面落真实主体（见 identity.go 的提取顺序），
+	// MCP 面恒为空串 = **无身份**。「谁发起的」是审计的第一问，空串不是「查不到」而是
+	// 「发起方本来就没身份」——这个区别要留着，别在展示层补一个 anonymous 把它糊过去。
+	//
+	// 刻意**不**加 json:"-"（与 OwnerPID 相反）：审计要能被外部读到，`GET /api/executions`
+	// 直接就能回答「这条执行是谁发起的」。omitempty 只是让老记录不至于多出一个空串字段。
+	Actor string `json:"actor,omitempty"`
 	// OwnerPID 是发起这次执行的进程 pid（评审 I-1④）。**不出现在 JSON 里**
 	// （json:"-"）：它只服务一个用途——判断一条长期 running 的记录是否是**孤儿**
 	// （发起它的进程已不存在，而记录永远停在 running）。这是「进程被强杀时不更新状态」
@@ -75,7 +83,10 @@ func NewExecStore() *ExecStore {
 	if dir := filepath.Dir(path); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	// _txlock=immediate 与 registry.go 同一条理由：database/sql 发的是裸 BEGIN（deferred），
+	// 「先读后写」升级到写锁时不调用 busy handler，busy_timeout 形同虚设──直接 SQLITE_BUSY。
+	// 执行台账是高频并发写面（多实例 serve + CLI 同时记），缺了它就会偶发丢写入。
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		// 极端情况下（如只读文件系统）退化为纯内存，保证服务能起；
@@ -108,11 +119,15 @@ func (s *ExecStore) migrate() {
 		result      TEXT,
 		started_at  TEXT NOT NULL,
 		finished_at TEXT,
-		owner_pid   INTEGER NOT NULL DEFAULT 0
+		owner_pid   INTEGER NOT NULL DEFAULT 0,
+		actor       TEXT NOT NULL DEFAULT ''
 	)`)
 	// 老库补列（评审 I-1④）：列已存在时 SQLite 报错，忽略即可（无 IF NOT EXISTS 语法）。
 	// 新库由上面的 CREATE TABLE 带上本列，这里对它是 no-op。
 	_, _ = s.db.Exec(`ALTER TABLE executions ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0`)
+	// actor 补列（③ 审计 2026-09-26）。老执行记录的主体无从追溯，补成空串是**如实**——
+	// 不要在这里填 "-"，那会把「当时没有记录主体」伪装成「当时是无身份」，两件事不同。
+	_, _ = s.db.Exec(`ALTER TABLE executions ADD COLUMN actor TEXT NOT NULL DEFAULT ''`)
 	_, _ = s.db.Exec(`CREATE TABLE IF NOT EXISTS execution_logs (
 		id       INTEGER PRIMARY KEY AUTOINCREMENT,
 		exec_id  TEXT NOT NULL,
@@ -125,7 +140,7 @@ func (s *ExecStore) migrate() {
 }
 
 // execColumns 是 executions 表的**读取列清单**（单一处定义，防止 Get/List/Create 三处漂移）。
-const execColumns = `id, flow_id, status, error, tool_ids, result, started_at, finished_at, owner_pid`
+const execColumns = `id, flow_id, status, error, tool_ids, result, started_at, finished_at, owner_pid, actor`
 
 // LogEntry 是一条执行日志（stdout/stderr 行，关联到 exec + step）。
 type LogEntry struct {
@@ -178,11 +193,15 @@ func (s *ExecStore) LogSink() engine.LogSink {
 //
 // OwnerPID 记下**发起本次执行的进程**（评审 I-1④）：进程被强杀时不会有人来更新这条记录，
 // 于是它永远停在 running——只有把属主 pid 落盘，后来的查询才能判断它是不是孤儿。
-func (s *ExecStore) Create(flowID string) Execution {
-	e := Execution{ID: newID("exec_"), FlowID: flowID, Status: StatusRunning, StartedAt: time.Now(), OwnerPID: os.Getpid()}
+//
+// actor 是**发起主体**（③ 审计）：REST 面给真实主体，MCP 面给空串（=无身份，如实）。
+// 刻意区分「空串 = 发起方没身份」与「查不到」——前者是事实，后者是日志缺字段。
+func (s *ExecStore) Create(flowID, actor string) Execution {
+	e := Execution{ID: newID("exec_"), FlowID: flowID, Status: StatusRunning, StartedAt: time.Now(),
+		OwnerPID: os.Getpid(), Actor: actor}
 	_, _ = s.db.Exec(
-		`INSERT INTO executions (id, flow_id, status, tool_ids, started_at, owner_pid) VALUES (?, ?, ?, '[]', ?, ?)`,
-		e.ID, e.FlowID, e.Status, e.StartedAt.Format(time.RFC3339Nano), e.OwnerPID,
+		`INSERT INTO executions (id, flow_id, status, tool_ids, started_at, owner_pid, actor) VALUES (?, ?, ?, '[]', ?, ?, ?)`,
+		e.ID, e.FlowID, e.Status, e.StartedAt.Format(time.RFC3339Nano), e.OwnerPID, e.Actor,
 	)
 	return e
 }
@@ -283,13 +302,14 @@ func scanExecution(scanner interface {
 	Scan(dest ...interface{}) error
 }) (Execution, error) {
 	var (
-		id, flowID, status, errMsg, toolIDs, result, startedAt, finishedAt sql.NullString
-		ownerPID                                                           sql.NullInt64
+		id, flowID, status, errMsg, toolIDs, result, startedAt, finishedAt, actor sql.NullString
+		ownerPID                                                                  sql.NullInt64
 	)
-	if err := scanner.Scan(&id, &flowID, &status, &errMsg, &toolIDs, &result, &startedAt, &finishedAt, &ownerPID); err != nil {
+	if err := scanner.Scan(&id, &flowID, &status, &errMsg, &toolIDs, &result, &startedAt, &finishedAt, &ownerPID, &actor); err != nil {
 		return Execution{}, err
 	}
-	e := Execution{ID: id.String, FlowID: flowID.String, Status: status.String, Error: errMsg.String, OwnerPID: int(ownerPID.Int64)}
+	e := Execution{ID: id.String, FlowID: flowID.String, Status: status.String, Error: errMsg.String,
+		OwnerPID: int(ownerPID.Int64), Actor: actor.String}
 	if b := toolIDs.String; b != "" {
 		_ = json.Unmarshal([]byte(b), &e.ToolIDs)
 	}

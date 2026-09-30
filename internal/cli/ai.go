@@ -20,8 +20,8 @@ func aiCmd() *cobra.Command {
 	c.AddCommand(&cobra.Command{
 		Use:   "capabilities",
 		Short: "列出当前所有原子能力（内核 builtin + pure 原语 + 已注册 ext.*）及其方法参数 schema",
-		Long: "打印引擎当前装配的宿主能力目录：内核门禁原语（http/call/db/secret/event/subscribe）+ " +
-			"纯函数原子（time/template/crypto，始终可用、无需声明）+ 所有已注册 " +
+		Long: "打印引擎当前装配的宿主能力目录：内核门禁原语（http/call/db/secret/event/subscribe/config）+ " +
+			"纯函数原子（time/template/crypto/id/validate，始终可用、无需声明）+ 所有已注册 " +
 			"ext.* 扩展，每条带方法名、参数类型与必填标记。\n" +
 			"这是 agent 生成 Tool 时锚定的同一份目录（ext.registry.capabilities() / ext.ai.capabilities()），" +
 			"随 extensions 配置动态变化——新增扩展会自动出现在这里。",
@@ -65,15 +65,35 @@ func runAIReact(cmd *cobra.Command, args []string) error {
 	if strings.TrimSpace(task) == "" {
 		return fmt.Errorf("请提供任务描述：gear ai react \"...\"")
 	}
+	// 1) 持久 registry（只读用途：取真实工具目录给 agent 看）。
+	//
+	// 少了这一步，react 看到的 registry 里只有 SetupExtensions 自己注册的几个 ext 壳子——
+	// 实测 `ext.registry.tools()` 只吐 4 个 ext，而库里其实有 34 个 Tool（mindstorm__* 等
+	// 应用定义全看不见）。判据①「用 gear 自己的 AI 维护应用」的前提是它**看得见**这些定义。
+	persist, err := openRegistry()
+	if err != nil {
+		return err
+	}
+	defer persist.Close()
+
+	// 2) 内存 registry 跑 agent：react 会真的执行工具，用内存库避免把中间产物落进持久库。
 	reg, err := registry.Open(fmt.Sprintf("file:gear_ai_cli_%d?mode=memory&cache=shared", os.Getpid()))
 	if err != nil {
 		return fmt.Errorf("打开内存 registry 失败: %w", err)
 	}
 	defer reg.Close()
+	// 顺序要紧：先建引擎（SetupExtensions 填充合法 capability 集合），再灌工具目录——
+	// 反过来的话灌入会撞「未知的 capability」。
 	eng, err := cliEngine(reg)
 	if err != nil {
 		return err
 	}
+	// 3) 把持久库的目录灌进内存库（与 runAIGen 同一手法）：读是共享的，写仍隔离在内存里。
+	skipped, err := seedRefRegistry(reg, persist)
+	if err != nil {
+		return fmt.Errorf("灌入真实工具目录失败: %w", err)
+	}
+	warnSkipped(skipped)
 	agent := eng.AIAgent()
 	if agent == nil {
 		return fmt.Errorf("ext.ai 未装配（SetupExtensions 失败？）")
@@ -271,9 +291,11 @@ func runAIGen(cmd *cobra.Command, mode string, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := seedRefRegistry(refReg, reg); err != nil {
+	skipped, err := seedRefRegistry(refReg, reg)
+	if err != nil {
 		return fmt.Errorf("灌入真实工具目录失败: %w", err)
 	}
+	warnSkipped(skipped)
 
 	agent := eng.AIAgent()
 	if agent == nil {
@@ -319,26 +341,43 @@ func runAIGen(cmd *cobra.Command, mode string, args []string) error {
 // ctx.ext.registry 读到真实目录（ext.registry 关闭于引擎执行所用的 registry，即 refReg）。
 // 只灌真实内容，不灌参考 Flow 自身的 ai-gen/ai-create-flow（那些由 runAIGen 另行 upsert）。
 // 灌入的是指针副本，不会写回持久 registry。
-func seedRefRegistry(refReg, reg *registry.Registry) error {
+// seedRefRegistry 把持久 registry 的目录灌进内存 registry，返回**被跳过的定义 id**。
+//
+// 为什么跳过而不是报错退出：库里可能有过期定义（例如声明了已从内核删除的原语 kv——
+// 实测 `mindstorm__ui_set` 就是这种残留）。seed 的目的是「让 agent 看见目录」，因为一条
+// 坏记录就让整个 AI 能力不可用，代价与问题严重性不匹配。跳过并把 id 交回调用方点名，
+// 用户才知道该去修哪条定义——静默跳过等于把坏定义藏起来。
+func seedRefRegistry(refReg, reg *registry.Registry) ([]string, error) {
 	tools, err := reg.ListTools()
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var skipped []string
 	for _, t := range tools {
 		if err := refReg.UpsertTool(t); err != nil {
-			return err
+			skipped = append(skipped, t.ID)
+			continue
 		}
 	}
 	flows, err := reg.ListFlows()
 	if err != nil {
-		return err
+		return skipped, err
 	}
 	for _, f := range flows {
 		if err := refReg.UpsertFlow(f); err != nil {
-			return err
+			skipped = append(skipped, f.ID)
+			continue
 		}
 	}
-	return nil
+	return skipped, nil
+}
+
+// warnSkipped 把被跳过的定义打到 stderr：不打断流程，但必须让用户看得见。
+func warnSkipped(skipped []string) {
+	if len(skipped) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "警告：以下定义无法灌入 agent 目录（多半声明了不存在的原语，需重新注册）：%s\n", strings.Join(skipped, ", "))
 }
 
 // runAIComplete 实现 `ai complete "prompt"`：构造进程内 ext.ai agent，调 Complete（或 CompleteStream）。

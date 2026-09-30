@@ -44,6 +44,7 @@ EXCEPTION_KW = ["未实现", "不存在", "已删除", "历史", "deferred", "st
 KNOWN_REMOVED_PREFIXES = (
     "examples/gear-ai-sidecar/", "examples/gear-db-sidecar/",
     "examples/news-demo/", "examples/slack-sidecar/",
+    "plugin/web-ui/node_modules",
 )
 KNOWN_MERGED_PATHS = {
     "engine/primitive.go", "internal/engine/primitive.go",
@@ -272,10 +273,10 @@ def all_go_relpaths():
     """返回仓库内所有 .go 文件的相对路径集合，以及文件名集合。"""
     relpaths = set()
     basenames = set()
-    for dirpath, _, files in os.walk(REPO):
-        # 跳过非源码目录
-        if any(part in (".git", "build", "node_modules", "dist") for part in dirpath.split(os.sep)):
-            continue
+    for dirpath, dirnames, files in os.walk(REPO):
+        # 剪枝而非「遍历到再丢弃」：walk 仍会进入 node_modules 把 2 万+ 文件列一遍（实测 6s），
+        # 原地改 dirnames 才真正不进去。口径与原来的 continue 判定一致（同四个目录名）。
+        dirnames[:] = [d for d in dirnames if d not in (".git", "build", "node_modules", "dist")]
         for fn in files:
             if fn.endswith(".go"):
                 rel = os.path.relpath(os.path.join(dirpath, fn), REPO).replace(os.sep, "/")

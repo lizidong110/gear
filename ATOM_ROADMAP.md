@@ -10,11 +10,17 @@
 
 | 类别 | 定义 | 是否进 capability 门禁 | 示例 |
 |---|---|---|---|
-| **核心原子** | 内核内建、协议/产品无关、无业务语义的通用计算/IO 原语 | 是（`KnownPrimitives`） | `http` `call` `db` `secret` `event` `subscribe` |
+| **核心原子** | 内核内建、协议/产品无关、无业务语义的通用计算/IO 原语 | 是（`KnownPrimitives`） | `http` `call` `db` `secret` `event` `subscribe` `config` |
 | **纯函数核心原子** | 内核内建、始终可用、无外部依赖的纯计算工具（不应进门禁，否则违背纯函数直觉） | 否（文档化口径） | `time` `template` `crypto`（2026-09-19 落地，一等调用目标）；`json`（Lua 绑定，见下方说明） |
 | **可扩展原子** | 桥接某具体外部系统/协议的单操作连接器，以 `ext.*` 插拔 | 是（`ext.` 前缀 + 显式声明） | `ext.email` `ext.wecom` `ext.rabbitmq` … |
 
 **判定三问**：通用计算/基础 IO、不绑具体产品 → 核心；桥接具体外部系统/协议、仅暴露原生单操作 → 可扩展；含业务规则/多步组合/条件/领域语义 → **不是原子**（是领域工具 Lua 组合或 Flow）。
+
+> **2026-09-25 新增 `config`（第 7 个受门禁原语）**：持久化键值配置，落点由**宿主**决定（`<GEAR_HOME>/config.db`）。
+> 它进门禁的理由与 db 相同（跨越宿主边界、需显式授权）；它不是 db 的替代品——`db` 面向「任意外部库的结构化读写」，
+> `config` 面向「这一套 gear 自己的配置」。新增它的直接动因：Lua 沙箱禁 `os` 库、模板无 `${env}` 前缀，
+> 应用想用 `db` 存配置只能把绝对路径硬编码进 YAML（mindstorm 曾有 18 处 `local DSN = "D:/…/mindstorm.db"`）。
+> 内核 AI 缺省配置（`ai.*`）也读同一个库，使「配一次、所有进程生效」成立。
 
 > 红线（与 GEAR 工程方法一致）：每个 `ext.*` 必须 `ext.` 前缀、必声明 `schemas`、methods 与 schemas 一一对应，否则启动 fail-closed；调用遵循最小权限；未知枚举即拒（不静默）。
 
@@ -34,10 +40,43 @@
   由单 DSN `SQLiteDB` 改为 `MultiDB` 路由器（按 `driver/dsn` 懒开并缓存连接）。
 - `driver` 别名：`sqlite/sqlite3`→modernc；`mysql/mariadb`→go-sql-driver；`postgres/postgresql/pg`→pgx。
   三者驱动已在 `go.mod`，零新依赖。
-- Lua 调用：`ctx.db.query({driver, dsn, sql, params})` / `exec` / `ping`；`dsn` 缺省回退引擎内存 scratch 库。
+- Lua 调用：`ctx.db.query({driver, dsn, sql, params})` / `exec` / `batch` / `ping`；`dsn` 缺省回退引擎内存 scratch 库。
+  `batch` 于 2026-09-28 补齐（FR-2）：同事务执行多条语句、全或无，返回 `{results, rows_affected, committed}`。
 - 验证：`internal/cap` 新增 `TestMultiDBBackendsRouting`——真实 SQLite 文件跨实例落库读回、
   mysql/postgres/mariadb 驱动已链接（Ping 连不上即报错，非「驱动未注册」）、未知 driver 被拒。
+- 同批补齐的还有 `MultiDB.Tx(driver, dsn, fn)`（单事务闭包，失败即回滚）：迁移需要「一整段
+  可能含多条语句的 SQL」原子执行，而 `Batch` 只能吃已拆好的语句数组——两者不是替代关系。
 - 影响：原 `ext.db` sidecar 已被取代，仅作「自定义 sidecar 承载 DB」参考保留（`extensions.example.yaml` 已标注）。
+
+## 1.5 本期已落地：bundle 迁移（`kind: Migrations`，2026-09-28）
+
+- 声明位置：bundle 里一份 `kind: Migrations` 文档，条目 `{version, name, sql}`，目标库由
+  `driver` + `dsn`（相对库名锚 `GEAR_APP_DATA`，与 `ctx.db.*` 同口径）指定。**不进 registry**：
+  迁移是副作用，不是定义。
+- 执行时机：`gear_apply` / `gear_import` 里**先改库、再落定义**。顺序不是审美问题——先落定义
+  再迁移，中途失败就会留下「导入成功但库里没那张表」的合法状态，下游每个 Tool 都撞
+  `no such table`。
+- 三条口径：已应用的版本不重跑（台账 `gear_migrations` 在目标库里）；每条迁移单事务、失败即整条
+  回滚；`dry_run` 真跑 + 全回滚（坏 SQL 在写作期被抓出），但只报「将生效」不报「已生效」。
+- 验证：`internal/artifact/migrate_test.go` 七条（含「坏迁移时新 Tool 不得落库」「dry run 不留痕」）。
+
+## 1.6 本期已落地：Tool 声明式 REST 路由（`api:`，2026-09-28）
+
+- 声明位置：Tool YAML 的可选字段 `api: {method, path}`（`path` 支持 `{id}` 这类路径参数，
+  **名字即 Tool 的输入字段**）。`POST/PUT/PATCH` 还会把 JSON 请求体并入输入，路径参数优先。
+- 语义：声明了就**额外**挂一条资源路由，`GET /api/nodes/42` 的响应体就是该 Tool 的输出
+  （不包 `{output}`）；`POST /api/tools/{id}/run` 同时仍可用。未声明的 Tool 零变化。
+- **不鉴权**：gear 没有用户库（Q1 拍板：授权是业务的事，走 Hook）。资源路由只保证「长得像 REST」。
+- 为什么路由校验必须前移到写作期：net/http 对同名 pattern 的第二次注册是 **panic**（实测 go1.27），
+  而注册发生在起服那一刻——一个 YAML 字段就能让整个服务起不来。故 `ROUTE_INVALID`（形状）与
+  `ROUTE_CONFLICT`（同名，诊断点名两个 Tool）在 `gear_validate` / `gear_apply`（含 dry_run）里整包拒绝，
+  跨 bundle 的第二个由 registry 入库前拒。
+- 挂载方式：每方法一条 `METHOD /api/{path...}` 通配挂载点 + 请求期按段匹配（而不是「每条声明注册一条」）。
+  代价是拿路径参数要自己按段取（`r.PathValue` 只认挂载点那个 `path`），换来的是「改声明、删 Tool、
+  运行期新建 Tool」都不必重启、也不会 panic。
+- 验证：`internal/server/toolapi_test.go` 五条（含「旧端点仍可用」「通配挂载点不抢内核路由」）、
+  `internal/artifact/routes_test.go` 四条、`internal/model/route_test.go` 三条、
+  `internal/mcp/routes_test.go` 一条（接口面：字段级诊断 + apply 拒写）。
 
 ---
 
@@ -97,7 +136,12 @@
 | 原子 | 桥接 | 理由 | 验收标 |
 |---|---|---|---|
 | `ext.serve` | 静态网站 + 反向代理（类 nginx） | 给定一个端口 + 静态目录，起 HTTP 服务即可在浏览器访问；带 `proxy` 规则时把某些前缀（如 `/api`）反向代理到后端，**静态与接口同源**（dev 下 Vite 代理的生产等价物） | `start({port,dir,host,proxy})` 起服并返回 URL（含生效规则回显）/ `stop()` 释放端口；`proxy=[{path,target,strip_prefix}]` 最长前缀优先、`path` 非法或 `target` 非 http(s) 则 fail-closed、后端不可达返回 502；目录不存在、缺参 fail-closed；`plugin/verify.py` 已覆盖起服→访问→停止 + 反代转发/静态回落/非法规则拒绝 |
-| `ext.s3` / `ext.minio` / `ext.oss` | 对象存储 | 附件/文件类业务（合同/头像/导出） | put/get/delete 对象 |
+| **`ext.filestore`**（2026-09-28 已交付） | 本地文件系统（附件存取） | 附件/文件类业务（合同扫描件、头像）的**第一步**：先解决「路径不硬编码 + 路径穿越 + 大小上限」这三条安全基线；对象存储留给下一批 | `put({key,data_base64,content_type?})` / `get` / `stat` / `list({prefix?})` / `delete` / `url`。root 取调用参数或配置库 `filestore.root`，都没有即 fail-closed；**不跟随符号链接**、超限在落盘前拒；`plugin/verify.py` P1b 三项覆盖 |
+| **`ext.cron`**（2026-09-28 已交付） | 本地定时器（分钟级） | 定时任务（对账、日报、过期清理、定时导出）的**第一步**。刻意先做「零依赖 + 硬绑定」版：先把「时间表落在哪、进程死了算什么、重复触发如何去重」这三条问清楚，再谈分布式调度 | `add({name,expr,callback_url*,payload?,catch_up?,overlap?})` / `at({name,at,callback_url*})` / `list` / `cancel({name})`；**生命周期硬绑定**（进程退出即停且不接管，重启不接回错过的触发）；去重键 = name + 触发时刻（分钟粒度）；misfire 默认不补、`catch_up` 也只补最近一次；overlap 默认跳过；5 段 cron + `@` 宏；`plugin/verify.py` P1c 覆盖（含真 kill 进程证「到点无回推」） |
+| **`ext.oidc`**（2026-09-28 已交付） | 企业身份（握手） | 单点登录的**第一步**：只把「发现元数据 / 授权码换令牌 / 取 JWKS」这三件事做对并防住 issuer 混淆，不碰验签与会话 | `discovery({issuer*})` / `code_exchange({issuer*,code*,client_id*,redirect_uri*,client_secret?,code_verifier?})` / `jwks({issuer*,kid?})`。**只做握手**：不验签（归 `crypto.jwt_verify`）、不做会话；issuer 混淆两道防线（文档 issuer 须一致、`token_endpoint` 的 host 须同主机）；JWKS 长驻缓存（命中不发 HTTP、未知 `kid` 强制刷新、刷新失败退回旧缓存并置 `stale: true`）；授权服务器拒收时**不吐任何令牌字段**；入站 `/in/oidc/{label}` 只回报。样例 Tool `plugin/oidc_demo.yaml` 跑通 discovery→code_exchange→jwks→jwt_verify；`plugin/verify.py` P1d 覆盖（含反向验证：aud 写错即失败、换假钥匙报 `crypto/rsa: verification error`） |
+| **`ext.excel` / `ext.pdf`**（2026-09-29 已交付） | 办公文档写出（报表导出） | 管理系统导出报表/对账单是标配；零依赖手写 OOXML + 手写 TTF 子集（CJK 嵌入），不引入第三方库（`go.mod` 零变动，AC-E4-4） | `excel.write({path, sheets:[{name, rows:[[cell]]}], root?})` / `pdf.write({path, pages:[{text}], root?})`；cell 支持 字符串/数字/布尔/空；root 取调用参数或配置库、越界 fail-closed（同 outpath 囚禁）；PDF CJK 缺字即 `font_no_glyph` 报错、绝不画方框；`plugin/verify.py` P1e 覆盖（openpyxl 独立读回交叉验证 / 缺字 fail-closed / 越界 fail-closed）；样例 Tool `plugin/report_demo.yaml` 经内核 register+run 跑通两条链路（只直连侧车不算数） |
+| **`ext.oss`**（2026-09-30 已交付） | 对象存储（S3 兼容） | 附件/文件类业务（合同/头像/导出）要落到**企业已有的**对象存储，而不是 gear 自己的本地仓库（后者是 `ext.filestore`）。只做 S3 协议一套：阿里云 OSS / 腾讯云 COS / MinIO / R2 / Ceph 靠 `endpoint` 区分，不引 SDK | `put({key*,data_base64*,endpoint*,region*,bucket*,ak*,sk*,content_type?})` / `get` / `stat` / `list({prefix?,limit?})` / `delete` / `presign({key*,method?,expires?})`。**手写 AWS SigV4**（`crypto/hmac`+`crypto/sha256`，不引 `aws-sdk-go`，`go.mod` 零变动）；凭据只从入参进、**无配置库回退**（与 filestore 有意不同）；key 禁 `..`/空段/前导 `/`/反斜杠（远端无符号链接语义，**不走 outpath**）；32 MiB 上限在解 base64 **之前**判；大对象一律 `presign` 直传（内核调侧车硬超时 10s）；`path_style` 自动判（IP 即 path-style）。签名正确性：假 S3 端点从收到的原始请求反推 canonical request 重算比对 + botocore 与 aws4 两个独立实现的黄金向量；`plugin/verify.py` P1f 覆盖六方法往返与 fail-closed；样例 Tool `plugin/oss_demo.yaml` 经内核 register+run 跑通 |
+| **`ext.redis`**（2026-09-30 已交付） | Redis 数据结构 + 分布式锁 + 延迟队列 | 企业已有 Redis 的缓存/队列/分布式锁场景；零依赖手写 RESP2（不引 `go-redis`，保住 `go.mod` 零变动） | KV（`set/get/del/expire/ttl/exists/incr`）+ Hash（`hset/hget/hgetall/hdel`）+ List（`lpush/rpush/lpop/rpop/llen/lrange`）+ Set（`sadd/smembers/srem/scard`）+ ZSet（`zadd/zrange/zscore/zrem`）+ 分布式锁（`lock/unlock`，`SET NX PX` + 安全释放）+ 延迟队列（`enqueue/dequeue`，基于 zset） | **单连接串行即原子**：redis 单线程 + 侧车借一个连接连发多条命令，`GET+DEL` / `ZRANGEBYSCORE+ZREM` 不用 Lua 也天然原子（假端点同样成立）；key 禁 `\0/\n/\r`、限长 2048；`password` 无则不带 AUTH；内核调侧车硬超时 10s | `plugin/verify.py` P1g 覆盖全数据结构 + 锁 + 队列真实往返与 fail-closed；样例 Tool `plugin/redis_demo.yaml` 经内核 register+run 跑通；协议正确性由 `main_test.go` 内存假 Redis 把关 |
 | `ext.ldap` / `ext.oauth` / `ext.sso` | 企业身份 | 对接现有账号体系、做审批人校验 | 查用户/校验令牌 |
 | `ext.embedding` / `ext.vector` | 向量库 | RAG/语义检索，配合 `ext.llm` | embed / upsert / search |
 
@@ -106,7 +150,7 @@
 |---|---|---|
 | `ext.exchange` / `ext.google-calendar` | 日历 | 会议/排期类场景 |
 | `ext.stripe` / `ext.alipay` / `ext.wechat-pay` | 支付 | 交易/订阅类场景 |
-| `ext.sheet` / `ext.docx` / `ext.pdf` | 办公文档 | 报表生成/解析类场景 |
+| `ext.sheet` / `ext.docx` | 办公文档（`ext.excel` / `ext.pdf` 写出已交付，见 Phase 3；解析类仍待补） | 报表生成/解析类场景 |
 | `ext.redis-stream` | Redis Stream | 轻量事件流替代 |
 
 **每补一个 Phase 原子的动作清单**（统一流程，避免重蹈 `ext.oa` 覆辙）：
@@ -158,7 +202,21 @@
 - [x] 服务型 ext「声明 ↔ 实现」红线：侧车 `/caps` 端点 + `plugin/verify.py` 断言 `extensions.yaml` 的 methods ⊆ 侧车实现
 - [x] 每个扩展独立文件夹归入 `plugin/`，统一注册入口 `plugin/extensions.yaml`（目录约定生效）
 - [x] LLM 原子确认为内核内置 `ext.ai`（无需 `ext.llm` 重复建设）
-- [ ] 可扩展原子 P3–P4 逐个落地（对象存储/身份/向量 → 日历/支付/文档）
+- [x] 可扩展原子 P3 之文件类已落地：`ext.filestore`（2026-09-28，第二批 E2；`plugin/verify.py` P1b）
+- [x] 可扩展原子 P3 之调度类已落地：`ext.cron`（2026-09-28，第二批 E3；`plugin/verify.py` P1c）。
+  生命周期口径按 2026-09-28 拍板**修正为硬绑定**（初稿的「重启后按 misfire 处理」作废）：
+  进程退出即停且不接管，只有「有进程在跑 / 没进程」两态；cron 表落盘只用于重建同一张时间表，
+  **不是跨进程任务队列**
+- [x] 可扩展原子 P3 之身份类已落地：`ext.oidc`（2026-09-28，第二批 E1；`plugin/verify.py` P1d）。
+  只做握手不验签不建会话；issuer 混淆两道防线；JWKS 长驻缓存 + 未知 kid 强制刷新 + 刷新失败置 stale
+- [x] 可扩展原子 P3 之对象存储已落地：`ext.oss`（2026-09-30，第三批 E5；`plugin/verify.py` P1f，手写 SigV4，`go.mod` 零变动）
+- [x] 可扩展原子 P3 之 Redis 已落地：`ext.redis`（2026-09-30，第三批 E5；`plugin/verify.py` P1g，手写 RESP2 零依赖，KV/Hash/List/Set/ZSet + 分布式锁 + 延迟队列 29 方法）
+- [ ] 可扩展原子 P3–P4 逐个落地（向量 → 日历/支付/文档/IM）
 - [x] `ext.*` 方法级 schema 进入 step 直调静态校验（2026-09-19 修掉红线冲突缺口：`CapabilityRegistry.schemas` + `applyExtSchemas`，注册期即拒未知方法/未知参数，`validatePrimitiveArgs` 与 `InvokeCapability` 同源）
 - [x] 核心纯函数原子（time/template/crypto）补齐（2026-09-19：`internal/engine/purefunc.go`，`kind=pure`、Lua 无条件注入、Flow 可 `call: crypto.hash` 直调、注册期静态校验）
+- [x] **纯函数族扩容至 5 个**（2026-09-28）：新增族 `id`（uuid/nanoid/code）与 `validate`（json_schema），
+  并把 JWT 三件套（`crypto.jwt_decode/verify/sign`）+ 口令哈希（`crypto.password_hash/verify`）补进 `crypto` 族。
+  零新增依赖（jsonschema 与 uuid 本就在 `go.mod`）。**业务价值**：企业应用最常见的「前端拿 IdP 的 id_token 直接验签」
+  这条路径根本不需要侧车（见 `ENTERPRISE_PRIMITIVE_GAP.md` §3.5）。口径锁：`internal/mcp/mcp_test.go`
+  的 `TestMCPCapabilities*` 已把 5 个族一并锁住。
 - [ ] 新增任意场景 = 拼 Flow（最多写几个 Lua 薄工具），**不改任何 Go 二进制**

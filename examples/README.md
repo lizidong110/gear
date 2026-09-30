@@ -5,6 +5,11 @@
 
 > **约定：测试不再依赖本目录。** 测试固件统一放在仓库根的 `testdata/`（与 `examples/` 解耦），
 > 所以改这里的演示文件**不会**影响测试；但若想让测试也覆盖新写法，请同步更新 `testdata/` 对应文件。
+>
+> **唯一例外：`examples/auth-app/`。** `internal/artifact/auth_sample_test.go` 直接读它的
+> `bundle.yaml` 跑鉴权链路（放行 / 拒绝 / 不泄露凭据）。这条破例是刻意的：样板的价值在于
+> 「它自己就是能跑的」，另抄一份固件只会让测试变绿而样板失效。改这份 bundle 的 Tool / Hook
+> 请一并跑 `go test ./internal/artifact/ -run TestAuthSample`。
 
 | 文件 | 说明 |
 | --- | --- |
@@ -14,6 +19,7 @@
 | `sleeper_tool.yaml` | 示例 Tool：`sleep` 工具，供 `service_flow.yaml` 调用。 |
 | `ai-create-flow.yaml` | `gear ai gen` 的 `ai-gen` 配方来源（含 `ai-gen` Tool 的 Lua entry，是生成逻辑的单一真相源）。 |
 | `news-top10.yaml` | `gear serve --seed examples/news-top10.yaml` 灌入的 `news.top10` Flow + `news.fetch` Tool 示例，提供 `/api/news` 演示。 |
+| `auth-app/` | **Hook 鉴权样板**（`ENTERPRISE_PRD.md` FR-1）：登录发令牌 → Bearer 主体 → 守卫 Hook 验签 → 受保护 Tool。零内核改动，含 `README.md` 与回归测试。 |
 
 ## 不会写 YAML？用 `gear scaffold`
 

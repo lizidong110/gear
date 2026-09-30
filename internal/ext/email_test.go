@@ -157,26 +157,103 @@ func TestResolveRecipients(t *testing.T) {
 // 扩展原子的凭据与连接配置必须全部来自调用参数，**禁止**读进程环境变量
 // （否则同一原子在不同 Tool 里行为会随宿主环境漂移，且无从追溯）。
 // 这条守卫同时防止那个已被删除的 intOrEnv（os.Getenv 读端口）死灰复燃。
+// sidecarGlobs 是 service ext 侧车的源码目录（相对本包 internal/ext）。
+//
+// 2026-09-30 补上：此前这条守卫只扫 `internal/ext`，于是 `plugin/*-sidecar` 里的
+// os.Getenv **完全没人管** —— mqtt-sidecar 就在读 MQTT_BROKER 却一直没被拦。
+// once 型原子和 service 型侧车只是载体不同，**都是 ext 的实现**，规矩必须一样。
+var sidecarGlobs = []string{"../../plugin/*-sidecar"}
+
+// bootstrapEnvWhitelist 是「进程自身怎么启动」这类环境变量的白名单。
+//
+// 判据：它描述这个进程**该在哪儿跑 / 启动时往哪连**，而不是「去连谁的凭据」——
+// 凭据与连接配置一律从调用参数进，没有例外。新增任何一项都必须在这里写清理由，
+// 否则就是给规矩开后门。
+var bootstrapEnvWhitelist = map[string]map[string]string{
+	"mqtt-sidecar": {
+		"MQTT_BROKER": "侧车启动时就得连上一个 broker，这是「往哪连」的兜底默认值（公共测试 broker），不是凭据；真正的 broker 由 publish/subscribe 的入参给",
+	},
+	"pdf-sidecar": {
+		"WINDIR": "定位系统字体目录（%WINDIR%\\Fonts）—— 找的是本机装字体的固定位置，不是凭据也不是「去连谁」；字体路径本身可由 font 入参显式指定",
+	},
+}
+
 func TestExtAtomsMustNotReadEnv(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil || len(files) == 0 {
 		t.Fatalf("读取本包源文件失败: %v", err)
 	}
 	for _, f := range files {
-		if strings.HasSuffix(f, "_test.go") {
-			continue
-		}
-		b, err := os.ReadFile(f)
+		assertNoEnvRead(t, f, nil)
+	}
+
+	checked := 0
+	for _, dir := range sidecarGlobs {
+		dirs, err := filepath.Glob(dir)
 		if err != nil {
-			t.Fatalf("读 %s 失败: %v", f, err)
+			t.Fatalf("扫描侧车目录失败: %v", err)
 		}
-		for i, line := range strings.Split(string(b), "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), "//") {
-				continue
-			}
-			if strings.Contains(line, "os.Getenv") {
-				t.Fatalf("%s:%d 违反红线：扩展原子不得读取环境变量\n  %s", f, i+1, strings.TrimSpace(line))
+		if len(dirs) == 0 {
+			t.Fatalf("%s 没匹配到任何目录：路径变了还是侧车被挪走了？守卫不能静默失效", dir)
+		}
+		for _, d := range dirs {
+			src, _ := filepath.Glob(filepath.Join(d, "*.go"))
+			for _, f := range src {
+				assertNoEnvRead(t, f, bootstrapEnvWhitelist[filepath.Base(d)])
+				checked++
 			}
 		}
 	}
+	if checked == 0 {
+		t.Fatal("一个侧车源文件都没扫到，守卫形同虚设")
+	}
+}
+
+func assertNoEnvRead(t *testing.T, f string, allow map[string]string) {
+	t.Helper()
+	if strings.HasSuffix(f, "_test.go") {
+		return
+	}
+	b, err := os.ReadFile(f)
+	if err != nil {
+		t.Fatalf("读 %s 失败: %v", f, err)
+	}
+	for i, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		if !strings.Contains(line, "os.Getenv") {
+			continue
+		}
+		name := envNameIn(line)
+		// COORD_ADDR 是引擎注入的「我在哪个端口上服务」，全侧车通用（不是连接配置）。
+		if name == "COORD_ADDR" || name == "INBOUND_ADDR" || name == "WEBHOOK_ADDR" {
+			continue
+		}
+		if _, ok := allow[name]; ok {
+			continue
+		}
+		t.Fatalf("%s:%d 违反红线：ext 不得读取环境变量（凭据与连接配置一律从调用参数进）\n  %s",
+			f, i+1, strings.TrimSpace(line))
+	}
+}
+
+// envNameIn 取一行里 os.Getenv("X") 的 X；取不到就返回空（空=不放行，fail-closed）。
+func envNameIn(line string) string {
+	const mark = "os.Getenv("
+	i := strings.Index(line, mark)
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+len(mark):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		return ""
+	}
+	rest = rest[j+1:]
+	k := strings.Index(rest, `"`)
+	if k < 0 {
+		return ""
+	}
+	return rest[:k]
 }

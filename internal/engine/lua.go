@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -108,6 +109,55 @@ func luaDBArgs(L *lua.LState) (driver, dsn, sql string, params []interface{}, er
 		params = p
 	}
 	return driver, dsn, sql, params, nil
+}
+
+// luaDBBatchArgs 从 Lua 第 1 个参数读取 db.batch 的
+// {driver?, dsn?, statements:[{sql, params?}, ...]}。
+// 与 luaDBArgs 同形态，多解一层 statements 数组：元素是表就按 {sql, params} 读，
+// 是裸字符串就整条当 SQL——前者适合参数化，后者只用于纯 DDL 之类的无参语句。
+func luaDBBatchArgs(L *lua.LState) (driver, dsn string, stmts []cap.BatchStmt, err error) {
+	m, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{})
+	if !ok {
+		return "", "", nil, fmt.Errorf("db.batch 调用需传入 table：{driver?, dsn?, statements:[{sql, params?}]}")
+	}
+	driver, _ = m["driver"].(string)
+	dsn, _ = m["dsn"].(string)
+	arr, ok := m["statements"].([]interface{})
+	if !ok || len(arr) == 0 {
+		return "", "", nil, fmt.Errorf("db.batch 缺少必填参数 statements（非空数组）")
+	}
+	for _, it := range arr {
+		switch v := it.(type) {
+		case string:
+			if strings.TrimSpace(v) == "" {
+				return "", "", nil, fmt.Errorf("db.batch 的 statements 里有空白语句（sql 不能为空）")
+			}
+			stmts = append(stmts, cap.BatchStmt{SQL: v})
+		case map[string]interface{}:
+			sql, _ := v["sql"].(string)
+			if strings.TrimSpace(sql) == "" {
+				return "", "", nil, fmt.Errorf("db.batch 的 statements 元素缺少必填参数 sql")
+			}
+			var p []interface{}
+			if pp, ok := v["params"].([]interface{}); ok {
+				p = pp
+			}
+			stmts = append(stmts, cap.BatchStmt{SQL: sql, Params: p})
+		default:
+			return "", "", nil, fmt.Errorf("db.batch 的 statements 元素必须是 {sql, params?} 表或 SQL 字符串，实际 %T", it)
+		}
+	}
+	return driver, dsn, stmts, nil
+}
+
+// luaConfigArgs 从 Lua 第 1 个参数读取 config 调用的具名 table（{key=...} / {key=,value=} / {prefix=}）。
+// 与 db 同款「单具名 table」形态；缺字段由各方法自行判必填（此处只做容器塑形）。
+func luaConfigArgs(L *lua.LState) (map[string]interface{}, error) {
+	m, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("config 调用需传入 table：{key=...} / {key=..., value=...} / {prefix=...}")
+	}
+	return m, nil
 }
 
 // subscriptionRequestFromMap 把 Lua table（JSON 兼容 map）塑形成 Subscribe.Start 的请求体。
@@ -257,6 +307,25 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 			return 1
 		}))
 		ctxTable.RawSetString("json", t)
+	}
+
+	// ctx.caller：本次执行的调用上下文（IDENTITY_CONTEXT_DESIGN.md §3.3）。
+	//
+	// 与 ctx.json 同理**无条件**注入——身份是 Hook 做鉴权的依据，不能要求 Tool 去声明
+	// capabilities 才能拿到（那样等于把鉴权门槛设在被鉴权方的手里）。
+	// 字段：ctx.caller.subject（主体；空串 = 无身份）、ctx.caller.app_id、ctx.caller.via（调用链）。
+	// 注入者只有 engine.hostFor / primitiveHost 两处，写入 rc.caller，脚本侧只读。
+	if host != nil {
+		caller := host.Caller()
+		t := L.NewTable()
+		t.RawSetString("subject", lua.LString(caller.Subject))
+		t.RawSetString("app_id", lua.LString(caller.AppID))
+		via := L.NewTable()
+		for i, v := range caller.Via {
+			via.RawSetInt(i+1, lua.LString(v))
+		}
+		t.RawSetString("via", via)
+		ctxTable.RawSetString("caller", t)
 	}
 
 	// 纯函数核心原子（time/template/crypto）：内核内建、始终可用，故与 ctx.json 一样**无条件**
@@ -437,6 +506,46 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 			}
 			return 0
 		}))
+		// batch 的失败**不抛错**：返回 {results=[...], rows_affected=[...], committed=false}，
+		// 让应用看到「第几条、什么错」后走自己的分支（物理上数据已回滚，不会留下脏库）。
+		// 抛错的只有「调用本身不成立」（空 statements / 拿不到连接 / 开事务失败）。
+		t.RawSetString("batch", L.NewFunction(func(L *lua.LState) int {
+			d, err := host.DB()
+			if err != nil {
+				L.RaiseError("db.batch 失败: %v", err)
+				return 0
+			}
+			driver, dsn, stmts, err := luaDBBatchArgs(L)
+			if err != nil {
+				L.RaiseError("db.batch 失败: %v", err)
+				return 0
+			}
+			out, err := d.Batch(driver, dsn, stmts)
+			if err != nil {
+				L.RaiseError("db.batch 失败: %v", err)
+				return 0
+			}
+			// 显式按字段组装，而不是 toLuaValue(out) 直接拍 struct：committed 必须是布尔
+			// 且失败那条只在有 error 时才有 error 键（Lua 侧 `if r.error then` 靠它判）。
+			results := make([]interface{}, 0, len(out.Results))
+			for _, r := range out.Results {
+				one := map[string]interface{}{"rows_affected": r.RowsAffected}
+				if r.Error != "" {
+					one["error"] = r.Error
+				}
+				results = append(results, one)
+			}
+			ra := make([]interface{}, 0, len(out.RowsAffected))
+			for _, n := range out.RowsAffected {
+				ra = append(ra, n)
+			}
+			L.Push(toLuaValue(L, map[string]interface{}{
+				"committed":     out.Committed,
+				"results":       results,
+				"rows_affected": ra,
+			}))
+			return 1
+		}))
 		t.RawSetString("ping", L.NewFunction(func(L *lua.LState) int {
 			d, err := host.DB()
 			if err != nil {
@@ -455,6 +564,109 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 			return 0
 		}))
 		ctxTable.RawSetString("db", t)
+	}
+
+	// ctx.config: get/set/delete/list（持久化键值配置；落点由**宿主**决定 = gearhome 的 config.db）。
+	// 调用形态：ctx.config.get({key="ai.api_key"})、ctx.config.set({key="ai.model", value="..."})。
+	//
+	// 为什么不让应用用 db 自己建 settings 表：db 的 dsn 缺省回退「内存 scratch 库，重启即丢」，
+	// 而 Lua 沙箱读不到 GEAR_HOME（禁 os 库、模板无 ${env} 前缀），应用只能硬编码绝对路径。
+	// config 把「库在哪」这件宿主才知道的事留在宿主侧，应用只需声明 capabilities: [config]。
+	if declared["config"] {
+		t := L.NewTable()
+		t.RawSetString("get", L.NewFunction(func(L *lua.LState) int {
+			c, err := host.Config()
+			if err != nil {
+				L.RaiseError("config.get 失败: %v", err)
+				return 0
+			}
+			m, err := luaConfigArgs(L)
+			if err != nil {
+				L.RaiseError("config.get 失败: %v", err)
+				return 0
+			}
+			key, _ := m["key"].(string)
+			v, err := c.Get(key)
+			if err != nil {
+				// 「没配过」(ErrConfigNotFound) 在 Lua 侧平返回空串：KV GET 不存在即空，
+				// 调用方通常用 `or ""` 兜底（如 mindstorm 的 settings_get）。其它错误仍上浮。
+				// 注意 Get 的 ErrConfigNotFound 语义（区分「没配」与「用户故意留空」）不动——
+				// 那是给 Go 侧 resolveLLMConfig 回退链用的，与 Lua 侧的平滑取值不冲突。
+				if errors.Is(err, cap.ErrConfigNotFound) {
+					L.Push(lua.LString(""))
+					return 1
+				}
+				L.RaiseError("config.get 失败: %v", err)
+				return 0
+			}
+			L.Push(lua.LString(v))
+			return 1
+		}))
+		t.RawSetString("set", L.NewFunction(func(L *lua.LState) int {
+			c, err := host.Config()
+			if err != nil {
+				L.RaiseError("config.set 失败: %v", err)
+				return 0
+			}
+			m, err := luaConfigArgs(L)
+			if err != nil {
+				L.RaiseError("config.set 失败: %v", err)
+				return 0
+			}
+			key, _ := m["key"].(string)
+			v, ok := m["value"].(string)
+			if !ok {
+				L.RaiseError("config.set 失败: %v", fmt.Errorf("缺少必填参数 value（要清除请用 delete）"))
+				return 0
+			}
+			if err := c.Set(key, v); err != nil {
+				L.RaiseError("config.set 失败: %v", err)
+				return 0
+			}
+			return 0
+		}))
+		t.RawSetString("delete", L.NewFunction(func(L *lua.LState) int {
+			c, err := host.Config()
+			if err != nil {
+				L.RaiseError("config.delete 失败: %v", err)
+				return 0
+			}
+			m, err := luaConfigArgs(L)
+			if err != nil {
+				L.RaiseError("config.delete 失败: %v", err)
+				return 0
+			}
+			key, _ := m["key"].(string)
+			if err := c.Delete(key); err != nil {
+				L.RaiseError("config.delete 失败: %v", err)
+				return 0
+			}
+			return 0
+		}))
+		t.RawSetString("list", L.NewFunction(func(L *lua.LState) int {
+			c, err := host.Config()
+			if err != nil {
+				L.RaiseError("config.list 失败: %v", err)
+				return 0
+			}
+			prefix := ""
+			if L.Get(1) != lua.LNil {
+				m, err := luaConfigArgs(L)
+				if err != nil {
+					L.RaiseError("config.list 失败: %v", err)
+					return 0
+				}
+				prefix, _ = m["prefix"].(string)
+			}
+			out, err := c.List(prefix)
+			if err != nil {
+				L.RaiseError("config.list 失败: %v", err)
+				return 0
+			}
+			L.Push(toLuaValue(L, out))
+			return 1
+		}))
+		ctxTable.RawSetString("config", t)
 	}
 
 	// 扩展原语（用户/插件注册）：遍历已声明且非内置的名字，查目录注入 ctx.<name>。

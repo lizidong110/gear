@@ -6,8 +6,8 @@ Gear 是「机制内核」：只给 能力原语 + Tool（执行单元）+ Flow�
 并附 warning——该进程会随**发起启动的那次会话**结束被回收。它是 running，但活不到会话之后。
 
 ## 四层模型
-- **能力原语（宿主提供）**：受门禁 6 个 `http/call/db/secret/event/subscribe`（须声明才可用）；
-  免门禁纯函数 3 个 `time/template/crypto`（始终可用，**声明了反而被拒**）；`ext.*`（须注册且须声明）。
+- **能力原语（宿主提供）**：受门禁 7 个 `http/call/db/secret/event/subscribe/config`（须声明才可用）；
+  免门禁纯函数 5 个 `time/template/crypto/id/validate`（始终可用，**声明了反而被拒**）；`ext.*`（须注册且须声明）。
   `json` **不是能力**（只是 Lua 的 `ctx.json` 绑定，Flow 不能直调）。
 - **Tool** = 能力 + 业务逻辑，可复用。**可复用的才建 Tool；一次性的直接在 `step.call` 写「能力.方法」**。
 - **Flow** = 编排执行单元（谁先谁后 / 何时跑 / 是否长驻）。
@@ -36,6 +36,10 @@ Gear 是「机制内核」：只给 能力原语 + Tool（执行单元）+ Flow�
 `gear_guide`(手册) · `gear_catalog`(摘要) · `gear_describe`(全量) · `gear_capabilities`(能力与参数)
 · `gear_validate`(校验 YAML) · `gear_apply`(落库) · `gear_delete` · `gear_promote` · `gear_invoke`(能力直调)
 · `gear_run`(一次性编排) · `gear_execution`(执行记录/日志) · `gear_app`(起停查应用) · `gear_doctor`(环境自检)
+· `gear_export`(导出产物，可备份/换机器/交付) · `gear_import`(导回产物)
+
+**造完一个应用，就用 `gear_export` 把它导出一份**：只有 Tool/Flow 在 registry 里不算「你的产品」——
+静态资源不在库里、清单也带不走，换台机器就只剩一堆散落状态。产物是目录形态（可 git 版本化）或 `.gearapp` 包。
 
 ## 完成的证据（缺一不可）
 `gear_validate` 的 `valid:true` + `gear_apply` 的 `applied` 清单 +

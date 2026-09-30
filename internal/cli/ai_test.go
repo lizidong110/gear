@@ -38,8 +38,12 @@ func TestSeedRefRegistry(t *testing.T) {
 		t.Fatalf("open refReg 失败: %v", err)
 	}
 	defer refReg.Close()
-	if err := seedRefRegistry(refReg, reg); err != nil {
+	skipped, err := seedRefRegistry(refReg, reg)
+	if err != nil {
 		t.Fatalf("seedRefRegistry 失败: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("合法定义不该被跳过，实际跳过 %v", skipped)
 	}
 	tools, err := refReg.ListTools()
 	if err != nil {

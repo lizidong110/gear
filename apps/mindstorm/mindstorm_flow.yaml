@@ -26,7 +26,7 @@ steps:
     depends_on: [anchor]
     input:
       port: 8090
-      dir: D:/gadern/gear/apps/mindstorm/www
+      dir: apps/mindstorm/www
       host: 127.0.0.1
       proxy:
         - path: /api

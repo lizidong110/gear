@@ -53,8 +53,16 @@ PLUGINBIN="$ROOT/$PLUGINBIN_REL"
 #   gear 进 build/，sidecar 进 build/plugin/
 TARGETS=(
   "cmd/gear|gear|$BIN_REL"
+  "plugin/cron-sidecar|cron-sidecar|$PLUGINBIN_REL"
+  "plugin/filestore-sidecar|filestore-sidecar|$PLUGINBIN_REL"
   "plugin/kafka-sidecar|kafka-sidecar|$PLUGINBIN_REL"
+  # 2026-09-30 补：这三个一直漏在清单外（此前只靠 verify.py 自己 go build 才编出来）
+  "plugin/xlsx-sidecar|xlsx-sidecar|$PLUGINBIN_REL"
+  "plugin/pdf-sidecar|pdf-sidecar|$PLUGINBIN_REL"
+  "plugin/oss-sidecar|oss-sidecar|$PLUGINBIN_REL"
+  "plugin/redis-sidecar|redis-sidecar|$PLUGINBIN_REL"
   "plugin/mqtt-sidecar|mqtt-sidecar|$PLUGINBIN_REL"
+  "plugin/oidc-sidecar|oidc-sidecar|$PLUGINBIN_REL"
   "plugin/rabbitmq-sidecar|rabbitmq-sidecar|$PLUGINBIN_REL"
   "plugin/serve-sidecar|serve-sidecar|$PLUGINBIN_REL"
   "plugin/sidecar-template|sidecar-template|$PLUGINBIN_REL"

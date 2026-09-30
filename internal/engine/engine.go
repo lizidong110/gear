@@ -18,6 +18,7 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v5"
 
 	"gear/internal/cap"
+	"gear/internal/gearhome"
 	"gear/internal/model"
 	"gear/internal/registry"
 )
@@ -60,12 +61,29 @@ type Engine struct {
 	// secret 是宿主注入的运行期密钥源（WithSecret）；nil 表示用 host 自带（默认 nil →
 	// 声明 secret 的 Tool 收到 ErrCapabilityUnavailable，fail-closed）。
 	secret cap.Secret
+	// config 是宿主注入的键值配置库（WithConfigStore），落点由装配方决定
+	// （生产应为 gearhome.ConfigDBPath()）。nil = 不提供 config 原语：声明了 config 的
+	// Tool 运行期收到 ErrCapabilityUnavailable（fail-closed，不静默退化成「内存里存一下」），
+	// 且 AI 缺省配置不生效（回退链退化为 env + 内置默认）。
+	config cap.Config
 	// progressOut 是执行进度（step 通过/跳过/service 启动）的输出目标；nil = os.Stdout。
 	//
 	// 为什么可替换：MCP 的 **stdio transport 下 stdout 只能承载协议帧**——一行 `✓ step …`
 	// 就足以让严格客户端解析失败（`plugin/mcp_wire_probe.py` 抓到的真实事故）。
 	// 默认仍是 os.Stdout（CLI 直接看得到），由传输层（`gear mcp`）按需改指 stderr。
 	progressOut io.Writer
+	// scope 是本次进程归属的应用命名空间（`--scope`，IDENTITY_CONTEXT_DESIGN.md §4.3）。
+	//
+	// **空 = 不启用守卫**，行为与未加本特性时逐字一致——这是刻意的默认值：现有定义都是
+	// 「先存在、后挂 App」（`apps/mindstorm` 的 22 个 Tool 与 apps 表是两条独立路径），
+	// 默认开会让单机版立刻跑不起来。开了才 fail-closed。
+	//
+	// 它是**进程级**而非按请求的：`gear serve` 的引擎是长驻共享实例，而 `cap.Resolver`
+	// 的签名里没有 context，按请求切换 scope 在那个面上做不到（硬要做就得改解析器契约）。
+	// 这与推荐拓扑一致——每租户一个 gear 进程 + 独立 GEAR_HOME，一个进程只跑一个应用。
+	// 将来若真要「一进程多应用」，改的方向是把它迁到 `cap.Caller.AppID` 而非补第二个字段
+	// （那个字段已经在 ① 的身份链路里，只是水位为零）。
+	scope string
 }
 
 // New 构造引擎。可用 WithMaxParallel / WithHost / WithSandbox / WithCapabilities 等选项覆盖默认行为。
@@ -84,6 +102,10 @@ func New(reg *registry.Registry, opts ...func(*Engine)) *Engine {
 	// 调用方已显式 WithHost 自带 Secret 时尊重调用方配置（不静默覆盖）。
 	if e.secret != nil && e.host.Secret == nil {
 		e.host.Secret = e.secret
+	}
+	// 配置库注入（config 原语）：同上口径，显式 WithHost 自带的 Config 优先。
+	if e.config != nil && e.host.Config == nil {
+		e.host.Config = e.config
 	}
 	// 默认扩展目录（无扩展能力时仅内核原语可用，行为与历史一致）。
 	if e.capReg == nil {
@@ -134,6 +156,13 @@ func (e *Engine) bindAIAgent() {
 		return rt.Run(ctx, entry, input, host)
 	}
 	e.ai.validateFlow = e.ValidateFlowStatic
+	// AI 缺省配置：宿主装配了 config 原语时，让它成为 ext.ai 回退链的第三层
+	// （调用参数 > 环境变量 > 配置库 > 内置默认），使 `gear config set ai.api_key ...`
+	// 配一次即在所有入口生效——不必再给每个进程 export GEAR_AI_*。
+	// 未装配 config 时保持原行为（MockLLM 也不受影响）。
+	if e.host != nil && e.host.Config != nil {
+		e.ai.SetConfigStore(e.host.Config)
+	}
 }
 
 // newReactHost 为 react 构造「声明全部 capability」的宿主视图：内核原语（builtin + pure）+ 已注册 ext.* 全部放行，
@@ -205,8 +234,10 @@ func defaultProviders() *cap.Providers {
 	seq := atomic.AddInt64(&capDBSeq, 1)
 	dsn := fmt.Sprintf("file:gear_cap_%d?mode=memory&cache=shared", seq)
 	// 内置多后端 DB：默认 scratch 内存 SQLite（dsn），mysql/postgres 由调用方显式传 dsn。
+	// 第二个参数是「应用给相对库名时的落点根目录」——由 gearhome 决定，与 cwd 无关，
+	// 应用因此不必把绝对路径硬编码进 YAML（见 gearhome.AppDataDir 的存在理由）。
 	// NewMultiDB 永不返回 nil，故 Providers.DB 用接口承载时不会出现 typed-nil。
-	dbCap := cap.NewMultiDB(dsn)
+	dbCap := cap.NewMultiDB(dsn, gearhome.AppDataDir())
 	return &cap.Providers{
 		HTTP:  &http.Client{Timeout: 30 * time.Second},
 		Event: cap.NewMemEvent(),
@@ -246,10 +277,124 @@ func WithSecret(s cap.Secret) func(*Engine) {
 // 不调用时使用空目录（仅内核原语可用，行为与历史一致）。
 // 例：reg := engine.NewCapabilityRegistry(); reg.Register("ext.slack", ...); engine.New(r, engine.WithCapabilities(reg))
 //
+// WithConfigStore 装配键值配置原语（config）。
+//
+// 装配后两件事同时生效（同一份库，避免「界面配了、CLI 读不到」）：
+//  1. 声明 `capabilities: [config]` 的 Tool 可用 ctx.config.get/set/delete/list——应用配置
+//     落盘持久化，不必把 DSN 硬编码进 YAML，也不必靠环境变量把配置灌进进程。
+//  2. ext.ai 的 provider/model/base_url/api_key/max_tokens 缺省时回退到配置库的 ai.* 键
+//     （回退链：调用参数 > 环境变量 > 配置库 > 内置默认），使 `gear config set ai.api_key …`
+//     配一次即在所有入口生效。
+//
+// 默认**不装配**（fail-closed，与 Secret/Subscribe 同口径）：声明了 config 的 Tool 会收到
+// ErrCapabilityUnavailable，而不是静默退化成「内存里存一下、重启就丢」。
+func WithConfigStore(c cap.Config) func(*Engine) {
+	return func(e *Engine) { e.config = c }
+}
+
+// NewDefaultConfigStore 返回落点为 gearhome.ConfigDBPath() 的配置库（宿主默认装配件）。
+//
+// 各入口（CLI / REST / app）统一取用本函数，避免「两个入口各拼一次路径」导致落点漂移。
+// 真正的打开是懒执行的：构造它不会碰磁盘。
+func NewDefaultConfigStore() cap.Config {
+	return cap.NewConfigStore(gearhome.ConfigDBPath())
+}
+
 // WithAIAgent 注入进程内 ext.ai agent（generate/complete/catalog/domains/validate/capabilities）。
 // 由 SetupExtensions 在注册 ext.ai 时一并调用；不调用则引擎无 AI 能力。
 func WithAIAgent(a *AIAgent) func(*Engine) {
 	return func(e *Engine) { e.ai = a }
+}
+
+// WithScope 设置运行期命名空间守卫的作用域（应用 id，即 registry `apps` 表里的 App.ID）。
+//
+// 传空串 = 不启用（默认）。非空时，本次进程在**运行期解析点**拒绝任何不属于该应用的
+// 已注册对象（Tool / Flow / Hook 的 action），见 `guardScope` 的注释。
+//
+// 注意它**不是**按请求的开关：`gear serve` 的引擎是长驻共享实例，作用域跟着进程走。
+func WithScope(scope string) func(*Engine) {
+	return func(e *Engine) { e.scope = scope }
+}
+
+// Host 返回注入的宿主能力集合（只读）。
+//
+// 为什么需要它：迁移这类「内核自己要动库」的场景必须拿到**引擎那个** MultiDB，
+// 而不是另造一个——两个实例就是两个连接池，同一份 sqlite 被两条连接开着，
+// 「busy_timeout 兜得住」只是侥幸。
+func (e *Engine) Host() *cap.Providers {
+	if e == nil {
+		return nil
+	}
+	return e.host
+}
+
+// Scope 返回当前守卫作用域（空串 = 未启用）。
+func (e *Engine) Scope() string { return e.scope }
+
+// guardScope 在运行期解析点做命名空间守卫（IDENTITY_CONTEXT_DESIGN.md §4.3）。
+//
+// ## 守什么
+//
+// 已注册对象（Tool / Flow）的 **id**。判定复用 `model.App.Owns`——与写入期
+// `checkNamespace` 同一份规则，不存在「写入期认、运行期不认」的漂移。
+//
+// ## 不守什么（同样是设计的一部分）
+//
+// **原语直调**（`ext.serve` / `static_site.serve` / `db.query`）**不在守卫范围内**。
+// 它们不是 registry 对象，是 gear 自带的平台能力；把平台能力按应用前缀一刀切，
+// 会让任何一个开了 `--scope` 的应用连自己的 Flow 都跑不起来（mindstorm 的入口 Flow
+// 同时调用了 `mindstorm__config` 与 `static_site.serve`）。守的语义是「别碰**别人应用的
+// 定义**」，不是「别用平台」。
+//
+// ## 空 scope
+//
+// `e.scope == ""` 直接放行。这不是「没实现」，是 §4.3 定的启用策略：默认不开，
+// 否则先存在后挂 App 的老定义全部跑不起来。
+//
+// ## 落点（五处，缺一处就等于没守卫）
+//
+// | # | 位置 | 拦什么 |
+// |---|---|---|
+// | 1 | `runFlow` 入口 | 整个 Flow 的 id（跑别人应用的 Flow） |
+// | 2 | `resolveStepCallView` | step 解析出的调用目标（Tool 与 Flow 两条分支） |
+// | 3 | `newResolver` 的两处 | 由 step.Call 动态解析出的目标 |
+// | 4 | `applyHooks` / `applyFlowScopedHooks` | Hook 的 action |
+// | 5 | `RunToolExec` | 直接点名执行一个 Tool（`gear tool run` 那条路） |
+//
+// 前四处都在「解析」链路上；**第 5 处不在** —— `RunToolExec` 自己拼 `resolvedCall`，
+// 从 2 那里直接跳过，而它正是「不经 Flow 就能执行任意 Tool」的捷径。
+// 这第五处是 2026-09-26 实跑验证时补的：当时只验了 Flow 面，`gear tool run`
+// 一测就穿了。教训是「解析点」不能按**语义**列（step / hook），得按**代码路径**列
+// ——凡是自己造 out 的调用点，都得单独数一遍。
+func (e *Engine) guardScope(id string) error {
+	if e.scope == "" {
+		return nil
+	}
+	if (&model.App{ID: e.scope}).Owns(id) {
+		return nil
+	}
+	return diagWrap(CodeScopeViolation,
+		fmt.Errorf("命名空间守卫：本进程 scope=%q 不允许引用 %q", e.scope, id),
+		"", "scope",
+		fmt.Sprintf("把 %q 改成 %s__ 开头，或去掉 --scope 关闭守卫；要确认可用 id 用 gear_catalog(kind=tool)", id, e.scope))
+}
+
+// guardFlowScope 是 guardScope 的 Flow 版本：**额外放行应用自己的 entry_flow**。
+//
+// 入口 Flow 按约定**可以**不带前缀（与 artifact.Composition 的豁免同口径：它的 id 可能就是
+// 裸的 `up`）。少了这条豁免，`gear app start --scope mindstorm mindstorm.up` 会连自己的入口
+// 都跑不起来——守卫把「自己」也挡在门外的实现，比没有守卫更糟。
+func (e *Engine) guardFlowScope(flow *model.Flow) error {
+	if e.scope == "" {
+		return nil
+	}
+	if (&model.App{ID: e.scope}).Owns(flow.ID) {
+		return nil
+	}
+	if app, err := e.reg.GetApp(e.scope); err == nil && app != nil && flow.ID == app.EntryFlow {
+		return nil
+	}
+	return e.guardScope(flow.ID)
 }
 
 // AIAgent 返回进程内 ext.ai agent（未装配时 nil）。
@@ -337,6 +482,7 @@ func (e *Engine) hostFor(tool *model.Tool, rc *runContext) *cap.Context {
 	c := e.hostForChain(tool, callChainOf(rc))
 	if rc != nil {
 		c.SetSubscriptionOwner(cap.SubscriptionOwner{FlowID: rc.flowID, ExecID: rc.execID})
+		c.SetCaller(rc.caller) // 身份唯一的注入点（见 cap.Caller：别在别处再写一遍）
 	}
 	return c
 }
@@ -366,6 +512,11 @@ func (e *Engine) newResolver() cap.Resolver {
 	return func(target string, input map[string]interface{}, via []string) (map[string]interface{}, error) {
 		// 1) Tool 优先（call 的主通道是调用一个已注册 Tool）。
 		if tool, err := e.reg.GetTool(target); err == nil && tool != nil {
+			// 运行期命名空间守卫（`--scope`）：ctx.call 是除 step.call 之外的第二条逃逸路径
+			// ——它把 target 交给了原语直调，能摸到的对象比 step.call 多，不拦就白守卫了。
+			if err := e.guardScope(tool.ID); err != nil {
+				return nil, err
+			}
 			rt, err := runtimeForCaps(tool.Runtime, e.sandboxPolicy, e.capReg)
 			if err != nil {
 				return nil, err
@@ -379,6 +530,9 @@ func (e *Engine) newResolver() cap.Resolver {
 		}
 		// 2) Flow：内联执行，循环守卫（target 已在调用链上则拦截，避免 A→B→A 无限递归）。
 		if flow, err := e.reg.GetFlow(target); err == nil && flow != nil {
+			if err := e.guardScope(flow.ID); err != nil {
+				return nil, err
+			}
 			for _, id := range via {
 				if id == target {
 					return nil, fmt.Errorf("call %q 会形成循环调用（调用链 %v），已拦截", target, via)
@@ -466,12 +620,30 @@ func (e *Engine) RunFlowResultObserved(flowID string, observe ToolObserver) (*Ru
 	return e.RunFlowExec(flowID, "", observe)
 }
 
+// RunFlowResultCtx 是 RunFlowResult 的带调用上下文版本。
+//
+// 存在的唯一理由：大部分场景（含全部测试）不需要身份，用 RunFlowResult 更省事；
+// 而**需要身份**的场景（Hook 鉴权、审计）只有这一处入口，不会漏。
+// 实现上它就是 RunFlowExecWithVars 的薄壳，没有第二套执行路径。
+func (e *Engine) RunFlowResultCtx(ctx context.Context, flowID string) (*RunResult, error) {
+	return e.RunFlowExecWithVars(ctx, flowID, "", nil, nil)
+}
+
 // RunFlowExec 是 RunFlowResultObserved 的带执行 id 版本：execID 非空时，引擎会把每个
 // step 的运行日志（stdout/stderr 行）经 logSink 上报（REQ-API-LOGS / #71），供
 // `GET /api/executions/{id}/logs` 查询。execID 为空则行为与 RunFlowResultObserved 完全一致
 // （不记日志，兼容历史调用点与测试）。
 func (e *Engine) RunFlowExec(flowID, execID string, observe ToolObserver) (*RunResult, error) {
-	return e.runFlow(flowID, execID, observe, nil)
+	return e.RunFlowExecCtx(context.Background(), flowID, execID, observe)
+}
+
+// RunFlowExecCtx 是 RunFlowExec 的带调用上下文版本（与 RunFlowResultCtx 同一套路）。
+//
+// 它的**唯一**现存调用方是 REST 的 `POST /api/executions`：执行是在闸门 worker 里异步跑的，
+// 不能在闭包里沿用请求的 ctx（handler 一返回请求 ctx 就取消，跑到一半的执行会被判超时）。
+// 故请求侧的做法是「只把主体字符串抓出来」，在这里重新构造一个活着的 ctx。
+func (e *Engine) RunFlowExecCtx(ctx context.Context, flowID, execID string, observe ToolObserver) (*RunResult, error) {
+	return e.RunFlowExecWithVars(ctx, flowID, execID, observe, nil)
 }
 
 // RunFlowWithVars 与 RunFlowResult 相同，但把 vars **覆盖合并**进 Flow 声明的初始 vars
@@ -481,19 +653,23 @@ func (e *Engine) RunFlowExec(flowID, execID string, observe ToolObserver) (*RunR
 // 合并结果作为 rc.vars，before_flow Hook 仍可在此基础上继续改写。
 // vars 为空/nil 时行为等价于 RunFlowResult。
 func (e *Engine) RunFlowWithVars(flowID string, vars map[string]interface{}) (*RunResult, error) {
-	return e.runFlow(flowID, "", nil, vars)
+	return e.runFlow(context.Background(), flowID, "", nil, vars)
 }
 
 // RunFlowExecWithVars 是 RunFlowExec 与 RunFlowWithVars 的合体入口：
 // 带 exec id（step 日志经 logSink 落盘 + 运行期注销守卫上报）**且**支持 vars
 // 运行时覆盖。MCP 执行面用这个：同步等结果、要日志、要传参，三者都要。
 // vars 为 nil 时行为与 RunFlowExec 完全一致。
-func (e *Engine) RunFlowExecWithVars(flowID, execID string, observe ToolObserver, vars map[string]interface{}) (*RunResult, error) {
-	return e.runFlow(flowID, execID, observe, vars)
+//
+// ctx 携带调用上下文（IDENTITY_CONTEXT_DESIGN.md）。它是**唯一**带 ctx 的 Flow 执行入口，
+// 其余公开入口一律传 context.Background()（= 无身份，与改造前同语义）后委托到它——
+// 这样身份来源只有一个，不存在「两条路径两套身份」的漂移。
+func (e *Engine) RunFlowExecWithVars(ctx context.Context, flowID, execID string, observe ToolObserver, vars map[string]interface{}) (*RunResult, error) {
+	return e.runFlow(ctx, flowID, execID, observe, vars)
 }
 
 // runFlow 是 RunFlowExec / RunFlowWithVars 的公共前置：取 Flow → 拒绝 service step → 执行。
-func (e *Engine) runFlow(flowID, execID string, observe ToolObserver, varsOverride map[string]interface{}) (*RunResult, error) {
+func (e *Engine) runFlow(ctx context.Context, flowID, execID string, observe ToolObserver, varsOverride map[string]interface{}) (*RunResult, error) {
 	flow, err := e.reg.GetFlow(flowID)
 	if err != nil {
 		return nil, err
@@ -501,12 +677,17 @@ func (e *Engine) runFlow(flowID, execID string, observe ToolObserver, varsOverri
 	if flow == nil {
 		return nil, fmt.Errorf("Flow 不存在: %s", flowID)
 	}
+	// 运行期命名空间守卫（`--scope`）：本进程只允许跑自己名下的 Flow。
+	// 放在取到 flow 之后、拒绝 service 之前：两条拒绝互不掩盖，先报「越权」才报「别用 flow run 起长驻」。
+	if err := e.guardFlowScope(flow); err != nil {
+		return nil, err
+	}
 	for _, s := range flow.Steps {
 		if s.IsService() {
 			return nil, fmt.Errorf("step %s 是 service 模式（长驻），不能用 flow run 一次性执行；请用 `app run %s` 监管", s.ID, flowID)
 		}
 	}
-	return e.runWithVars(flow, observe, execID, nil, varsOverride)
+	return e.runWithVars(ctx, flow, observe, execID, nil, varsOverride)
 }
 
 // mergeVars 把运行期覆盖合并进 Flow 声明的 vars（覆盖优先），返回新 map。
@@ -535,18 +716,25 @@ func mergeVars(base, override map[string]interface{}) map[string]interface{} {
 // 需依附某个 Flow，此处没有 Flow 可依附）。session 作用域命名空间用 tool id（等价于「只含一步的 Flow」），
 // 运行结束即回收。
 func (e *Engine) RunTool(toolID string, input map[string]interface{}) (map[string]interface{}, error) {
-	return e.RunToolExec(toolID, input, "")
+	return e.RunToolExec(context.Background(), toolID, input, "")
 }
 
 // RunToolExec 是 RunTool 的带执行 id 版本：execID 非空时把运行日志经 logSink 上报，
 // 供 `GET /api/executions/{id}/logs` 查询（与 RunFlowExec 同语义）。
-func (e *Engine) RunToolExec(toolID string, input map[string]interface{}, execID string) (map[string]interface{}, error) {
+func (e *Engine) RunToolExec(ctx context.Context, toolID string, input map[string]interface{}, execID string) (map[string]interface{}, error) {
 	tool, err := e.reg.GetTool(toolID)
 	if err != nil {
 		return nil, err
 	}
 	if tool == nil {
 		return nil, fmt.Errorf("Tool 不存在: %s", toolID)
+	}
+	// 第 5 个运行期解析点（其余四处见 guardScope 注释里的落点表）。这条路由本方法自己拼
+	// resolvedCall，**不经 `resolveStepCallView`**，所以那条路上的守卫对它无效——
+	// 而它就长在 `gear tool run` 上：不经过任何 Flow 也能点名执行一个 Tool，
+	// 正是最直接、最该堵死的越权入口。守卫必须在这里插一次，不能指望上游替我们拦。
+	if err := e.guardScope(toolID); err != nil {
+		return nil, err
 	}
 	if input == nil {
 		input = map[string]interface{}{}
@@ -563,6 +751,10 @@ func (e *Engine) RunToolExec(toolID string, input map[string]interface{}, execID
 		execID:    execID,
 		logSink:   e.logSinkFor(execID),
 		flowID:    toolID, // 供 hostFor 拼调用链
+	}
+	// 与 runWithVars 同口径：调用上下文在 rc 构造处读一次（见 cap.Caller）。
+	if cr, ok := CallerFrom(ctx); ok {
+		rc.caller = cr
 	}
 	// step.ID 用 tool id：出错时「step <id> 执行失败」能直接指出是哪个 Tool。
 	step := model.Step{ID: toolID, Call: toolID, Input: input}
@@ -608,19 +800,27 @@ func plannedToolIDs(flow *model.Flow, hooks []model.Hook) []string {
 }
 
 func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string, ancestors []string) (*RunResult, error) {
-	return e.runWithVars(flow, observe, execID, ancestors, nil)
+	return e.runWithVars(context.Background(), flow, observe, execID, ancestors, nil)
 }
 
 // runWithVars 执行一个**已加载**的 Flow（run 的执行内核）。varsOverride 非空时与 flow.Vars
 // 合并后作为初始 vars（覆盖优先）——用于「运行时给 Flow 传参」，不改动 registry 里的 Flow 快照；
 // 合并结果随后仍会被 before_flow Hook 改写。
-func (e *Engine) runWithVars(flow *model.Flow, observe ToolObserver, execID string, ancestors []string, varsOverride map[string]interface{}) (*RunResult, error) {
+// runWithVars 执行一个**已加载**的 Flow（run 的执行内核）。varsOverride 非空时与 flow.Vars
+// 合并后作为初始 vars（覆盖优先）——用于「运行时给 Flow 传参」，不改动 registry 里的 Flow 快照；
+// 合并结果随后仍会被 before_flow Hook 改写。
+//
+// ctx 携带调用上下文（IDENTITY_CONTEXT_DESIGN.md），在**此处**（rc 构造点）被读一次写进
+// runContext.caller，此后整条运行期都从 rc 取——不必再把 ctx 传到最底层的 Hook / step 里。
+// 当前上游公开入口一律传 context.Background()，语义等同改造前的「无身份」。
+func (e *Engine) runWithVars(ctx context.Context, flow *model.Flow, observe ToolObserver, execID string, ancestors []string, varsOverride map[string]interface{}) (*RunResult, error) {
 	// 订阅所属按 Flow/Exec 回收（运行结束 defer）：
 	// 本次运行中经 ctx.subscribe.start 建立的订阅在此一并 StopByOwner。
 	if e.subscriber != nil && flow.ID != "" {
 		defer e.subscriber.StopByOwner(cap.SubscriptionOwner{FlowID: flow.ID, ExecID: execID})
 	}
-	ctx := context.Background() // 同 execLevel：运行期取消由层级 ctx 负责，run() 顶层用 Background
+	// 直接用调用方传入的 ctx（**不**再起一个 Background）：它既承担运行期取消的传递，
+	// 也承载调用上下文。层级取消由 execLevel 自行 WithCancel 派生，与本 ctx 无关。
 	levels, err := topoLevels(flow.Steps)
 	if err != nil {
 		return nil, err
@@ -645,6 +845,11 @@ func (e *Engine) runWithVars(flow *model.Flow, observe ToolObserver, execID stri
 		logSink:   e.logSinkFor(execID),
 		ancestors: ancestors,
 		flowID:    flow.ID,
+	}
+	// 调用上下文在**此处**读一次，此后整条运行期都从 rc 取。
+	// 未命中 = 无身份（Subject 为空），不是「匿名用户」——Hook 要能区分「没验过」。
+	if cr, ok := CallerFrom(ctx); ok {
+		rc.caller = cr
 	}
 
 	// before_flow Hook（#72）：Flow 开始执行前，按 flow.ID 匹配。可改写初始 vars
@@ -799,6 +1004,10 @@ type runContext struct {
 	ancestors []string
 	// flowID 是本 Flow 的 id（供递归守卫快速拼出完整调用链）。
 	flowID string
+	// caller 是本次执行的调用上下文（IDENTITY_CONTEXT_DESIGN.md §3.2）。**唯一写入口**：
+	// 只从引擎边界的 ctx 值读取，永不取自 vars / 调用参数——调用方无法伪造身份。
+	// 经 hostFor / primitiveHost 注入宿主视图，故 Hook 与 Tool 都能看到。
+	caller cap.Caller
 }
 
 // setStep 记录一个 step 的最终 input/output（并发安全）。

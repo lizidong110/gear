@@ -213,5 +213,11 @@ mark { background: #7a5c00; color: #ffe08a; border-radius: 2px; padding: 0 1px; 
 }
 .modal-input:focus { outline: 1px solid #0a84ff; border-color: #0a84ff; }
 .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+/* AI 配置面板（⚙）：label 上、输入框下的两行式表单行 */
+.settings-modal { min-width: 340px; }
+.set-row { display: flex; flex-direction: column; gap: 4px; }
+.set-row .set-label { font-size: 11px; color: #8b8b8b; text-transform: uppercase; letter-spacing: .04em; }
+.set-row select.modal-input, .set-row input.modal-input { width: 100%; }
+.left-head-actions { display: inline-flex; gap: 5px; align-items: center; }
 .tiny.danger { color: #ff8f8f; border-color: #5a2a2a; }
 .tiny.danger:hover { background: #3a1a1a; color: #ffb4b4; }

@@ -27,7 +27,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local SCHEMA = [[
     CREATE TABLE IF NOT EXISTS trees(
       id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT DEFAULT '',
@@ -46,6 +46,16 @@ entry: |
       id TEXT PRIMARY KEY, tree_id TEXT, node_id TEXT, prompt_hash TEXT,
       model TEXT, created_at TEXT DEFAULT (datetime('now')));
     CREATE INDEX IF NOT EXISTS idx_aicalls_hash ON ai_calls(prompt_hash);
+    -- 应用级设置（key/value）。目前存 AI 配置（ai_provider/ai_base_url/ai_model/ai_api_key），
+    -- [已弃用] settings 表：2026-09-25 起 AI 配置统一存内核配置库（ctx.config / config.db，
+    -- 与 gear config set 同源），不再自建 settings 表。保留建表语句仅作向后兼容（空表无害）。
+    CREATE TABLE IF NOT EXISTS settings(
+      key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    -- 联网检索结果缓存（24h TTL，见 mindstorm__web_search）：同一查询只打一次搜索引擎，
+    -- 降低被搜狗反爬盯上的概率。
+    CREATE TABLE IF NOT EXISTS search_cache(
+      query TEXT PRIMARY KEY, text TEXT, results_json TEXT,
+      created_at TEXT DEFAULT (datetime('now')));
   ]]
   ctx.db.exec({driver="sqlite", dsn=DSN, sql=SCHEMA})
   return {ok = true}
@@ -72,7 +82,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local id = ctx.input.id
   local title = ctx.input.title
   local cat = ctx.input.category or ""
@@ -105,7 +115,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local cat = ctx.input.category
   local sql, params
   if cat and cat ~= "" then
@@ -136,7 +146,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local id = ctx.input.id
   ctx.db.exec({driver="sqlite", dsn=DSN, sql="DELETE FROM nodes WHERE tree_id=?", params={id}})
   ctx.db.exec({driver="sqlite", dsn=DSN, sql="DELETE FROM trees WHERE id=?", params={id}})
@@ -165,7 +175,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local id = ctx.input.id
   local title = ctx.input.title
   local cat = ctx.input.category
@@ -209,7 +219,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local id = ctx.input.id
   local tree_id = ctx.input.tree_id
   local pid = ctx.input.parent_id or ""
@@ -270,7 +280,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local tree_id = ctx.input.tree_id
   local pid = ctx.input.parent_id or ""
   local sql, params
@@ -293,6 +303,12 @@ id: mindstorm__node_get
 name: 取单节点（含 path/child_count）
 runtime: lua
 capabilities: [db]
+# 声明式 REST 路由（FR-3）：这条 Tool 对外就是资源 GET /api/nodes/{id}，
+# 前端可以按标准 REST 写客户端（gen-client.mjs 会为它生成真 REST 方法）。
+# 鉴权不在这一层——真前门由 flow 里的 Hook 守；这里只保证「长得像 REST」。
+api:
+  method: GET
+  path: /api/nodes/{id}
 input_schema:
   type: object
   properties:
@@ -316,7 +332,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local id = ctx.input.id
   local rows = ctx.db.query({driver="sqlite", dsn=DSN,
     sql="SELECT n.id,n.tree_id,n.parent_id,n.path,n.ord,n.depth,n.title,n.body,n.summary,n.ai_generated,"
@@ -346,7 +362,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local id = ctx.input.id
   local title = ctx.input.title
   local body = ctx.input.body
@@ -380,7 +396,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local id = ctx.input.id
   local r = ctx.db.query({driver="sqlite", dsn=DSN, sql="SELECT path FROM nodes WHERE id=?", params={id}})
   if not r or #r == 0 then error("node 不存在: " .. id) end
@@ -423,7 +439,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local q = ctx.input.q
   if not q or q == "" then
     return {nodes = ctx.json.decode("[]"), count = 0}
@@ -510,7 +526,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local node_id = ctx.input.node_id
   local tag = (ctx.input.tag or ""):gsub("^%s+", ""):gsub("%s+$", "")
   if tag == "" then error("tag 不能为空") end
@@ -537,7 +553,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local node_id = ctx.input.node_id
   local tag = ctx.input.tag
   ctx.db.exec({driver="sqlite", dsn=DSN, sql="DELETE FROM node_tags WHERE node_id=? AND tag=?", params={node_id, tag}})
@@ -563,7 +579,7 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local rows = ctx.db.query({driver="sqlite", dsn=DSN, sql="SELECT tag FROM node_tags WHERE node_id=? ORDER BY tag", params={ctx.input.node_id}}) or {}
   local tags = {}
   for _, r in ipairs(rows) do table.insert(tags, r.tag) end
@@ -589,10 +605,270 @@ versions:
   - version: "1.0.0"
     state: stable
 entry: |
-  local DSN = "D:/gadern/gear/build/mindstorm.db"
+  local DSN = "mindstorm.db"
   local rows = ctx.db.query({driver="sqlite", dsn=DSN, sql="SELECT DISTINCT tag FROM node_tags ORDER BY tag", params={}}) or {}
   local tags = {}
   for _, r in ipairs(rows) do table.insert(tags, r.tag) end
   local j = ctx.json.encode(tags)
   if #tags == 0 then j = "[]" end
   return {tags = ctx.json.decode(j)}
+---
+kind: Tool
+id: mindstorm__settings_get
+name: 读应用设置（AI 配置）
+description: 读取内核配置库（config.db）里的 AI 四项配置（provider/base_url/model/api_key），与 `gear config` 同源——不再读自建 settings 表（2026-09-25 迁移）。未设置的项返回空串。api_key 原样返回——本应用是 127.0.0.1 单人本地应用，前端流式路径（REST SSE 直调 ext.ai）需要真实 key 作调用参数。
+runtime: lua
+capabilities: [config]
+input_schema:
+  type: object
+  properties: {}
+output_schema:
+  type: object
+  properties:
+    settings:
+      type: object
+      properties:
+        ai_provider: {type: string}
+        ai_base_url: {type: string}
+        ai_model: {type: string}
+        ai_api_key: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  -- AI 配置统一存内核配置库（ctx.config / config.db），与 gear config set 同源——
+  -- 不再自建 settings 表 + 硬编码 mindstorm.db（2026-09-25 迁移）。
+  local KEYS = {"ai_provider", "ai_base_url", "ai_model", "ai_api_key"}
+  local MAP = {ai_provider="ai.provider", ai_base_url="ai.base_url", ai_model="ai.model", ai_api_key="ai.api_key"}
+  local out = {}
+  for _, k in ipairs(KEYS) do
+    out[k] = ctx.config.get({key = MAP[k]}) or ""
+  end
+  return {settings = out}
+---
+kind: Tool
+id: mindstorm__settings_set
+name: 写应用设置（AI 配置）
+description: 保存 AI 配置到内核配置库（config.db，与 gear config set 同源，2026-09-25 迁移）。传哪些字段就写哪些；字段传空串 = 删除该项（清除后回退引擎默认 / GEAR_AI_* 环境变量 / 配置库里的其它项）。api_key 只落本地 config.db，不外传。
+runtime: lua
+capabilities: [config]
+input_schema:
+  type: object
+  properties:
+    ai_provider: {type: string}
+    ai_base_url: {type: string}
+    ai_model: {type: string}
+    ai_api_key: {type: string}
+output_schema:
+  type: object
+  properties:
+    ok: {type: boolean}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  -- AI 配置统一存内核配置库（ctx.config / config.db），与 gear config set 同源（2026-09-25 迁移）。
+  local KEYS = {"ai_provider", "ai_base_url", "ai_model", "ai_api_key"}
+  local MAP = {ai_provider="ai.provider", ai_base_url="ai.base_url", ai_model="ai.model", ai_api_key="ai.api_key"}
+  for _, k in ipairs(KEYS) do
+    local v = ctx.input[k]
+    if v ~= nil then
+      local cfgkey = MAP[k]
+      if v == "" then
+        ctx.config.delete({key = cfgkey})
+      else
+        ctx.config.set({key = cfgkey, value = v})
+      end
+    end
+  end
+  return {ok = true}
+
+---
+kind: Tool
+id: mindstorm__web_search
+name: 联网检索（搜狗+360 回退，无 key，带缓存）
+description: 搜索给定关键词，返回前 N 条「标题+摘要」纯文本资料段。搜狗为主引擎，触发反爬时自动回退 360；结果带 24 小时缓存（同一查询只打一次引擎）。无需任何 API key。供 AI 生成前把权威资料锚进 prompt；两引擎都失败时抛错，由调用方降级为「无检索直接生成」。
+runtime: lua
+capabilities: [http, db]
+timeout: "25s"
+input_schema:
+  type: object
+  properties:
+    query: {type: string}
+    count: {type: integer}
+  required: [query]
+output_schema:
+  type: object
+  properties:
+    query: {type: string}
+    text: {type: string}
+    cached: {type: boolean}
+    results:
+      type: array
+      items:
+        type: object
+        properties:
+          title: {type: string}
+          url: {type: string}
+          snippet: {type: string}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  -- 联网检索 Tool：搜狗为主、360 回退，结果带 24h 缓存（无 key、国内直连）。
+  -- 引擎选型（2026-09-24 实测）：必应对无 cookie 脚本只按查询词前两个汉字出结果，弃用；
+  -- 搜狗结果最准但连续自动化请求会弹反爬验证码（用户真机复现过），故：
+  --   1) 同一查询 24h 内命中 search_cache 直接返回（大幅降频，这是防风控的主力）；
+  --   2) 搜狗弹验证码/失败时回退 360（so.com，结果结构 res-title/res-desc）；
+  --   3) 两引擎都挂才抛错，前端降级为无检索生成。
+  local query = tostring(ctx.input.query or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if query == "" then error("query 不能为空") end
+  local MAX_RESULTS = 8
+  local n = tonumber(ctx.input.count) or 6
+  if n < 1 then n = 6 end
+  if n > MAX_RESULTS then n = MAX_RESULTS end
+  local DSN = "mindstorm.db"
+
+  -- UTF-8 → percent-encoding（Lua 5.1 无现成库，按字节编即可，中文=3字节序列）
+  local function urlencode(s)
+    local out = {}
+    for i = 1, #s do
+      local b = string.byte(s, i)
+      if (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+        or b == 45 or b == 46 or b == 95 or b == 126 then
+        table.insert(out, string.char(b))
+      else
+        table.insert(out, string.format("%%%02X", b))
+      end
+    end
+    return table.concat(out)
+  end
+
+  -- 常见 HTML 实体解码 + 剥标签 + 压空白
+  local function decodeEntities(s)
+    s = s:gsub("&ensp;", " "):gsub("&emsp;", " "):gsub("&nbsp;", " ")
+    s = s:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&#39;", "'")
+    s = s:gsub("&amp;", "&")
+    s = s:gsub("&#(%d+);", function(d)
+      local c = tonumber(d)
+      if c and c >= 32 and c < 127 then return string.char(c) end
+      return " "
+    end)
+    return s
+  end
+  local function stripTags(s)
+    s = s:gsub("<[^>]+>", "")
+    return decodeEntities(s):gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "")
+  end
+  local function cleanHtml(html)
+    return html:gsub("<script[^>]*>.-</script>", " "):gsub("<style[^>]*>.-</style>", " ")
+  end
+  local HEADERS = {
+    ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    ["Accept"] = "text/html,application/xhtml+xml",
+    ["Accept-Language"] = "zh-CN,zh;q=0.9",
+  }
+
+  -- ---------- 引擎一：搜狗 ----------
+  local function fetchSogou()
+    local url = "https://www.sogou.com/web?query=" .. urlencode(query)
+    local resp = ctx.http.Request("GET", url, nil, HEADERS)
+    if resp.status ~= 200 then error("HTTP " .. tostring(resp.status)) end
+    local html = cleanHtml(resp.body)
+    if html:find("antispider", 1, true) or html:find("验证码", 1, true) then
+      error("触发反爬验证码")
+    end
+    -- 逐块抽取：div.vrwrap → h3.vr-title 标题 + div.space-txt 摘要
+    local results, pos = {}, 1
+    while #results < n do
+      local s = html:find('class="vrwrap"', pos, true)
+      if not s then break end
+      local s2 = html:find('class="vrwrap"', s + 1, true)
+      local seg = html:sub(s, (s2 or #html + 1) - 1)
+      pos = s + 1
+      local rawTitle = seg:match('<h3[^>]*vr%-title[^>]*>%s*<a[^>]*>(.-)</a>') or seg:match("<h3[^>]*>(.-)</h3>")
+      local snippet = seg:match('<div[^>]*space%-txt[^>]*>(.-)</div>')
+      if not snippet then
+        for p in seg:gmatch("<p[^>]*>(.-)</p>") do
+          if #p > 40 then snippet = p break end
+        end
+      end
+      local title = stripTags(rawTitle or "")
+      if title ~= "" and #title > 3 then
+        table.insert(results, {title = title, url = "", snippet = stripTags(snippet or "")})
+      end
+    end
+    if #results == 0 then error("未解析出结果") end
+    return results
+  end
+
+  -- ---------- 引擎二：360（回退） ----------
+  local function fetchSo360()
+    local url = "https://www.so.com/s?q=" .. urlencode(query)
+    local resp = ctx.http.Request("GET", url, nil, HEADERS)
+    if resp.status ~= 200 then error("HTTP " .. tostring(resp.status)) end
+    local html = cleanHtml(resp.body)
+    -- 逐块抽取：li.res-list → h3.res-title>a（真实链接在 data-mdurl）+ p.res-desc 摘要
+    local results, pos = {}, 1
+    while #results < n do
+      local s = html:find('class="res-list"', pos, true)
+      if not s then break end
+      local s2 = html:find('class="res-list"', s + 1, true)
+      local seg = html:sub(s, (s2 or #html + 1) - 1)
+      pos = s + 1
+      local rawTitle = seg:match('<h3[^>]*res%-title[^>]*>%s*<a[^>]*>(.-)</a>')
+      local snippet = seg:match('<p[^>]*class="[^"]*res%-desc[^"]*"[^>]*>(.-)</p>')
+      local title = stripTags(rawTitle or "")
+      if title ~= "" and #title > 3 then
+        table.insert(results, {title = title, url = "", snippet = stripTags(snippet or "")})
+      end
+    end
+    if #results == 0 then error("未解析出结果") end
+    return results
+  end
+
+  -- ---------- 缓存（24h）：同一查询只打一次引擎，这是防风控的主力 ----------
+  local function getCached()
+    local ok, r = pcall(function()
+      return ctx.db.query({driver="sqlite", dsn=DSN,
+        sql="SELECT text, results_json FROM search_cache WHERE query=? AND created_at > datetime('now','-1 day')",
+        params={query}})
+    end)
+    if ok and r and #r > 0 then
+      local ok2, arr = pcall(function() return ctx.json.decode(r[1].results_json) end)
+      if ok2 and type(arr) == "table" then return r[1].text, arr end
+    end
+    return nil, nil
+  end
+  local function putCached(text, results)
+    pcall(function()
+      ctx.db.exec({driver="sqlite", dsn=DSN,
+        sql="INSERT OR REPLACE INTO search_cache(query,text,results_json,created_at) VALUES(?,?,?,datetime('now'))",
+        params={query, text, ctx.json.encode(results)}})
+    end)
+  end
+
+  local cachedText, cachedResults = getCached()
+  if cachedText then
+    return {query = query, text = cachedText, results = cachedResults, cached = true}
+  end
+
+  -- 主引擎搜狗 → 失败回退 360
+  local okS, results = pcall(fetchSogou)
+  if not okS then
+    local ok3, r3 = pcall(fetchSo360)
+    if not ok3 then
+      error("搜狗与 360 均失败（搜狗: " .. tostring(results) .. "；360: " .. tostring(r3) .. "）")
+    end
+    results = r3
+  end
+
+  local textParts = {}
+  for i, item in ipairs(results) do
+    local line = "[" .. tostring(i) .. "] " .. item.title
+    if item.snippet ~= "" then line = line .. "\n摘要: " .. item.snippet end
+    table.insert(textParts, line)
+  end
+  local text = table.concat(textParts, "\n\n")
+  putCached(text, results)
+  return {query = query, text = text, results = results}
