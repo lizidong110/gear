@@ -248,5 +248,3 @@ func asString(v interface{}) (string, bool) { s, ok := v.(string); return s, ok 
 func asInt(v interface{}) (int64, bool) { n, ok := v.(int64); return n, ok }
 
 func asArray(v interface{}) ([]interface{}, bool) { a, ok := v.([]interface{}); return a, ok }
-
-func isNil(v interface{}) bool { return v == nil }

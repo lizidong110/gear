@@ -113,16 +113,16 @@ func readCmd(br *bufio.Reader) ([]string, error) {
 }
 
 type rval struct {
-	kind byte  // '+', '-', ':', '$', '*'
+	kind byte // '+', '-', ':', '$', '*'
 	s    string
-	n     int64
-	arr   []rval
+	n    int64
+	arr  []rval
 }
 
 func rStr(s string) rval  { return rval{kind: '+', s: s} }
 func rInt(n int64) rval   { return rval{kind: ':', n: n} }
 func rBulk(s string) rval { return rval{kind: '$', s: s} }
-func rNil() rval         { return rval{kind: '$', n: -1} }
+func rNil() rval          { return rval{kind: '$', n: -1} }
 func rErr(s string) rval  { return rval{kind: '-', s: s} }
 func rArr(v []rval) rval  { return rval{kind: '*', arr: v} }
 

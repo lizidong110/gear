@@ -288,7 +288,7 @@ func TestReactPromptAndToolsText(t *testing.T) {
 		"ext.demo": {"run": {Description: "演示扩展方法", Parameters: map[string]ParamSchema{"x": {Type: "string"}}}},
 	})
 
-	all := a.reactSystemPrompt(nil, 4, false)
+	all := a.reactSystemPrompt(reactAllow{all: true}, 4, false)
 	if !strings.Contains(all, "最多 4 步") || !strings.Contains(all, "Final Answer") {
 		t.Fatal("系统提示须含步数上限与输出格式约定")
 	}
@@ -297,19 +297,146 @@ func TestReactPromptAndToolsText(t *testing.T) {
 	}
 	// 走 function calling 时必须**不再**要求手写 ```json 围栏：协议已经给了调用通道，
 	// 再让模型手打一遍 JSON 就是基线 B-1 那种「两头打架」。
-	withTools := a.reactSystemPrompt(nil, 4, true)
+	withTools := a.reactSystemPrompt(reactAllow{all: true}, 4, true)
 	if strings.Contains(withTools, "```json") {
 		t.Fatal("下发 function 声明后不应再要求模型手写 json 围栏")
 	}
 	if !strings.Contains(withTools, "工具调用") {
 		t.Fatal("走协议时应提示用工具调用机制")
 	}
-	only := a.reactToolsText([]string{"db"})
+	// brief 模式只给「能力 → 方法名」索引：参数细节已在 function 声明里，
+	// 再抄一遍就是同一份信息付两遍钱（全目录 115 个方法，双重下发单轮 10-15k token）。
+	if strings.Contains(withTools, "ctx.ext.demo.run({") {
+		t.Fatal("下发 function 声明时提示词里不应重复列出方法参数")
+	}
+	if !strings.Contains(withTools, "- ext.demo:") {
+		t.Fatal("brief 模式应列出能力与允许的方法名索引")
+	}
+	only := a.reactToolsText(reactAllow{names: []string{"db"}}, false)
 	if strings.Contains(only, "ctx.http") {
 		t.Fatal("allow 过滤后不得列出未授权的原语")
 	}
 	if !strings.Contains(only, "ctx.db.exec") {
 		t.Fatal("allow 内的原语应列出")
+	}
+}
+
+// TestReactAllowMethodLevel：allow 必须支持方法级（"ext.redis.set"）。
+//
+// 动机是工具面膨胀：只想要 ext.redis 的两个方法，旧语义也得把 29 个方法全塞进请求，
+// 工具越多模型越选不准。方法级 allow 让「给权限」与「给工具面」解耦。
+func TestReactAllowMethodLevel(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, map[string]map[string]MethodSchema{
+		"ext.demo": {
+			"run":  {Description: "跑", Parameters: map[string]ParamSchema{"x": {Type: "string"}}},
+			"stop": {Description: "停", Parameters: map[string]ParamSchema{"y": {Type: "string"}}},
+		},
+	})
+
+	// 只允许一个方法：另一个不得进入工具声明。
+	specs, byName := a.reactToolSpecs(reactAllow{names: []string{"ext.demo"}, methods: map[string]bool{"ext.demo.run": true}})
+	if len(specs) != 1 {
+		t.Fatalf("方法级 allow 应只产出 1 个工具，实际 %d：%v", len(specs), byName)
+	}
+	if _, ok := byName[SanitizeToolName("ext.demo.run")]; !ok {
+		t.Fatalf("应保留 ext.demo.run，实际 %v", byName)
+	}
+	// 守卫层同样按方法收窄：调未开放的方法要被拒。
+	al := reactAllow{names: []string{"ext.demo"}, methods: map[string]bool{"ext.demo.run": true}}
+	if !al.allows("ext.demo", "run") {
+		t.Fatal("已开放的方法应放行")
+	}
+	if al.allows("ext.demo", "stop") {
+		t.Fatal("未开放的方法必须被拒")
+	}
+}
+
+// TestReactAllowUnknownRejected：显式 allow 里认不出的项必须报错，不能静默忽略——
+// 静默忽略等于让调用方以为开了权限实际没开，agent 调不到工具还不知道为什么。
+func TestReactAllowUnknownRejected(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, nil)
+	if _, err := a.resolveReactAllow([]string{"ext.nope"}, true, true); err == nil {
+		t.Fatal("未知能力必须报错")
+	}
+	if _, err := a.resolveReactAllow([]string{"ext.ai.no_such_method"}, true, true); err == nil {
+		t.Fatal("未知方法必须报错")
+	}
+	// 通配符仍可用，但必须显式给。
+	al, err := a.resolveReactAllow([]string{ReactAllowAll}, true, true)
+	if err != nil || !al.all {
+		t.Fatalf("显式 %q 应得到不设限，实际 %+v err=%v", ReactAllowAll, al, err)
+	}
+	// 从 Tool 声明继承来的能力清单走宽松口径：没装配的能力跳过而不是打挂整个 react
+	// （那是定义层面的问题，注册期已校验过合法性）。
+	got, err := a.resolveReactAllow([]string{"ext.nope", "http"}, true, false)
+	if err != nil || len(got.names) != 1 || got.names[0] != "http" {
+		t.Fatalf("继承来的清单应跳过未装配项，实际 %+v err=%v", got, err)
+	}
+}
+
+// TestReactDefaultCapabilitySetIsNarrow：Go 直调没给 allow 时必须是收窄的默认集，
+// 不再是整个能力目录（115 个方法会让模型选不准）。
+func TestReactDefaultCapabilitySetIsNarrow(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	a := newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, nil)
+
+	def, err := a.resolveReactAllow(nil, false, true)
+	if err != nil {
+		t.Fatalf("默认集解析失败: %v", err)
+	}
+	if def.all {
+		t.Fatal("默认集不得是不设限")
+	}
+	specs, _ := a.reactToolSpecs(def)
+	if len(specs) == 0 {
+		t.Fatal("默认集不得为空")
+	}
+	// 默认集必须远小于全目录，且不超工具数上限。
+	allSpecs, _ := a.reactToolSpecs(reactAllow{all: true})
+	if len(specs) >= len(allSpecs) {
+		t.Fatalf("默认集(%d) 必须小于全目录(%d)", len(specs), len(allSpecs))
+	}
+	if len(specs) > maxReactTools {
+		t.Fatalf("默认集(%d) 不得超过工具数上限 %d", len(specs), maxReactTools)
+	}
+}
+
+// TestReactToolBudgetRejected：工具数超上限必须报错，绝不静默截断——
+// 截断等于偷偷改了 agent 的能力边界，模型调不到却不知道为什么。
+func TestReactToolBudgetRejected(t *testing.T) {
+	a, _ := newReactAgent(t, &scriptedLLM{texts: []string{"Final Answer: x"}})
+
+	// 造一个方法数超过上限的能力（真实目录里 ext.redis 一家 29 个方法，全目录 115 个，
+	// 撞上限就是这个道理；测试不依赖真实目录规模，免得装了新扩展就变绿）。
+	big := map[string]MethodSchema{}
+	for i := 0; i < maxReactTools+5; i++ {
+		big[fmt.Sprintf("m%02d", i)] = MethodSchema{Description: "占位"}
+	}
+	if a.extCaps == nil {
+		a.extCaps = map[string]map[string]MethodSchema{}
+	}
+	a.extCaps["ext.big"] = big
+
+	_, err := a.React(context.Background(), "任务", ReactOpts{Allow: []string{"ext.big"}, AllowSet: true})
+	if err == nil {
+		t.Fatal("工具数超过上限必须报错")
+	}
+	if !strings.Contains(err.Error(), "超过上限") {
+		t.Fatalf("报错须点名「超过上限」并给出收窄办法，实际 %v", err)
+	}
+
+	// 方法级 allow 能把同一个能力收窄到上限内：这是「不砍能力、只收窄工具面」的出口。
+	_, err = a.React(context.Background(), "任务", ReactOpts{
+		Allow:    []string{"ext.big.m01", "ext.big.m02"},
+		AllowSet: true,
+	})
+	if err != nil {
+		t.Fatalf("方法级 allow 收窄后应能正常跑，实际 %v", err)
 	}
 }
 
@@ -397,7 +524,7 @@ func TestReactToolSpecsCoverCapabilityCatalog(t *testing.T) {
 		}}},
 	})
 
-	specs, byName := a.reactToolSpecs(nil)
+	specs, byName := a.reactToolSpecs(reactAllow{all: true})
 	if len(specs) == 0 {
 		t.Fatal("能力目录非空时工具声明不得为空")
 	}
@@ -435,7 +562,7 @@ func TestReactToolSpecsCoverCapabilityCatalog(t *testing.T) {
 	}
 
 	// allow 过滤后只剩该能力名下的方法。
-	specs2, byName2 := a.reactToolSpecs([]string{"ext.demo"})
+	specs2, byName2 := a.reactToolSpecs(reactAllow{names: []string{"ext.demo"}})
 	if len(specs2) == 0 {
 		t.Fatal("allow 内应保留工具")
 	}

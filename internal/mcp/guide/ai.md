@@ -55,6 +55,30 @@ ctx.ext.ai.react({ task = ctx.input.task, allow = { "http" } })
 
 CLI 那条路径不受影响：`gear ai react` 由命令自己决定 `--allow`，不经过 Tool 的能力边界。
 
+### 2.4.1 工具不是越多越好：方法级 allow 与工具数上限
+
+能力目录实测 **28 个能力 / 115 个方法**（`gear ai capabilities` 可查）。react 会把每个被允许
+的方法展开成一条 function 声明随请求下发，**每一轮都重发**。工具越多模型越容易选错——同一个
+能力下几十个近义方法时尤其明显，单轮光工具定义就能吃掉上万 token。
+
+所以「给权限」和「给工具面」是两件事，可以只放宽前者：
+
+- **方法级 allow**：只想用 redis 的两个方法，写 `allow = { "ext.redis.get", "ext.redis.set" }`
+  就够了，不必开放整个 `ext.redis`（29 个方法）。
+- **工具数上限 48**：一次 react 最多下发 48 个工具，超了**直接报错**而不是静默截断——
+  截断等于偷偷改了 agent 的能力边界，模型调不到某个工具却不知道为什么。报错会点名超限并
+  提示用方法级 allow 收窄。
+
+```lua
+-- 能碰 redis，但只开两个方法：工具面 2 个，权限仍在自己声明的能力内
+ctx.ext.ai.react({ task = ctx.input.task, allow = { "ext.redis.get", "ext.redis.set" } })
+```
+
+CLI 那条路径以前「不给 `--allow` 就是全目录」，现在也收窄了：不给 `--allow` 用一组通用能力
+（http / call / db / secret / config / time / template / id / validate + ext.registry，共 23 个方法），
+重型扩展（ext.redis 29 个、ext.oss 6 个）和 crypto（13 个）不在其中。要全目录请显式
+`--allow-all`，但那多半会撞上 48 的上限——撞了就说明该改用方法级 `--allow`。
+
 ## 2.5 一个装好就能跑的完整范例
 
 `examples/agent-app/` 就是本文的最小实证形态，整套定义只有一份 bundle：

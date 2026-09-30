@@ -341,12 +341,12 @@ type reactAllow struct {
 	all     bool
 }
 
-// reactAllowAll 是 allow 里的通配符：显式要求不设限（整个能力目录）。
+// ReactAllowAll 是 allow 里的通配符：显式要求不设限（整个能力目录）。
 //
 // 默认不再是全量。能力目录实测 28 个能力 / 115 个方法，全量下发意味着每轮请求都塞进
 // 115 条 function 声明——工具越多模型越选不准（工具面膨胀），且重型扩展里绝大多数方法
 // 与当前任务无关。要全量必须显式写出来。
-const reactAllowAll = "*"
+const ReactAllowAll = "*"
 
 // maxReactTools 是单次 react 允许下发的工具数上限，超出直接报错（不静默截断）。
 //
@@ -368,9 +368,15 @@ var defaultReactCapabilities = []string{
 // resolveReactAllow 由调用方给定的原始 allow 与「是否显式给定」解析出允许集。
 //
 // set=false 不再是「不设限」，而是回到默认集——历史行为会把 115 个方法全塞进请求。
-// 允许项可以是能力名（"ext.redis"，该能力所有方法）或方法名（"ext.redis.set"）；
-// 认不出来的项直接报错，不静默忽略（忽略等于让调用方以为开了权限实际没开）。
-func (a *AIAgent) resolveReactAllow(names []string, set bool) (reactAllow, error) {
+// 允许项可以是能力名（"ext.redis"，该能力所有方法）或方法名（"ext.redis.set"）。
+//
+// strict 区分两种来源，与 Gear 一贯的「显式从严、继承从宽」同口径：
+//   - strict=true（调用方**显式**给的 allow）：认不出的项直接报错。静默忽略等于让调用方
+//     以为开了权限实际没开，agent 调不到工具还不知道为什么。
+//   - strict=false（从 Tool 声明的 capabilities **继承**来的）：未装配的能力跳过。那是
+//     定义的问题、不是本次调用的问题，且注册期已校验过合法性——为一个没启用的扩展
+//     把整个 react 打挂，代价与问题严重性不匹配。
+func (a *AIAgent) resolveReactAllow(names []string, set, strict bool) (reactAllow, error) {
 	if !set {
 		caps := make([]string, 0, len(defaultReactCapabilities))
 		for _, c := range defaultReactCapabilities {
@@ -388,7 +394,7 @@ func (a *AIAgent) resolveReactAllow(names []string, set bool) (reactAllow, error
 		if x == "" {
 			continue
 		}
-		if x == reactAllowAll {
+		if x == ReactAllowAll {
 			return reactAllow{all: true}, nil
 		}
 		if a.knownCapability(x) {
@@ -402,6 +408,9 @@ func (a *AIAgent) resolveReactAllow(names []string, set bool) (reactAllow, error
 		// （ext.ai.complete → ext.ai + complete；http.Request → http + Request）。
 		capName, method, ok := splitCapMethod(x)
 		if !ok || !a.knownMethod(capName, method) {
+			if !strict {
+				continue
+			}
 			return reactAllow{}, fmt.Errorf("react 的 allow 含 %q：既不是已知能力，也不是「已知能力.方法」；"+
 				"可用 gear ai capabilities 或 ext.ai.capabilities() 看目录", x)
 		}
@@ -429,6 +438,23 @@ func (r reactAllow) allows(capName, method string) bool {
 	return r.methods[capName+"."+method]
 }
 
+// String 把允许集渲染成可读形式，用于「工具不在允许列表」的报错——报错里必须点名
+// 到底允许了什么，否则调用方只能猜。
+func (r reactAllow) String() string {
+	if r.all {
+		return "*"
+	}
+	if len(r.methods) > 0 {
+		ms := make([]string, 0, len(r.methods))
+		for m := range r.methods {
+			ms = append(ms, m)
+		}
+		sort.Strings(ms)
+		return strings.Join(ms, ", ")
+	}
+	return strings.Join(r.names, ", ")
+}
+
 // knownCapability 报告 name 是否是当前装配的能力名（门禁原语 / 纯函数原子 / 已注册 ext.*）。
 func (a *AIAgent) knownCapability(name string) bool {
 	for _, p := range allBuiltinPrimitives() {
@@ -451,6 +477,18 @@ func (a *AIAgent) knownMethod(capName, method string) bool {
 		return ok
 	}
 	return false
+}
+
+// knownOnly 从一批能力名里挑出当前**已装配**的那些（未装配的丢弃）。
+// 只用于「从 Tool 声明继承来的能力清单」——显式给的 allow 走 resolveReactAllow 的 strict 路径。
+func (a *AIAgent) knownOnly(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if a.knownCapability(n) {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // splitCapMethod 把 "ext.redis.set" 拆成 ("ext.redis", "set")。
@@ -489,7 +527,7 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 	// 允许集在这里定型，不再有「没传就全给」的隐式回退。
 	// Allow 非空即视为「已给定」：否则 Go 侧写 `Allow:["http"]` 却忘了 AllowSet，会静默
 	// 落回默认集——那正是被收掉的同一个坑，只是换了个方向。只有「两个都没给」才是默认集。
-	allow, err := a.resolveReactAllow(opts.Allow, opts.AllowSet || len(opts.Allow) > 0)
+	allow, err := a.resolveReactAllow(opts.Allow, opts.AllowSet || len(opts.Allow) > 0, true)
 	if err != nil {
 		return nil, err
 	}
@@ -690,7 +728,15 @@ func (a *AIAgent) ReactMethod(args map[string]interface{}, callerCaps ...string)
 	explicit := toStringSlice(args["allow"])
 	if len(explicit) > 0 && len(callerCaps) > 0 {
 		for _, name := range explicit {
-			if !containsString(callerCaps, name) {
+			// allow 项可以是「能力」（ext.redis）或「能力.方法」（ext.redis.set）：
+			// 子集校验比的是**能力部分**——在自己能力内再收窄到方法不是越权。
+			capName := name
+			if !a.knownCapability(name) {
+				if c, _, ok := splitCapMethod(name); ok {
+					capName = c
+				}
+			}
+			if !containsString(callerCaps, capName) {
 				return nil, fmt.Errorf("react 的 allow 含 %q，但本 Tool 只声明了 %v——allow 不能超出自己的 capability；"+
 					"要用更多能力，请在本 Tool 的 capabilities 里声明", name, callerCaps)
 			}
@@ -701,7 +747,9 @@ func (a *AIAgent) ReactMethod(args map[string]interface{}, callerCaps ...string)
 		opts.AllowSet = true
 	} else {
 		// 缺省 = 调用方声明的那一份；一份都没声明就一个工具都不给（而不是退回全目录）。
-		opts.Allow = callerCaps
+		// 这里过一遍 knownOnly：声明了但当前没装配的能力（扩展没启用）不该让整个 react
+		// 报错——那是定义层面的问题，注册期已经校验过合法性。
+		opts.Allow = a.knownOnly(callerCaps)
 		opts.AllowSet = true
 	}
 	if s, ok := args["provider"].(string); ok && s != "" {
@@ -726,11 +774,17 @@ func (a *AIAgent) ReactMethod(args map[string]interface{}, callerCaps ...string)
 // useTools 表示本轮会随请求下发 function 声明（原生 function calling）。为 true 时不再要求模型
 // 手写 ```json 围栏——协议已经给了调用通道，再要求它手打一遍 JSON 只会两头打架（基线 B-1 的
 // 「格式不遵守白扔一步」就是这么来的）。
-func (a *AIAgent) reactSystemPrompt(allow []string, maxSteps int, useTools bool) string {
-	tools := a.reactToolsText(allow)
+func (a *AIAgent) reactSystemPrompt(al reactAllow, maxSteps int, useTools bool) string {
+	// useTools=true 时协议侧已随请求下发完整 function 声明，提示词里只给「能力 → 方法名」
+	// 索引（brief），不把参数再抄一遍——同一份信息付两遍钱，且每轮都要重发。
+	tools := a.reactToolsText(al, useTools)
 	var b strings.Builder
 	b.WriteString("你是一个运行在 Gear 引擎内的 ReAct（推理 + 行动）智能体。你可以通过调用「内置工具」逐步推理与行动，直到能回答用户任务。\n\n")
-	b.WriteString("## 可用工具（只能使用下列工具，不要编造）\n")
+	if useTools {
+		b.WriteString("## 可用能力（方法名索引，参数见工具声明；只能使用下列工具，不要编造）\n")
+	} else {
+		b.WriteString("## 可用工具（只能使用下列工具，不要编造）\n")
+	}
 	b.WriteString(tools)
 	b.WriteString("\n\n## 每轮输出格式（严格遵守）\n")
 	if useTools {
@@ -753,7 +807,7 @@ func (a *AIAgent) reactSystemPrompt(allow []string, maxSteps int, useTools bool)
 		b.WriteString("- 每轮只能调用一个工具。Action 必须是合法 JSON（放在 ```json ... ``` 围栏内）。\n")
 		b.WriteString("- tool 字段为「<能力名>.<方法>」：内置原语如 http.Request / db.query / secret.get；扩展如 ext.ai.complete。\n")
 	}
-	b.WriteString("- 内置原语按「位置参数」调用，args 的键对应上面列出的参数名（可选参数缺省传 null）。\n")
+	b.WriteString("- 内置原语按「位置参数」调用，args 的键对应工具声明里的参数名（可选参数缺省传 null）。\n")
 	b.WriteString("- 扩展（ext.*）按「单个具名 table」调用，args 整体作为 { ... } 传入 ctx.ext.<name>.<method>({...})。\n")
 	b.WriteString("- Observation（工具返回）会由系统填回作为下一步输入；不要自己编造 Observation。\n")
 	b.WriteString(fmt.Sprintf("- 最多 %d 步。若卡住，请尽快给出 Final Answer。\n", maxSteps))
@@ -761,30 +815,43 @@ func (a *AIAgent) reactSystemPrompt(allow []string, maxSteps int, useTools bool)
 }
 
 // reactToolsText 把可用工具压成给 LLM 看的文本（与 capabilitiesText 同源，但支持 allow 过滤）。
-func (a *AIAgent) reactToolsText(allow []string) string {
-	allowed := map[string]bool{}
-	for _, x := range allow {
-		allowed[x] = true
-	}
-	// nil = 不设限（Go 直调路径的历史行为）；**空 slice = 一个都不给**。
-	// 不能写成 `len(allowed) == 0`：那会把「显式清空」也解释成「全给」，正是 2026-09-27
-	// 收口 react 默认权限时要堵的口。
-	filter := func(name string) bool {
-		return allow == nil || allowed[name]
+//
+// brief=true 只列「能力 → 方法名」索引，不含参数细节。协议侧已经下发了完整 function 声明，
+// 再在提示词里抄一遍参数等于同一份信息付两遍钱——全目录实测 115 个方法，双重下发时单轮
+// 光工具定义就 10-15k token，且每一轮都重发。brief 模式下模型先看索引定位能力，参数看
+// 工具声明，两边互补而不是重复。
+//
+// brief=false（没有 function calling 可依赖的文本兜底路径）必须给全：那时模型只能从这段
+// 文本知道有什么工具、每个方法收什么参数。
+func (a *AIAgent) reactToolsText(al reactAllow, brief bool) string {
+	// allowedMethods 按序取出该能力下被允许的方法名。
+	allowedMethods := func(capName string, ms map[string]MethodSchema) []string {
+		out := []string{}
+		for _, m := range sortedKeys(ms) {
+			if al.allows(capName, m) {
+				out = append(out, m)
+			}
+		}
+		return out
 	}
 	var sb strings.Builder
 	// 与 capabilitiesText 同源（allBuiltinPrimitives 单一来源），不再写死 6+1 个名字——
 	// 这样 subscribe / 纯函数 time/template/crypto/id/validate 都会自然进入 ReAct 工具清单，
 	// 且裸函数原语（call）按 ctx.call(...) 形态渲染（见 bareFunctionPrimitives）。
 	for _, p := range allBuiltinPrimitives() {
-		if !filter(p) {
-			continue
-		}
 		ms, ok := builtinCapabilitySchemas[p]
 		if !ok {
 			continue
 		}
-		for _, m := range sortedKeys(ms) {
+		names := allowedMethods(p, ms)
+		if len(names) == 0 {
+			continue
+		}
+		if brief {
+			sb.WriteString(fmt.Sprintf("- %s: %s\n", p, methodIndex(names)))
+			continue
+		}
+		for _, m := range names {
 			sch := ms[m]
 			switch {
 			case bareFunctionPrimitives[p]:
@@ -799,17 +866,46 @@ func (a *AIAgent) reactToolsText(allow []string) string {
 		}
 	}
 	if len(a.extCaps) > 0 {
-		sb.WriteString("# ctx.ext.<name>.<method> 只接受「单个具名 table」参数：\n")
-		for name, ms := range a.extCaps {
-			if !filter(name) {
+		// ext 名来自 map，遍历顺序不稳定——排序后再渲染，保证同一份输入总是同一份提示词
+		// （顺序不稳会让「模型看到的工具顺序」在不同进程里不一样，问题难复现）。
+		extNames := make([]string, 0, len(a.extCaps))
+		for name := range a.extCaps {
+			extNames = append(extNames, name)
+		}
+		sort.Strings(extNames)
+		for _, name := range extNames {
+			names := allowedMethods(name, a.extCaps[name])
+			if len(names) == 0 {
 				continue
 			}
-			for m, sch := range ms {
+			if brief {
+				sb.WriteString(fmt.Sprintf("- %s: %s\n", name, methodIndex(names)))
+				continue
+			}
+			sb.WriteString("# ctx.ext.<name>.<method> 只接受「单个具名 table」参数：\n")
+			for _, m := range names {
+				sch := a.extCaps[name][m]
 				sb.WriteString(fmt.Sprintf("- ctx.%s.%s({ %s }): %s\n", name, m, fieldsList(sch.Parameters), sch.Description))
 			}
 		}
 	}
+	if brief {
+		return "（下面只列能力与方法名，参数以工具声明为准，不要编造）\n" + sb.String()
+	}
 	return sb.String()
+}
+
+// reactMethodIndexLimit 是 brief 模式下单个能力最多列出的方法名个数。
+const reactMethodIndexLimit = 8
+
+// methodIndex 把方法名压成一行索引，超出上限只列前几个并**如实给出总数**——
+// 与 truncateObservation 同一口径：截断必须告知总数，不能让模型按数得着的条目下结论。
+func methodIndex(ms []string) string {
+	if len(ms) <= reactMethodIndexLimit {
+		return strings.Join(ms, ", ")
+	}
+	return strings.Join(ms[:reactMethodIndexLimit], ", ") +
+		fmt.Sprintf(" …等共 %d 个方法", len(ms))
 }
 
 // reactToolSpecs 生成给模型的工具声明（原生 function calling 用），并带回「压平名 → 原名」的反查表。
@@ -820,14 +916,7 @@ func (a *AIAgent) reactToolsText(allow []string) string {
 //
 // 与 reactToolsText 同源（都是能力目录的另一种渲染），两边都受 allow 过滤，保证
 // 「prompt 里写了的工具」与「协议里声明的工具」是同一批——不然模型会调到一个 prompt 里没有的。
-func (a *AIAgent) reactToolSpecs(allow []string) ([]ToolSpec, map[string]string) {
-	allowed := map[string]bool{}
-	for _, x := range allow {
-		allowed[x] = true
-	}
-	// 见 reactToolsText 同款注释：nil = 不设限，空 slice = 一个都不给。
-	filter := func(name string) bool { return allow == nil || allowed[name] }
-
+func (a *AIAgent) reactToolSpecs(al reactAllow) ([]ToolSpec, map[string]string) {
 	specs := []ToolSpec{}
 	byName := map[string]string{}
 	add := func(orig string, sch MethodSchema) {
@@ -843,14 +932,14 @@ func (a *AIAgent) reactToolSpecs(allow []string) ([]ToolSpec, map[string]string)
 		byName[flat] = orig
 	}
 	for _, p := range allBuiltinPrimitives() {
-		if !filter(p) {
-			continue
-		}
 		ms, ok := builtinCapabilitySchemas[p]
 		if !ok {
 			continue
 		}
 		for _, m := range sortedKeys(ms) {
+			if !al.allows(p, m) {
+				continue
+			}
 			add(p+"."+m, ms[m])
 		}
 	}
@@ -862,10 +951,10 @@ func (a *AIAgent) reactToolSpecs(allow []string) ([]ToolSpec, map[string]string)
 	}
 	sort.Strings(extNames)
 	for _, name := range extNames {
-		if !filter(name) {
-			continue
-		}
 		for _, m := range sortedKeys(a.extCaps[name]) {
+			if !al.allows(name, m) {
+				continue
+			}
 			add(name+"."+m, a.extCaps[name][m])
 		}
 	}

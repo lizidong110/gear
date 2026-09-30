@@ -195,7 +195,7 @@ func fmtKind(v interface{}) string {
 // 此前写死的「6+1」名单漏了 subscribe，也漏了纯函数 time/template/crypto；且 call 被渲染成
 // 非法的 ctx.call.Call(...) 形态（Lua 侧 call 是裸函数 ctx.call(target, input)，运行期才炸）。
 func TestReactToolsTextCoversAllPrimitives(t *testing.T) {
-	txt := (&AIAgent{}).reactToolsText(nil)
+	txt := (&AIAgent{}).reactToolsText(reactAllow{all: true}, false)
 
 	// 受门禁原语：位置参数形态必须齐全（含此前遗漏的 subscribe / config）
 	for _, want := range []string{

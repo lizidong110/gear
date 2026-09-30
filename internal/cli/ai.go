@@ -36,7 +36,8 @@ func aiCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error { return runAIReact(cmd, args) },
 	}
 	reactC.Flags().Int("max-steps", 6, "最大步数")
-	reactC.Flags().StringSlice("allow", nil, "限制可用工具（如 http,secret）；默认全部")
+	reactC.Flags().StringSlice("allow", nil, "限制可用工具：能力名（http,secret）或方法名（ext.redis.set）；默认一组通用能力，不是全目录")
+	reactC.Flags().Bool("allow-all", false, "不设限地开放整个能力目录。慎用：工具越多模型越选不准，且很可能撞上内核的工具数上限")
 	reactC.Flags().String("model", "", "模型名（可选，缺省读 GEAR_AI_MODEL）")
 	reactC.Flags().String("provider", "", "模型厂商（可选，缺省读 GEAR_AI_PROVIDER）")
 	reactC.Flags().String("base-url", "", "API base（可选，缺省读 GEAR_AI_BASE_URL）")
@@ -100,7 +101,18 @@ func runAIReact(cmd *cobra.Command, args []string) error {
 	}
 	maxSteps, _ := cmd.Flags().GetInt("max-steps")
 	allow, _ := cmd.Flags().GetStringSlice("allow")
-	opts := engine.ReactOpts{MaxSteps: maxSteps, Allow: allow}
+	allowAll, _ := cmd.Flags().GetBool("allow-all")
+	// --allow-all 与 --allow 互斥：两个都给说明没想清楚要什么，报出来比挑一个静默执行好。
+	if allowAll && len(allow) > 0 {
+		return fmt.Errorf("--allow-all 与 --allow 不能同时给：前者不设限，后者是白名单，语义冲突")
+	}
+	opts := engine.ReactOpts{MaxSteps: maxSteps}
+	if allowAll {
+		opts.Allow = []string{engine.ReactAllowAll}
+		opts.AllowSet = true
+	} else {
+		opts.Allow = allow
+	}
 	if s, _ := cmd.Flags().GetString("model"); s != "" {
 		opts.Model = s
 	}

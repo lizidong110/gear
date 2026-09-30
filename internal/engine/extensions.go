@@ -501,7 +501,7 @@ func defaultAISchemas() map[string]MethodSchema {
 		"react": {Description: "ReAct 智能体：LLM 逐步调用内核原语（builtin + pure）与已注册 ext.* 完成任务，返回 {answer,steps,used_tools}", Parameters: map[string]ParamSchema{
 			"task":        {Type: "string", Description: "任务描述", Required: true},
 			"max_steps":   {Type: "number", Description: "最大步数（可选，默认 6）"},
-			"allow":       {Type: "array", Description: "限制可用工具（可选，默认全部内置原语 + ext.*）"},
+			"allow":       {Type: "array", Description: "限制可用工具（可选）。项可以是能力名（http / ext.redis，该能力全部方法）或方法名（ext.redis.set，只开这一个）；不给则用默认集（通用能力，不是全目录）；给 \"*\" 表示不设限。工具数超上限会报错，请用方法级 allow 收窄"},
 			"provider":    {Type: "string", Description: "模型厂商（可选；缺省回退 env GEAR_AI_PROVIDER，再回退内置默认 siliconflow）"},
 			"model":       {Type: "string", Description: "模型名（可选；缺省回退 env GEAR_AI_MODEL，再回退厂商默认）"},
 			"base_url":    {Type: "string", Description: "API base（可选；缺省回退 env GEAR_AI_BASE_URL，再回退厂商默认）"},

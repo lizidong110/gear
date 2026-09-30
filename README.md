@@ -241,10 +241,11 @@ type Hook struct {
 **`gear ai`**（内置 `ext.ai` 进程内 agent）
 - `ai gen flow` / `ai gen tool`：`--intent` / 位置参数、`--register`（自动落库）
 - `ai capabilities`：打印当前能力目录（内核原语 + 已注册 `ext.*`）。内核原语分两类：**受门禁的 builtin 7 个**（http/call/db/secret/event/subscribe/config，需在 Tool 里声明 `capabilities`）+ **始终可用的 pure 5 个**（time/template/crypto/id/validate，无需声明）。目录由代码单一来源渲染（`allBuiltinPrimitives` + `capabilityCatalog`），不再各写一份字面量清单
-- `ai react "任务"`：跑一个 ReAct 循环（每步思考→调工具→看结果，直到 Final Answer）。`--max-steps`（默认 6）/ `--allow`（限制可用能力）。等价于在 Tool 的 entry 里调 `ctx.ext.ai.react({ task = "..." })`——**用它打造自己的 agent 是最短路径**
+- `ai react "任务"`：跑一个 ReAct 循环（每步思考→调工具→看结果，直到 Final Answer）。`--max-steps`（默认 6）/ `--allow`（限制可用能力：能力名如 `http,secret`，或方法名如 `ext.redis.set`）/ `--allow-all`（不设限开放整个能力目录）。等价于在 Tool 的 entry 里调 `ctx.ext.ai.react({ task = "..." })`——**用它打造自己的 agent 是最短路径**
 - `ai complete "prompt"`：单轮补全（无记忆、无工具）。仅做「一次问答」时用，多步任务请走 `ai react`
   > **react 走原生 function calling**：工具声明由能力目录自动生成并随请求下发（`ToolSpec`），模型用 `tool_calls` 回调用意图，引擎不再从自由文本里抠 JSON 围栏。工具名里的「.」会被压成「_」（`http.Request` → `http_Request`，OpenAI 的 function name 字符集所限）。
   > **`ai react` 会先灌入持久 registry 的目录**（与 `ai gen` 同一手法）：agent 看得到真实的 Tool/Flow 定义，写操作仍隔离在内存库里。库里若有声明了不存在原语的过期定义，会被跳过并在 stderr 点名（不会让整个命令失败）。
+  > **工具不是越多越好**：能力目录有 28 个能力 / 115 个方法，全量下发会让模型选不准。不给 `--allow` 时用一组通用能力（23 个方法），重型扩展（ext.redis 29 个方法）和 crypto（13 个）需显式声明；一次最多下发 48 个工具，超了报错而不是静默截断——请用方法级 `--allow ext.redis.set` 收窄。
 
 **`gear config`**（持久化键值配置，落点 `<GEAR_HOME>/config.db`，`GEAR_CONFIG_DB` 可覆盖）
 - `config get <key>` / `config set <key> <value>` / `config delete <key>` / `config list [前缀]` / `config path`
