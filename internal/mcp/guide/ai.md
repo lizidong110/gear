@@ -20,7 +20,7 @@ local r = ctx.ext.ai.react({ task = ctx.input.task, max_steps = 12 })
 return { answer = r.answer }
 ```
 
-CLI 等价：`gear ai react "任务" --max-steps 6 --allow http,db`。还可加 `--mode meta`（元工具模式）或 `--plan`（先意图分析）。
+CLI 等价：`gear ai react "任务" --max-steps 6 --allow http,db`。还可加 `--mode meta`（元工具模式）。
 
 **它走原生 function calling**：工具声明由能力目录自动生成后随请求下发，模型用 `tool_calls`
 回调用意图，引擎不再从自由文本里抠 JSON 围栏。两个后果：
@@ -105,23 +105,6 @@ ctx.ext.ai.react({ task = ctx.input.task, mode = "meta" })
 
 > 内置检索靠 `ext.ai.find` / `ext.ai.describe`（BM25 + 受控关键词表，按能力域归类）；
 > 它检索的是**能力目录的方法层**，与 `ext.ai.catalog` 检索的 registry 业务 Tool 是两套语料，别混。
-
-### 2.4.3 意图分流（`plan = true`）：纯问答直接回答，跳过循环
-
-只有 react 一个脑子时，连「今天天气怎么样」这种纯问答也会触发一轮工具循环（即使没调成工具也白跑）。
-`plan = true` 在进循环前先花 1 次轻量调用做意图分析，把任务分三类：
-
-- **direct_answer**：不需要工具，直接以分析出的回答收尾，**不进 ReAct 循环**（省一整轮昂贵的工具循环）。
-- **tool_needed**：需要工具，把分析出的计划注入首条消息，再进循环照计划执行。
-- **ambiguous**：保守当 tool_needed 处理。
-
-```lua
-local r = ctx.ext.ai.react({ task = ctx.input.task, plan = true })
--- r 比普通返回多带 intent / plan / needs_tools 三个字段
-```
-
-返回结构因此多了 `intent`（分类）、`plan`（分步计划）、`needs_tools`（是否需要工具）；
-直答路径下 `steps` 为空、`used_tools` 为空。默认关闭，行为不变。
 
 ## 2.5 一个装好就能跑的完整范例
 

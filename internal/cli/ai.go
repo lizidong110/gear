@@ -37,7 +37,6 @@ func aiCmd() *cobra.Command {
 	}
 	reactC.Flags().Int("max-steps", 6, "最大步数")
 	reactC.Flags().String("mode", "", "工具面模式：空（默认）= 扁平全量；meta = 元工具模式（恒定 4 个工具按需检索，规模无关）")
-	reactC.Flags().Bool("plan", false, "先做一次意图分析：纯问答直接回答、跳过 ReAct 循环（省 token）；需要工具的给出计划再进循环")
 	reactC.Flags().StringSlice("allow", nil, "限制可用工具：能力名（http,secret）或方法名（ext.redis.set）；默认一组通用能力，不是全目录")
 	reactC.Flags().Bool("allow-all", false, "不设限地开放整个能力目录。慎用：工具越多模型越选不准，且很可能撞上内核的工具数上限")
 	reactC.Flags().String("model", "", "模型名（可选，缺省读 GEAR_AI_MODEL）")
@@ -111,9 +110,6 @@ func runAIReact(cmd *cobra.Command, args []string) error {
 	opts := engine.ReactOpts{MaxSteps: maxSteps}
 	if s, _ := cmd.Flags().GetString("mode"); s != "" {
 		opts.Mode = s
-	}
-	if b, _ := cmd.Flags().GetBool("plan"); b {
-		opts.Plan = true
 	}
 	if allowAll {
 		opts.Allow = []string{engine.ReactAllowAll}

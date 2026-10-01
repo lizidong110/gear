@@ -363,7 +363,6 @@ type ReactOpts struct {
 	APIKey      string   // API key（可选，优先 env）
 	Temperature float64  // 采样温度（可选，默认 0.3）
 	Mode        string   // 工具面模式：""（默认）= 扁平全量；"meta" = 4 个元工具按需检索
-	Plan        bool     // 是否先做意图分析（判断需不需要工具、给出计划）：纯问答可跳过 ReAct 循环省 token
 }
 
 // ReactModeMeta 是「元工具模式」：工具面恒定为 4 个元工具（find / describe / invoke / registry），
@@ -594,38 +593,6 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 	usedTools := []string{}
 	seen := map[string]bool{}
 	finalAnswer := ""
-
-	// 意图分流（Plan 模式）：先花 1 次轻量调用判断「要不要进 ReAct 循环」。
-	// 纯问答/闲聊直接收尾，省掉一整轮昂贵的工具循环。默认关闭，行为不变。
-	var intentInfo map[string]interface{}
-	if opts.Plan {
-		intent, plan, needsTools, directAnswer, perr := a.planTask(ctx, task, opts)
-		if perr != nil {
-			return nil, fmt.Errorf("react 意图分析失败: %w", perr)
-		}
-		intentInfo = map[string]interface{}{"intent": intent, "plan": plan, "needs_tools": needsTools}
-		if !needsTools {
-			// 不需要工具：直接以意图分析的回答收尾，不再进循环。
-			steps = append(steps, map[string]interface{}{
-				"thought":     "意图分析：无需调用工具，直接回答",
-				"action":      nil,
-				"observation": directAnswer,
-			})
-			return map[string]interface{}{
-				"answer":      strings.TrimSpace(directAnswer),
-				"intent":      intent,
-				"plan":        plan,
-				"needs_tools": needsTools,
-				"steps":       steps,
-				"used_tools":  []string{},
-			}, nil
-		}
-		// 需要工具：把计划注入首条 user 消息，让循环照计划推进。
-		if p := strings.TrimSpace(plan); p != "" {
-			msgs[1]["content"] = fmt.Sprintf("%s\n\n已分析出的执行计划（请照此推进，用完工具后给 Final Answer）：\n%s",
-				msgs[1]["content"], p)
-		}
-	}
 
 	// appendAssistant 把模型这一轮的回话按协议塞回序列：带 tool_calls 时必须原样带上，
 	// 否则下一条 tool 结果没有可对应的 id（OpenAI 兼容端点会直接判非法）。
@@ -937,11 +904,6 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 		"steps":      steps,
 		"used_tools": usedTools,
 	}
-	if intentInfo != nil {
-		result["intent"] = intentInfo["intent"]
-		result["plan"] = intentInfo["plan"]
-		result["needs_tools"] = intentInfo["needs_tools"]
-	}
 	return result, nil
 }
 
@@ -1005,9 +967,6 @@ func (a *AIAgent) ReactMethod(args map[string]interface{}, callerCaps ...string)
 	if s, ok := args["mode"].(string); ok && s != "" {
 		opts.Mode = s
 	}
-	if b, ok := args["plan"].(bool); ok && b {
-		opts.Plan = true
-	}
 	// 显式给 allow 时必须是调用方自己声明的子集——否则「给个 allow 绕过门禁」就成了后门。
 	explicit := toStringSlice(args["allow"])
 	if len(explicit) > 0 && len(callerCaps) > 0 {
@@ -1052,55 +1011,6 @@ func (a *AIAgent) ReactMethod(args map[string]interface{}, callerCaps ...string)
 		opts.Temperature = v
 	}
 	return a.React(context.Background(), task, opts)
-}
-
-// planTask 是 react 之前的「意图分析」层：判断任务是否需要工具、给出执行计划。
-//
-// 意义：绝大多数纯问答/闲聊根本不需要进 ReAct 循环（那是一连串昂贵的工具调用）；
-// 先花 1 次轻量调用把意图分出来，direct_answer 类直接收尾，能省掉整个循环。这是把
-// 「只有 react 一个脑子」升级成「意图分流 → 直答 / 进循环」的关键一步。
-//
-// 失败时**保守退化为 needsTools=true**：宁可多跑一轮循环，也不要误把需要工具的任务当成能直答。
-// 返回 needsTools=false 时调用方应直接以 answer 收尾，不再进循环。
-func (a *AIAgent) planTask(ctx context.Context, task string, opts ReactOpts) (intent, plan string, needsTools bool, answer string, err error) {
-	sys := "你是 Gear 智能体的规划器。分析用户任务，判断它是否需要调用工具（如发 HTTP 请求、" +
-		"查数据库、调扩展能力 ext.*）才能完成，还是仅靠常识/知识就能直接回答。\n" +
-		"必须只输出一个 JSON 对象（不要任何多余文字、不要 markdown 围栏）：\n" +
-		"{\"intent\": \"direct_answer 或 tool_needed 或 ambiguous\", " +
-		"\"needs_tools\": true或false, " +
-		"\"plan\": \"分步计划（tool_needed 时写执行步骤，direct_answer 时为空串）\", " +
-		"\"answer\": \"若不需要工具、可立即给出的回答（direct_answer 时填写，否则空串）\"}"
-	req := LLMRequest{
-		System:      sys,
-		Prompt:      "任务：" + task,
-		Provider:    opts.Provider,
-		Model:       opts.Model,
-		BaseURL:     opts.BaseURL,
-		APIKey:      opts.APIKey,
-		Temperature: opts.Temperature,
-		Format:      "json",
-	}
-	text, cerr := a.llm.Complete(ctx, req)
-	if cerr != nil {
-		return "", "", true, "", cerr
-	}
-	v, perr := extractJSONToAny(text)
-	if perr != nil {
-		return "", "", true, "", nil
-	}
-	m, ok := v.(map[string]interface{})
-	if !ok {
-		return "", "", true, "", nil
-	}
-	intent, _ = m["intent"].(string)
-	plan, _ = m["plan"].(string)
-	answer, _ = m["answer"].(string)
-	if b, ok := m["needs_tools"].(bool); ok {
-		needsTools = b
-	} else {
-		needsTools = true
-	}
-	return intent, plan, needsTools, answer, nil
 }
 
 // reactSystemPrompt 拼装 ReAct 的系统提示：可用工具（来自能力目录，可经 allow 过滤）+ 输出格式 + 规则。
