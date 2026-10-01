@@ -529,11 +529,18 @@ func orSchema(m map[string]interface{}) map[string]interface{} {
 // ---- 配置化扩展加载：取代原先「启动处写死 ext.ai」 ----
 
 // ParamSchema 描述某个方法参数的类型/语义（喂给 agent 的 capabilities() 目录，PRD §9.3 最小上下文的扩展）。
+//
+// 嵌套（REQ-AI-SCHEMA-NESTED）：object 类型可用 Properties 描述子字段，array 类型可用 Items 描述元素；
+// methodSchemaToJSON 会递归展开成 JSON Schema 的 properties/items，让模型在字段级拿到约束，
+// 避免「传错子字段 → 拖到 Lua 运行期才炸」。两者都可选，且只允许用在「形状固定且已知」的参数上——
+// 自由 map（headers/input/payload/vars/validate.schema）坚决不填，填死反而误导模型。
 type ParamSchema struct {
-	Type        string   `yaml:"type" json:"type"` // string/object/array/number/bool
-	Description string   `yaml:"description" json:"description,omitempty"`
-	Enum        []string `yaml:"enum" json:"enum,omitempty"`         // 枚举约束（可选）
-	Required    bool     `yaml:"required" json:"required,omitempty"` // 是否必填（可选）
+	Type        string                 `yaml:"type" json:"type"` // string/object/array/number/bool
+	Description string                 `yaml:"description" json:"description,omitempty"`
+	Enum        []string               `yaml:"enum" json:"enum,omitempty"`                       // 枚举约束（可选）
+	Required    bool                   `yaml:"required" json:"required,omitempty"`               // 是否必填（可选）
+	Properties  map[string]ParamSchema `yaml:"properties,omitempty" json:"properties,omitempty"` // object 的子字段（可选）
+	Items       *ParamSchema           `yaml:"items,omitempty" json:"items,omitempty"`           // array 的元素 schema（可选）
 }
 
 // MethodSchema 描述扩展原语某个方法的参数结构，agent 生成 tool 的 entry 时据此知道 ctx.ext.<x>.<method> 吃什么字段。
@@ -595,18 +602,22 @@ var builtinCapabilitySchemas = map[string]map[string]MethodSchema{
 			"driver": {Type: "string", Enum: []string{"sqlite", "mysql", "postgres"}, Description: "数据库驱动（缺省 sqlite；别名 mysql/mariadb、postgres/postgresql/pg）"},
 			"dsn":    {Type: "string", Description: "连接串（sqlite 文件或内存 DSN；mysql/postgres 必填，含口令优先 ${secrets.*}）"},
 			"sql":    {Type: "string", Description: "SQL（用 ? 占位符，配套 params）", Required: true},
-			"params": {Type: "array", Description: "预编译占位符参数（按顺序，可选）"},
+			"params": {Type: "array", Description: "预编译占位符参数（按顺序，可选）", Items: &ParamSchema{Description: "占位符值（标量：字符串/数字/布尔，按顺序对应 SQL 中的 ?）"}},
 		}},
 		"exec": {Description: "执行写操作（INSERT/UPDATE/DELETE/DDL），成功返回 nil、失败经 err 表达", Parameters: map[string]ParamSchema{
 			"driver": {Type: "string", Enum: []string{"sqlite", "mysql", "postgres"}, Description: "数据库驱动（缺省 sqlite）"},
 			"dsn":    {Type: "string", Description: "连接串（mysql/postgres 必填，含口令优先 ${secrets.*}）"},
 			"sql":    {Type: "string", Description: "SQL（用 ? 占位符，配套 params）", Required: true},
-			"params": {Type: "array", Description: "预编译占位符参数（按顺序，可选）"},
+			"params": {Type: "array", Description: "预编译占位符参数（按顺序，可选）", Items: &ParamSchema{Description: "占位符值（标量：字符串/数字/布尔，按顺序对应 SQL 中的 ?）"}},
 		}},
 		"batch": {Description: "事务批处理：多条语句同事务顺序执行，**全或无**（任一条失败整体回滚，committed=false，results 指明第几条、什么错）。DDL 可与 DML 混批（SQLite 同事务内同原子；其它方言见 atoms.md）", Parameters: map[string]ParamSchema{
-			"driver":     {Type: "string", Enum: []string{"sqlite", "mysql", "postgres"}, Description: "数据库驱动（缺省 sqlite）"},
-			"dsn":        {Type: "string", Description: "连接串（mysql/postgres 必填，含口令优先 ${secrets.*}）"},
-			"statements": {Type: "array", Description: "语句数组，至少一条；每个元素是 {sql, params?} 表或裸 SQL 字符串。sql 为该条语句（用 ? 占位符），params 为该条自己的参数（可选）", Required: true},
+			"driver": {Type: "string", Enum: []string{"sqlite", "mysql", "postgres"}, Description: "数据库驱动（缺省 sqlite）"},
+			"dsn":    {Type: "string", Description: "连接串（mysql/postgres 必填，含口令优先 ${secrets.*}）"},
+			"statements": {Type: "array", Description: "语句数组，至少一条；每个元素是 {sql, params?} 表或裸 SQL 字符串。sql 为该条语句（用 ? 占位符），params 为该条自己的参数（可选）", Required: true,
+				Items: &ParamSchema{Type: "object", Description: "一条语句（推荐结构化写法；也可直接给裸 SQL 字符串）", Properties: map[string]ParamSchema{
+					"sql":    {Type: "string", Description: "该条语句（用 ? 占位符）", Required: true},
+					"params": {Type: "array", Description: "该条自己的参数（可选，按顺序对应 ?）"},
+				}}},
 		}},
 		"ping": {Description: "探活（sqlite 文件可打开 / mysql/postgres 网络连得通即 ok）", Parameters: map[string]ParamSchema{
 			"driver": {Type: "string", Enum: []string{"sqlite", "mysql", "postgres"}, Description: "数据库驱动（缺省 sqlite）"},
@@ -629,9 +640,16 @@ var builtinCapabilitySchemas = map[string]map[string]MethodSchema{
 	},
 	"subscribe": {
 		"start": {Description: "建立订阅（source=事件源，config=源配置，callback=投递动作），返回 handle", Parameters: map[string]ParamSchema{
-			"source":   {Type: "string", Description: "事件源（首批 mqtt）", Required: true},
-			"config":   {Type: "object", Description: "事件源配置（mqtt: {topic, qos}）", Required: true},
-			"callback": {Type: "object", Description: "投递动作 {type, target, input}", Required: true},
+			"source": {Type: "string", Description: "事件源（首批 mqtt）", Required: true},
+			"config": {Type: "object", Description: "事件源配置（mqtt: {topic, qos}）", Required: true, Properties: map[string]ParamSchema{
+				"topic": {Type: "string", Description: "订阅主题", Required: true},
+				"qos":   {Type: "number", Description: "QoS 等级 0/1/2（缺省 0）"},
+			}},
+			"callback": {Type: "object", Description: "投递动作 {type, target, input}", Required: true, Properties: map[string]ParamSchema{
+				"type":   {Type: "string", Description: "投递类型（如 tool / flow）", Required: true},
+				"target": {Type: "string", Description: "目标 Tool/Flow 的 id"},
+				"input":  {Type: "object", Description: "传入目标的参数（可选，结构随目标而定）"},
+			}},
 		}},
 		"stop": {Description: "取消订阅（按 handle）", Parameters: map[string]ParamSchema{
 			"handle": {Type: "string", Description: "订阅句柄", Required: true},

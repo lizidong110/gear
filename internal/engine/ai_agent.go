@@ -1385,30 +1385,68 @@ func (a *AIAgent) reactToolSpecs(al reactAllow, meta bool) ([]ToolSpec, map[stri
 	return specs, byName
 }
 
+// schemaMaxDepth 是 methodSchemaToJSON 递归下钻的层数上限（防自引用死循环 / 超深嵌套）。
+const schemaMaxDepth = 6
+
 // methodSchemaToJSON 把方法级参数 schema 转成 JSON Schema（function calling 的 parameters）。
-// 只转能力目录已经声明的东西：type / description / enum / required，不凭空补 items 之类的细节——
-// 编不出来就交给模型按 description 猜，好过编一个错的把调用卡死在校验上。
+// 顶层是 object（properties = 具名字段），并递归展开嵌套 object（Properties）/ array（Items）——
+// 这样模型在字段级就能拿到约束，避免「传错子字段 → 拖到 Lua 运行期才炸」（REQ-AI-SCHEMA-NESTED）。
+// 只转能力目录已声明的东西；自由 map 型参数不画蛇添足（见 ParamSchema 注释）。
 func methodSchemaToJSON(ms MethodSchema) map[string]any {
-	props := map[string]any{}
-	required := []string{}
-	for name, p := range ms.Parameters {
-		prop := map[string]any{"type": p.Type}
-		if p.Description != "" {
-			prop["description"] = p.Description
-		}
-		if len(p.Enum) > 0 {
-			prop["enum"] = p.Enum
-		}
-		props[name] = prop
-		if p.Required {
-			required = append(required, name)
-		}
-	}
-	out := map[string]any{"type": "object", "properties": props}
-	if len(required) > 0 {
-		out["required"] = required
+	return schemaObjectToJSON(ms.Parameters, 0)
+}
+
+// schemaObjectToJSON 把一组具名字段编成 JSON Schema 的 object（type + properties + required 包装）。
+func schemaObjectToJSON(params map[string]ParamSchema, depth int) map[string]any {
+	out := map[string]any{"type": "object", "properties": fieldsToJSON(params, depth)}
+	if req := requiredNames(params); len(req) > 0 {
+		out["required"] = req
 	}
 	return out
+}
+
+// fieldsToJSON 把具名字段编成 map[字段名]字段schema——即 JSON Schema 里 "properties" 的**值本身**
+// （纯字段 map，不带 type/required 外层）。嵌套 object 参数的子字段就直接挂在这里，不再整段重包一层 object。
+func fieldsToJSON(params map[string]ParamSchema, depth int) map[string]any {
+	props := map[string]any{}
+	for name, p := range params {
+		props[name] = paramSchemaToJSON(p, depth)
+	}
+	return props
+}
+
+func requiredNames(params map[string]ParamSchema) []string {
+	req := []string{}
+	for name, p := range params {
+		if p.Required {
+			req = append(req, name)
+		}
+	}
+	return req
+}
+
+// paramSchemaToJSON 编单个参数的 JSON Schema，递归处理嵌套 object（Properties）与 array（Items）。
+func paramSchemaToJSON(p ParamSchema, depth int) map[string]any {
+	prop := map[string]any{}
+	if p.Type != "" {
+		prop["type"] = p.Type
+	}
+	if p.Description != "" {
+		prop["description"] = p.Description
+	}
+	if len(p.Enum) > 0 {
+		prop["enum"] = p.Enum
+	}
+	if depth < schemaMaxDepth && len(p.Properties) > 0 {
+		prop["properties"] = fieldsToJSON(p.Properties, depth+1)
+		if req := requiredNames(p.Properties); len(req) > 0 {
+			prop["required"] = req
+		}
+	}
+	if depth < schemaMaxDepth && p.Items != nil {
+		prop["items"] = paramSchemaToJSON(*p.Items, depth+1)
+	}
+	return prop
 }
 
 // bareFunctionPrimitives 是「在 Lua 侧绑定成**裸函数**、而非带方法的表」的原语——目前只有 call
