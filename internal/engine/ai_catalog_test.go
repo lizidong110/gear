@@ -196,3 +196,152 @@ func TestExtractJSONToAny(t *testing.T) {
 		t.Fatal("非法 JSON 必须报错（由上层回灌提示词重试，不静默猜值）")
 	}
 }
+
+// ---- 方法层检索（能力目录） ----
+//
+// 与 Tool 层（Retrieve）是两个层面：这里检索的是内核能力目录的**方法**（http.Request /
+// ext.redis.set），不是 registry 里的业务 Tool。react 下发的是方法层，所以这一层的召回质量
+// 直接决定「按需检索」能不能取代「全量平铺」。
+
+func newCatalogAgent(t *testing.T) *AIAgent {
+	t.Helper()
+	reg := newTestRegistry(t)
+	t.Cleanup(func() { _ = reg.Close() })
+	return newAIAgent(reg, &scriptedLLM{}, stubRecipes{}, nil)
+}
+
+// TestCapabilityKeywordsReferToRealEntries：关键词表的 key 必须指向真实存在的能力或方法。
+//
+// 拼错一个 key 的后果是**静默失效**——该方法从此检索不到，而没有任何报错。
+// 这正是这里最难查的故障形态：词表看着没错，召回悄悄变差。
+func TestCapabilityKeywordsReferToRealEntries(t *testing.T) {
+	a := newCatalogAgent(t)
+	ents := a.capabilityEntries()
+	byID := map[string]CapabilityEntry{}
+	caps := map[string]bool{}
+	for _, e := range ents {
+		byID[e.ID] = e
+		caps[e.Capability] = true
+	}
+	// 纯函数与门禁原语的能力名恒在目录里；ext.* 是否装配取决于运行环境，
+	// 故 ext 的 key 只校验「方法级 key 的能力部分已被本目录收录」这一条可行约束。
+	for k := range capabilityKeywords {
+		if _, ok := byID[k]; ok {
+			continue // 方法级：真实方法
+		}
+		if strings.HasPrefix(k, "ext.") {
+			continue // ext 域级：装配与否随环境变，不做存在性断言
+		}
+		if !caps[k] {
+			t.Fatalf("关键词表的 key %q 既不是已知方法也不是已知能力（拼错即静默失效）", k)
+		}
+	}
+	// 负向：方法级 key 拼错必须被上面那条抓到。
+	if _, ok := byID["db.quer"]; ok {
+		t.Fatal("测试前提不成立：db.quer 不该是真实方法")
+	}
+}
+
+// TestFindCapabilityRecallsOnRealCatalog：在**真实能力目录**上测召回。
+// 只造 3 个假工具的自造小目录测不出任何问题——BM25 的 IDF 依赖整个目录的词频分布。
+func TestFindCapabilityRecallsOnRealCatalog(t *testing.T) {
+	a := newCatalogAgent(t)
+	if n := len(a.capabilityEntries()); n < 20 {
+		t.Fatalf("测试目录太小（%d 个方法），测不出真实召回", n)
+	}
+	cases := []struct {
+		query string
+		want  string // 期望的 Top-1
+	}{
+		{"发起一个 HTTP 请求", "http.Request"},
+		{"查询数据库", "db.query"},
+		{"加密一段文本", "crypto.encrypt"},
+		{"生成 uuid", "id.uuid"},
+		{"读取密钥", "secret.get"},
+		{"渲染模板", "template.render"},
+		{"当前时间", "time.now"},
+		{"发布事件", "event.notify"},
+		{"校验 JSON 是否符合 schema", "validate.json_schema"},
+	}
+	for _, c := range cases {
+		hits := a.FindCapability(c.query, "", 1)
+		if len(hits) != 1 {
+			t.Fatalf("query=%q 应有 1 个命中，实际 %d", c.query, len(hits))
+		}
+		if hits[0].ID != c.want {
+			t.Fatalf("query=%q Top-1 应为 %s，实际 %s（%.2f 分）", c.query, c.want, hits[0].ID, hits[0].Score)
+		}
+	}
+}
+
+// TestFindCapabilityDomainFilterAndFallback：限域检索 + 限域无命中回退全域。
+// 回退是刻意的：给空列表会让模型去编工具名，比多给几个无关候选糟得多。
+func TestFindCapabilityDomainFilterAndFallback(t *testing.T) {
+	a := newCatalogAgent(t)
+	// domain 按**能力名**匹配，不是 id 首段：方法 id 形如 ext.redis.set，按首段截会全落进
+	// "ext" 一个域，限定等于没限定（domainOf 是给 Tool 层点分 id 设计的）。
+	inDB := a.FindCapability("随便查点什么", "db", 50)
+	if len(inDB) == 0 {
+		t.Fatal("限域 db 应有结果")
+	}
+	for _, h := range inDB {
+		if h.Capability != "db" {
+			t.Fatalf("限域后不得出现其它能力，实际 %s", h.Capability)
+		}
+	}
+	// 限域无命中 → 回退全域（不返回空）
+	all := a.FindCapability("渲染模板", "db", 5)
+	if len(all) == 0 {
+		t.Fatal("限域无命中必须回退全域，不得返回空列表")
+	}
+	if all[0].ID != "template.render" {
+		t.Fatalf("回退全域后应仍能命中正确方法，实际 %s", all[0].ID)
+	}
+}
+
+// TestDescribeCapabilityReturnsFullSchema：describe 必须给出**完整**参数契约
+// （类型 / 必填 / 枚举），而 find 只给名字与参数名——这是「按需展开」的第二级。
+func TestDescribeCapabilityReturnsFullSchema(t *testing.T) {
+	a := newCatalogAgent(t)
+	sch, ok := a.DescribeCapability("http.Request")
+	if !ok {
+		t.Fatal("http.Request 应在能力目录里")
+	}
+	url, ok := sch.Parameters["url"]
+	if !ok {
+		t.Fatalf("describe 应给出参数表，实际 %+v", sch.Parameters)
+	}
+	if !url.Required {
+		t.Fatal("url 是必填参数，describe 必须如实标出必填")
+	}
+	if url.Type != "string" {
+		t.Fatalf("url 类型应为 string，实际 %q", url.Type)
+	}
+	// 负向：目录外的方法必须明确说不存在，而不是返回一个空 schema。
+	if _, ok := a.DescribeCapability("db.no_such_method"); ok {
+		t.Fatal("不存在的 method 必须返回 ok=false，不得返回空 schema 冒充命中")
+	}
+}
+
+// TestCapabilityDomainsGroupMethods：域概览把方法按能力聚合，方法名升序。
+// 这是「分类」在提示词里的落点：模型先扫一眼有哪些域，再决定去哪个域里检索。
+func TestCapabilityDomainsGroupMethods(t *testing.T) {
+	a := newCatalogAgent(t)
+	ds := a.CapabilityDomains()
+	if len(ds) < 5 {
+		t.Fatalf("域数太少（%d），测不出聚合", len(ds))
+	}
+	prev := ""
+	for _, d := range ds {
+		if d.Name <= prev && prev != "" {
+			t.Fatalf("域应按名字升序，实际 %q 在 %q 之后", d.Name, prev)
+		}
+		prev = d.Name
+		if len(d.Methods) == 0 {
+			t.Fatalf("域 %q 不该是空的", d.Name)
+		}
+		if d.Summary == "" {
+			t.Fatalf("域 %q 应带一句摘要（否则模型只能看名字猜）", d.Name)
+		}
+	}
+}

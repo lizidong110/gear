@@ -487,6 +487,14 @@ func defaultAISchemas() map[string]MethodSchema {
 		"domains": {Description: "按 namespace 归类的能力域概览", Parameters: map[string]ParamSchema{
 			"tools": {Type: "array", Description: "工具目录", Required: true},
 		}},
+		"find": {Description: "能力目录检索：按自然语言找「内核原语 / 纯函数 / ext.*」的方法，返回 Top-K 摘要（id + 一句话 + 参数名）。检索的是**方法层**（http.Request / ext.redis.set），不是 registry 里的业务 Tool——后者用 catalog", Parameters: map[string]ParamSchema{
+			"query":  {Type: "string", Description: "检索词（中英文皆可）", Required: true},
+			"domain": {Type: "string", Description: "限定能力名，如 http / ext.redis（可选；限域无命中会回退全域）"},
+			"k":      {Type: "number", Description: "Top-K（可选，默认 5）"},
+		}},
+		"describe": {Description: "取一个方法的完整参数契约（类型/必填/枚举）。与 find 配套：先 find 找到名字，再 describe 取 schema，不必一次摊开整个目录", Parameters: map[string]ParamSchema{
+			"id": {Type: "string", Description: "方法全名，如 http.Request / ext.redis.set", Required: true},
+		}},
 		"validate": {Description: "Flow/Tool 静态校验（复用引擎单一真相源）", Parameters: map[string]ParamSchema{
 			"kind":  {Type: "string", Description: "flow|tool|hook", Required: true},
 			"def":   {Type: "object", Description: "待校验定义", Required: true},

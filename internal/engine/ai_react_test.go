@@ -288,7 +288,7 @@ func TestReactPromptAndToolsText(t *testing.T) {
 		"ext.demo": {"run": {Description: "演示扩展方法", Parameters: map[string]ParamSchema{"x": {Type: "string"}}}},
 	})
 
-	all := a.reactSystemPrompt(reactAllow{all: true}, 4, false)
+	all := a.reactSystemPrompt(reactAllow{all: true}, 4, false, false)
 	if !strings.Contains(all, "最多 4 步") || !strings.Contains(all, "Final Answer") {
 		t.Fatal("系统提示须含步数上限与输出格式约定")
 	}
@@ -297,7 +297,7 @@ func TestReactPromptAndToolsText(t *testing.T) {
 	}
 	// 走 function calling 时必须**不再**要求手写 ```json 围栏：协议已经给了调用通道，
 	// 再让模型手打一遍 JSON 就是基线 B-1 那种「两头打架」。
-	withTools := a.reactSystemPrompt(reactAllow{all: true}, 4, true)
+	withTools := a.reactSystemPrompt(reactAllow{all: true}, 4, true, false)
 	if strings.Contains(withTools, "```json") {
 		t.Fatal("下发 function 声明后不应再要求模型手写 json 围栏")
 	}
@@ -336,7 +336,7 @@ func TestReactAllowMethodLevel(t *testing.T) {
 	})
 
 	// 只允许一个方法：另一个不得进入工具声明。
-	specs, byName := a.reactToolSpecs(reactAllow{names: []string{"ext.demo"}, methods: map[string]bool{"ext.demo.run": true}})
+	specs, byName := a.reactToolSpecs(reactAllow{names: []string{"ext.demo"}, methods: map[string]bool{"ext.demo.run": true}}, false)
 	if len(specs) != 1 {
 		t.Fatalf("方法级 allow 应只产出 1 个工具，实际 %d：%v", len(specs), byName)
 	}
@@ -392,12 +392,12 @@ func TestReactDefaultCapabilitySetIsNarrow(t *testing.T) {
 	if def.all {
 		t.Fatal("默认集不得是不设限")
 	}
-	specs, _ := a.reactToolSpecs(def)
+	specs, _ := a.reactToolSpecs(def, false)
 	if len(specs) == 0 {
 		t.Fatal("默认集不得为空")
 	}
 	// 默认集必须远小于全目录，且不超工具数上限。
-	allSpecs, _ := a.reactToolSpecs(reactAllow{all: true})
+	allSpecs, _ := a.reactToolSpecs(reactAllow{all: true}, false)
 	if len(specs) >= len(allSpecs) {
 		t.Fatalf("默认集(%d) 必须小于全目录(%d)", len(specs), len(allSpecs))
 	}
@@ -477,6 +477,175 @@ func TestReactUsesNativeToolCalls(t *testing.T) {
 	}
 }
 
+// TestReactExecutesEveryToolCallInATurn：模型一轮给多个 tool_calls 时必须**全部**执行。
+// 旧实现只跑 calls[0]、其余静默丢弃：模型以为调了、实际没调，下一轮拿不到任何结果，
+// 只能原样重发，直到撞上重复调用守卫被判「疑似陷入循环」——一个不存在的死循环。
+func TestReactExecutesEveryToolCallInATurn(t *testing.T) {
+	llm := &scriptedLLM{
+		texts: []string{"", "Final Answer: 完成"},
+		calls: [][]ToolCall{
+			{
+				{ID: "c1", Name: SanitizeToolName("db.exec"), Arguments: `{"sql":"SELECT 1"}`},
+				{ID: "c2", Name: SanitizeToolName("db.exec"), Arguments: `{"sql":"SELECT 2"}`},
+			},
+			nil,
+		},
+	}
+	a, entries := newReactAgent(t, llm)
+	if _, err := a.React(context.Background(), "查两件事", ReactOpts{}); err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	if len(*entries) != 2 {
+		t.Fatalf("一轮给了 2 个 tool_call 必须都执行，实际 %d 次：%v", len(*entries), *entries)
+	}
+	// 协议层：每个 tool_call 都要有同 id 的 tool 结果，少一条端点就判请求非法。
+	next := llm.got[len(llm.got)-1]
+	ids := map[string]bool{}
+	for _, m := range next.Messages {
+		if tc, ok := m["tool_calls"].([]map[string]any); ok {
+			for _, c := range tc {
+				if id, _ := c["id"].(string); id != "" {
+					ids[id] = true
+				}
+			}
+		}
+	}
+	if len(ids) != 2 {
+		t.Fatalf("assistant 消息应带 2 个 tool_call，实际 %v", ids)
+	}
+	paired := 0
+	for _, m := range next.Messages {
+		if m["role"] == "tool" {
+			if id, _ := m["tool_call_id"].(string); ids[id] {
+				paired++
+			}
+		}
+	}
+	if paired != 2 {
+		t.Fatalf("应有 2 条与 tool_call 配对的 tool 结果，实际 %d", paired)
+	}
+}
+
+// TestReactFinalAnswerInThoughtDoesNotEndRun：正文里提到 Final Answer 不等于要收尾。
+// 旧正则 `(?i)Final Answer\s*:\s*([\s\S]*)` 大小写不敏感且贪婪到结尾，模型在 Thought 里写
+// 「下一步我会输出 Final Answer: ...」就当场被判收尾——循环一步没跑，答案里没有工具结果。
+func TestReactFinalAnswerInThoughtDoesNotEndRun(t *testing.T) {
+	llm := &scriptedLLM{
+		texts: []string{"Thought: 我先调工具，下一步输出 Final Answer: 待定", "Final Answer: 真正答案"},
+		calls: [][]ToolCall{
+			{{ID: "c1", Name: SanitizeToolName("db.exec"), Arguments: `{"sql":"SELECT 1"}`}},
+			nil,
+		},
+	}
+	a, entries := newReactAgent(t, llm)
+	res, err := a.React(context.Background(), "查一下", ReactOpts{})
+	if err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	m, _ := res.(map[string]interface{})
+	// 本轮带 tool_calls 就绝不能判收尾：模型自己都还没看到工具结果。
+	if m["answer"] != "真正答案" {
+		t.Fatalf("带 tool_calls 的轮次不应判收尾，answer 应为第二轮的真正答案，实际 %q", m["answer"])
+	}
+	if len(*entries) != 1 {
+		t.Fatalf("工具应真的执行了一次，实际 %v", *entries)
+	}
+}
+
+// TestReactFinalAnswerTakesLastOccurrence：一处以上出现 Final Answer 时取**最后一次**。
+// 模型常先起草再改口，取第一次会拿到被自己推翻的草稿。
+func TestReactFinalAnswerTakesLastOccurrence(t *testing.T) {
+	llm := &scriptedLLM{texts: []string{"Thought: 计划\nFinal Answer: 草稿\n\n重新想了想\nFinal Answer: 定稿"}}
+	a, _ := newReactAgent(t, llm)
+	res, err := a.React(context.Background(), "直接答", ReactOpts{})
+	if err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	if m, _ := res.(map[string]interface{}); m["answer"] != "定稿" {
+		t.Fatalf("应取最后一次 Final Answer，实际 %q", m["answer"])
+	}
+}
+
+// TestReactEmptyFinalAnswerDoesNotEndRun：写了「Final Answer:」却没内容，不算回答。
+// 收一个空答案比多跑一步更难查——用户只看到 answer 是空串，不知道卡在哪。
+func TestReactEmptyFinalAnswerDoesNotEndRun(t *testing.T) {
+	llm := &scriptedLLM{texts: []string{"Final Answer:   \n", "Final Answer: 有内容了"}}
+	a, _ := newReactAgent(t, llm)
+	res, err := a.React(context.Background(), "答一下", ReactOpts{})
+	if err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	m, _ := res.(map[string]interface{})
+	if m["answer"] != "有内容了" {
+		t.Fatalf("空 Final Answer 不应收尾，实际 %q", m["answer"])
+	}
+	steps, _ := m["steps"].([]map[string]interface{})
+	if len(steps) != 2 {
+		t.Fatalf("空 Final Answer 那轮应被当作「未收尾」继续跑，实际 steps=%v", steps)
+	}
+	// 回灌的反馈必须自洽：它写了 Final Answer，就不能说它「未输出 Final Answer」。
+	obs, _ := steps[0]["observation"].(string)
+	if !strings.Contains(obs, "没给出内容") {
+		t.Fatalf("应点明「写了 Final Answer 但没内容」，实际 %q", obs)
+	}
+	if strings.Contains(obs, "既未输出合法") {
+		t.Fatalf("不得回灌自相矛盾的格式提示，实际 %q", obs)
+	}
+}
+
+// TestReactNudgesFinalAnswerOnLastStep：倒数第二步用完后必须提醒「只剩最后 1 步」。
+// 不提醒的话模型常在最后一步还要再调一次工具，于是步数用尽、拿不到 Final Answer，
+// 用户看到的是「（达到最大步数 N，未给出 Final Answer）」。
+func TestReactNudgesFinalAnswerOnLastStep(t *testing.T) {
+	llm := &scriptedLLM{
+		texts: []string{"", "Final Answer: 收尾"},
+		calls: [][]ToolCall{{{ID: "c1", Name: SanitizeToolName("db.exec"), Arguments: `{}`}}, nil},
+	}
+	a, _ := newReactAgent(t, llm)
+	if _, err := a.React(context.Background(), "任务", ReactOpts{MaxSteps: 2}); err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	last := llm.got[len(llm.got)-1]
+	for _, m := range last.Messages {
+		if s, _ := m["content"].(string); strings.Contains(s, "只剩最后 1 步") {
+			return
+		}
+	}
+	t.Fatal("末步前应追加收敛引导，实际没有")
+}
+
+// TestReactCompactsOverBudgetContext：超预算折叠最早的观察，但**绝不删条目**——
+// 删条目会破坏 assistant(tool_calls) ↔ tool(tool_call_id) 的配对，端点直接判请求非法。
+func TestReactCompactsOverBudgetContext(t *testing.T) {
+	msgs := []map[string]any{
+		{"role": "system", "content": "系统提示"},
+		{"role": "user", "content": "任务"},
+		{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "c1"}}},
+		{"role": "tool", "tool_call_id": "c1", "content": strings.Repeat("x", 40000)},
+		{"role": "tool", "tool_call_id": "c2", "content": strings.Repeat("y", 40000)},
+	}
+	got := compactReactMessages(msgs)
+	if len(got) != len(msgs) {
+		t.Fatalf("折叠不得改变条数（协议配对会断），实际 %d → %d", len(msgs), len(got))
+	}
+	if s, _ := got[3]["content"].(string); !strings.Contains(s, "已折叠") {
+		t.Fatalf("最早的观察应被折叠，实际 %q", s)
+	}
+	// 折叠后总长必须落到预算内，否则等于没压。
+	total := 0
+	for _, m := range got {
+		total += len(fmt.Sprint(m["content"]))
+	}
+	if total > reactContextBudget {
+		t.Fatalf("折叠后仍超预算：%d > %d", total, reactContextBudget)
+	}
+	// 负向：预算内不得动手。
+	same := compactReactMessages([]map[string]any{{"role": "system", "content": "短"}})
+	if len(same) != 1 {
+		t.Fatal("未超预算时不应改动消息序列")
+	}
+}
+
 // TestReactRejectsUnknownToolNameFromToolCall：模型给了目录里没有的工具名时，
 // 必须明确回绝并列出可用工具，而不是丢一段 Lua 栈错误让它猜（基线 B-3）。
 func TestReactRejectsUnknownToolNameFromToolCall(t *testing.T) {
@@ -524,7 +693,7 @@ func TestReactToolSpecsCoverCapabilityCatalog(t *testing.T) {
 		}}},
 	})
 
-	specs, byName := a.reactToolSpecs(reactAllow{all: true})
+	specs, byName := a.reactToolSpecs(reactAllow{all: true}, false)
 	if len(specs) == 0 {
 		t.Fatal("能力目录非空时工具声明不得为空")
 	}
@@ -562,7 +731,7 @@ func TestReactToolSpecsCoverCapabilityCatalog(t *testing.T) {
 	}
 
 	// allow 过滤后只剩该能力名下的方法。
-	specs2, byName2 := a.reactToolSpecs(reactAllow{names: []string{"ext.demo"}})
+	specs2, byName2 := a.reactToolSpecs(reactAllow{names: []string{"ext.demo"}}, false)
 	if len(specs2) == 0 {
 		t.Fatal("allow 内应保留工具")
 	}
@@ -1224,5 +1393,187 @@ func TestReactMethodReadsIntegerNumbersFromLua(t *testing.T) {
 		if got := strings.Contains(answer, "完成"); got != c.wantDone {
 			t.Errorf("max_steps=%v 时 answer 应含「完成」=%v，实际 %q", c.maxSteps, c.wantDone, answer)
 		}
+	}
+}
+
+// ---- React 元工具模式（Mode=meta）----
+//
+// 工具面恒定为 4 个元工具（find/describe/invoke/registry），与能力目录规模（实测 28 能力 /
+// 115 方法）彻底解耦。这是把「115 个方法平铺进工具面导致工具越多越降智」这个问题的治本办法：
+// 模型先检索、再按需取 schema、最后直调，单轮请求的工具定义从 10-15k token 降到几百。
+
+func TestReactMetaToolSpecsAreConstantFour(t *testing.T) {
+	a := newCatalogAgent(t)
+	// 用不同的 allow 都能得到同一份 4 元工具面：证明规模无关（这是 meta 模式存在的意义）。
+	for _, al := range []reactAllow{{names: []string{"db"}}, {all: true}} {
+		specs, byName := a.reactToolSpecs(al, true)
+		if len(specs) != 4 {
+			t.Fatalf("元工具面应恒为 4 个，实际 %d（allow=%+v）", len(specs), al)
+		}
+		want := map[string]string{
+			"ext_ai_find":        "ext.ai.find",
+			"ext_ai_describe":    "ext.ai.describe",
+			"ext_ai_invoke":      "ext.ai.invoke",
+			"ext_registry_tools": "ext.registry.tools",
+		}
+		for name, orig := range want {
+			if byName[name] != orig {
+				t.Errorf("元工具 %q 反查应为 %q，实际 %q", name, orig, byName[name])
+			}
+		}
+	}
+}
+
+func TestReactMetaBypassesFlatToolBudget(t *testing.T) {
+	// flat 模式 Allow=* 必撞 maxReactTools（115 个方法）；meta 模式工具面恒 4，不受此约束。
+	a, _ := newReactAgent(t, &scriptedLLM{texts: []string{"Final Answer: 直接答"}})
+	if _, err := a.React(context.Background(), "任务",
+		ReactOpts{MaxSteps: 1, Allow: []string{ReactAllowAll}, AllowSet: true, Mode: ReactModeMeta}); err != nil {
+		t.Fatalf("元工具模式不应受工具数上限约束，实际报错: %v", err)
+	}
+}
+
+func TestReactMetaRetrievalStepsAreFree(t *testing.T) {
+	// 核心不变量：find/describe/registry 是「检索步」、不计入 MaxSteps 预算；只有 invoke 才算。
+	// 这里 MaxSteps=1，模型仍可在 invoke 之前自由地 find 一次——证明检索步没吃掉执行预算。
+	a, entries := newReactAgent(t, &scriptedLLM{
+		texts: []string{
+			"Thought: 先用 find 检索数据库方法",
+			"Thought: 用 db.query 查 users 表",
+			"Final Answer: 已查到 users 表数据。",
+		},
+		calls: [][]ToolCall{
+			{{ID: "c1", Name: "ext_ai_find", Arguments: `{"query":"查询数据库"}`}},
+			{{ID: "c2", Name: "ext_ai_invoke", Arguments: `{"capability":"db","method":"query","args":{"table":"users"}}`}},
+			nil,
+		},
+	})
+	out, err := a.React(context.Background(), "查 users 表",
+		ReactOpts{MaxSteps: 1, Allow: []string{"db"}, AllowSet: true, Mode: ReactModeMeta})
+	if err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	m := out.(map[string]interface{})
+	if m["answer"] != "已查到 users 表数据。" {
+		t.Errorf("answer 应为最终答案，实际 %v", m["answer"])
+	}
+	if len(*entries) < 2 {
+		t.Fatalf("find 与 invoke 都应真正执行（分别 1 次），实际 entries=%v", *entries)
+	}
+}
+
+func TestReactMetaInvokeRespectsBudget(t *testing.T) {
+	// MaxSteps=1 时只允许 1 次 invoke；第二次 invoke 应被预算拦下（不真正执行、回灌提示）。
+	a, entries := newReactAgent(t, &scriptedLLM{
+		texts: []string{
+			"Thought: 调一次 db.query",
+			"Thought: 想再调一次",
+			"Final Answer: 完成。",
+		},
+		calls: [][]ToolCall{
+			{{ID: "c1", Name: "ext_ai_invoke", Arguments: `{"capability":"db","method":"query","args":{"table":"a"}}`}},
+			{{ID: "c2", Name: "ext_ai_invoke", Arguments: `{"capability":"db","method":"query","args":{"table":"b"}}`}},
+			nil,
+		},
+	})
+	if _, err := a.React(context.Background(), "任务",
+		ReactOpts{MaxSteps: 1, Allow: []string{"db"}, AllowSet: true, Mode: ReactModeMeta}); err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	if len(*entries) != 1 {
+		t.Errorf("MaxSteps=1 只应执行 1 次 invoke，实际 %d 次: %v", len(*entries), *entries)
+	}
+}
+
+func TestReactMetaInvokeHonorsAllow(t *testing.T) {
+	// invoke 解析出的能力必须在 allow 内：即便工具面只有 4 个元工具，越权调用仍要被拦。
+	a, entries := newReactAgent(t, &scriptedLLM{
+		texts: []string{
+			"Thought: 想调 secret.get",
+			"Final Answer: 没调成。",
+		},
+		calls: [][]ToolCall{
+			{{ID: "c1", Name: "ext_ai_invoke", Arguments: `{"capability":"secret","method":"get","args":{"name":"x"}}`}},
+			nil,
+		},
+	})
+	_, err := a.React(context.Background(), "任务",
+		ReactOpts{MaxSteps: 2, Allow: []string{"db"}, AllowSet: true, Mode: ReactModeMeta})
+	if err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	joined := strings.Join(*entries, "\n")
+	if strings.Contains(joined, "secret.get") {
+		t.Errorf("invoke 越权调用 secret 应被 allow 拦下，实际 entries=%v", *entries)
+	}
+}
+
+func TestReactMetaSystemPromptDescribesWorkflow(t *testing.T) {
+	p := (&AIAgent{}).reactMetaSystemPrompt(4)
+	for _, need := range []string{"ext_ai_find", "ext_ai_describe", "ext_ai_invoke", "ext_registry_tools"} {
+		if !strings.Contains(p, need) {
+			t.Errorf("元工具系统提示须列出 %q", need)
+		}
+	}
+	if !strings.Contains(p, "find") || !strings.Contains(p, "describe") || !strings.Contains(p, "invoke") {
+		t.Error("元工具系统提示须说明 find → describe → invoke 的工作流")
+	}
+}
+
+// ---- React 意图分流（Plan 模式）----
+//
+// 只有 react 一个脑子的问题是：连「今天天气怎么样」这种纯问答也会触发一轮工具循环（即使没调成工具
+// 也白跑）。Plan 模式先花 1 次轻量调用把意图分出来：direct_answer 直接收尾、tool_needed 才进循环。
+
+func TestReactPlanDirectAnswerSkipsLoop(t *testing.T) {
+	// 意图分析判为「无需工具」→ 直接以 answer 收尾，不进 ReAct 循环（不调 LLM.CompleteTools、不执行工具）。
+	a, entries := newReactAgent(t, &scriptedLLM{
+		texts: []string{`{"intent":"direct_answer","needs_tools":false,"plan":"","answer":"北京是中国的首都。"}`},
+	})
+	out, err := a.React(context.Background(), "中国的首都是哪",
+		ReactOpts{MaxSteps: 4, Allow: []string{"db"}, AllowSet: true, Plan: true})
+	if err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	m := out.(map[string]interface{})
+	if m["answer"] != "北京是中国的首都。" {
+		t.Errorf("answer 应等于意图分析的直答，实际 %v", m["answer"])
+	}
+	if m["needs_tools"] != false {
+		t.Errorf("needs_tools 应为 false，实际 %v", m["needs_tools"])
+	}
+	if len(*entries) != 0 {
+		t.Errorf("直答路径不应执行任何工具，实际 entries=%v", *entries)
+	}
+}
+
+func TestReactPlanToolNeededEntersLoop(t *testing.T) {
+	// 意图分析判为「需要工具」→ 进 ReAct 循环，并按计划执行了一次 invoke。
+	a, entries := newReactAgent(t, &scriptedLLM{
+		texts: []string{
+			`{"intent":"tool_needed","needs_tools":true,"plan":"1. 查数据库","answer":""}`,
+			"Thought: 用 db.query 查 users 表",
+			"Final Answer: 查到了。",
+		},
+		calls: [][]ToolCall{
+			nil, // 计划阶段用的是 Complete，不走这里
+			{{ID: "c1", Name: "ext_ai_invoke", Arguments: `{"capability":"db","method":"query","args":{"table":"users"}}`}},
+			nil,
+		},
+	})
+	out, err := a.React(context.Background(), "查 users 表",
+		ReactOpts{MaxSteps: 4, Allow: []string{"db"}, AllowSet: true, Mode: ReactModeMeta, Plan: true})
+	if err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	m := out.(map[string]interface{})
+	if m["needs_tools"] != true {
+		t.Errorf("needs_tools 应为 true，实际 %v", m["needs_tools"])
+	}
+	if m["answer"] != "查到了。" {
+		t.Errorf("answer 应为循环产出，实际 %v", m["answer"])
+	}
+	if len(*entries) < 1 {
+		t.Errorf("需要工具时应执行至少 1 次 invoke，实际 entries=%v", *entries)
 	}
 }

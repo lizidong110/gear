@@ -20,7 +20,7 @@ local r = ctx.ext.ai.react({ task = ctx.input.task, max_steps = 12 })
 return { answer = r.answer }
 ```
 
-CLI 等价：`gear ai react "任务" --max-steps 6 --allow http,db`。
+CLI 等价：`gear ai react "任务" --max-steps 6 --allow http,db`。还可加 `--mode meta`（元工具模式）或 `--plan`（先意图分析）。
 
 **它走原生 function calling**：工具声明由能力目录自动生成后随请求下发，模型用 `tool_calls`
 回调用意图，引擎不再从自由文本里抠 JSON 围栏。两个后果：
@@ -78,6 +78,50 @@ CLI 那条路径以前「不给 `--allow` 就是全目录」，现在也收窄�
 （http / call / db / secret / config / time / template / id / validate + ext.registry，共 23 个方法），
 重型扩展（ext.redis 29 个、ext.oss 6 个）和 crypto（13 个）不在其中。要全目录请显式
 `--allow-all`，但那多半会撞上 48 的上限——撞了就说明该改用方法级 `--allow`。
+
+### 2.4.2 元工具模式（`mode = "meta"`）：工具面恒定 4 个，与目录规模解耦
+
+上面的「工具越多越降智」还有个更彻底的治法，对应你之前问的「MCP 面为什么只挂 15 个意图级工具、
+而不是把 115 个方法平铺」——react 之前恰恰踩进了 MCP 面刻意避开的那个坑：把 115 个方法平铺进
+工具面、每轮重发。元工具模式把这个坑填了：
+
+```lua
+ctx.ext.ai.react({ task = ctx.input.task, mode = "meta" })
+```
+
+工具面**恒定 4 个**，不再随能力数增长：
+
+| 元工具 | 作用 |
+|---|---|
+| `ext_ai_find(query, domain?, limit?)` | 在能力目录里按语义检索方法（BM25），如「加密一段文本」「发邮件」 |
+| `ext_ai_describe(id)` | 拿到方法全名后，查它的完整参数契约（类型 / 必填 / 枚举） |
+| `ext_ai_invoke(capability, method, args)` | 真正执行一个方法（find→describe→invoke 的最后一跳） |
+| `ext_registry_tools(prefix?, limit?)` | 发现调用方在 registry 里定义的业务 Tool / Flow |
+
+工作流是 **find → describe → invoke**：模型先检索定位方法、看清楚参数怎么填，再直调。
+**检索步（find/describe/registry）不计入步数预算**，只有 invoke 算一步——所以 `max_steps`
+约束的是「真正动手几次」，而不是「想了几步」。单轮请求的工具定义从 10-15k token 降到几百，
+且 `--allow-all` 在元模式下**不再撞上限**（工具面永远 4 个）。
+
+> 内置检索靠 `ext.ai.find` / `ext.ai.describe`（BM25 + 受控关键词表，按能力域归类）；
+> 它检索的是**能力目录的方法层**，与 `ext.ai.catalog` 检索的 registry 业务 Tool 是两套语料，别混。
+
+### 2.4.3 意图分流（`plan = true`）：纯问答直接回答，跳过循环
+
+只有 react 一个脑子时，连「今天天气怎么样」这种纯问答也会触发一轮工具循环（即使没调成工具也白跑）。
+`plan = true` 在进循环前先花 1 次轻量调用做意图分析，把任务分三类：
+
+- **direct_answer**：不需要工具，直接以分析出的回答收尾，**不进 ReAct 循环**（省一整轮昂贵的工具循环）。
+- **tool_needed**：需要工具，把分析出的计划注入首条消息，再进循环照计划执行。
+- **ambiguous**：保守当 tool_needed 处理。
+
+```lua
+local r = ctx.ext.ai.react({ task = ctx.input.task, plan = true })
+-- r 比普通返回多带 intent / plan / needs_tools 三个字段
+```
+
+返回结构因此多了 `intent`（分类）、`plan`（分步计划）、`needs_tools`（是否需要工具）；
+直答路径下 `steps` 为空、`used_tools` 为空。默认关闭，行为不变。
 
 ## 2.5 一个装好就能跑的完整范例
 

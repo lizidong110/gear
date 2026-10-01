@@ -241,7 +241,7 @@ type Hook struct {
 **`gear ai`**（内置 `ext.ai` 进程内 agent）
 - `ai gen flow` / `ai gen tool`：`--intent` / 位置参数、`--register`（自动落库）
 - `ai capabilities`：打印当前能力目录（内核原语 + 已注册 `ext.*`）。内核原语分两类：**受门禁的 builtin 7 个**（http/call/db/secret/event/subscribe/config，需在 Tool 里声明 `capabilities`）+ **始终可用的 pure 5 个**（time/template/crypto/id/validate，无需声明）。目录由代码单一来源渲染（`allBuiltinPrimitives` + `capabilityCatalog`），不再各写一份字面量清单
-- `ai react "任务"`：跑一个 ReAct 循环（每步思考→调工具→看结果，直到 Final Answer）。`--max-steps`（默认 6）/ `--allow`（限制可用能力：能力名如 `http,secret`，或方法名如 `ext.redis.set`）/ `--allow-all`（不设限开放整个能力目录）。等价于在 Tool 的 entry 里调 `ctx.ext.ai.react({ task = "..." })`——**用它打造自己的 agent 是最短路径**
+- `ai react "任务"`：跑一个 ReAct 循环（每步思考→调工具→看结果，直到 Final Answer）。`--max-steps`（默认 6）/ `--allow`（限制可用能力：能力名如 `http,secret`，或方法名如 `ext.redis.set`）/ `--allow-all`（不设限开放整个能力目录）/ `--mode meta`（元工具模式：工具面恒定 4 个、按需检索，规模无关）/ `--plan`（先意图分析：纯问答直接回答、跳过循环）。等价于在 Tool 的 entry 里调 `ctx.ext.ai.react({ task = "..." })`（同款 `mode` / `plan` 字段）——**用它打造自己的 agent 是最短路径**
 - `ai complete "prompt"`：单轮补全（无记忆、无工具）。仅做「一次问答」时用，多步任务请走 `ai react`
   > **react 走原生 function calling**：工具声明由能力目录自动生成并随请求下发（`ToolSpec`），模型用 `tool_calls` 回调用意图，引擎不再从自由文本里抠 JSON 围栏。工具名里的「.」会被压成「_」（`http.Request` → `http_Request`，OpenAI 的 function name 字符集所限）。
   > **`ai react` 会先灌入持久 registry 的目录**（与 `ai gen` 同一手法）：agent 看得到真实的 Tool/Flow 定义，写操作仍隔离在内存库里。库里若有声明了不存在原语的过期定义，会被跳过并在 stderr 点名（不会让整个命令失败）。

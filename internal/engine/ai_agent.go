@@ -203,6 +203,41 @@ func (a *AIAgent) Catalog(args map[string]interface{}) (interface{}, error) {
 	return map[string]interface{}{"tools": Retrieve(tools, domain, query, k)}, nil
 }
 
+// Find 在**能力目录**里按 BM25 检索方法（ext.ai.find）。
+//
+// 与 Catalog 的区别必须说死：Catalog/Retrieve 检索的是 registry 里的业务 Tool（设计态
+// generate 生成 Flow 用），Find 检索的是内核能力目录的**方法**（http.Request / ext.redis.set）。
+// 两者语料不相交——用 Catalog 去找方法只会拿到空结果，还容易误判成「检索坏了」。
+func (a *AIAgent) Find(args map[string]interface{}) (interface{}, error) {
+	query, _ := args["query"].(string)
+	if strings.TrimSpace(query) == "" {
+		return nil, fmt.Errorf("find 需要 query（检索词）；要看全部能力域请用 ext.ai.capabilities()")
+	}
+	domain, _ := args["domain"].(string)
+	k := 5
+	// toFloat 而非断言 float64：Lua 整数字面量出来是 int64（见 ReactMethod 同款坑）。
+	if v, ok := toFloat(args["k"]); ok && int(v) > 0 {
+		k = int(v)
+	}
+	return map[string]interface{}{"hits": a.FindCapability(query, domain, k)}, nil
+}
+
+// Describe 返回一个方法的完整参数契约（ext.ai.describe）。
+// 与 Find 合成「按需展开」：先用 find 看清有哪些方法，再只取要用的那一个的 schema——
+// 不用一次把 115 个方法的完整 schema 都摊开。
+func (a *AIAgent) Describe(args map[string]interface{}) (interface{}, error) {
+	id, _ := args["id"].(string)
+	if strings.TrimSpace(id) == "" {
+		return nil, fmt.Errorf("describe 需要 id（形如 http.Request 或 ext.redis.set）")
+	}
+	sch, ok := a.DescribeCapability(id)
+	if !ok {
+		// 明确报错而不是回空：空结果会让调用方以为「这个方法的参数就是空」。
+		return nil, fmt.Errorf("能力 %q 不在目录里；用 ext.ai.find 检索，或 ext.ai.capabilities() 看全目录", id)
+	}
+	return sch, nil
+}
+
 // Domains 按 namespace 归类出能力域概览。
 func (a *AIAgent) Domains(args map[string]interface{}) (interface{}, error) {
 	tools, err := a.loadTools()
@@ -327,7 +362,14 @@ type ReactOpts struct {
 	BaseURL     string   // API base（可选）
 	APIKey      string   // API key（可选，优先 env）
 	Temperature float64  // 采样温度（可选，默认 0.3）
+	Mode        string   // 工具面模式：""（默认）= 扁平全量；"meta" = 4 个元工具按需检索
+	Plan        bool     // 是否先做意图分析（判断需不需要工具、给出计划）：纯问答可跳过 ReAct 循环省 token
 }
+
+// ReactModeMeta 是「元工具模式」：工具面恒定为 4 个元工具（find / describe / invoke / registry），
+// 与能力目录规模（实测 28 能力 / 115 方法）彻底解耦。模型先用 find 检索、describe 取 schema，
+// 再用 invoke 直调——单轮请求的工具定义从 10-15k token 降到几百。flat 模式仍是默认，保证兼容。
+const ReactModeMeta = "meta"
 
 // reactAllow 把「react 能调哪些工具」从**隐式约定**变成**显式值**。
 //
@@ -531,13 +573,14 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 	if err != nil {
 		return nil, err
 	}
-	tools, toolByName := a.reactToolSpecs(allow)
-	// 工具数上限在这里拦（写作期可查，不必等模型选错）：宁可报错让人收窄，也不静默截断。
-	if len(tools) > maxReactTools {
+	metaMode := opts.Mode == ReactModeMeta
+	tools, toolByName := a.reactToolSpecs(allow, metaMode)
+	// 工具数上限（flat 模式）：宁可报错让人收窄，也不静默截断——meta 模式工具面恒定为 4 个，不在此列。
+	if !metaMode && len(tools) > maxReactTools {
 		return nil, fmt.Errorf("react 工具数 %d 超过上限 %d：工具越多模型越选不准；"+
-			"请用方法级 allow（形如 \"ext.redis.set\"）收窄，或砍掉与本次任务无关的能力", len(tools), maxReactTools)
+			"请用方法级 allow（形如 \"ext.redis.set\"）收窄，或改用元工具模式（mode=\"meta\"，工具面恒定 4 个）", len(tools), maxReactTools)
 	}
-	sys := a.reactSystemPrompt(allow, opts.MaxSteps, len(tools) > 0)
+	sys := a.reactSystemPrompt(allow, opts.MaxSteps, len(tools) > 0, metaMode)
 	// msgs 是本任务的完整消息序列（取代原先「把历史拼成一段长文本」的做法）。
 	//
 	// 必须按协议维护而不是拼文本：assistant 消息里带了 tool_calls 之后，紧跟着的必须是
@@ -551,6 +594,38 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 	usedTools := []string{}
 	seen := map[string]bool{}
 	finalAnswer := ""
+
+	// 意图分流（Plan 模式）：先花 1 次轻量调用判断「要不要进 ReAct 循环」。
+	// 纯问答/闲聊直接收尾，省掉一整轮昂贵的工具循环。默认关闭，行为不变。
+	var intentInfo map[string]interface{}
+	if opts.Plan {
+		intent, plan, needsTools, directAnswer, perr := a.planTask(ctx, task, opts)
+		if perr != nil {
+			return nil, fmt.Errorf("react 意图分析失败: %w", perr)
+		}
+		intentInfo = map[string]interface{}{"intent": intent, "plan": plan, "needs_tools": needsTools}
+		if !needsTools {
+			// 不需要工具：直接以意图分析的回答收尾，不再进循环。
+			steps = append(steps, map[string]interface{}{
+				"thought":     "意图分析：无需调用工具，直接回答",
+				"action":      nil,
+				"observation": directAnswer,
+			})
+			return map[string]interface{}{
+				"answer":      strings.TrimSpace(directAnswer),
+				"intent":      intent,
+				"plan":        plan,
+				"needs_tools": needsTools,
+				"steps":       steps,
+				"used_tools":  []string{},
+			}, nil
+		}
+		// 需要工具：把计划注入首条 user 消息，让循环照计划推进。
+		if p := strings.TrimSpace(plan); p != "" {
+			msgs[1]["content"] = fmt.Sprintf("%s\n\n已分析出的执行计划（请照此推进，用完工具后给 Final Answer）：\n%s",
+				msgs[1]["content"], p)
+		}
+	}
 
 	// appendAssistant 把模型这一轮的回话按协议塞回序列：带 tool_calls 时必须原样带上，
 	// 否则下一条 tool 结果没有可对应的 id（OpenAI 兼容端点会直接判非法）。
@@ -609,7 +684,143 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 		return record(obs)
 	}
 
-	for i := 0; i < opts.MaxSteps; i++ {
+	// runCall 执行一条原生 tool_call，返回要回灌的 Observation（消息组装由调用方按 id 负责）。
+	// 与 execute 同理抽成闭包：原生协议路径和文本兜底路径共用同一套守卫，抄两份必漏改。
+	runCall := func(c ToolCall, thought string) string {
+		orig, ok := toolByName[c.Name]
+		if !ok {
+			// 模型给了目录里没有的名字：明确回绝并列出可用工具。少了这一步，它拿到的是
+			// 一段 Lua 栈错误（attempt to index a nil value），只能瞎猜重试。
+			// 工具多时如实截断（不静默缩水）：列全量本身就会把上下文撑爆。
+			names := make([]string, 0, len(tools))
+			for _, t := range tools {
+				names = append(names, t.Name)
+			}
+			listed := names
+			if len(listed) > 20 {
+				listed = append(listed[:20:20], fmt.Sprintf("…（共 %d 个，其余请用检索工具查找）", len(names)))
+			}
+			obs := fmt.Sprintf("工具 %q 不存在，可用工具：%s", c.Name, strings.Join(listed, ", "))
+			steps = append(steps, map[string]interface{}{"thought": thought, "action": nil, "observation": obs})
+			return obs
+		}
+		args := map[string]interface{}{}
+		if s := strings.TrimSpace(c.Arguments); s != "" {
+			if err := json.Unmarshal([]byte(s), &args); err != nil {
+				obs := fmt.Sprintf("工具 %q 的参数不是合法 JSON：%v", orig, err)
+				steps = append(steps, map[string]interface{}{"thought": thought, "action": orig, "observation": obs})
+				return obs
+			}
+			if args == nil {
+				args = map[string]interface{}{}
+			}
+		}
+		tool, method := splitToolMethod(orig, "")
+		return execute(tool, method, args, thought)
+	}
+
+	// isMetaRetrieval 报告 orig（压平前的工具全名）是不是「检索类元工具」——find / describe /
+	// registry。这类调用不计入执行步数预算，且绕过 allow 守卫（它们是发现机制本身，元工具
+	// 模式下永远可用；若被 allow 拦住，反而让 invoke 没东西可查）。
+	//
+	// invoke 不在这里：它是真正的执行动作，必须受 allow 与步数预算约束。
+	isMetaRetrieval := func(orig string) bool {
+		return orig == "ext.ai.find" || orig == "ext.ai.describe" || orig == "ext.registry.tools"
+	}
+
+	// execInternal 与 execute 同执行通道，但**跳过 allow 守卫**——只用于元工具外壳
+	// （find/describe/registry），它们本身不受 allow 约束。重复调用守卫、执行、观察截断依旧生效。
+	execInternal := func(tool, method string, args map[string]interface{}, thought string) string {
+		action := tool + "." + method
+		record := func(obs string) string {
+			steps = append(steps, map[string]interface{}{"thought": thought, "action": action, "observation": obs})
+			return obs
+		}
+		key := action + " " + stableJSON(args)
+		if seen[key] {
+			return record("检测到重复调用相同工具与参数，疑似陷入循环，已停止该步")
+		}
+		seen[key] = true
+		entry, err := buildActionEntry(tool, method, args)
+		if err != nil {
+			return record("构建工具调用失败：" + err.Error())
+		}
+		out, err := a.exec(ctx, entry, map[string]interface{}{})
+		var obs string
+		if err != nil {
+			obs = "工具执行错误：" + err.Error()
+		} else if out != nil {
+			if r, ok := out["result"]; ok {
+				obs = stableJSON(r)
+			} else {
+				obs = stableJSON(out)
+			}
+		} else {
+			obs = "(无输出)"
+		}
+		obs = truncateObservation(obs, 3000)
+		usedTools = appendUnique(usedTools, action)
+		return record(obs)
+	}
+
+	// parseToolCallArgs 解析一条 tool_call 的 JSON 参数（容错：非法 JSON 也返回空 map 不崩）。
+	parseToolCallArgs := func(s string) map[string]interface{} {
+		args := map[string]interface{}{}
+		if s := strings.TrimSpace(s); s != "" {
+			if err := json.Unmarshal([]byte(s), &args); err != nil {
+				args = map[string]interface{}{}
+			}
+		}
+		if args == nil {
+			args = map[string]interface{}{}
+		}
+		return args
+	}
+
+	// runMetaRetrieval 执行检索类元工具（find / describe / registry），返回要回灌的 Observation。
+	// 复用 execute 的通道但跳过 allow：元工具是发现面，元模式下恒可用。
+	runMetaRetrieval := func(c ToolCall, orig, thought string) string {
+		args := parseToolCallArgs(c.Arguments)
+		switch orig {
+		case "ext.ai.find":
+			return execInternal("ext.ai", "find", args, thought)
+		case "ext.ai.describe":
+			return execInternal("ext.ai", "describe", args, thought)
+		case "ext.registry.tools":
+			return execInternal("ext.registry", "tools", args, thought)
+		}
+		return "未知的元工具：" + orig
+	}
+
+	// runMetaInvoke 执行 ext.ai.invoke：从参数解出真正要调的能力与方法，再走 execute（受 allow 与预算约束）。
+	runMetaInvoke := func(c ToolCall, thought string) string {
+		args := parseToolCallArgs(c.Arguments)
+		tool, _ := args["capability"].(string)
+		method, _ := args["method"].(string)
+		if tool == "" || method == "" {
+			obs := "ext.ai.invoke 需要 capability 与 method（形如 {\"capability\":\"db\",\"method\":\"query\"}）"
+			steps = append(steps, map[string]interface{}{"thought": thought, "action": "ext.ai.invoke", "observation": obs})
+			return obs
+		}
+		callArgs, _ := args["args"].(map[string]interface{})
+		if callArgs == nil {
+			callArgs = map[string]interface{}{}
+		}
+		return execute(tool, method, callArgs, thought)
+	}
+
+	// execSteps 是「真正执行了一次能力调用」的计数；maxRounds 是 LLM 轮次的上限（防死循环）。
+	// 两者在 flat 模式重合（每轮调用都算一步、且 MaxSteps 即轮次上限）；在 meta 模式分开：
+	// find/describe/registry 是「检索步」、不计入预算，只有 invoke 才算一步，故轮次上限放宽松。
+	execSteps := 0
+	maxRounds := opts.MaxSteps
+	if metaMode {
+		maxRounds = opts.MaxSteps*3 + 5
+	}
+	for i := 0; i < maxRounds; i++ {
+		// 上下文预算：每轮开工前压一次。不压的话长任务会在第 4、5 步撞上端点的上下文
+		// 窗口，报出来的却是「LLM 调用失败」，看不出根因是上下文——最难的那种 bug。
+		msgs = compactReactMessages(msgs)
 		req := LLMRequest{
 			Messages:    msgs,
 			Provider:    opts.Provider,
@@ -635,60 +846,78 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 			resp = text
 		}
 
-		// Final Answer 优先于 Action。
-		if fa, ok := extractFinalAnswer(resp); ok {
-			finalAnswer = strings.TrimSpace(fa)
-			steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": nil, "observation": finalAnswer})
-			break
+		// Final Answer 判定必须**让位于**工具调用：模型这一轮还带着 tool_calls，说明它
+		// 自己也没看到工具结果，正文里那句「Final Answer」只是计划或口误——照它收尾就
+		// 等于让循环在第一次思考时结束，答案里一个工具都没真跑过。
+		//
+		// 历史缺陷（2026-10-01 修）：旧代码先判 Final Answer，且用的正则
+		// `(?i)Final Answer\s*:\s*([\s\S]*)` 大小写不敏感 + 贪婪到结尾。模型在 Thought 里
+		// 写一句「下一步我会输出 Final Answer:」就当场被判收尾，整个循环提前退出。
+		if len(calls) == 0 {
+			if fa, ok := extractFinalAnswer(resp); ok {
+				finalAnswer = strings.TrimSpace(fa)
+				steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": nil, "observation": finalAnswer})
+				break
+			}
 		}
 
 		// 原生 tool_calls 优先：模型按协议给出的调用意图，比从自由文本里抠 JSON 可靠得多——
 		// 基线 B-1（格式不遵守白扔一步）与 B-3（编造工具名只换回一段 Lua 栈错误）都出在老路径上。
 		// 有 tool_calls 就不再解析正文。
 		if len(calls) > 0 {
-			// 每轮只处理第一个调用（与「每轮只能调用一个工具」的约定一致），并且只把这
-			// 一个记回 assistant 消息——协议要求每个 tool_call 都有对应的 tool 结果，
-			// 记多了对不上会被端点判非法。
-			active := calls[0]
-			appendAssistant(resp, []ToolCall{active})
-			toolMsg := func(obs string) {
-				msgs = append(msgs, map[string]any{"role": "tool", "tool_call_id": active.ID, "content": obs})
-			}
-
-			orig, ok := toolByName[active.Name]
-			if !ok {
-				// 模型给了目录里没有的名字：明确回绝并列出可用工具。少了这一步，它拿到的是
-				// 一段 Lua 栈错误（attempt to index a nil value），只能瞎猜重试。
-				names := make([]string, 0, len(tools))
-				for _, t := range tools {
-					names = append(names, t.Name)
-				}
-				obs := fmt.Sprintf("工具 %q 不存在，可用工具：%s", active.Name, strings.Join(names, ", "))
-				steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": nil, "observation": obs})
-				toolMsg(obs)
-				continue
-			}
-			args := map[string]interface{}{}
-			if s := strings.TrimSpace(active.Arguments); s != "" {
-				if err := json.Unmarshal([]byte(s), &args); err != nil {
-					obs := fmt.Sprintf("工具 %q 的参数不是合法 JSON：%v", orig, err)
-					steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": orig, "observation": obs})
-					toolMsg(obs)
-					continue
-				}
-				if args == nil {
-					args = map[string]interface{}{}
+			// 模型一轮可以给多个调用（tool_calls 本就是数组，并行调用是协议允许的）。
+			// 旧实现只执行 calls[0]，其余**静默丢弃**：模型以为调了、实际没调，下一轮拿不到
+			// 任何结果，只能原样重发，直到撞上重复调用守卫被判「疑似陷入循环」。
+			// 每个调用都必须有一条同 id 的 tool 消息回灌，少一条端点就判请求非法。
+			appendAssistant(resp, calls)
+			invokedThisRound := false
+			thought := trimThought(resp)
+			for _, c := range calls {
+				orig := toolByName[c.Name]
+				switch {
+				case metaMode && orig == "ext.ai.invoke":
+					// invoke 是真正的能力调用：计为一步、受 allow 与预算双重约束。
+					if execSteps >= opts.MaxSteps {
+						msgs = append(msgs, map[string]any{"role": "tool", "tool_call_id": c.ID,
+							"content": fmt.Sprintf("已达到最大调用步数 %d，请直接给出 Final Answer（不再执行工具调用）。", opts.MaxSteps)})
+						invokedThisRound = true
+						continue
+					}
+					invokedThisRound = true
+					msgs = append(msgs, map[string]any{"role": "tool", "tool_call_id": c.ID, "content": runMetaInvoke(c, thought)})
+				case metaMode && isMetaRetrieval(orig):
+					// find / describe / registry 是「检索步」：不计入步数预算，绕过 allow 守卫
+					// （它们是发现机制本身，永远可用），只复用重复调用守卫避免死循环。
+					msgs = append(msgs, map[string]any{"role": "tool", "tool_call_id": c.ID, "content": runMetaRetrieval(c, orig, thought)})
+				default:
+					// flat 模式的真实能力调用（或文本兜底路径），按原逻辑走 execute / runCall。
+					invokedThisRound = true
+					msgs = append(msgs, map[string]any{"role": "tool", "tool_call_id": c.ID, "content": runCall(c, thought)})
 				}
 			}
-			tool, method := splitToolMethod(orig, "")
-			obs := execute(tool, method, args, trimThought(resp))
-			toolMsg(obs)
+			if invokedThisRound {
+				execSteps++
+			}
+			// 末步收敛引导：不提醒的话模型常在最后一步还要再调一次工具，于是步数用尽、
+			// 拿不到 Final Answer，用户看到的是「（达到最大步数 N，未给出 Final Answer）」。
+			if remaining := opts.MaxSteps - execSteps; remaining <= 1 {
+				msgs = append(msgs, map[string]any{"role": "user",
+					"content": "只剩最后 1 步：请直接给出 Final Answer（信息不足就说明缺什么、已完成了哪些）。"})
+			}
 			continue
 		}
 
 		// 文本兜底：模型没给 tool_calls（不支持 function calling，或这轮只想说话）时沿用老路径。
 		// 这里没有 tool_calls，回灌就用普通 user 消息——不带 tool_call_id 才合法。
 		appendAssistant(resp, nil)
+		// 写了「Final Answer:」却没内容：明确要它补上。落到下面的兜底会回灌「既未输出合法
+		// Action 也未输出 Final Answer」——对它来说这句话是错的（它明明写了），只能瞎重试。
+		if reFinalAny.MatchString(resp) {
+			obs := "你写了 Final Answer 但没给出内容，请把答案补在 Final Answer 后面。"
+			steps = append(steps, map[string]interface{}{"thought": trimThought(resp), "action": nil, "observation": obs})
+			msgs = append(msgs, map[string]any{"role": "user", "content": "Observation: " + obs})
+			continue
+		}
 		tool, method, args, ok := parseReactAction(resp)
 		if !ok {
 			obs := "你本轮既未输出合法 Action（```json {...} ```）也未输出 Final Answer，请严格按格式继续。"
@@ -703,11 +932,60 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 	if finalAnswer == "" {
 		finalAnswer = fmt.Sprintf("（达到最大步数 %d，未给出 Final Answer）", opts.MaxSteps)
 	}
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"answer":     finalAnswer,
 		"steps":      steps,
 		"used_tools": usedTools,
-	}, nil
+	}
+	if intentInfo != nil {
+		result["intent"] = intentInfo["intent"]
+		result["plan"] = intentInfo["plan"]
+		result["needs_tools"] = intentInfo["needs_tools"]
+	}
+	return result, nil
+}
+
+// reactContextBudget 是 react 消息序列的软上限（字符数，含 system 提示与全部观察）。
+//
+// 按字符数而不是 token 数：内核不该为一个提示词去引分词器，粗粒度够用；真要精确就得按
+// 模型算，那是 ai_llm.go 的职责。48000 字符约合中文 48k token，够 max_steps 跑完一轮。
+const reactContextBudget = 48000
+
+// compactReactMessages 超预算时把**最早的观察**折叠成一行摘要；前两条（system + 任务）永不折叠。
+//
+// 折叠而非丢弃：删条目会破坏「assistant(tool_calls) ↔ tool(tool_call_id)」的配对，端点直接
+// 判请求非法。折叠只换 content，条数与 id 都不动，协议层面始终自洽。
+//
+// 折叠而非截断：截断把一条观察砍成半句，模型读到残缺 JSON 比没有这条更容易出错。
+// 折叠保留「第几条、原本多长」，它要细节可以重新调一次工具——这是可恢复的，截断不是。
+func compactReactMessages(msgs []map[string]any) []map[string]any {
+	if len(msgs) <= 2 {
+		return msgs
+	}
+	total := 0
+	for _, m := range msgs {
+		total += len(fmt.Sprint(m["content"]))
+	}
+	if total <= reactContextBudget {
+		return msgs
+	}
+	folded := 0
+	// 从最早开始折：早期观察被后续步骤取代的概率最高。
+	for i := 2; i < len(msgs) && total > reactContextBudget; i++ {
+		role, _ := msgs[i]["role"].(string)
+		if role != "tool" && role != "user" {
+			continue
+		}
+		body, _ := msgs[i]["content"].(string)
+		if len(body) <= 32 {
+			continue // 太短，折了也省不出什么
+		}
+		folded++
+		summary := fmt.Sprintf("（第 %d 条观察已折叠，原 %d 字符；需要细节请重新调用该工具）", folded, len(body))
+		msgs[i]["content"] = summary
+		total += len(summary) - len(body)
+	}
+	return msgs
 }
 
 // ReactMethod 暴露给 Lua ctx.ext.ai.react：解析参数后跑 React 循环。
@@ -723,6 +1001,12 @@ func (a *AIAgent) ReactMethod(args map[string]interface{}, callerCaps ...string)
 	// `max_steps = 8` 一直按默认 6 步跑，肉眼看不出来。
 	if v, ok := toFloat(args["max_steps"]); ok && int(v) > 0 {
 		opts.MaxSteps = int(v)
+	}
+	if s, ok := args["mode"].(string); ok && s != "" {
+		opts.Mode = s
+	}
+	if b, ok := args["plan"].(bool); ok && b {
+		opts.Plan = true
 	}
 	// 显式给 allow 时必须是调用方自己声明的子集——否则「给个 allow 绕过门禁」就成了后门。
 	explicit := toStringSlice(args["allow"])
@@ -770,11 +1054,63 @@ func (a *AIAgent) ReactMethod(args map[string]interface{}, callerCaps ...string)
 	return a.React(context.Background(), task, opts)
 }
 
+// planTask 是 react 之前的「意图分析」层：判断任务是否需要工具、给出执行计划。
+//
+// 意义：绝大多数纯问答/闲聊根本不需要进 ReAct 循环（那是一连串昂贵的工具调用）；
+// 先花 1 次轻量调用把意图分出来，direct_answer 类直接收尾，能省掉整个循环。这是把
+// 「只有 react 一个脑子」升级成「意图分流 → 直答 / 进循环」的关键一步。
+//
+// 失败时**保守退化为 needsTools=true**：宁可多跑一轮循环，也不要误把需要工具的任务当成能直答。
+// 返回 needsTools=false 时调用方应直接以 answer 收尾，不再进循环。
+func (a *AIAgent) planTask(ctx context.Context, task string, opts ReactOpts) (intent, plan string, needsTools bool, answer string, err error) {
+	sys := "你是 Gear 智能体的规划器。分析用户任务，判断它是否需要调用工具（如发 HTTP 请求、" +
+		"查数据库、调扩展能力 ext.*）才能完成，还是仅靠常识/知识就能直接回答。\n" +
+		"必须只输出一个 JSON 对象（不要任何多余文字、不要 markdown 围栏）：\n" +
+		"{\"intent\": \"direct_answer 或 tool_needed 或 ambiguous\", " +
+		"\"needs_tools\": true或false, " +
+		"\"plan\": \"分步计划（tool_needed 时写执行步骤，direct_answer 时为空串）\", " +
+		"\"answer\": \"若不需要工具、可立即给出的回答（direct_answer 时填写，否则空串）\"}"
+	req := LLMRequest{
+		System:      sys,
+		Prompt:      "任务：" + task,
+		Provider:    opts.Provider,
+		Model:       opts.Model,
+		BaseURL:     opts.BaseURL,
+		APIKey:      opts.APIKey,
+		Temperature: opts.Temperature,
+		Format:      "json",
+	}
+	text, cerr := a.llm.Complete(ctx, req)
+	if cerr != nil {
+		return "", "", true, "", cerr
+	}
+	v, perr := extractJSONToAny(text)
+	if perr != nil {
+		return "", "", true, "", nil
+	}
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		return "", "", true, "", nil
+	}
+	intent, _ = m["intent"].(string)
+	plan, _ = m["plan"].(string)
+	answer, _ = m["answer"].(string)
+	if b, ok := m["needs_tools"].(bool); ok {
+		needsTools = b
+	} else {
+		needsTools = true
+	}
+	return intent, plan, needsTools, answer, nil
+}
+
 // reactSystemPrompt 拼装 ReAct 的系统提示：可用工具（来自能力目录，可经 allow 过滤）+ 输出格式 + 规则。
 // useTools 表示本轮会随请求下发 function 声明（原生 function calling）。为 true 时不再要求模型
 // 手写 ```json 围栏——协议已经给了调用通道，再要求它手打一遍 JSON 只会两头打架（基线 B-1 的
 // 「格式不遵守白扔一步」就是这么来的）。
-func (a *AIAgent) reactSystemPrompt(al reactAllow, maxSteps int, useTools bool) string {
+func (a *AIAgent) reactSystemPrompt(al reactAllow, maxSteps int, useTools bool, meta bool) string {
+	if meta {
+		return a.reactMetaSystemPrompt(maxSteps)
+	}
 	// useTools=true 时协议侧已随请求下发完整 function 声明，提示词里只给「能力 → 方法名」
 	// 索引（brief），不把参数再抄一遍——同一份信息付两遍钱，且每轮都要重发。
 	tools := a.reactToolsText(al, useTools)
@@ -814,8 +1150,36 @@ func (a *AIAgent) reactSystemPrompt(al reactAllow, maxSteps int, useTools bool) 
 	return b.String()
 }
 
-// reactToolsText 把可用工具压成给 LLM 看的文本（与 capabilitiesText 同源，但支持 allow 过滤）。
-//
+// reactMetaSystemPrompt 是元工具模式的系统提示：工具面恒定 4 个，提示词里把「怎么用这 4 个工具」
+// 说清楚，而不是列能力目录（那样又回到全量平铺的老路）。核心是一句话工作流：find → describe → invoke。
+func (a *AIAgent) reactMetaSystemPrompt(maxSteps int) string {
+	var b strings.Builder
+	b.WriteString("你是一个运行在 Gear 引擎内的 ReAct（推理 + 行动）智能体。Gear 的能力目录有上百个方法，但你不一次全看，而是**按需检索**——你手上只有 4 个工具：\n\n")
+	b.WriteString("## 你的工具（恒定 4 个，不要编造别的）\n")
+	b.WriteString("- `ext_ai_find(query, domain?, limit?)`：按自然语言检索能力目录里的方法（BM25）。不确定能做什么、或不知道方法名叫什么时先调它。返回方法全名 + 一句话说明 + 参数名。\n")
+	b.WriteString("- `ext_ai_describe(id)`：拿到方法全名后，查它的完整参数契约（类型 / 必填 / 枚举）。调 invoke 之前务必先看清楚参数怎么填。\n")
+	b.WriteString("- `ext_ai_invoke(capability, method, args)`：真正执行一个方法。capability 是能力名（如 db / http / ext.redis），method 是方法名（如 query / set / encrypt），args 是 describe 给的参数对象。\n")
+	b.WriteString("- `ext_registry_tools(prefix?, limit?)`：列出用户在 registry 里定义的业务 Tool / Flow，需要调用用户自建工具时用它发现。\n\n")
+	b.WriteString("## 工作流（严格遵守）\n")
+	b.WriteString("1. 先用 `ext_ai_find` 找到匹配任务的方法；一次找不到就换个说法或加 domain 再找。\n")
+	b.WriteString("2. 对要调用的每个方法，先 `ext_ai_describe` 看参数，再 `ext_ai_invoke` 执行——**不要凭猜测填参数**，参数结构以 describe 为准。\n")
+	b.WriteString("3. 信息足够后输出 Final Answer。find / describe / registry 是「检索步」、不计入下面的步数预算；只有 invoke 才算一步。\n\n")
+	b.WriteString("## 每轮输出格式（严格遵守）\n")
+	b.WriteString("先写思考，然后用**工具调用**发起调用（不要把参数手写成 JSON 文本）：\n\n")
+	b.WriteString("Thought: <这一步你在想什么>\n")
+	b.WriteString("（随后发起一次工具调用）\n\n")
+	b.WriteString("当你认为信息已足够、可以回答用户时，输出：\n\n")
+	b.WriteString("Thought: <总结>\n")
+	b.WriteString("Final Answer: <给用户的完整回答>\n\n")
+	b.WriteString("## 规则\n")
+	b.WriteString("- 工具名形如 ext_ai_find：下划线处原本是「.」（ext.ai.find 压平而来），字符集所限。\n")
+	b.WriteString("- 每轮只能调用一个工具，用工具调用发起；参数是结构化的，不要手写 JSON 文本。\n")
+	b.WriteString("- 不要编造方法名或参数；拿不准就 find / describe，找不到就说明做不到。\n")
+	b.WriteString("- Observation（工具返回）会由系统填回作为下一步输入；不要自己编造 Observation。\n")
+	b.WriteString(fmt.Sprintf("- 最多 %d 步调用（invoke 计数；find/describe 不计）。若卡住，请尽快给出 Final Answer。\n", maxSteps))
+	return b.String()
+}
+
 // brief=true 只列「能力 → 方法名」索引，不含参数细节。协议侧已经下发了完整 function 声明，
 // 再在提示词里抄一遍参数等于同一份信息付两遍钱——全目录实测 115 个方法，双重下发时单轮
 // 光工具定义就 10-15k token，且每一轮都重发。brief 模式下模型先看索引定位能力，参数看
@@ -916,7 +1280,67 @@ func methodIndex(ms []string) string {
 //
 // 与 reactToolsText 同源（都是能力目录的另一种渲染），两边都受 allow 过滤，保证
 // 「prompt 里写了的工具」与「协议里声明的工具」是同一批——不然模型会调到一个 prompt 里没有的。
-func (a *AIAgent) reactToolSpecs(al reactAllow) ([]ToolSpec, map[string]string) {
+// reactMetaToolSpecs 是「元工具模式」的工具面：恒定 4 个工具（find / describe / invoke /
+// registry），与能力目录规模（实测 28 能力 / 115 方法）彻底解耦。模型先 find 检索、describe
+// 取 schema，再 invoke 直调真正的方法；registry 工具用于发现调用方在 registry 里定义的业务 Tool。
+//
+// 返回 byName：压平名 → orig（压平前的全名）。orig 在主循环里用来区分「这到底是哪种元工具」。
+func reactMetaToolSpecs() ([]ToolSpec, map[string]string) {
+	str := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
+	num := func(desc string) map[string]any { return map[string]any{"type": "number", "description": desc} }
+	obj := func(desc string) map[string]any { return map[string]any{"type": "object", "description": desc} }
+	specs := []ToolSpec{
+		{
+			Name:        "ext_ai_find",
+			Description: "在能力目录里按语义检索可用方法（BM25）。当你不确定该调哪个能力/方法、或想知道某件事能不能做时先调它。",
+			Parameters: map[string]any{"type": "object", "properties": map[string]any{
+				"query":  str("自然语言检索词，如「查询数据库」「加密一段文本」「发邮件」"),
+				"domain": str("（可选）限定到某个能力域，如 db / ext.redis / crypto，缩小范围"),
+				"limit":  num("（可选）返回几条，默认 5"),
+			}, "required": []string{"query"}},
+		},
+		{
+			Name:        "ext_ai_describe",
+			Description: "返回某个方法的完整参数契约（参数名/类型/是否必填/枚举）。先用 find 拿到方法全名（如 db.query），再 describe 看怎么填参数。",
+			Parameters: map[string]any{"type": "object", "properties": map[string]any{
+				"id": str("方法全名，如 http.Request / ext.redis.set / db.query"),
+			}, "required": []string{"id"}},
+		},
+		{
+			Name:        "ext_ai_invoke",
+			Description: "真正执行一个能力方法。capability 是能力名（如 db / http / ext.redis），method 是方法名（如 query / set / encrypt），args 是该方法的参数对象（结构见 describe 的返回）。",
+			Parameters: map[string]any{"type": "object", "properties": map[string]any{
+				"capability": str("能力名，如 db / http / ext.redis"),
+				"method":     str("方法名，如 query / set / Request"),
+				"args":       obj("该方法所需的参数对象（结构见 ext_ai_describe 的返回）"),
+			}, "required": []string{"capability", "method"}},
+		},
+		{
+			Name:        "ext_registry_tools",
+			Description: "列出调用方在 registry 里定义的业务 Tool / Flow（id/name/description）。当你需要调用用户自建的工具时用它发现。",
+			Parameters: map[string]any{"type": "object", "properties": map[string]any{
+				"prefix": str("（可选）按 id 前缀过滤"),
+				"limit":  num("（可选）返回几条，默认 10"),
+			}},
+		},
+	}
+	byName := map[string]string{
+		"ext_ai_find":        "ext.ai.find",
+		"ext_ai_describe":    "ext.ai.describe",
+		"ext_ai_invoke":      "ext.ai.invoke",
+		"ext_registry_tools": "ext.registry.tools",
+	}
+	return specs, byName
+}
+
+// reactToolSpecs 生成给模型的工具声明（原生 function calling 用），并带回「压平名 → 原名」的反查表。
+//
+// 与 reactToolsText 同源（都是能力目录的另一种渲染），两边都受 allow 过滤，保证
+// 「prompt 里写了的工具」与「协议里声明的工具」是同一批——不然模型会调到一个 prompt 里没有的。
+func (a *AIAgent) reactToolSpecs(al reactAllow, meta bool) ([]ToolSpec, map[string]string) {
+	if meta {
+		return reactMetaToolSpecs()
+	}
 	specs := []ToolSpec{}
 	byName := map[string]string{}
 	add := func(orig string, sch MethodSchema) {
@@ -1138,7 +1562,18 @@ func luaQuote(s string) string {
 
 var (
 	reActionJSON = regexp.MustCompile("(?s)```json\\s*(\\{.*?\\})\\s*```")
-	reFinal      = regexp.MustCompile(`(?i)Final Answer\s*:\s*([\s\S]*)`)
+	// reFinal 的三处口径都是踩过坑才定下来的：
+	//   - `(?:^|\n)` 要求 Final Answer 是**一行的开头内容**，而不是正文里随便冒出来的一句话；
+	//   - 前置贪婪 `.*` 让匹配落在**最后一次**出现处——模型往往先在 Thought 里写
+	//     「下一步我会输出 Final Answer: ...」，真正的答案在末尾；
+	//   - 不再用一个捕获组吞到结尾（`[\s\S]*`），而是交给 extractFinalAnswer 判空，
+	//     写了「Final Answer:」却不给内容不算收尾。
+	// 历史正则 `(?i)Final Answer\s*:\s*([\s\S]*)` 三条全犯：大小写不敏感、不限位置、贪婪到结尾。
+	reFinal = regexp.MustCompile(`(?s)(?i).*(?:^|\n)[ \t]*Final Answer[ \t]*:[ \t]*(.*)`)
+	// reFinalAny 只判「提没提过 Final Answer」，不限定格式与内容。用来区分两种失败：
+	// 写了标记但没内容 → 要它补答案；压根没写 → 才是格式不遵守。混成一句回灌会让模型
+	// 读到自相矛盾的反馈（它明明写了），只能瞎重试。
+	reFinalAny = regexp.MustCompile(`(?i)final\s*answer`)
 )
 
 // parseReactAction 从 LLM 输出里解析 Action：在 ```json ... ``` 围栏内找 {tool,method?,args}。
@@ -1191,7 +1626,13 @@ func extractFinalAnswer(text string) (string, bool) {
 	if m == nil {
 		return "", false
 	}
-	return m[1], true
+	ans := strings.TrimSpace(m[1])
+	if ans == "" {
+		// 写了「Final Answer:」却没内容，等于没回答。按未收尾处理，让循环再走一步——
+		// 收一个空答案比多跑一步更难查（用户只看到 answer 是空字符串，不知道卡在哪）。
+		return "", false
+	}
+	return ans, true
 }
 
 // trimThought 取 LLM 输出中 Action: 之前的部分作为「思考」（无 Action 则取全文）。
@@ -1499,7 +1940,9 @@ func (a *AIAgent) flowCapabilitiesText() string {
 }
 
 // sortedKeys 返回方法 schema 的方法名（升序），供提示词稳定渲染。
-func sortedKeys(ms map[string]MethodSchema) []string {
+// sortedKeys 取 map 的键并升序返回。泛型：方法目录（MethodSchema）与参数表（ParamSchema）
+// 都要用——写成具体类型就得抄两份，抄两份必漂移。
+func sortedKeys[T any](ms map[string]T) []string {
 	out := make([]string, 0, len(ms))
 	for m := range ms {
 		out = append(out, m)
@@ -1821,10 +2264,10 @@ type GenResult struct {
 // aiMethodNames 是「注册方法清单」（用于 capabilities 目录与 schema 守卫），含 complete_stream；
 // aiSyncMethods 是「走同步分发的子集」。两者不一致会让静态校验出错，由
 // TestAIMethodNamesMatchDefaultSchemas 守着。
-var aiMethodNames = []string{"complete", "catalog", "domains", "validate", "generate", "capabilities", "react", "complete_stream"}
+var aiMethodNames = []string{"complete", "catalog", "domains", "find", "describe", "validate", "generate", "capabilities", "react", "complete_stream"}
 
 // aiSyncMethods 是 ext.ai 里「同步分发」的方法（不含回调式的 complete_stream）。
-var aiSyncMethods = []string{"complete", "catalog", "domains", "validate", "generate", "capabilities", "react"}
+var aiSyncMethods = []string{"complete", "catalog", "domains", "find", "describe", "validate", "generate", "capabilities", "react"}
 
 // callAIMethod 按方法名分发到 AIAgent 的稳定层方法（同步路径），供 Lua / go-host Provider 共用。
 // callerCaps 是调用方 Tool 声明的 capability，只有 react 用它——见 ReactMethod。
@@ -1836,6 +2279,10 @@ func callAIMethod(a *AIAgent, method string, args map[string]interface{}, caller
 		return a.Catalog(args)
 	case "domains":
 		return a.Domains(args)
+	case "find":
+		return a.Find(args)
+	case "describe":
+		return a.Describe(args)
 	case "validate":
 		return a.ValidateMethod(args)
 	case "capabilities":
@@ -1845,7 +2292,7 @@ func callAIMethod(a *AIAgent, method string, args map[string]interface{}, caller
 	case "react":
 		return a.ReactMethod(args, callerCaps...)
 	default:
-		return nil, fmt.Errorf("ext.ai 不支持的方法 %q（仅 complete/catalog/domains/validate/generate/capabilities/react/complete_stream）", method)
+		return nil, fmt.Errorf("ext.ai 不支持的方法 %q（仅 complete/catalog/domains/find/describe/validate/generate/capabilities/react/complete_stream）", method)
 	}
 }
 

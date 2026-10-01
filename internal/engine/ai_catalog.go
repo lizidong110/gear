@@ -127,13 +127,45 @@ func Retrieve(catalog []ToolSummary, domain, query string, k int) []ToolSummary 
 		return out
 	}
 
-	// 建倒排统计：每篇文档的词元、文档频率 df、总词元数（算平均文档长度）。
 	docs := make([][]string, len(pool))
-	df := map[string]int{}
 	total := 0
 	for i, t := range pool {
-		toks := tokenize(t.ID + " " + t.Description)
-		docs[i] = toks
+		docs[i] = tokenize(t.ID + " " + t.Description)
+		total += len(docs[i])
+	}
+	terms := uniqueTokens(tokenize(query))
+	if len(terms) == 0 || total == 0 {
+		// 查不出词元（空查询）或整个目录都没词元：无分可打，按目录原序取前 k。
+		out := make([]ToolSummary, k)
+		copy(out, pool[:k])
+		return out
+	}
+
+	out := make([]ToolSummary, 0, k)
+	for _, s := range bm25Rank(docs, terms) {
+		if len(out) >= k {
+			break
+		}
+		out = append(out, pool[s.Idx])
+	}
+	return out
+}
+
+// bm25Score 是一篇文档的打分结果：下标 + 分数。
+type bm25Score struct {
+	Idx   int
+	Score float64
+}
+
+// bm25Rank 对一批**已词元化**的文档按查询词元打分，返回按分数降序的结果。
+//
+// 抽出来是因为 Tool 层（Retrieve）与方法层（FindCapability）共用同一套打分：抄两份的话，
+// 将来调 k1/b 或改长度归一化必然漏改其中一份，两个检索器的排序口径会悄悄漂移。
+// 同分保持文档原序（SliceStable），结果可复现。
+func bm25Rank(docs [][]string, terms []string) []bm25Score {
+	df := map[string]int{}
+	total := 0
+	for _, toks := range docs {
 		total += len(toks)
 		seen := map[string]bool{}
 		for _, tk := range toks {
@@ -143,46 +175,345 @@ func Retrieve(catalog []ToolSummary, domain, query string, k int) []ToolSummary 
 			}
 		}
 	}
-	terms := uniqueTokens(tokenize(query))
-	if len(terms) == 0 || total == 0 {
-		out := make([]ToolSummary, k)
-		copy(out, pool[:k])
-		return out
+	avgdl := float64(total)
+	if len(docs) > 0 {
+		avgdl /= float64(len(docs))
 	}
-
-	avgdl := float64(total) / float64(len(pool))
+	if avgdl == 0 {
+		avgdl = 1 // 防除零：空文档时长度归一化项失去意义，退化为纯 IDF·TF 打分
+	}
 	const k1, b = 1.2, 0.75
-	type scored struct {
-		idx   int
-		score float64
-	}
-	scores := make([]scored, len(pool))
-	for i := range pool {
+	scores := make([]bm25Score, len(docs))
+	for i, toks := range docs {
 		tf := map[string]int{}
-		for _, tk := range docs[i] {
+		for _, tk := range toks {
 			tf[tk]++
 		}
-		dl := float64(len(docs[i]))
+		dl := float64(len(toks))
 		var s float64
 		for _, term := range terms {
 			n := df[term]
 			if n == 0 {
 				continue
 			}
-			idf := math.Log(1 + (float64(len(pool))-float64(n)+0.5)/(float64(n)+0.5))
+			// IDF 加了 +1 并做平滑：目录小时不至于出现负分（负分会让「无命中」看起来像命中）。
+			idf := math.Log(1 + (float64(len(docs))-float64(n)+0.5)/(float64(n)+0.5))
 			f := float64(tf[term])
 			s += idf * (f * (k1 + 1)) / (f + k1*(1-b+b*dl/avgdl))
 		}
-		scores[i] = scored{idx: i, score: s}
+		scores[i] = bm25Score{Idx: i, Score: s}
 	}
-	sort.SliceStable(scores, func(i, j int) bool { return scores[i].score > scores[j].score })
+	sort.SliceStable(scores, func(i, j int) bool { return scores[i].Score > scores[j].Score })
+	return scores
+}
 
-	out := make([]ToolSummary, 0, k)
-	for _, e := range scores {
+// ---- 方法层检索（能力目录） ----
+//
+// 与上面的 Tool 层是**两个层面，语料不相交**：
+//   - Tool 层：registry 里用户定义的业务 Tool（Retrieve 的输入，供 ext.ai.generate 设计态用）；
+//   - 方法层：内核能力目录（http.Request / ext.redis.set …，实测 28 能力 / 115 方法）。
+//
+// 分层之前这里没有索引：react 下发的是方法层，而唯一能检索的 Retrieve 只认 Tool 层，
+// 于是「给 react 做按需检索」无从下手——只能全量平铺，工具越多模型越选不准。
+
+// CapabilityEntry 是方法层的一条语料（一个方法）。
+// 这里的「分类维度」是**能力名本身**（Capability 字段）：`ext.redis.set` 属于 `ext.redis` 域。
+// 刻意不引入自由 tags——标签会漂移（db/database/数据库 三个同义标签谁维护？），
+// 而能力名是装配时就定死的结构化层级，零维护成本，且天然与权限边界（capabilities）同构。
+type CapabilityEntry struct {
+	ID          string   `json:"id"`               // http.Request / ext.redis.set——与 react 工具名同源
+	Capability  string   `json:"capability"`       // http / ext.redis
+	Method      string   `json:"method"`           // Request / set
+	Kind        string   `json:"kind"`             // builtin / pure / ext
+	Description string   `json:"description"`      //
+	Params      []string `json:"params,omitempty"` // 参数名：检索信号最强的一部分
+}
+
+// CapabilityHit 是 find 的一个命中：比条目多一个分数，让调用方（与模型）看得出「为什么是这条」。
+// 有分数也能让模型分辨「检索到了但都不太像」和「检索到明确的一条」。
+type CapabilityHit struct {
+	CapabilityEntry
+	Score float64 `json:"score"`
+}
+
+// CapabilitySchema 是 describe 的返回：一个方法的完整参数契约。
+// find 只给摘要（名字 + 一句话 + 参数名），describe 才给类型与必填——
+// 这是「按需展开」的两级：模型先看清有哪些、再只取要用的那一个的完整契约。
+type CapabilitySchema struct {
+	CapabilityEntry
+	Parameters map[string]ParamSchema `json:"parameters,omitempty"`
+}
+
+// CapabilityDomain 是方法层的一个能力域概览，给模型「先看清有哪些域」用。
+type CapabilityDomain struct {
+	Name    string   `json:"name"`
+	Kind    string   `json:"kind"`
+	Methods []string `json:"methods"`
+	Summary string   `json:"summary"`
+}
+
+// capabilityEntries 由能力目录构造方法层索引（能力名升序 + 方法名升序，顺序稳定可复现）。
+func (a *AIAgent) capabilityEntries() []CapabilityEntry {
+	out := []CapabilityEntry{}
+	for _, p := range allBuiltinPrimitives() {
+		ms, ok := builtinCapabilitySchemas[p]
+		if !ok {
+			continue
+		}
+		for _, m := range sortedKeys(ms) {
+			out = append(out, CapabilityEntry{
+				ID: p + "." + m, Capability: p, Method: m, Kind: primitiveKind(p),
+				Description: ms[m].Description, Params: sortedKeys(ms[m].Parameters),
+			})
+		}
+	}
+	// ext 名来自 map，遍历顺序不稳定——排序后再进数组。顺序不稳会让「同一 query 的 Top-K」
+	// 在不同进程里不一样，线上的检索问题将无法复现。
+	extNames := make([]string, 0, len(a.extCaps))
+	for name := range a.extCaps {
+		extNames = append(extNames, name)
+	}
+	sort.Strings(extNames)
+	for _, name := range extNames {
+		for _, m := range sortedKeys(a.extCaps[name]) {
+			out = append(out, CapabilityEntry{
+				ID: name + "." + m, Capability: name, Method: m, Kind: primitiveKind(name),
+				Description: a.extCaps[name][m].Description, Params: sortedKeys(a.extCaps[name][m].Parameters),
+			})
+		}
+	}
+	// 全表按（能力名, 方法名）排序：allBuiltinPrimitives 的顺序是给「目录展示」用的
+	// （门禁原语在前、纯函数在后），检索索引不该继承它——否则同分时的兜底顺序取决于
+	// 展示顺序，换一次展示口径检索结果就跟着变。
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Capability != out[j].Capability {
+			return out[i].Capability < out[j].Capability
+		}
+		return out[i].Method < out[j].Method
+	})
+	return out
+}
+
+// capabilityKeywords 是能力名的检索同义词——**受控词表**，不是自由标签。
+//
+// 为什么必须有：方法描述是英文 + 代码味的（db.exec 的描述里根本没有「数据库」三个字），
+// 而用户的检索词是中文的。两侧词元不相交，BM25 再准也打不出分。实测「写一条数据库记录」
+// 排第一的是 validate.json_schema——只因为它那句长描述里「数据」出现了两次。
+//
+// 为什么不做成自由 tags：标签由谁填、填几个、同义词怎么收敛（db / database / 数据库）全靠
+// 自觉，必然漂移成一堆同义标签。这里与**能力**绑定：一处定义、该能力下所有方法共享，
+// 由内核或插件作者在能力定义处维护，是可审计、可校验的受控词表——
+// 分类维度仍然是能力名本身，关键词只是给它补上「用户会怎么说」。
+//
+// 只收录「描述里不出现、但用户一定会用」的词；描述已有的词不必重复，BM25 会自己算到。
+//
+// key 可以是**能力名**（该能力下没有更细词条时兜底）也可以是**方法全名**（优先匹配）。
+// 方法级必须存在：crypto 一家 13 个方法，共享「加密」会让「加密一段文本」排到 crypto.hash 上
+// （就因为 hash 的描述里恰好有「文本」二字）——域越大、语义越杂，越要按方法拆。
+//
+// 每个 key 都必须是真实存在的能力名或方法全名，由 TestCapabilityKeywordsReferToRealEntries 守着：
+// 拼错一个就静默失效，而静默失效正是这里最难查的故障形态。
+var capabilityKeywords = map[string][]string{
+	// ---- 能力级（兜底） ----
+	"http":      {"http", "请求", "接口", "api", "网页", "下载", "上传", "post", "get", "调接口"},
+	"call":      {"工具", "流程", "调别的工具", "编排"},
+	"db":        {"数据库", "sql", "查表", "记录", "读库", "存表"},
+	"secret":    {"密钥", "凭据", "凭证", "密码", "token", "证书"},
+	"event":     {"事件", "消息", "广播", "通知"},
+	"subscribe": {"订阅", "监听", "推送"},
+	"config":    {"配置", "设置项", "偏好"},
+	"time":      {"时间", "日期", "时间戳"},
+	"template":  {"模板", "渲染", "占位符", "变量替换"},
+	"crypto":    {"密码学", "加解密", "签名", "哈希"},
+	"id":        {"标识", "随机数"},
+	"validate":  {"校验", "验证", "合法", "schema"},
+
+	// ---- 方法级（优先；大而杂的域必须拆到这一层） ----
+	"db.query":               {"查询", "读取", "select", "查数据", "检索"},
+	"db.exec":                {"写入", "插入", "更新", "删除", "写操作", "insert", "update", "delete"},
+	"db.batch":               {"批量", "事务", "多条", "原子"},
+	"db.ping":                {"探活", "连通", "健康检查"},
+	"event.notify":           {"发布", "广播", "发送事件", "触发"},
+	"event.wait":             {"等待", "接收", "阻塞"},
+	"subscribe.start":        {"订阅", "监听", "mqtt"},
+	"subscribe.stop":         {"取消订阅", "停止监听"},
+	"config.get":             {"读取配置", "获取配置"},
+	"config.set":             {"写入配置", "保存配置", "修改配置"},
+	"config.delete":          {"删除配置", "清除配置"},
+	"config.list":            {"列出配置", "配置列表"},
+	"time.now":               {"当前时间", "现在", "今天"},
+	"time.parse":             {"解析时间", "字符串转时间"},
+	"time.format":            {"格式化时间", "时间戳转字符串"},
+	"time.sleep":             {"等待", "延时", "休眠", "阻塞"},
+	"crypto.encrypt":         {"加密", "aes", "密文", "encode"},
+	"crypto.decrypt":         {"解密", "aes", "明文"},
+	"crypto.hash":            {"摘要", "哈希", "md5", "sha", "散列"},
+	"crypto.hmac":            {"hmac", "签名", "消息认证"},
+	"crypto.hmac_verify":     {"hmac", "验签", "校验签名"},
+	"crypto.jwt_sign":        {"jwt", "签发", "签发令牌"},
+	"crypto.jwt_verify":      {"jwt", "验签", "校验令牌"},
+	"crypto.jwt_decode":      {"jwt", "解码", "解析令牌"},
+	"crypto.password_hash":   {"口令", "密码", "存密码"},
+	"crypto.password_verify": {"口令", "密码", "校验密码", "登录"},
+	"crypto.random":          {"随机数", "随机", "nonce", "盐"},
+	"crypto.base64_encode":   {"base64", "编码"},
+	"crypto.base64_decode":   {"base64", "解码"},
+	"id.uuid":                {"uuid", "唯一标识", "guid"},
+	"id.nanoid":              {"nanoid", "短标识", "唯一标识"},
+	"id.code":                {"验证码", "随机码", "邀请码", "短信"},
+
+	// ---- ext 域级（方法名是英文，靠域名把中文查询接进来） ----
+	"ext.ai":        {"智能体", "大模型", "llm", "对话", "生成"},
+	"ext.registry":  {"注册表", "工具列表", "能力目录", "元数据"},
+	"ext.redis":     {"redis", "缓存", "键值", "kv"},
+	"ext.email":     {"邮件", "邮箱", "发信", "smtp"},
+	"ext.oss":       {"对象存储", "文件上传", "下载", "oss", "s3"},
+	"ext.filestore": {"文件", "存储", "上传", "下载"},
+	"ext.kafka":     {"消息队列", "mq", "kafka", "消费", "投递"},
+	"ext.rabbitmq":  {"消息队列", "mq", "rabbitmq", "消费", "投递"},
+	"ext.cron":      {"定时", "调度", "计划任务", "cron"},
+	"ext.sms":       {"短信", "验证码", "通知"},
+	"ext.webhook":   {"webhook", "回调", "钩子"},
+	"ext.wecom":     {"企业微信", "机器人", "群通知"},
+	"ext.pdf":       {"pdf", "文档", "导出"},
+	"ext.excel":     {"excel", "表格", "导出"},
+	"ext.oidc":      {"oidc", "单点登录", "身份认证"},
+	"ext.serve":     {"服务", "http 服务", "监听端口"},
+}
+
+// keywordsFor 取一条方法的检索关键词：**方法级优先，能力级兜底**。
+// 没有对应词条时返回空串（BM25 仍能按 id / 描述 / 参数名打分，不是零召回）。
+func keywordsFor(e CapabilityEntry) string {
+	if kw, ok := capabilityKeywords[e.ID]; ok {
+		return strings.Join(kw, " ")
+	}
+	return strings.Join(capabilityKeywords[e.Capability], " ")
+}
+
+// firstSentence 取描述的第一句（到首个句号 / 分号 / 换行为止）。
+//
+// 长描述尾部的「★ 口径」说明会把词频堆高，让无关方法靠长度和重复词胜出——
+// 检索只需要知道它「大概是干什么的」，完整描述由 describe 返回。
+func firstSentence(s string) string {
+	if i := strings.IndexAny(s, "。；;\n"); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// capabilityCorpus 是一条方法的检索语料：id 两份 + 能力关键词两份 + 描述首句 + 参数名。
+//
+// 加权（重复进语料）的两项：
+//   - id：同时含能力名与方法名，是「我要找什么」最强的信号；
+//   - 关键词：跨中英文的桥，权重必须高于描述，否则长描述仍会用词频压过它。
+//     BM25 有 TF 饱和，重复一次只是抬升，不会压过其它词。
+//
+// 参数名必须进语料：搜 "sql" 该命中 db.query，而它的描述里未必出现这个词——
+// 只按描述检索会让「按参数名找方法」这条路整个失效。
+func capabilityCorpus(e CapabilityEntry) string {
+	kw := keywordsFor(e)
+	return e.ID + " " + e.ID + " " + kw + " " + kw + " " +
+		firstSentence(e.Description) + " " + strings.Join(e.Params, " ")
+}
+
+// FindCapability 在能力目录里按 BM25 检索方法，返回 Top-K。
+//
+// domain 按**能力名**匹配而不是 id 首段：方法层 id 形如 "ext.redis.set"，按首段截会全部
+// 落进 "ext" 一个域（domainOf 是给 Tool 层的点分 id 设计的），限定域等于没限定。
+func (a *AIAgent) FindCapability(query, domain string, k int) []CapabilityHit {
+	if k <= 0 {
+		k = 5
+	}
+	pool0 := a.capabilityEntries()
+	if len(pool0) == 0 {
+		return []CapabilityHit{}
+	}
+	pool := pool0
+	limited := false
+	if d := strings.TrimSpace(domain); d != "" && d != "general" && d != "all" {
+		filtered := make([]CapabilityEntry, 0, len(pool))
+		for _, e := range pool {
+			if e.Capability == d {
+				filtered = append(filtered, e)
+			}
+		}
+		// 限域无命中回退全域，与 Retrieve 同口径：给空列表会让模型自己去编工具名，
+		// 比多给几个无关候选糟得多。
+		if len(filtered) > 0 {
+			pool = filtered
+			limited = true
+		}
+	}
+	terms := uniqueTokens(tokenize(query))
+	hits := rankCapability(pool, terms, k)
+	// 限域后**一个词都没命中**（最高分 0）：说明这个域选错了，回退全域重检。
+	// 判据是「有没有命中」而不是「域内够不够 k 个」——后者会让限域变成装饰：
+	// 只要域里有 k 个方法就照给，哪怕全是无关项。
+	// 空查询（terms 为空）不回退：那是「没给检索词」，本来就该按目录原序取域内前 k。
+	if limited && len(terms) > 0 && len(hits) > 0 && hits[0].Score == 0 {
+		return rankCapability(pool0, terms, k)
+	}
+	return hits
+}
+
+// rankCapability 对一个候选池按查询词元打分取 Top-K。
+//
+// 不做「候选不足 k 个就全给」的短路：限域后池子常常很小，短路会跳过打分，
+// 于是「域内谁更相关」这件事完全没排——限域就只剩过滤作用了。
+func rankCapability(pool []CapabilityEntry, terms []string, k int) []CapabilityHit {
+	if len(pool) == 0 {
+		return []CapabilityHit{}
+	}
+	docs := make([][]string, len(pool))
+	for i, e := range pool {
+		docs[i] = tokenize(capabilityCorpus(e))
+	}
+	out := make([]CapabilityHit, 0, k)
+	for _, s := range bm25Rank(docs, terms) {
 		if len(out) >= k {
 			break
 		}
-		out = append(out, pool[e.idx])
+		out = append(out, CapabilityHit{CapabilityEntry: pool[s.Idx], Score: s.Score})
+	}
+	return out
+}
+
+// DescribeCapability 返回某个方法的完整参数契约；id 不在目录里时 ok=false。
+// 与 FindCapability 的合成即「按需展开」：先检索到名字，再只取这一个的 schema。
+func (a *AIAgent) DescribeCapability(id string) (CapabilitySchema, bool) {
+	for _, e := range a.capabilityEntries() {
+		if e.ID != id {
+			continue
+		}
+		sch := CapabilitySchema{CapabilityEntry: e}
+		if ms, ok := builtinCapabilitySchemas[e.Capability]; ok {
+			sch.Parameters = ms[e.Method].Parameters
+		} else if ms, ok := a.extCaps[e.Capability]; ok {
+			sch.Parameters = ms[e.Method].Parameters
+		}
+		return sch, true
+	}
+	return CapabilitySchema{}, false
+}
+
+// CapabilityDomains 给方法层的域概览（能力名升序）：每个域含哪些方法 + 一句摘要。
+// 这是「分类」在提示词里的落点——模型先扫一眼 28 个域，再决定去哪个域里检索，
+// 比在 115 个方法里盲检准得多。
+func (a *AIAgent) CapabilityDomains() []CapabilityDomain {
+	byName := map[string]*CapabilityDomain{}
+	order := []string{}
+	for _, e := range a.capabilityEntries() {
+		d, ok := byName[e.Capability]
+		if !ok {
+			d = &CapabilityDomain{Name: e.Capability, Kind: e.Kind, Summary: e.Description}
+			byName[e.Capability] = d
+			order = append(order, e.Capability)
+		}
+		d.Methods = append(d.Methods, e.Method)
+	}
+	out := make([]CapabilityDomain, 0, len(order))
+	for _, n := range order {
+		out = append(out, *byName[n])
 	}
 	return out
 }
