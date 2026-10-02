@@ -17,6 +17,7 @@ const router = createRouter({
       meta: { title: '执行记录' },
     },
     { path: '/apps', name: 'apps', component: () => import('@/views/AppsView.vue'), meta: { title: 'Apps 长驻' } },
+    { path: '/secrets', name: 'secrets', component: () => import('@/views/SecretsView.vue'), meta: { title: '密钥' } },
     {
       path: '/capabilities',
       name: 'capabilities',

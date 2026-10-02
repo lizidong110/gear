@@ -157,6 +157,11 @@ mark { background: #7a5c00; color: #ffe08a; border-radius: 2px; padding: 0 1px; 
 .md pre { background: #161616; border: 1px solid #333; border-radius: 8px; padding: 10px; overflow: auto; }
 .md pre code { background: none; padding: 0; color: #d4d4d4; }
 .md blockquote { border-left: 3px solid #0a84ff; margin: .5em 0; padding: .15em 0 .15em 10px; color: #9aa0a6; }
+.md table.md-table { border-collapse: collapse; margin: .6em 0; width: 100%; font-size: 12.5px; table-layout: fixed; }
+.md-table th, .md-table td { border: 1px solid #3a3a3a; padding: 5px 9px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.md-table th { background: #232323; color: #fff; font-weight: 600; }
+.md-table td { color: #cfcfcf; }
+.md-table tbody tr:nth-child(even) td { background: #1b1b1b; }
 .md a { color: #6cb6ff; }
 .md-empty { color: #6b6b6b; font-style: italic; }
 

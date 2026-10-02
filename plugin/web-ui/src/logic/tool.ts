@@ -97,12 +97,12 @@ export function toolErrors(t: Partial<ToolDTO>): string[] {
   if (so) errs.push(so)
 
   errs.push(...probeErrors(t.health_probe, t.id ?? ''))
-  errs.push(...apiRouteErrors(t.api, t.id ?? ''))
+  errs.push(...apiRouteErrors(t.api))
   return errs
 }
 
 /** 镜像 model.APIRoute.Validate：声明式 REST 路由的形状校验（FR-3）。 */
-export function apiRouteErrors(a: ToolApiDTO | null | undefined, toolId: string): string[] {
+export function apiRouteErrors(a: ToolApiDTO | null | undefined): string[] {
   if (!a) return []
   const errs: string[] = []
   if (!a.method) {

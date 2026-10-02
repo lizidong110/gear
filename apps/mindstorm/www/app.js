@@ -36,6 +36,14 @@ function inlineMd(s) {
     '<a href="$2" target="_blank" rel="noopener">$1</a>');
   return t;
 }
+/* GFM 表格分隔行判定：须含 |，且按 | 拆出的每格都是 :?-+:?（纯分隔/对齐标记）。
+ * 不以 | 开头但中间有 | 的分隔行也认（GFM 允许省略首尾管道）。 */
+function isTableSep(line) {
+  const s = String(line || "").trim();
+  if (s.indexOf("|") < 0) return false;
+  const cells = s.replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => c.trim());
+  return cells.length > 0 && cells.every(c => /^:?-+:?$/.test(c));
+}
 function mdToHtml(src) {
   if (!src || !src.trim()) return '<p class="md-empty">（空）</p>';
   const lines = src.replace(/\r\n/g, "\n").split("\n");
@@ -49,6 +57,40 @@ function mdToHtml(src) {
       while (i < lines.length && !/^```/.test(lines[i])) { buf.push(lines[i]); i++; }
       i++;
       html += `<pre><code>${escapeHtml(buf.join("\n"))}</code></pre>`;
+      continue;
+    }
+    // GFM 表格：表头行（含 |）+ 紧接分隔行（|:---:| 等）+ 数据行；支持对齐。
+    // 普通正文里偶含 | 但下一行不是分隔行时，不会误判为表格（避免把普通文本当表格）。
+    if (line.indexOf("|") >= 0 && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      closeList();
+      const splitCells = (s) => s.replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => c.trim());
+      const headerCells = splitCells(line);
+      const sepCells = splitCells(lines[i + 1]);
+      const aligns = sepCells.map(c => {
+        const l = c.startsWith(":"), r = c.endsWith(":");
+        return (l && r) ? "center" : r ? "right" : l ? "left" : "";
+      });
+      let j = i + 2;
+      const bodyRows = [];
+      while (j < lines.length && lines[j].trim().indexOf("|") >= 0) {
+        bodyRows.push(splitCells(lines[j]));
+        j++;
+      }
+      let t = '<table class="md-table"><thead><tr>';
+      headerCells.forEach((h, k) => {
+        t += `<th${aligns[k] ? ` style="text-align:${aligns[k]}"` : ""}>${inlineMd(h)}</th>`;
+      });
+      t += "</tr></thead><tbody>";
+      bodyRows.forEach(row => {
+        t += "<tr>";
+        headerCells.forEach((_, k) => {
+          t += `<td${aligns[k] ? ` style="text-align:${aligns[k]}"` : ""}>${inlineMd(row[k] || "")}</td>`;
+        });
+        t += "</tr>";
+      });
+      t += "</tbody></table>";
+      html += t;
+      i = j;
       continue;
     }
     let m = line.match(/^(#{1,6})\s+(.*)$/);        // 标题
@@ -1238,9 +1280,12 @@ async function selectNode(id, remember) {
   if (remember) LS.node = id;
   const node = state.nodes[id];
   if (!node || node.body === undefined) {
-    // 详情需要 body，node_children 不回 body → 用 node_get 补全
+    // 详情需要 body，node_children 不回 body → 用 node_get 补全。
+    // 注意：此处必须用工具通道 nodeGetRun，不能走 REST 资源路由 nodeGet——
+    // 运行实例若未重新部署，GET /api/nodes/{id} 这条资源路由没注册，
+    // 会整条失败导致 body 永远补不回来、刷新即丢。工具通道稳定可用。
     try {
-      const full = await API.nodeGet({ id });
+      const full = await API.nodeGetRun({ id });
       Object.assign(state.nodes[id], full);
     } catch (e) { toast("读取节点详情失败：" + e.message, true); }
   }

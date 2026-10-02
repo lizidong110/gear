@@ -36,6 +36,7 @@ import { toolErrors } from '@/logic/tool'
 import { BUILTIN_CAPABILITIES } from '@/logic/generated/enums'
 import { useCatalogStore } from '@/stores/catalog'
 import { useApiError } from '@/composables/useApiError'
+import { endpoints } from '@/api/endpoints'
 import CodeEditor from '@/components/CodeEditor.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import type { HealthProbeDTO, ToolDTO, ToolVersionDTO } from '@/api/types'
@@ -281,6 +282,7 @@ const columns = computed<DataTableColumns<ToolDTO>>(() => [
     render: (row) =>
       h(NSpace, { size: 8, align: 'center' }, () => [
         h(NButton, { size: 'small', onClick: () => openEdit(row) }, () => '编辑 / 覆盖'),
+        h(NButton, { size: 'small', onClick: () => openRun(row) }, () => '试运行'),
         h(NButton, { size: 'small', type: 'error', quaternary: true, onClick: () => confirmDelete(row) }, () => '注销'),
         h(
           NSelect,
@@ -316,6 +318,50 @@ function promoteOptionsFor(row: ToolDTO) {
 async function onPromoteSelect(row: ToolDTO, val: string) {
   const [version, target] = val.split('::')
   if (version && target) await promote(row.id, version, target)
+}
+
+// ---- Tool 单次试运行（POST /api/tools/{id}/run）：同步执行并直接显示输出 ----
+const runShow = ref(false)
+const runId = ref('')
+const runInputText = ref('{}')
+const runOutput = ref<unknown>(null)
+const runError = ref('')
+const runLoading = ref(false)
+
+function openRun(t: ToolDTO) {
+  runId.value = t.id
+  runInputText.value = '{}'
+  runOutput.value = null
+  runError.value = ''
+  runShow.value = true
+}
+
+async function runNow() {
+  runError.value = ''
+  let input: Record<string, unknown> = {}
+  try {
+    const v = JSON.parse(runInputText.value)
+    if (v !== null && (typeof v !== 'object' || Array.isArray(v))) {
+      runError.value = '入参必须是 JSON 对象'
+      return
+    }
+    input = (v ?? {}) as Record<string, unknown>
+  } catch (e) {
+    runError.value = `入参不是合法 JSON: ${(e as Error).message}`
+    return
+  }
+  runLoading.value = true
+  runOutput.value = null
+  try {
+    const r = await endpoints.runTool(runId.value, input)
+    runOutput.value = r.output
+    ok(`Tool ${r.id} 已执行`)
+  } catch (e) {
+    runError.value = (e as Error).message
+    report(e, '运行 Tool')
+  } finally {
+    runLoading.value = false
+  }
 }
 
 onMounted(async () => {
@@ -491,6 +537,28 @@ onMounted(async () => {
             <NButton @click="show = false">取消</NButton>
           </NSpace>
         </template>
+      </NDrawerContent>
+    </NDrawer>
+
+    <NDrawer v-model:show="runShow" :width="560" placement="right">
+      <NDrawerContent :title="`试运行 · ${runId}`" closable>
+        <NAlert v-if="runError" type="error" :title="runError" :bordered="false" style="margin-bottom: 12px" />
+        <NForm label-placement="top" size="small">
+          <NFormItem label="入参（JSON 对象，可留空 {}）">
+            <CodeEditor v-model="runInputText" language="json" height="200px" />
+          </NFormItem>
+        </NForm>
+        <NSpace style="margin-bottom: 12px">
+          <NButton type="primary" :loading="runLoading" @click="runNow">运行</NButton>
+        </NSpace>
+        <NFormItem label="输出">
+          <NInput
+            :value="runOutput === null ? '' : JSON.stringify(runOutput, null, 2)"
+            type="textarea"
+            readonly
+            :autosize="{ minRows: 6, maxRows: 16 }"
+          />
+        </NFormItem>
       </NDrawerContent>
     </NDrawer>
   </div>

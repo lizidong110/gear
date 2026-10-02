@@ -14,6 +14,7 @@ import {
   useMessage,
 } from 'naive-ui'
 import CodeEditor from '@/components/CodeEditor.vue'
+import { streamInvokeCapability } from '@/api/endpoints'
 import { useCapabilitiesStore } from '@/stores/capabilities'
 import { useApiError } from '@/composables/useApiError'
 import type { CapabilityDTO, CapMethodDTO, CapParamDTO } from '@/api/types'
@@ -37,6 +38,12 @@ const invoking = ref(false)
 const result = ref<unknown>(undefined)
 const err = ref('')
 const elapsed = ref<number | null>(null)
+const streaming = ref(false)
+const streamedText = ref('')
+/** 流式调用目前仅内核 ext.ai.complete_stream 支持（server.go:handleInvokeCapabilityStream）。 */
+const isStreamable = computed(
+  () => props.cap?.name === 'ext.ai' && props.methodName === 'complete_stream',
+)
 
 const callSig = computed(() =>
   props.cap?.kind === 'ext'
@@ -89,6 +96,7 @@ watch(
     result.value = undefined
     err.value = ''
     elapsed.value = null
+    streamedText.value = ''
     resetTemplate()
   },
 )
@@ -120,6 +128,46 @@ async function run() {
     report(e, `调用 ${props.cap.name}.${props.methodName}`)
   } finally {
     invoking.value = false
+  }
+}
+
+/** 流式执行（POST /api/capabilities/invoke/stream）：逐增量累积 delta 到 streamedText。
+ *  目前内核仅 ext.ai.complete_stream 支持；其它方法走这里会被内核回 400（前端照常显示错误）。 */
+async function runStream() {
+  if (!props.cap || !props.method) return
+  streaming.value = true
+  err.value = ''
+  streamedText.value = ''
+  result.value = undefined
+  elapsed.value = null
+  let parsed: Record<string, unknown>
+  try {
+    parsed = JSON.parse(argsText.value || '{}')
+  } catch (e) {
+    err.value = `参数 JSON 解析失败: ${(e as Error).message}`
+    streaming.value = false
+    return
+  }
+  const t0 = performance.now()
+  try {
+    let acc = ''
+    await streamInvokeCapability(
+      { name: props.cap.name, method: props.methodName, args: parsed },
+      (c) => {
+        if (c.error) {
+          err.value = c.error
+          return
+        }
+        if (c.delta) acc += c.delta
+        streamedText.value = acc
+      },
+    )
+    elapsed.value = Math.round(performance.now() - t0)
+  } catch (e) {
+    err.value = (e as Error).message
+    report(e, `流式调用 ${props.cap.name}.${props.methodName}`)
+  } finally {
+    streaming.value = false
   }
 }
 
@@ -188,6 +236,16 @@ async function copy(text: string, what: string) {
 
       <div class="run-row">
         <NButton type="primary" size="small" :loading="invoking" @click="run">执行</NButton>
+        <NButton
+          v-if="isStreamable"
+          type="primary"
+          size="small"
+          secondary
+          :loading="streaming"
+          @click="runStream"
+        >
+          流式执行
+        </NButton>
         <NButton size="small" quaternary @click="resetTemplate">重置模板</NButton>
         <NTag v-if="elapsed !== null" size="tiny" :bordered="false">{{ elapsed }} ms</NTag>
       </div>
@@ -204,6 +262,13 @@ async function copy(text: string, what: string) {
         <!-- 不用 NCode：naive 的代码块要自己注入 hljs，没注入只会在控制台刷
              `[naive/code]: hljs is not set.` 且不高亮。这里直接用主题化的 pre。 -->
         <pre class="result-pre">{{ resultText }}</pre>
+      </div>
+
+      <div v-if="streamedText" class="block" style="margin-top: 14px">
+        <div class="block-label">
+          <span>流式输出</span>
+        </div>
+        <pre class="result-pre">{{ streamedText }}</pre>
       </div>
 
       <NAlert type="warning" :bordered="false" style="margin-top: 16px" title="执行权限">

@@ -15,7 +15,8 @@ import {
 import { useAppsStore } from '@/stores/apps'
 import { useCatalogStore } from '@/stores/catalog'
 import { useApiError } from '@/composables/useApiError'
-import type { AppDTO } from '@/api/types'
+import { endpoints } from '@/api/endpoints'
+import type { AppDTO, PruneAppsRespDTO } from '@/api/types'
 
 const apps = useAppsStore()
 const catalog = useCatalogStore()
@@ -76,6 +77,34 @@ function confirmStop(a: AppDTO) {
         ok(`已停止 ${a.id}`)
       } catch (e) {
         report(e, '停止 App')
+      }
+    },
+  })
+}
+
+// ---- 清理应用台账（POST /api/apps/prune）：与内存侧 /api/apps 不是同一模型，
+//      动的是 `gear app start` 落下的持久台账。只删确定已终止的记录，不杀进程、不碰端口。 ----
+const pruning = ref(false)
+const pruneResult = ref<PruneAppsRespDTO | null>(null)
+
+function confirmPrune() {
+  dialog.warning({
+    title: '清理应用台账',
+    content:
+      '清理落盘台账里「确定已终止」的应用记录（exited / stopped / startup_failed）。只删记录、不杀进程、不碰端口；running / unknown 一律保留。',
+    positiveText: '清理',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      pruning.value = true
+      pruneResult.value = null
+      try {
+        const r = await endpoints.pruneApps({})
+        pruneResult.value = r
+        ok(`已清理 ${r.pruned_count} 条，跳过 ${r.skipped_count} 条`)
+      } catch (e) {
+        report(e, '清理台账')
+      } finally {
+        pruning.value = false
       }
     },
   })
@@ -142,6 +171,7 @@ onUnmounted(() => apps.stopPolling())
       <NSelect v-model:value="restart" :options="restartOptions" style="width: 300px" />
       <NButton type="primary" :loading="starting" :disabled="!flowId" @click="start">托管启动</NButton>
       <NButton @click="apps.loadList()">刷新</NButton>
+      <NButton :loading="pruning" @click="confirmPrune">清理台账</NButton>
     </NSpace>
 
     <NAlert v-if="flowId && !selectedHasService" type="info" :bordered="false" style="margin-bottom: 12px">
@@ -163,6 +193,17 @@ onUnmounted(() => apps.stopPolling())
         :row-key="(row: AppDTO) => row.id"
       />
       <NEmpty v-else description="当前没有受管的长驻 App" />
+    </NCard>
+
+    <NCard v-if="pruneResult" size="small" title="清理结果" style="margin-top: 12px">
+      <p>
+        已清理 <b>{{ pruneResult.pruned_count }}</b> 条，跳过
+        <b>{{ pruneResult.skipped_count }}</b> 条（apps_dir:
+        <code>{{ pruneResult.apps_dir }}</code>）
+      </p>
+      <p v-if="pruneResult.pruned.length">已清理：{{ pruneResult.pruned.join(', ') }}</p>
+      <p v-if="pruneResult.skipped.length">已跳过：{{ pruneResult.skipped.join(', ') }}</p>
+      <p v-if="pruneResult.hint" class="text-3">{{ pruneResult.hint }}</p>
     </NCard>
   </div>
 </template>

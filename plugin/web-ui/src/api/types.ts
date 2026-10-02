@@ -175,3 +175,37 @@ export interface CapabilityInvokeReq {
 export interface CapabilityInvokeResp {
   result: unknown
 }
+
+/** GET /api/secrets：只回密钥名（不回明文、不回值；写入/读出都走运行期，管理面只列名）。 */
+export interface SecretListDTO {
+  names: string[]
+}
+
+/** POST /api/tools/{id}/run 的响应：同步执行单个 Tool 并直接返回输出（与 MCP `gear_run` 对齐）。 */
+export interface RunToolRespDTO {
+  id: string
+  output: unknown
+}
+
+/** POST /api/apps/prune 的请求体（body 空 = 全量、非 dry-run）。 */
+export interface PruneAppsReqDTO {
+  flow_id?: string
+  dry_run?: boolean
+}
+
+/** POST /api/apps/prune 的响应：清理落盘台账里确定已终止的应用记录。
+ *  pruned/skipped 是应用 id 列表；hint 仅当存在 skipped 时给出（说明保守边界）。 */
+export interface PruneAppsRespDTO {
+  dry_run: boolean
+  apps_dir: string
+  pruned: string[]
+  skipped: string[]
+  pruned_count: number
+  skipped_count: number
+  hint?: string
+}
+
+/** POST /api/events/{handle} 的回推体（subscribe 机制：sidecar 收到消息后 POST 到这里）。 */
+export interface SubscriptionEventReqDTO {
+  payload: unknown
+}
