@@ -4,16 +4,18 @@ import { NAlert, NButton, NEmpty, NInput, NPopover, NTag, useMessage } from 'nai
 import { useCapabilitiesStore } from '@/stores/capabilities'
 import { useApiError } from '@/composables/useApiError'
 import CapMethodInvoke from '@/components/CapMethodInvoke.vue'
+import { capCallSig } from '@/logic/capSig'
 import type { CapabilityDTO, CapMethodDTO } from '@/api/types'
 
 const caps = useCapabilitiesStore()
 const { brief } = useApiError()
 const message = useMessage()
 
-// 调用签名：内置原语走位置参数 ctx.<name>.<method>，ext.* 走单个具名 table ctx.ext.<name>.<method>({...})。
-// 与 recipes/tool.yaml 里钉死的入口契约一致，避免模型写成位置参数。
+// 调用签名：统一 ctx.<name>.<method>——cap.name 已含命名空间（内置 http，扩展 ext.ai），
+// 拼装细节与「双 ext.」防回归见 @/logic/capSig。ext.* 单具名 table、内置位置参数的实参样式
+// 由 argStyle 展示，这里只给基名（「复制签名」用）。
 function callSig(cap: CapabilityDTO, method: string): string {
-  return cap.kind === 'ext' ? `ctx.ext.${cap.name}.${method}` : `ctx.${cap.name}.${method}`
+  return capCallSig(cap, method, false)
 }
 const argStyle = (cap: CapabilityDTO) => (cap.kind === 'ext' ? '单具名 table' : '位置参数')
 const isExt = (cap: CapabilityDTO) => cap.kind === 'ext'

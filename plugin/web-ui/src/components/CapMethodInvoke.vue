@@ -17,6 +17,7 @@ import CodeEditor from '@/components/CodeEditor.vue'
 import { streamInvokeCapability } from '@/api/endpoints'
 import { useCapabilitiesStore } from '@/stores/capabilities'
 import { useApiError } from '@/composables/useApiError'
+import { capCallSig } from '@/logic/capSig'
 import type { CapabilityDTO, CapMethodDTO, CapParamDTO } from '@/api/types'
 
 const props = defineProps<{
@@ -45,11 +46,8 @@ const isStreamable = computed(
   () => props.cap?.name === 'ext.ai' && props.methodName === 'complete_stream',
 )
 
-const callSig = computed(() =>
-  props.cap?.kind === 'ext'
-    ? `ctx.ext.${props.cap.name}.${props.methodName}({...})`
-    : `ctx.${props.cap?.name}.${props.methodName}(...)`,
-)
+// 签名统一由 @/logic/capSig 拼（cap.name 已含 ext. 命名空间，别再补——防 ctx.ext.ext.* 回归）。
+const callSig = computed(() => (props.cap ? capCallSig(props.cap, props.methodName) : ''))
 
 const params = computed<[string, CapParamDTO][]>(() =>
   Object.entries(props.method?.parameters ?? {}).sort(([a], [b]) => a.localeCompare(b)),
