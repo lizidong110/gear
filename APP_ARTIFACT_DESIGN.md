@@ -152,7 +152,7 @@ gear import <path>   [--overwrite] [--dry-run] [--apps-dir <dir>]
 
 ### 实施后补记（与文档的偏差）
 
-三处按实测调整，文档正文以**本段为准**：
+六处按实测调整，文档正文以**本段为准**：
 
 1. **静态资源开关改为 opt-out**（`NoStatic`）而非设计里写的 `include_static`：漏设时
    「拷」是安全侧——忘了设就得到一个不能交付的产物，代价太大。MCP 侧仍是 `include_static`（默认 true）。
@@ -161,6 +161,16 @@ gear import <path>   [--overwrite] [--dry-run] [--apps-dir <dir>]
    导出方的仓库摆放习惯不是应用的一部分。
 3. **导入落地时会重写 `layout`**（指向 `<apps_dir>/<app_id>/…`），否则导进来的应用
    指向的路径在这台机器上不存在——「app.yaml 原样」这一条让位给了「导进来能用」。
+4. **`layout.files` 支持 `dir: true`**（2026-10-10）：整目录递归拷贝，而不是逐个列文件。
+   前端 `dist` 是「带 hash、重建即变名」的产物，列清单会随构建失效，声明整目录永远跟得上。
+   导出时展开成逐文件写进 `static_files`（import 端据此逐文件落地并**重写** `layout` 为展开形态）。
+5. **`app_id` 可以是 Flow id**（2026-10-10）：registry 里没有 App 清单时，按入口 Flow 解析
+   （`<id>` → `<id>.up` → 唯一 `<id>.` 前缀）并**临时合成**一份清单（**不写库**——export 是只读操作），
+   `warnings` 里如实说明；静态资源按该 Flow 的 `static_site.serve` 的 `dir` 推断。歧义即 `BAD_ARGUMENT`，不猜。
+   ——用户的绝大多数应用只有 Flow（`gear app run/start` 起的），旧行为下 `export wms` 直接 `NOT_FOUND`。
+6. **`--root` 缺省改为「从 cwd 逐级向上找」**（2026-10-10）：清单里的路径通常相对**仓库根**写
+   （`build/dist`），而用户常在子目录（`build/`）里跑 gear，死守 cwd 会把 `build/dist` 拼成
+   `build/build/dist`。绝对路径的声明与基准目录无关。返回值新增 `static_root` 让调用方看得见实际用的根。
 
 **不进 v1 的**：schema 迁移、定义变更历史（`UpsertTool` 覆盖不留旧）、跨 App 隔离、
 身份链路。这些是 L2/L3 的下一批，混进来会让第一步做不完。

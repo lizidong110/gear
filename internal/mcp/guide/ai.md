@@ -130,6 +130,38 @@ ctx.ext.ai.react({ task = ctx.input.task, mode = "meta" })
   依赖」是引擎硬约束。于是只剩「写死」或「赌同层并行谁先跑」两条路，前者可复现。
   （这条缺口已登记为 `REQ-APP-SITE-DEPS`。）
 
+## 2.6 失败恢复层：出错了谁先兜
+
+react 的每一步都可能失败：工具报错、provider 限流、模型给了坏参数、查询空手而归。
+原先把一切错误当同一句 Observation 丢回给模型，恢复全靠「模型自己再说一遍」，provider 一出
+瞬时错误整个 react 直接死。现在的分层是（`internal/engine/ai_recovery.go`）：
+
+| 层 | 触发条件 | 动作 | 烧 LLM 轮次 |
+|---|---|---|---|
+| L0 机械重试 | transient（超时 / 429 / 连接重置，含 body 里的 429/502/503/504） | 引擎直接重试，退避 150ms 起翻倍封顶 2s | 否 |
+| L1.5 换通道 | 端点不吃工具声明 | 降级为文本 Action 协议（重建系统提示词）；元工具模式刻意不降级 | 否 |
+| L1 结构化信号 | 其余可恢复失败（bad_input / upstream_bad / semantic_empty） | 回灌分类 + 范围 + 原因 + 建议，由模型重决策 | 信号本身不烧，模型下一步才烧 |
+| 震荡守卫 | 同一动作同类型失败连续达阈值 | 封禁该动作 + 记缺口，不再烧预算 | 否 |
+| 兜底 | auth / unrecoverable 立即记缺口；其余阈值到了记 | 步数耗尽的答案带缺口清单（带缺失作答） | 否 |
+
+七类失败：`transient` / `channel` / `bad_input` / `upstream_bad` / `semantic_empty` / `auth` /
+`unrecoverable`，每类一张声明式策略表；判不出的一律 `unrecoverable`——**方向选不可恢复**：
+当可恢复会在确定性错误上白烧预算，当不可恢复只损失一次重试机会。错误自己实现
+`RecoverableError` 接口时听实现方的（tool 最懂自己的错误），中央 heuristic 只兜底。
+
+**对调用方的新增输出**（始终存在、空切片，不必先判存在性）：
+
+- `gaps`：缺口清单（哪个动作、哪类失败、原因）。auth 与 unrecoverable 立即进；其余震荡后才进。
+- `recovery_log`：恢复流水（重试几次、换了什么通道、封禁了什么），排查「它为什么这么答」用。
+
+三个反直觉点，都是踩出来的：
+
+- **`ctx.http.Request` 不把非 2xx 当错误**，status 在 body 里。不接住 body，L0 对 HTTP 类工具
+  等于不存在——这是七类里 transient 最常见来源，却最容易漏。
+- **引擎重试与模型重发必须分开**：重复调用守卫只拦模型（同工具同参数），不拦引擎的 L0——否则
+  重试第一步就被自己人拦下，恢复层形同虚设。
+- **`max_steps` 计数的是 invoke**，机械重试不占步数。烧的是 provider 配额，不是执行步预算。
+
 ## 3. 路径二：手写 Lua 循环（真正自建）
 
 ```lua

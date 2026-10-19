@@ -5,6 +5,7 @@ import (
 
 	"gear/internal/cap"
 	"gear/internal/engine"
+	"gear/internal/gearhome"
 	"gear/internal/registry"
 )
 
@@ -24,10 +25,13 @@ func cliEngine(reg *registry.Registry, opts ...func(*engine.Engine)) (*engine.En
 	if err != nil {
 		return nil, fmt.Errorf("初始化扩展失败: %w", err)
 	}
+	// 密钥源（REQ-API-SECRETS，2026-10-02 改为持久化到 secrets.db）：CLI 路径也 Open 同一份库，
+	// 这样 `gear secret set` 写入的密钥在 `gear run/exec/ai` 运行期经 ${secrets.x} / ctx.secret.get 可用。
+	// 顺序：Open 先把库里密钥载入内存，再 SeedFromEnv 用环境变量覆盖同名项（与 server.New 同口径）。
 	secrets := cap.NewSecretStore()
-	// 从 GEAR_SECRET_<NAME> 播种，让 MCP/CLI 路径也可用 ${secrets.x}（与 REST 服务的 s.secrets 一致）。
-	// 播种失败即 fail-closed：名字非法（空名/含空白/${}）会让该密钥静默缺失——「配了却读不到」
-	// 在 CLI/MCP 路径同样极难排查。REST 面（server.New）同口径，两个入口对同一环境变量必须同行为。
+	if err := secrets.Open(gearhome.SecretsDBPath()); err != nil {
+		return nil, fmt.Errorf("打开密钥库失败: %w", err)
+	}
 	if err := secrets.SeedFromEnv(); err != nil {
 		return nil, fmt.Errorf("播种环境变量密钥失败: %w", err)
 	}

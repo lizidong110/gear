@@ -72,6 +72,14 @@ myapp/
 
 - `gear_export(app_id, out_dir, format)` → 目录（默认，可 diff 可 git 版本化）或 `.gearapp` 包。
   **dir 形态的目标目录必须不存在或为空**：gear 不会为一个可重新生成的产物删掉一个内容未知的目录。
+  - `app_id` **优先取 App 清单**；只注册过 Flow 的应用（如 `wms`/`mindstorm`）也能导：把 id 当入口 Flow
+    解析（`<id>` → `<id>.up` → 唯一 `<id>.` 前缀），并**临时合成**一份清单（**不写库**，warnings 里会说明）。
+    静态资源按该 Flow 的 `static_site.serve` 的 `dir` 推断。歧义（多个 `<id>.*` 且无 `<id>.up`）会报
+    `BAD_ARGUMENT`，不会替你猜。要固化清单，用 `gear_apply` 提交 `kind: App`。
+  - **静态资源在哪**：按 `layout.files` 声明路径解析。不传 `static_root` 时**从当前目录逐级向上找**
+    能解析声明路径的目录——清单里的路径通常相对仓库根写（`build/dist`），而你常在子目录（`build/`）里
+    跑 gear，死守 cwd 会拼成 `build/build/dist`。绝对路径的声明与基准目录无关。返回值里的 `static_root`
+    就是本次实际用的目录，看得见才好排查。
 - `gear_import(source, overwrite, dry_run, apps_dir)` → 校验格式版本 → 落库（App→Tool→Flow→Hook）。
   冲突语义与 `gear_apply` **逐条一致**（dry_run 不写、未传 overwrite 且冲突则整批拒绝）。
 - **静态资源默认不落地**（保持「gear 不持有静态资源」的边界）。传 `apps_dir` 才落地到

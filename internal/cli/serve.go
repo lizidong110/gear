@@ -25,7 +25,13 @@ func serveCmd() *cobra.Command {
 	var allowRemote bool
 	c := &cobra.Command{
 		Use:   "serve",
-		Short: "启动 REST 执行面（PRD §11；执行是异步的，POST 返回 202 + execution id）",
+		Short: "启动 REST 执行面（PRD §11；执行面无鉴权，默认只绑回环）",
+		Long: "启动 REST 执行面（PRD §11）。\n\n" +
+			"两种执行语义不要混：\n" +
+			"  POST /api/tools/{id}/run   同步——直接返回该 Tool 的输出（200）\n" +
+			"  POST /api/executions       异步——返回 202 + execution id，用 GET /api/executions/{id} 查\n\n" +
+			"⚠ 执行面**无鉴权**（只绑回环 + 校验 Origin；不带 Origin 的本机请求照常放行）。" +
+			"在这个面上开发的业务应用必须自建登录与权限，平台面不提供——见 gear_guide(\"security\")。",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// 闸必须在 ListenAndServe 之前——等监听上了再说就晚了。
 			if err := httpsafe.CheckBindAddr("REST 执行面", serverAddr, "读写 registry 与明文 secrets、执行编排", allowRemote); err != nil {

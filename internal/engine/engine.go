@@ -84,6 +84,12 @@ type Engine struct {
 	// 将来若真要「一进程多应用」，改的方向是把它迁到 `cap.Caller.AppID` 而非补第二个字段
 	// （那个字段已经在 ① 的身份链路里，只是水位为零）。
 	scope string
+	// openURLs 收集「打开地址」：Flow 收尾步（如 web_ui.done）在其 output 里带回 url / open_urls，
+	// 引擎在跑 once 步时顺手收集，供 REST 监管（POST /api/apps）与进程内 app run 复用——
+	// 与 CLI `app start` 走独立子进程日志扫描（GEAR_OPEN_URL=）是两条互补通道，互不冲突。
+	// key = flowID（同一 Flow 多次受管共享同一地址集合，属可接受的边界）。
+	openURLMu sync.Mutex
+	openURLs  map[string][]string
 }
 
 // New 构造引擎。可用 WithMaxParallel / WithHost / WithSandbox / WithCapabilities 等选项覆盖默认行为。

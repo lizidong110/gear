@@ -52,9 +52,14 @@ type AppLayout struct {
 }
 
 // AppFile 是布局里声明的一份静态资源。Required 为 false 时缺失只报 warning 不阻断。
+//
+// Dir 为 true 时 Path 视为一个**目录**，导出时递归拷贝其下全部文件（保留相对结构），
+// 而不是单个文件。给前端 dist 这类「带 hash、重建即变名」的产物用最稳：列清单会随
+// 构建失效，声明整目录则永远跟得上。import 端按展开后的逐文件落地并重写 layout。
 type AppFile struct {
 	Path     string `yaml:"path" json:"path"`
 	Required bool   `yaml:"required" json:"required"`
+	Dir      bool   `yaml:"dir" json:"dir"`
 }
 
 // AppStart 描述应用启动方式（重启策略与声明端口）。

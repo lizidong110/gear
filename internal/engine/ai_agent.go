@@ -21,10 +21,12 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cloudwego/eino/compose"
 	"github.com/yuin/gopher-lua"
@@ -117,6 +119,10 @@ type AIAgent struct {
 	// 使 generate 的「生成 → 校验 → 修正」与 CLI/REST/MCP 的注册校验共用同一份规则，
 	// 不产生第二套判定（PRD §9.2 单一真相源）。nil 时 Validate 退化为只做结构校验并显式说明。
 	validateFlow func(*model.Flow) error
+	// retryBackoff 是恢复层（ai_recovery.go）机械重试的退避函数：attempt → 睡眠时长。
+	// nil = 默认（150ms 起翻倍、封顶 2s）。测试注入零值——恢复路径必须确定性，
+	// 不能靠「睡一会儿看起来对了」。
+	retryBackoff func(attempt int) time.Duration
 }
 
 // newAIAgent 构造进程内 agent。
@@ -593,6 +599,9 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 	usedTools := []string{}
 	seen := map[string]bool{}
 	finalAnswer := ""
+	// 黑板：失败/恢复流水/缺口全程记在这里（REQ-REACT-RECOVERY）。它既是恢复决策的
+	// 状态，也是可观测面——结果里的 recovery_log 与 gaps 直接由它产出。
+	board := newReactBoard(opts.MaxSteps)
 
 	// appendAssistant 把模型这一轮的回话按协议塞回序列：带 tool_calls 时必须原样带上，
 	// 否则下一条 tool 结果没有可对应的 id（OpenAI 兼容端点会直接判非法）。
@@ -612,9 +621,16 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 		msgs = append(msgs, m)
 	}
 
-	// execute 跑一次工具调用并返回回灌给模型的 Observation：allow 守卫 → 重复调用守卫 →
-	// 编 Lua 入口 → 沙箱执行。抽成闭包是因为「原生 tool_calls」与「文本解析兜底」两条路径
-	// 共用同一套守卫——抄两份的话，将来加一条守卫必然漏改其中一份（判据③：保持简洁）。
+	// execute 跑一次工具调用并返回回灌给模型的 Observation：allow 守卫 → 震荡守卫 →
+	// 重复调用守卫 → 编 Lua 入口 → 沙箱执行（带 L0 机械重试）→ 失败分类与信号回灌。
+	// 抽成闭包是因为「原生 tool_calls」与「文本解析兜底」两条路径共用同一套守卫——
+	// 抄两份的话，将来加一条守卫必然漏改其中一份（判据③：保持简洁）。
+	//
+	// 恢复分层（REQ-REACT-RECOVERY，与 REWOO-with-recovery 同构）：
+	//   L0    机械重试 transient / 可重试 HTTP 状态码——不烧 LLM 轮次（重试的是同一次模型决策）；
+	//   L1    结构化失败信号回灌（类型/范围/原因/建议）——模型按信号改下一步，即 react 的「重规划」；
+	//   兜底  连续失败达阈值 → 封禁该动作 + 记缺口（震荡守卫）；auth/unrecoverable 立即记缺口。
+	// 重复调用守卫拦的是**模型重发**；机械重试是引擎行为，不受它管（否则 transient 永远没得重试）。
 	execute := func(tool, method string, args map[string]interface{}, thought string) string {
 		action := tool + "." + method
 		record := func(obs string) string {
@@ -624,6 +640,10 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 		if !allow.allows(tool, method) {
 			return record(fmt.Sprintf("工具 %q 不在允许列表 [%s] 中，请改用允许的工具", action, allow.String()))
 		}
+		// 震荡守卫：同一动作同类型失败已达阈值 → 不再执行，回灌封禁说明（并提示缺口作答）。
+		if notice, blocked := board.blockedNotice(action); blocked {
+			return record(notice)
+		}
 		key := action + " " + stableJSON(args)
 		if seen[key] {
 			return record("检测到重复调用相同工具与参数，疑似陷入循环，已停止该步")
@@ -631,20 +651,56 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 		seen[key] = true
 		entry, err := buildActionEntry(tool, method, args)
 		if err != nil {
-			return record("构建工具调用失败：" + err.Error())
+			// 编不出入口 = 模型选错了方法/形态（如内置原语没有该方法）。按 bad_input 记：
+			// 模型换对方法就能好，机械重试同样输入毫无意义。
+			f := reactFailure{Class: FailBadInput, Action: action, Reason: err.Error(), Scope: board.scopeHint()}
+			board.noteFailure(f)
+			return record(failureSignal(f))
 		}
-		out, err := a.exec(ctx, entry, map[string]interface{}{})
-		var obs string
-		if err != nil {
-			obs = "工具执行错误：" + err.Error()
-		} else if out != nil {
-			if r, ok := out["result"]; ok {
-				obs = stableJSON(r)
-			} else {
-				obs = stableJSON(out)
+		// L0：执行 + 机械重试。两类触发：exec 报 transient 错；结果带可重试 HTTP 状态码
+		// （ctx.http.Request 不把非 2xx 当错误、status 在 body 里，不接住 L0 就对 HTTP 工具不存在）。
+		var out map[string]interface{}
+		var execErr error
+		attempts := 0
+		for {
+			out, execErr = a.exec(ctx, entry, map[string]interface{}{})
+			if execErr == nil {
+				if _, retryable := retryableHTTPStatus(out); !retryable ||
+					attempts >= maxToolRetries || !board.spendRetry() || ctx.Err() != nil {
+					break
+				}
+				attempts++
+				board.recordRecovery(fmt.Sprintf("L0 重试 %s（HTTP 状态码可重试，第 %d 次）", action, attempts))
+				sleepBackoff(a.retryBackoff, attempts-1)
+				continue
 			}
+			f := classifyToolFailure(action, execErr)
+			if !failureRecovery[f.Class].retry || attempts >= maxToolRetries ||
+				!board.spendRetry() || ctx.Err() != nil {
+				// 不可机械恢复（或重试耗尽）→ 登记失败 + 回灌结构化信号，下一步交给模型（L1）。
+				f.Scope = board.scopeHint()
+				f.Attempts = attempts
+				board.noteFailure(f)
+				board.noteEvidence(false)
+				return record(failureSignal(f))
+			}
+			attempts++
+			board.recordRecovery(fmt.Sprintf("L0 重试 %s（%s，第 %d 次）：%v", action, f.Class, attempts, execErr))
+			sleepBackoff(a.retryBackoff, attempts-1)
+		}
+		// 空结果：不是错误（确实没数据就是正确答案），只登记 semantic_empty 供震荡守卫计数。
+		if isEmptyToolResult(out) {
+			board.noteFailure(reactFailure{Class: FailSemanticEmpty, Action: action,
+				Reason: "工具返回空结果", Scope: board.scopeHint()})
+			board.noteEvidence(false)
+			return record("【空结果】查询未返回任何数据。如确认目标不存在，请直接说明「未找到」，不要换参数反复查询。")
+		}
+		board.noteEvidence(true)
+		var obs string
+		if r, ok := out["result"]; ok {
+			obs = stableJSON(r)
 		} else {
-			obs = "(无输出)"
+			obs = stableJSON(out)
 		}
 		obs = truncateObservation(obs, 3000)
 		usedTools = appendUnique(usedTools, action)
@@ -668,6 +724,9 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 				listed = append(listed[:20:20], fmt.Sprintf("…（共 %d 个，其余请用检索工具查找）", len(names)))
 			}
 			obs := fmt.Sprintf("工具 %q 不存在，可用工具：%s", c.Name, strings.Join(listed, ", "))
+			// 记 bad_input：模型选了个不存在的工具，它自己就能改（换清单里的）。
+			board.noteFailure(reactFailure{Class: FailBadInput, Action: c.Name,
+				Reason: "工具不存在（不在本次允许的工具面内）", Scope: "self"})
 			steps = append(steps, map[string]interface{}{"thought": thought, "action": nil, "observation": obs})
 			return obs
 		}
@@ -675,6 +734,8 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 		if s := strings.TrimSpace(c.Arguments); s != "" {
 			if err := json.Unmarshal([]byte(s), &args); err != nil {
 				obs := fmt.Sprintf("工具 %q 的参数不是合法 JSON：%v", orig, err)
+				board.noteFailure(reactFailure{Class: FailBadInput, Action: orig,
+					Reason: "tool_call 参数不是合法 JSON：" + err.Error(), Scope: "self"})
 				steps = append(steps, map[string]interface{}{"thought": thought, "action": orig, "observation": obs})
 				return obs
 			}
@@ -796,21 +857,17 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 			APIKey:      opts.APIKey,
 			Temperature: opts.Temperature,
 		}
-		var resp string
-		var calls []ToolCall
-		if len(tools) > 0 {
-			// 带工具声明走原生 function calling —— 模型按协议给出调用意图。
-			res, err := a.llm.CompleteTools(ctx, req, tools)
-			if err != nil {
-				return nil, fmt.Errorf("react 第 %d 步 LLM 调用失败: %w", i+1, err)
-			}
-			resp, calls = res.Text, res.ToolCalls
-		} else {
-			text, err := a.llm.Complete(ctx, req)
-			if err != nil {
-				return nil, fmt.Errorf("react 第 %d 步 LLM 调用失败: %w", i+1, err)
-			}
-			resp = text
+		// LLM 调用走恢复包装（REQ-REACT-RECOVERY）：provider 侧瞬时错误机械重试（L0）；
+		// 端点不吃工具声明时换通道降级为文本协议（L1.5）。降级是换通道、不是失败，
+		// 所以不返回错误，只把工具面切掉、重建提示词，下一轮用新通道重问。
+		resp, calls, degraded, err := a.completeReactStep(ctx, req, tools, board, !metaMode)
+		if err != nil {
+			return nil, err
+		}
+		if degraded {
+			tools = nil
+			msgs[0]["content"] = a.reactSystemPrompt(allow, opts.MaxSteps, false, false)
+			continue
 		}
 
 		// Final Answer 判定必须**让位于**工具调用：模型这一轮还带着 tool_calls，说明它
@@ -839,6 +896,7 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 			appendAssistant(resp, calls)
 			invokedThisRound := false
 			thought := trimThought(resp)
+			gapsBefore := len(board.gaps)
 			for _, c := range calls {
 				orig := toolByName[c.Name]
 				switch {
@@ -864,6 +922,10 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 			}
 			if invokedThisRound {
 				execSteps++
+			}
+			// 本轮新产生的缺口要立刻让模型知道：不知道缺口存在的「带缺失作答」只是自欺。
+			if len(board.gaps) > gapsBefore {
+				msgs = append(msgs, map[string]any{"role": "user", "content": board.gapNotice()})
 			}
 			// 末步收敛引导：不提醒的话模型常在最后一步还要再调一次工具，于是步数用尽、
 			// 拿不到 Final Answer，用户看到的是「（达到最大步数 N，未给出 Final Answer）」。
@@ -892,17 +954,31 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 			msgs = append(msgs, map[string]any{"role": "user", "content": "Observation: " + obs})
 			continue
 		}
+		gapsBefore := len(board.gaps)
 		obs := execute(tool, method, args, trimThought(resp))
+		// 同原生路径：本轮新产生的缺口立刻同步给模型（回答时才第一次知道就太晚了）。
+		if len(board.gaps) > gapsBefore {
+			msgs = append(msgs, map[string]any{"role": "user", "content": board.gapNotice()})
+		}
 		msgs = append(msgs, map[string]any{"role": "user", "content": "Observation: " + obs})
 	}
 
 	if finalAnswer == "" {
 		finalAnswer = fmt.Sprintf("（达到最大步数 %d，未给出 Final Answer）", opts.MaxSteps)
+		// 带缺失作答：步数耗尽时若有缺口，答案必须带上——静默残缺比明说缺失坏得多。
+		if len(board.gaps) > 0 {
+			finalAnswer += "\n\n未能获取的数据/能力：\n" + board.gapNotice()
+		}
 	}
+	// gaps / recovery_log 始终存在（空切片而非缺字段）：调用方 `if r.gaps then` 与
+	// `#r.gaps == 0` 都成立，不必先判存在性。gaps 是「带缺失作答」的事实来源，
+	// recovery_log 是 L0/L1.5 恢复流水（ReAct 逐步可视的补强面）。
 	result := map[string]interface{}{
-		"answer":     finalAnswer,
-		"steps":      steps,
-		"used_tools": usedTools,
+		"answer":       finalAnswer,
+		"steps":        steps,
+		"used_tools":   usedTools,
+		"gaps":         board.gaps,
+		"recovery_log": board.recovery,
 	}
 	return result, nil
 }
@@ -1056,6 +1132,7 @@ func (a *AIAgent) reactSystemPrompt(al reactAllow, maxSteps int, useTools bool, 
 	b.WriteString("- 内置原语按「位置参数」调用，args 的键对应工具声明里的参数名（可选参数缺省传 null）。\n")
 	b.WriteString("- 扩展（ext.*）按「单个具名 table」调用，args 整体作为 { ... } 传入 ctx.ext.<name>.<method>({...})。\n")
 	b.WriteString("- Observation（工具返回）会由系统填回作为下一步输入；不要自己编造 Observation。\n")
+	b.WriteString("- 工具失败时会回灌「失败信号」（类型/范围/原因/建议）：按信号修正调用，不要原样重发同一调用；已被判为缺口的数据，在 Final Answer 里如实说明，不得编造。\n")
 	b.WriteString(fmt.Sprintf("- 最多 %d 步。若卡住，请尽快给出 Final Answer。\n", maxSteps))
 	return b.String()
 }
@@ -1086,6 +1163,7 @@ func (a *AIAgent) reactMetaSystemPrompt(maxSteps int) string {
 	b.WriteString("- 每轮只能调用一个工具，用工具调用发起；参数是结构化的，不要手写 JSON 文本。\n")
 	b.WriteString("- 不要编造方法名或参数；拿不准就 find / describe，找不到就说明做不到。\n")
 	b.WriteString("- Observation（工具返回）会由系统填回作为下一步输入；不要自己编造 Observation。\n")
+	b.WriteString("- 调用失败时会回灌「失败信号」（类型/范围/原因/建议）：按信号修正调用，不要原样重发同一调用；已被判为缺口的数据，在 Final Answer 里如实说明，不得编造。\n")
 	b.WriteString(fmt.Sprintf("- 最多 %d 步调用（invoke 计数；find/describe 不计）。若卡住，请尽快给出 Final Answer。\n", maxSteps))
 	return b.String()
 }
@@ -1127,16 +1205,7 @@ func (a *AIAgent) reactToolsText(al reactAllow, brief bool) string {
 		}
 		for _, m := range names {
 			sch := ms[m]
-			switch {
-			case bareFunctionPrimitives[p]:
-				// call 在 Lua 侧是裸函数 ctx.call(target, input)，不是 ctx.call.Call(...)。
-				// 写成带 .Call 的形态会让模型编出「索引函数」的非法调用，到运行期才炸。
-				sb.WriteString(fmt.Sprintf("- ctx.%s(%s): %s\n", p, paramList(sch.Parameters), sch.Description))
-			case pureFuncPrimitives[p]:
-				sb.WriteString(fmt.Sprintf("- ctx.%s.%s({ %s }): %s\n", p, m, fieldsList(sch.Parameters), sch.Description))
-			default:
-				sb.WriteString(fmt.Sprintf("- ctx.%s.%s(%s): %s\n", p, m, paramList(sch.Parameters), sch.Description))
-			}
+			sb.WriteString(fmt.Sprintf("- %s: %s\n", a.callSignature(p, m, sch), sch.Description))
 		}
 	}
 	if len(a.extCaps) > 0 {
@@ -1159,7 +1228,7 @@ func (a *AIAgent) reactToolsText(al reactAllow, brief bool) string {
 			sb.WriteString("# ctx.ext.<name>.<method> 只接受「单个具名 table」参数：\n")
 			for _, m := range names {
 				sch := a.extCaps[name][m]
-				sb.WriteString(fmt.Sprintf("- ctx.%s.%s({ %s }): %s\n", name, m, fieldsList(sch.Parameters), sch.Description))
+				sb.WriteString(fmt.Sprintf("- %s: %s\n", a.callSignature(name, m, sch), sch.Description))
 			}
 		}
 	}
@@ -1466,12 +1535,51 @@ func luaLiteral(v interface{}) string {
 			ps = append(ps, luaLiteral(e))
 		}
 		return "{" + strings.Join(ps, ", ") + "}"
+	case json.Number:
+		// json.Number 底层是 string，落进 default 会被 json.Marshal 再包一层双引号编成
+		// Lua **字符串**（"3600"），而调用方给的是数字。只有开了 UseNumber 的解码器才产出它——
+		// 今天 MCP/REST 两条路都不开（实测解出 float64），但换解码器就会静默失真，故显式兜住。
+		if i, err := x.Int64(); err == nil {
+			return strconv.FormatInt(i, 10)
+		}
+		if f, err := x.Float64(); err == nil {
+			return luaLiteral(f)
+		}
+		// 不是合法数字：如实当字符串交给下游，不猜、不静默丢弃。
+		return luaQuote(x.String())
 	default:
+		// switch 未列出的**整数**种类（int8/int16/uint*/uintptr）同样必须编成数字字面量，
+		// 否则落进下面的 marshal 兜底会被包成字符串，Lua 侧拿到 string 而不是 number。
+		if lit, ok := unlistedIntegerLiteral(x); ok {
+			return lit
+		}
+		// 兜底：任何 JSON 可序列化的值（struct / []string / map[string]string / map[any]any …）
+		// 先编成 JSON 再解回通用类型递归渲染，**而不是把它的 JSON 文本当字符串包起来**——
+		// 后者是静默类型丢失：Lua 侧收到 string，报错要拖到调用深处才炸，甚至根本不炸。
 		if b, err := json.Marshal(x); err == nil {
+			var generic interface{}
+			if err := json.Unmarshal(b, &generic); err == nil {
+				return luaLiteral(generic)
+			}
 			return luaQuote(string(b))
 		}
+		// 表达不了的值一律编成 nil（不猜一个字面量出来，避免编出语法错的 Lua）。
 		return "nil"
 	}
+}
+
+// unlistedIntegerLiteral 只兜上面类型 switch **没有列出**的整数种类。
+// 刻意不重复覆盖 int/int32/int64/float32/float64——同一类型有两条渲染路径必然漂移。
+// 无符号一律用 FormatUint：uint64 超过 2^53 时经 JSON 会丢精度，那是静默数据损坏。
+func unlistedIntegerLiteral(v interface{}) (string, bool) {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Int8, reflect.Int16:
+		return strconv.FormatInt(rv.Int(), 10), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return strconv.FormatUint(rv.Uint(), 10), true
+	}
+	return "", false
 }
 
 // luaQuote 转义并包裹成双引号 Lua 字符串字面量。
@@ -1811,8 +1919,11 @@ func (a *AIAgent) capabilitySummaries() []map[string]interface{} {
 }
 
 // capabilitiesText 把能力参数压成给 LLM 看的文本（方法签名 + 参数 + 描述）。
-// 顺序与内容取 allBuiltinPrimitives 单一来源；纯函数原子按「单具名 table」渲染
-// （与 ctx.ext.* 同款），避免模型写成位置参数。
+// 顺序与内容取 allBuiltinPrimitives 单一来源。
+//
+// **调用形态直接取 invokeFormFor**（不另判）：此前这里是「纯函数走 table、其余一律走位置参数」
+// 的二分判据，于是 db.* / config.* / subscribe.start 被渲染成位置参数、call 被渲染成
+// ctx.call.Call(...)——模型照抄编出的代码要到 Lua 运行期才炸（外部实测 2026-10-03 的头号误用来源）。
 func (a *AIAgent) capabilitiesText() string {
 	var sb strings.Builder
 	for _, p := range allBuiltinPrimitives() {
@@ -1822,11 +1933,7 @@ func (a *AIAgent) capabilitiesText() string {
 		}
 		for _, m := range sortedKeys(ms) {
 			sch := ms[m]
-			if pureFuncPrimitives[p] {
-				sb.WriteString(fmt.Sprintf("- ctx.%s.%s({ %s }): %s\n", p, m, fieldsList(sch.Parameters), sch.Description))
-				continue
-			}
-			sb.WriteString(fmt.Sprintf("- ctx.%s.%s(%s): %s\n", p, m, paramList(sch.Parameters), sch.Description))
+			sb.WriteString(fmt.Sprintf("- %s: %s\n", a.callSignature(p, m, sch), sch.Description))
 		}
 	}
 	if len(a.extCaps) > 0 {
@@ -1834,7 +1941,7 @@ func (a *AIAgent) capabilitiesText() string {
 			"按当前已注册 ext.* 实时列出，非写死；新增扩展会自动出现在这里）：\n")
 		for name, ms := range a.extCaps {
 			for m, sch := range ms {
-				sb.WriteString(fmt.Sprintf("- ctx.%s.%s({ %s }): %s\n", name, m, fieldsList(sch.Parameters), sch.Description))
+				sb.WriteString(fmt.Sprintf("- %s: %s\n", a.callSignature(name, m, sch), sch.Description))
 				// 参数明细按名排序：map 迭代顺序是随机的，提示词必须可复现
 				// （同一份目录渲染两次不一致 → 生成结果与测试都会随机漂移）。
 				pkeys := make([]string, 0, len(sch.Parameters))
@@ -1854,6 +1961,17 @@ func (a *AIAgent) capabilitiesText() string {
 		}
 	}
 	return sb.String()
+}
+
+// callSignature 返回一个方法的**可复制调用签名**（如 `ctx.db.query({ driver = string, sql = string })`）。
+//
+// 判据来自 invokeFormFor（全能力唯一实现）。判不出来时**不给签名**，只留一个明确的占位——
+// 编一个看着像真的形态比不编更坏：模型会照抄，而错误要到运行期才暴露。
+func (a *AIAgent) callSignature(cap, method string, sch MethodSchema) string {
+	if _, sig, ok := invokeFormFor(cap, method, a.extCaps); ok {
+		return sig
+	}
+	return cap + "." + method + "（调用形态未登记，先用 gear_capabilities 查证后再写）: " + paramList(sch.Parameters)
 }
 
 // flowCapabilitiesText 把能力目录压成「Flow step 直调」的形式：

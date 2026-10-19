@@ -28,8 +28,13 @@ func exportCmd() *cobra.Command {
 			"  zip        打成单个 .gearapp 包，便于发送\n\n" +
 			"dir 形态的 --out 必须是**不存在的路径或空目录**：gear 不会为一个可重新生成的产物\n" +
 			"删掉一个内容未知的目录。zip 形态覆盖同名文件。\n\n" +
-			"静态资源按 layout.files 声明的路径、相对 --root（默认当前工作目录）去找。\n" +
-			"gear 从不持有这些文件（由调用方的文件工具写），所以「它在哪」只能由你告诉。",
+			"<app-id> 优先取 registry 里的 kind: App 清单；没有清单时退一步把 id 当入口 Flow 解析\n" +
+			"（`<id>` / `<id>.up` / 唯一 `<id>.` 前缀），并按该 Flow 临时合成一份清单（不写库）——\n" +
+			"所以只有 Flow 的应用（如 wms、wms.up）也能直接导。\n\n" +
+			"静态资源按 layout.files 声明的路径去找：--root 指定基准目录；不指定则**从当前目录\n" +
+			"逐级向上找**能解析声明路径的目录（用户常在 build/ 子目录里跑，而路径相对仓库根写）。\n" +
+			"绝对路径的声明与基准目录无关。gear 从不持有这些文件（由调用方的文件工具写），\n" +
+			"所以「它在哪」只能由你告诉。",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out, _ := cmd.Flags().GetString("out")
@@ -57,6 +62,13 @@ func exportCmd() *cobra.Command {
 				len(res.Components.Tools), len(res.Components.Flows),
 				len(res.Components.Hooks), len(res.Components.StaticFiles), res.Components.EntryFlow)
 			fmt.Fprintf(w, "  静态资源: 已拷 %d 份\n", len(res.Files))
+			if res.StaticRoot != "" {
+				how := "自动向上查找"
+				if !res.StaticRootAuto {
+					how = "--root 指定"
+				}
+				fmt.Fprintf(w, "  静态根目录: %s（%s）\n", res.StaticRoot, how)
+			}
 			for _, warn := range res.Warnings {
 				fmt.Fprintf(w, "  ⚠ %s\n", warn)
 			}
@@ -66,7 +78,7 @@ func exportCmd() *cobra.Command {
 	}
 	c.Flags().String("out", "", "产物输出路径（dir 形态为目录；zip 形态为文件路径，扩展名留空自动补 .gearapp）")
 	c.Flags().StringVar(&format, "format", "dir", "产物形态：dir | zip")
-	c.Flags().StringVar(&staticRoot, "root", "", "解析 layout.files 相对路径的根目录（默认当前工作目录）")
+	c.Flags().StringVar(&staticRoot, "root", "", "解析 layout.files 相对路径的根目录（默认从当前目录逐级向上找能解析声明路径的目录）")
 	c.Flags().BoolVar(&noStatic, "no-static", false, "只导出定义，不拷静态资源（产物不自包含，不能当交付物用）")
 	return c
 }

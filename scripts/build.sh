@@ -4,7 +4,9 @@
 #
 # 覆盖范围：
 #   - build/gear(.exe)                  ← cmd/gear（主 CLI / 内核）
-#   - build/plugin/*-sidecar(.exe)      ← plugin/ 下全部 package main（共 6 个）
+#   - build/plugin/*-sidecar(.exe)      ← plugin/ 下全部 package main（共 15 个，见 TARGETS）
+#                                          （此处不再写死数字口径：历史上一直停在「共 6 个」，
+#                                           每次加侧车都忘了改，反而是个会骗人的注释）
 #
 # 用法：  bash scripts/build.sh
 # 退出码即结果（0=PASS）。go build 本身增量编译，重复跑只重建改动过的包。
@@ -62,6 +64,7 @@ TARGETS=(
   "plugin/oss-sidecar|oss-sidecar|$PLUGINBIN_REL"
   "plugin/redis-sidecar|redis-sidecar|$PLUGINBIN_REL"
   "plugin/mqtt-sidecar|mqtt-sidecar|$PLUGINBIN_REL"
+  "plugin/mongo-sidecar|mongo-sidecar|$PLUGINBIN_REL"
   "plugin/oidc-sidecar|oidc-sidecar|$PLUGINBIN_REL"
   "plugin/rabbitmq-sidecar|rabbitmq-sidecar|$PLUGINBIN_REL"
   "plugin/serve-sidecar|serve-sidecar|$PLUGINBIN_REL"
@@ -70,12 +73,37 @@ TARGETS=(
 )
 
 FAILED=0
+# 版本注入（2026-10-03）：`gear version` / `--version` 的数据源。
+#
+# 取值口径：优先 git tag（vX.Y.Z），没有精确 tag 时用 `describe --always` 的短 sha，
+# 再没有（不在 git 检出里 / 无 git）才是 dev。**注入失败不阻塞构建**——
+# buildinfo.Version 保持 dev，`gear version` 会明说「dev = 构建时未注入版本号」，
+# 而不是让人以为拿到的是发布构建（不谎报）。
+GEAR_VER="$(git describe --tags --exact-match 2>/dev/null || git describe --tags --always --dirty 2>/dev/null || echo dev)"
+GEAR_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo none)"
+GEAR_TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+GEAR_LDFLAGS="-X gear/internal/buildinfo.Version=$GEAR_VER"
+GEAR_LDFLAGS="$GEAR_LDFLAGS -X gear/internal/buildinfo.Commit=$GEAR_SHA"
+GEAR_LDFLAGS="$GEAR_LDFLAGS -X gear/internal/buildinfo.BuildTime=$GEAR_TS"
+
 echo "══════════ Gear 编译 $(date '+%F %T') ══════════"
+echo "版本注入：Version=$GEAR_VER Commit=$GEAR_SHA BuildTime=$GEAR_TS"
 for t in "${TARGETS[@]}"; do
   IFS='|' read -r pkg name out <<< "$t"
   dst="$out/$name$EXT"
   echo
   echo "── 编译 $pkg → $ROOT/$dst"
+
+  # 只有主二进制带版本注入：侧车是插件，不是 gear 本体，注入它们没有消费者
+  # （真要标侧车版本，`gear version` 里给的是产物构建时间）。
+  # ⚠ `-ldflags=` 必须作为**一个整体参数**交给 go build，不能把变量裸展开在命令行里：
+  # GEAR_LDFLAGS 含 3 个 `-X`（空格分隔），写成 `go build $ldflags -o ...` 时会被 shell
+  # 拆成多个词，于是 `-o` 落到「包路径」的位置 → `malformed import path "-o": leading dash`。
+  # 实测（2026-10-08）：本 bug 随上面这段版本注入一起引入，**此后 build/gear.exe 一次都没被
+  # 成功重建过**——脚本仍会继续把 14 个 sidecar 全编完、最后才在汇总打一个 ❌，极易被忽略。
+  # 代价是 MCP 面一直跑着 10-03 的旧二进制（见 .workbuddy/memory/2026-10-08.md 根因分析）。
+  ldflags_value=""
+  [ "$name" = "gear" ] && ldflags_value="$GEAR_LDFLAGS"
 
   # 构建到 .new 再就地换上，而不是直接覆盖目标。两个原因，都是实测出来的：
   #  1. **Windows 不允许覆盖正在运行的 exe**（开发时 gear.exe 往往正作为 MCP stdio 服务跑着），
@@ -86,7 +114,7 @@ for t in "${TARGETS[@]}"; do
   tmp="$out/$name.new$EXT"
   built_at="$(date +%s)"
 
-  if ! go build -trimpath -o "$tmp" "./$pkg" 2>&1; then
+  if ! go build -trimpath "-ldflags=$ldflags_value" -o "$tmp" "./$pkg" 2>&1; then
     echo "❌ $name（编译失败，见上方错误）"
     FAILED=1
     continue

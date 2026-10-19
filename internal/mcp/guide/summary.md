@@ -20,6 +20,8 @@ Gear 是「机制内核」：只给 能力原语 + Tool（执行单元）+ Flow�
 → ④ `gear_validate`（不落库，可无限重试）→ ⑤ `gear_apply`（原子落库）→ ⑥ `gear_app(start, flow_id)`
 → ⑦ `gear_app(status)` + 端口探活 + 日志行 → ⑧ 汇报并**告知如何停止**。
 
+做带 UI 的应用：前端**别手写裸 HTML+JS**，先 `gear_guide("frontend")` 用 petite-vue（下载到 `www/vendor/` 离线引入、保持模块化）。
+
 ## 八条铁律
 1. 写「能力.方法」前先 `gear_capabilities`，不许猜（`crypto/time/template` 免门禁、`json` 不是能力、`ext.*` 必须声明）。
 2. 先 `gear_validate` 再 `gear_apply`，不要「先写进去再改」。

@@ -25,6 +25,7 @@ import (
 	"gear/internal/app"
 	"gear/internal/cap"
 	"gear/internal/engine"
+	"gear/internal/gearhome"
 	"gear/internal/httpsafe"
 	"gear/internal/model"
 	"gear/internal/registry"
@@ -36,6 +37,10 @@ type AppInstance struct {
 	FlowID    string    `json:"flow_id"`
 	Restart   string    `json:"restart"`
 	StartedAt time.Time `json:"started_at"`
+	// OpenURLs 是该 Flow 收尾步（如 web_ui.done）带回的「打开地址」，由引擎在跑 once 步时收集
+	// （见 engine.OpenURLs）。前端据此把可点击链接直接呈现，用户启动后即可一键跳转。
+	// 与 CLI `app start` 走日志扫描 GEAR_OPEN_URL= 是两条互补通道（REST 监管是进程内、无日志文件）。
+	OpenURLs []string `json:"open_urls"`
 
 	cancel context.CancelFunc
 }
@@ -47,9 +52,13 @@ type Server struct {
 	engine *engine.Engine
 	mux    *http.ServeMux
 
-	// secrets 是进程内密钥源（REQ-API-SECRETS）：管理面经 REST /api/secrets 写入、
-	// 启动期经 GEAR_SECRET_* 环境变量播种；注入引擎后运行期只读（ctx.secret.get）。
+	// secrets 是密钥源（REQ-API-SECRETS，2026-10-02 改为持久化到 secrets.db）：管理面经
+	// REST /api/secrets 或 CLI `gear secret` 写入 secrets.db，启动期经 GEAR_SECRET_* 环境变量
+	// 播种（仅内存）；注入引擎后运行期只读（ctx.secret.get）。
 	secrets *cap.SecretStore
+	// secretsPath 是 secrets.db 落点（默认 gearhome.SecretsDBPath）；CLI 经 WithSecretsDBPath
+	// 注入，供测试隔离，避免读写真实 <GEAR_HOME>/secrets.db。
+	secretsPath string
 
 	appMu  sync.Mutex
 	apps   map[string]*AppInstance
@@ -105,6 +114,19 @@ func WithRegistryPath(p string) ServerOption { return func(s *Server) { s.regist
 // WithAppsDir 显式指定应用台账目录（覆盖 <registry 同目录>/apps 的推导）。
 func WithAppsDir(d string) ServerOption { return func(s *Server) { s.appsDir = d } }
 
+// WithSecretsDBPath 显式指定密钥库（secret 原语）落点（覆盖 <gearhome>/secrets.db 的推导）。
+// CLI `gear serve` 默认用 gearhome；测试注入临时库以保证密闭，避免污染真实密钥库。
+func WithSecretsDBPath(p string) ServerOption { return func(s *Server) { s.secretsPath = p } }
+
+// Close 释放 Server 持有的外部资源（目前仅 secrets.db 连接）；应在进程退出/测试清理时调用，
+// 否则 SQLite 连接持有的文件锁会让临时目录无法删除（Windows 上表现为 cleanup 失败）。
+func (s *Server) Close() error {
+	if s.secrets != nil {
+		return s.secrets.Close()
+	}
+	return nil
+}
+
 // WithOnListen 注册「监听绑定成功」回调，参数是**真实**绑定地址（含内核分配的端口号）。
 // 回调在 Serve 之前同步执行，故可安全地在里面打印（CLI 用它把真实端口吐给父进程解析）。
 func WithOnListen(h func(realAddr string)) ServerOption { return func(s *Server) { s.onListen = h } }
@@ -138,7 +160,15 @@ func New(reg *registry.Registry, opts ...ServerOption) (*Server, error) {
 	//
 	// 顺序要求：必须排在并发闸门**之前**——闸门的 worker goroutine 在构造期就已启动，
 	// 之后再返回 error 会留下永不退出的 goroutine（NewConcurrencyGate 无人 Shutdown）。
+	// secrets 密钥源（REQ-API-SECRETS，2026-10-02 改为持久化到 secrets.db）：
+	// Open 先把库里全部密钥载入内存，再 SeedFromEnv 用环境变量覆盖同名项（环境是部署期权威）。
+	if s.secretsPath == "" {
+		s.secretsPath = gearhome.SecretsDBPath()
+	}
 	s.secrets = cap.NewSecretStore()
+	if err := s.secrets.Open(s.secretsPath); err != nil {
+		return nil, fmt.Errorf("打开密钥库失败: %w", err)
+	}
 	if err := s.secrets.SeedFromEnv(); err != nil {
 		return nil, fmt.Errorf("播种环境变量密钥失败: %w", err)
 	}
@@ -324,8 +354,98 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// errorBody 是 REST 错误响应的**结构化**形状（2026-10-03，此前只有 `{"error": "一整段文本"}`）。
+//
+// 为什么改：调用方（前端 / 脚本 / 智能体）此前只能正则剥错误文本，实测里有人写下
+// `replace(/^step \S+ 执行失败: lua 执行失败: /,”)` 这种正则——**文本形状一改就崩**。
+// 而 MCP 面早就是 `{code, message, hint}`，同一个内核两套错误口径，本身也是漂移。
+//
+// ⚠ `Error` 字段**保留且与 Message 同值**：既有调用方（`plugin/web-ui` 的 api client、
+// `apps/mindstorm/www/api.js`、全部 server 测试）都在读 `error` 字符串，删掉就是破坏性变更。
+// 它是兼容位，新代码读 `code` / `message` / `detail`。
+type errorBody struct {
+	// Error 是**兼容字段**（= Message）。新代码请读 Message。
+	Error string `json:"error"`
+	// Code 是机器可读错误码；取法与 MCP 面同源（诊断优先，状态兜底，见 restErrorCode）。
+	Code string `json:"code"`
+	// Message 是给人看的完整主句（栈回溯已拆到 detail）。
+	Message string `json:"message"`
+	// Detail 放 message 之后的技术细节（目前是 Lua stack traceback）：
+	// 让人读的部分与技术噪音分开，前端不必再自己剥。
+	// ⚠ 它以原文里那个分隔换行开头——这样 `message + detail` 与旧文本逐字相同（不丢信息）。
+	Detail string `json:"detail,omitempty"`
+	// Hint 是可据以行动的下一招（不是所有错误都有；不写就不出现，不塞占位）。
+	Hint string `json:"hint,omitempty"`
+	// TraceID 预留：将来把执行 id / 请求 id 串进来，便于日志对账。现在不生成——
+	// 填一个每次调用都不同的假 id 比不填更糟（它会让人以为真能查到东西）。
+	TraceID string `json:"trace_id,omitempty"`
+}
+
+// restStatusCodes 把 HTTP 状态映射为**兜底**错误码。
+//
+// 只列真的会出现的状态（发明一整套 RESTful 状态码不是本项目的风格）：
+// 有结构化诊断的错误一律用诊断里的真码，这里只是「这条路径没有诊断」时的诚实兜底。
+var restStatusCodes = map[int]string{
+	http.StatusBadRequest:          engine.CodeRESTBadRequest,
+	http.StatusNotFound:            "NOT_FOUND",
+	http.StatusMethodNotAllowed:    engine.CodeRESTMethodNotAllowed,
+	http.StatusConflict:            engine.CodeRESTConflict,
+	http.StatusTooManyRequests:     "EXECUTION_BUSY",
+	http.StatusInternalServerError: engine.CodeRESTInternal,
+	http.StatusServiceUnavailable:  engine.CodeRESTUnavailable,
+}
+
+// restErrorCode 取一个错误的结构化码：**诊断优先**（与 MCP 面 toolErrorFrom 同一条规则），
+// 没有诊断才按状态兜底，都没有就明说 UNCLASSIFIED（不假装知道原因）。
+func restErrorCode(status int, err error) string {
+	if diags := engine.Diagnostics(err); len(diags) > 0 {
+		if c := diags[0].Code; c != "" && c != engine.CodeUnclassified {
+			return c
+		}
+	}
+	if c, ok := restStatusCodes[status]; ok {
+		return c
+	}
+	return "UNCLASSIFIED"
+}
+
+// stackTraceMarker 是 gopher-lua 追加栈回溯的位置（实测输出里的字面量）。
+const stackTraceMarker = "\nstack traceback:"
+
+// splitStack 把「主句 + 栈回溯」拆开。
+//
+// 实测样本（REST 原样返回的一整段）：
+//
+//	step wms__list 执行失败: lua 执行失败: <string>:5: attempt to call ...
+//	stack traceback:
+//		[G]: in function 'call'
+//
+// 栈对排障有用、但对人读的第一句是噪音，故分字段；**不丢弃任何内容**
+// ——`message + detail` 与旧文本**逐字相同**（为此 detail 保留了原文里那个分隔换行：
+// 把它吃掉会让两个字段拼不回原文，而「不丢信息」是靠可复原来保证的，不是靠嘴说）。
+func splitStack(msg string) (message, detail string) {
+	if i := strings.Index(msg, stackTraceMarker); i >= 0 {
+		return msg[:i], msg[i:]
+	}
+	return msg, ""
+}
+
+// writeErr 写一个结构化错误响应（无 hint）。
 func writeErr(w http.ResponseWriter, code int, err error) {
-	writeJSON(w, code, map[string]string{"error": err.Error()})
+	writeErrHint(w, code, err, "")
+}
+
+// writeErrHint 写一个带 hint 的结构化错误响应。
+func writeErrHint(w http.ResponseWriter, code int, err error, hint string) {
+	msg := err.Error()
+	message, detail := splitStack(msg)
+	writeJSON(w, code, errorBody{
+		Error:   message, // 兼容位：与 Message 同值
+		Code:    restErrorCode(code, err),
+		Message: message,
+		Detail:  detail,
+		Hint:    hint,
+	})
 }
 
 func decodeJSON(r *http.Request, v interface{}) error {
@@ -536,7 +656,9 @@ func (s *Server) handleRunTool(w http.ResponseWriter, r *http.Request) {
 	ctx := engine.WithCaller(r.Context(), callerOf(r))
 	out, err := s.engine.RunToolExec(ctx, id, input, "")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		// 请求体多包了一层 `{"input":{...}}` 是实测里最常见的一类误用，而它的报错
+		// （schema missing properties）看着像「字段没传」——所以在这里点名。
+		writeErrHint(w, http.StatusBadRequest, err, wrappedInputHint(found, input))
 		return
 	}
 	if out == nil {
@@ -934,9 +1056,17 @@ func (s *Server) handleListApps(w http.ResponseWriter, r *http.Request) {
 	s.appMu.Lock()
 	out := make([]*AppInstance, 0, len(s.appSeq))
 	for _, id := range s.appSeq {
-		if a, ok := s.apps[id]; ok {
-			out = append(out, a)
+		a, ok := s.apps[id]
+		if !ok {
+			continue
 		}
+		// 复制一份再回填打开地址：避免并发读写共享的 *AppInstance（其 cancel 也随之复制，
+		// 但副本不调用 cancel，无副作用）。OpenURLs 来自引擎按 flowID 聚合的收尾步输出。
+		c := *a
+		if s.engine != nil {
+			c.OpenURLs = s.engine.OpenURLs(a.FlowID)
+		}
+		out = append(out, &c)
 	}
 	s.appMu.Unlock()
 	writeJSON(w, http.StatusOK, out)
@@ -955,6 +1085,10 @@ func (s *Server) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.cancel() // 取消 ctx ⇒ Supervisor 停止并杀掉所有 service 子进程
+	// 清理该 Flow 的打开地址缓存，避免留下过期链接（同名 Flow 再次受管时会被重新收集）。
+	if s.engine != nil {
+		s.engine.ClearOpenURLs(a.FlowID)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"stopped": id})
 }
 

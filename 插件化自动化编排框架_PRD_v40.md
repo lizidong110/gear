@@ -567,32 +567,6 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 | V3 | WASM runtime；event 触发；Web UI 作为可选 Flow（任意版本可 `app run`） | 无租户级隔离 |
 | V4 | 分布式调度、高可用、水平扩展 | — |
 
----
-
-## 13. 待确认项
-
-| # | 问题 | 当前默认 |
-|---|------|---------|
-| 1 | 同 tool_id 允许多主版本共存吗？ | 默认禁止，仅 side-by-side SDK 显式允许 |
-| 2 | 0.x 版本是精确 pin 还是项目级 opt-in？ | MVP 强制精确 pin |
-| 3 | 系统包（git、libxml2）由谁管理？ | 只声明前提并验证，不自动安装 |
-| 4 | 灰度粒度：全局切换 vs 按调用方细粒度？ | 调用方级显式选择 |
-| 5 | 晋升是否需要审批前置（双人复核）？ | 默认调用即晋升，可通过 before_promote Hook 扩展 |
-| 6 | 测试版运行结果是否独立审计？ | 同表记录，仅标记 stage |
-| 7 | CAS 是否要求严格预期版本匹配？ | 宽松策略（见 §7.3） |
-| 8 | Web UI 插件是否纳入首批 MVP？ | 否；UI 为可选 Flow，管理面靠 CLI（见 §14） |
-| 9 | 长驻 / 阻塞 step 的形态（daemon 标记 or server Tool）？ | **已定（S2）**：`step.mode: service`（§14.2） |
-| 10 | `app run` 默认 restart 策略与健康检查机制？ | restart **已定（S2）**：默认 `always`，`--restart=never` 可关；健康检查**已实现（#75）**：`health_probe`（http/tcp/cmd，连续失败达阈值只杀当前进程由 Relaunch 重启），注册期校验配置（REQ-APP-HEALTH） |
-| 11 | 执行入口的并发上限 / 进程池大小？ | **step 级已定（S4）**：`maxParallel` 默认 4（`--max-parallel` 可调，`app run --max` 管 Flow 数）；**跨进程队列/进程池已实现（#73）**：`ConcurrencyGate` 固定 worker 池 + 有界队列，满则拒（429 / `StatusRejected`），详见 §14.5（REQ-CONCURRENCY-CROSS） |
-| 12 | CLI 如何鉴权到 daemon、是否走同一套 capability？ | 待定 |
-| 13 | Hook 默认 criticality（日志类是否默认 best-effort）？ | 建议日志类 best-effort，待定（§5.4） |
-| 14 | 安全：process / go-host 绕过 capability、secret 经 argv 的处理？ | 暂搁置（deferred） |
-
----
-
-> **开发建议**：按 Tool Schema + Registry → Flow DSL 引擎 → Runtime 适配层（先 go-host + process）→ Hook + 灰度晋升 的顺序推进，每步可独立验证。
-
----
 
 ## 14. 进程模型与 App 运行
 

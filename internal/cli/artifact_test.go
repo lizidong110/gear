@@ -65,6 +65,37 @@ func seedApp(t *testing.T, regPath, root, id string) {
 	}
 }
 
+// seedAppWithCapabilities 同 seedApp，但让落库的 Tool 声明给定的 capabilities。
+//
+// 为什么要单独一个：REQ-IMPORT-EXTNAMES 要验的正是「声明了 ext.* 的 Tool 能被导入」，
+// 没有这个变体就只能验一个不带 capability 的普通应用——而那条路径本来就不会触发前置。
+func seedAppWithCapabilities(t *testing.T, regPath, root, id string, caps []string) {
+	t.Helper()
+	reg, err := registry.Open(regPath)
+	if err != nil {
+		t.Fatalf("打开 registry 失败: %v", err)
+	}
+	defer reg.Close()
+	a := &model.App{
+		ID: id, Name: id, EntryFlow: id + ".up",
+		Layout: model.AppLayout{Workdir: "apps/" + id},
+	}
+	b := &artifact.Bundle{
+		Apps: []*model.App{a},
+		Tools: []*model.Tool{{
+			ID: id + "__t", Runtime: model.RuntimeLua, Entry: "return {}",
+			Capabilities: caps,
+			InputSchema:  map[string]any{"type": "object"},
+			OutputSchema: map[string]any{"type": "object"},
+			Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
+		}},
+		Flows: []*model.Flow{{ID: id + ".up", Steps: []model.Step{{ID: "s1", Call: id + "__t"}}}},
+	}
+	if _, _, _, err := artifact.ApplyBundle(reg, b, nil, true); err != nil {
+		t.Fatalf("落库失败: %v", err)
+	}
+}
+
 // TestExportImportCommands CLI 侧 export → import 往返（含 zip 形态与 dry-run）。
 func TestExportImportCommands(t *testing.T) {
 	dir := t.TempDir()

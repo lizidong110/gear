@@ -89,7 +89,7 @@ export PATH
 # 2026-09-26 补入 internal/httpsafe（监听闸 + 同源判定：bind.go 从 mcp 提升为共享后，
 # 判定逻辑漏网即闸门漂移重演）。已存在但此前一直漏登记，一并补上。
 COVER_MIN=80
-COVER_PACKAGES="./internal/engine ./internal/cap ./internal/mcp ./internal/cli ./internal/server ./internal/model ./internal/registry ./internal/app ./internal/cmdline ./internal/gearhome ./internal/artifact ./internal/httpsafe ./internal/procalive"
+COVER_PACKAGES="./internal/engine ./internal/cap ./internal/mcp ./internal/cli ./internal/server ./internal/model ./internal/registry ./internal/app ./internal/cmdline ./internal/gearhome ./internal/artifact ./internal/httpsafe ./internal/procalive ./internal/doctor ./internal/luacap ./internal/sidecar/describe"
 
 # staticcheck 固定版本：原来写 @latest，每次都要联网解析版本再编译（实测 21s，且离线即挂），
 # 还会因为上游发新版而「同一份代码今天绿明天红」。现在预装到 GOPATH/bin 复用（实测 19s/8s），

@@ -225,6 +225,9 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 				return err
 			}
 			rc.setStep(step.ID, input, output)
+			// 收尾步（如 web_ui.done）带回的「打开地址」顺手收集，供 REST 监管 / 进程内 app run
+			// 透出（与 CLI `app start` 的日志扫描通道互补，见 openurl.go）。
+			collectStepOpenURLs(e, flowID, output)
 			e.progressf("✓ step %s (%s) -> %v\n", step.ID, step.Call, output)
 			return nil
 		})

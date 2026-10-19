@@ -41,6 +41,9 @@ const EnvExecDB = "GEAR_EXEC_DB"
 // 要隔离就设 GEAR_HOME，而不是单独挪这一个库。
 const EnvConfigDB = "GEAR_CONFIG_DB"
 
+// EnvSecretsDB 是覆盖密钥库（secret 原语）路径的环境变量。
+const EnvSecretsDB = "GEAR_SECRETS_DB"
+
 // EnvRegistry 是覆盖 registry（目录库）路径的环境变量。
 //
 // 它存在的理由是「**继承**」而不是「配置」：一个进程用 `--registry X` 起服后，它派生出去的子进程
@@ -104,6 +107,18 @@ func ConfigDBPath() string {
 		return p
 	}
 	return filepath.Join(Home(), "config.db")
+}
+
+// SecretsDBPath 返回密钥库（secret 原语）的默认路径：
+// `GEAR_SECRETS_DB` 优先，否则 `<Home>/secrets.db`。
+//
+// 与 config.db 刻意分开（configdb.go 的分工声明）：secret 是只读密钥源、运行期不回显明文，
+// 落独立文件既持久化（重启仍在、CLI/serve 共享）又不与 config 的「普通键值配置」合并。
+func SecretsDBPath() string {
+	if p := os.Getenv(EnvSecretsDB); p != "" {
+		return p
+	}
+	return filepath.Join(Home(), "secrets.db")
 }
 
 // EnvAppData 是覆盖「应用持久数据目录」的环境变量。

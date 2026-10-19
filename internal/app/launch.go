@@ -104,6 +104,10 @@ type StartResult struct {
 	// 的 start.ports 回退）/ none。三级来源若不报出来，「这次到底用了哪份」就成了暗口径
 	// ——排查「为什么探活没生效」时第一个要回答的就是它。
 	PortsSource string `json:"ports_source,omitempty"`
+	// OpenURLs 是从应用日志里挑出的「打开地址」标记（Flow 收尾步打印的 GEAR_OPEN_URL=…）。
+	// 起服 Flow 把静态站/后端地址经 sidecar 返回，但此前既不回显也不落台账，用户跑完
+	// app start 后「不知道到哪儿打开」——这条就是把地址显式捞出来（见 web_ui.done）。
+	OpenURLs []string `json:"open_urls,omitempty"`
 }
 
 // StopOptions 是停止一个应用的入参。
@@ -145,6 +149,8 @@ type StatusResult struct {
 	Ports     []PortState `json:"ports"`
 	LogPath   string      `json:"log_path"`
 	LastLogs  []string    `json:"last_logs,omitempty"`
+	// OpenURLs 见 StartResult.OpenURLs：从日志里捞出的「打开地址」。
+	OpenURLs []string `json:"open_urls,omitempty"`
 	// EscapedJob 见 StartResult.EscapedJob：进程死因的事后归因依据之一。
 	EscapedJob *bool `json:"escaped_job,omitempty"`
 }
@@ -297,6 +303,9 @@ func Start(opts StartOptions) (*StartResult, error) {
 			"若要长期托管，请让 gear 由一个不受该 Job 约束的进程发起（如在独立终端里执行 app start）。"
 	}
 	res.State, res.Ports, res.LastLogs = waitReady(rec, opts.WaitSeconds, preBusy)
+	// 捞「打开地址」：Flow 收尾步打印的 GEAR_OPEN_URL=…（见 web_ui.done）。
+	// 纯读取、不改动任何既有行为；没打标记的旧 Flow 返回 nil，完全不受影响。
+	res.OpenURLs = scanOpenURLs(rec.LogPath)
 	if res.State == string(StateStartupFailed) {
 		// 根因只在监管进程的日志里（派生进程是 detached 的，取不到退出码），挑出来挂在
 		// StartResult 上，好让 CLI / MCP 不必各自印那句对所有故障都成立的泛化文案。
@@ -509,6 +518,7 @@ func statusOf(rec *Record, tail int) *StatusResult {
 	if tail > 0 {
 		res.LastLogs = tailLogs(rec.LogPath, tail)
 	}
+	res.OpenURLs = scanOpenURLs(rec.LogPath)
 	return res
 }
 
@@ -557,4 +567,34 @@ func tailLogs(path string, n int) []string {
 		lines = lines[len(lines)-n:]
 	}
 	return lines
+}
+
+// scanOpenURLs 从应用日志里挑出「打开地址」标记行（约定格式：GEAR_OPEN_URL=<url>）。
+//
+// 为什么有这个约定（2026-10-10）：起服 Flow 经由 sidecar 把静态站/后端地址返回，但此前
+// 既不回显也不落台账——用户跑完 `app start web_ui.up` 后「不知道到哪儿打开」。
+// 由 Flow 的收尾步（如 web_ui.done）把地址打印成 `GEAR_OPEN_URL=<url>`，launcher 只做
+// 「把它显式报出来」这一件小事：纯读取、不改动任何现有行为，所有没打这个标记的旧 Flow
+// 完全不受影响（返回 nil）。任何想要「启动即告知地址」的站点类应用都可复用这一约定。
+func scanOpenURLs(logPath string) []string {
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		return nil
+	}
+	const prefix = "GEAR_OPEN_URL="
+	var out []string
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		u := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		out = append(out, u)
+	}
+	return out
 }

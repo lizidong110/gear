@@ -35,6 +35,7 @@
 | `BAD_DEPENDENCY` | 依赖不存在，或成环 | 检查 `depends_on` 与 `${steps.*}` 推断出的隐式依赖 |
 | `BAD_FLOW_STRUCTURE` | 缺 id / 缺 call / mode 非法 / 并行标注冲突 | 对照 `gear_guide("authoring")` 的全字段语义 |
 | `BAD_TOOL_STRUCTURE` | Tool 缺 id / runtime 未实现 / 无 versions | runtime 只支持 process / lua / go-host |
+| `LUA_CAP_UNDECLARED` | **Lua entry 用了某个受门禁能力，而 `capabilities:` 没声明它**（诊断会点名能力与 `entry.lua:行号`） | 给该 Tool 加 `capabilities: [db, http, …]`，或删掉 entry 里那次调用。⚠ 这类错误原先只在**运行期**炸成 `attempt to call a non-function object`（看着像函数写错了，真因是漏声明），现在写作期即拒。**纯函数原子（time/template/crypto/id/validate）无需声明**；`ctx.json` / `ctx.caller` 不是能力，不在声明范围内 |
 | `ROUTE_INVALID` | `api:` 声明的形状非法（`method` 不在 GET/POST/PUT/PATCH/DELETE 里，或 `path` 不以 `/api/` 开头 / 空段 / `{}` 没名字 / 占着内核资源根如 `/api/tools`） | 方法写大写；path 以 `/api/` 开头并换一棵不属于内核的子树（如 `/api/orders`）；占位符写 `{id}` 这种带名字的。**为什么必须挡在写作期**：net/http 对同名 pattern 的第二次注册是 panic，而注册发生在起服那一刻——一个 YAML 字段就能让服务起不来 |
 | `ROUTE_CONFLICT` | 两个 Tool 声明了同一个 `method`+`path`（两边各自都合法，只是不能共存） | 诊断会点名两个 Tool，改任一即可。同一 method+path 只能有一个：**两处声明同一资源等于让起服时 panic** |
 | `BAD_HOOK_STRUCTURE` | Hook 缺字段 / stage 非法 | stage ∈ before_flow/before_step/after_step/on_error/on_success/before_promote |
@@ -90,7 +91,7 @@
 | `DELETE_FAILED` | 删除失败（非 NOT_FOUND / IN_USE） | 看 message 与 hint |
 | `APPLY_FAILED` | 落库写入失败（非校验类，如写库错误） | 看 message；先 `gear_doctor` 确认 registry 可写 |
 | `PROMOTE_FAILED` | 版本晋升失败（非非法目标状态） | 看 message；确认 Tool 与版本号存在 |
-| `EXPORT_FAILED` | `gear_export` 失败（应用不存在 / 目标目录非空 / 写文件失败） | 应用不存在先 `gear_catalog(kind=app)` 确认；**dir 形态的目标必须不存在或为空**（gear 不会为一个可重新生成的产物删未知目录） |
+| `EXPORT_FAILED` | `gear_export` 失败（应用不存在 / 目标目录非空 / 写文件失败） | 应用不存在先 `gear_catalog(kind=app)` 确认；**只有 Flow 没有 App 清单的应用直接用入口 Flow id 也能导**（`<id>` / `<id>.up`）；**dir 形态的目标必须不存在或为空**（gear 不会为一个可重新生成的产物删未知目录） |
 | `IMPORT_FAILED` | `gear_import` 失败（格式不认识 / 产物损坏 / 落库冲突） | 看具体码：`ARTIFACT_VERSION_UNSUPPORTED` 与 `ARTIFACT_INVALID` 都从这里报出 |
 | `ARTIFACT_VERSION_UNSUPPORTED` | 产物的 `gear-artifact.yaml` 里 `version` 不是本 gear 支持的版本 | 用同版本 gear 重新导出，或升级 gear 再导入。**不猜、不静默降级**——导一半的库比拒绝难收拾 |
 | `ARTIFACT_INVALID` | 产物缺文件 / 元信息损坏 / 定义解析不过 / `entry_flow` 无法解析 | 重新 `gear_export` 一份；确认传的是产物**根目录**（含 `gear-artifact.yaml`/`app.yaml`/`bundle.yaml`/`kind: Migrations` 那份若带迁移） |
@@ -99,6 +100,36 @@
 | `MIGRATE_SQL_FAILED` | 某条迁移的 SQL 执行失败（该条已整条回滚） | 错误信息里带 `version=N(name)` 与数据库原始错误；修 SQL 后整条重跑（`gear_apply` 会拒掉整包，定义一个都不落库）。MySQL 上 DDL 会隐式提交，**回滚不保证生效**，先拿 `--dry-run` 验 |
 | `MIGRATE_NO_DB` | bundle 声明了 `migrations:` 但本次导入没有 db 实现 | 换用带宿主 db 的入口（如 `gear serve` 起的 MCP / `gear import`）；本码刻意 fail-closed：宁可拒绝，也不让「声明了迁移却没跑」成为合法状态 |
 | `CAPABILITIES_UNAVAILABLE` | 能力目录取不到（引擎未装配 AIAgent，或读取失败） | `gear_doctor` 看 `extensions` 块 |
+
+### REST 面（HTTP 状态映射的兜底码）
+
+REST 错误响应是**结构化**的（2026-10-03，此前只有 `{"error": "一整段文本"}`）：
+
+```json
+{ "error": "step wms__list 执行失败: lua 执行失败: <string>:5: attempt to call ...",
+  "code": "TOOL_RUN_FAILED",
+  "message": "step wms__list 执行失败: lua 执行失败: <string>:5: attempt to call ...",
+  "detail": "stack traceback:\n\t[G]: in function 'call'...",
+  "hint": "检测到你把入参包了一层 {\"input\": {...}}……" }
+```
+
+- `code` 的取法与 MCP 面**同源**：错误链里有结构化诊断就用诊断里的真码，没有才按
+  HTTP 状态兜底（下面这张表），都没有就明说 `UNCLASSIFIED`（不假装知道原因）。
+- `message` 与 `detail` 拼起来与旧的一整段文本**逐字相同**——拆分只是让人读的主句与技术噪音分开，**不丢信息**。
+- `error` 是**兼容位**（= `message`）：既有前端与脚本读它，删掉是破坏性变更。新代码读 `code`/`message`。
+- `hint` 只在真能给下一招时出现（如「你的入参包了一层 `input`，本端点要扁平 body」），不塞占位文本。
+
+| code | 对应 HTTP | 触发 |
+|---|---|---|
+| `BAD_REQUEST` | 400 | 请求体不合法、入参校验失败、Tool 执行失败等**无诊断**的 4xx |
+| `NOT_FOUND` | 404 | 对象不存在（Tool / Flow / Hook / 执行记录） |
+| `METHOD_NOT_ALLOWED` | 405 | 方法不匹配 |
+| `CONFLICT` | 409 | 引用守卫（被 Flow/Hook 引用、被 App 占用）拒绝删除 |
+| `EXECUTION_BUSY` | 429 | 并发达上限且队列已满（同 MCP 面同名码） |
+| `INTERNAL` | 500 | 读库/写库失败等内部错误 |
+| `UNAVAILABLE` | 503 | 依赖未就绪（密钥源未初始化等） |
+
+> 有诊断的错误**不会**落到这张表：例如 `ROUTE_INVALID`、`TX_ROLLBACK_FAILED` 一律用诊断里的真码。
 
 ### 三个「不是错误码，但必须先看」的坑
 

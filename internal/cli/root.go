@@ -3,6 +3,7 @@ package cli
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"gear/internal/buildinfo"
 	"gear/internal/gearhome"
 	"gear/internal/registry"
 )
@@ -34,8 +36,12 @@ func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "gear",
 		Short: "Gear — 插件化自动化编排框架内核",
-		Long:  "Gear 内核：引擎 + ctx.* 宿主能力 + app run/start 启动器。\nTool 是原子能力，Flow 是通用运行单元，服务=长驻不退出的 Flow。",
+		Long:  "Gear 内核：引擎 + ctx.* 宿主能力 + app run/start 启动器。\nTool 是原子能力，Flow 是通用运行单元，服务=长驻不退出的 Flow。\n怀疑二进制过时或环境没准备好时，先跑 `gear version` 与 `gear doctor`。",
+		// `--version` 与 `gear version` 同源（cobra 按模板自动生成 flag）。
+		// 此前两者都没有，于是「unknown command/flag」无法区分「功能没有」与「二进制旧」。
+		Version: buildinfo.Version,
 	}
+	root.SetVersionTemplate("gear {{.Version}}\n")
 	root.PersistentFlags().StringVar(&registryPath, "registry", defaultRegistry(),
 		"registry 数据库路径（默认 ~/.gear/registry.db）")
 	root.PersistentFlags().StringVar(&serverAddr, "addr", defaultAddr(),
@@ -43,7 +49,9 @@ func newRootCmd() *cobra.Command {
 	root.PersistentFlags().StringVar(&cliScope, "scope", "",
 		"运行期命名空间守卫的作用域（registry 里的 App.ID）：本进程只引用它名下的定义；空=不启用")
 
-	root.AddCommand(toolCmd(), flowCmd(), appCmd(), hookCmd(), serveCmd(), execCmd(), aiCmd(), mcpCmd(), extCmd(), scaffoldCmd(), configCmd(), exportCmd(), importCmd(), historyCmd())
+	// ⚠ 必须保持**单行**：tools/doc_audit.py 的 CLI 双向核对按这一行的文本提取子命令集，
+	//    拆成多行会让它只读到第一行的两个命令，进而把其余十几个全报成「文档有、代码无」。
+	root.AddCommand(toolCmd(), flowCmd(), appCmd(), hookCmd(), serveCmd(), execCmd(), aiCmd(), mcpCmd(), extCmd(), scaffoldCmd(), configCmd(), secretCmd(), exportCmd(), importCmd(), historyCmd(), versionCmd(), doctorCmd())
 	return root
 }
 
@@ -58,6 +66,16 @@ func defaultAddr() string {
 // Execute 是 CLI 入口。
 func Execute() {
 	if err := newRootCmd().Execute(); err != nil {
+		// `gear doctor` 用哨兵 error 表达「自检跑完了、但有告警」：退出码仍要给 1
+		//（脚本要能判断），但不打印错误文案——告警已经写在报告里了，重复一遍只是噪声。
+		if errors.Is(err, errSilentFailure) {
+			os.Exit(1)
+		}
+		// 未知子命令时补一句可判定的信息（version.go）：让人能区分「命令真没有」
+		// 与「二进制旧 / PATH 指错」——2026-10-03 实测的卡死点就在这里。
+		if hint := unknownCommandHint(err); hint != "" {
+			fmt.Fprintln(os.Stderr, hint)
+		}
 		os.Exit(1)
 	}
 }

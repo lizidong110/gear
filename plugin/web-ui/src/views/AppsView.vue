@@ -26,6 +26,8 @@ const dialog = useDialog()
 const flowId = ref<string | null>(null)
 const restart = ref('always')
 const starting = ref(false)
+// 刚启动的 App 的「打开地址」，用于启动后直接给出可点击跳转链接。
+const startedLinks = ref<string[]>([])
 
 const restartOptions = [
   { label: 'always · 崩溃后按指数退避重启', value: 'always' },
@@ -55,9 +57,14 @@ function uptime(a: AppDTO): string {
 async function start() {
   if (!flowId.value) return
   starting.value = true
+  startedLinks.value = []
   try {
     await apps.start(flowId.value, restart.value)
     ok(`已托管 ${flowId.value}（restart=${restart.value}）`)
+    // 启动后从刷新后的列表里取该 App 的打开地址，直接呈现可点击跳转链接
+    // （收尾步可能稍晚才回传地址，列表每 5s 轮询会自然补全；此处先尽量即时给出）。
+    const a = apps.apps.find((x) => x.flow_id === flowId.value)
+    startedLinks.value = a?.open_urls ?? []
   } catch (e) {
     report(e, '启动 App')
   } finally {
@@ -127,6 +134,22 @@ const columns = computed<DataTableColumns<AppDTO>>(() => [
   },
   { title: '已运行', key: 'uptime', width: 100, render: (row) => uptime(row) },
   {
+    title: '打开地址',
+    key: 'open_urls',
+    width: 260,
+    render: (row) => {
+      const urls = row.open_urls ?? []
+      if (urls.length === 0) return h('span', { class: 'text-3' }, '—')
+      return h(
+        'div',
+        { class: 'open-links' },
+        urls.map((u: string) =>
+          h('a', { href: u, target: '_blank', rel: 'noopener', class: 'open-link' }, u),
+        ),
+      )
+    },
+  },
+  {
     title: '操作',
     key: 'actions',
     fixed: 'right' as const,
@@ -179,6 +202,20 @@ onUnmounted(() => apps.stopPolling())
       通常这不是你想要的，请确认。
     </NAlert>
 
+    <NAlert v-if="startedLinks.length > 0" type="success" :bordered="false" style="margin-bottom: 12px">
+      <span>已托管，点此打开：</span>
+      <a
+        v-for="u in startedLinks"
+        :key="u"
+        :href="u"
+        target="_blank"
+        rel="noopener"
+        class="open-link"
+        style="margin-right: 12px"
+        >{{ u }}</a
+      >
+    </NAlert>
+
     <NCard size="small">
       <NDataTable
         v-if="apps.apps.length > 0"
@@ -210,4 +247,21 @@ onUnmounted(() => apps.stopPolling())
 
 <style scoped>
 /* .mono 已收归 src/styles/typography.css 的 .text-mono */
+</style>
+
+<style>
+/* 打开地址链接（render 函数产出的 <a> 不受 scoped 影响，故用全局样式）。 */
+.open-link {
+  color: var(--primary-color, #2080f0);
+  text-decoration: none;
+  word-break: break-all;
+}
+.open-link:hover {
+  text-decoration: underline;
+}
+.open-links {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
 </style>

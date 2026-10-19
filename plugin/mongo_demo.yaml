@@ -1,0 +1,122 @@
+# 演示 Tool：一次调用走通 ext.mongo 的代表性方法（ping / insert / find / update / aggregate / distinct / index / 集合管理 / delete）。
+#
+# 存在意义同 redis_demo.yaml / oss_demo.yaml：verify 若只直连侧车 HTTP 端点，只证明「侧车二进制写对了」，
+# 证明不了「能力接进引擎了」。本样例经 `gear tool register` + `gear tool run` 走内核的门禁
+# 与能力目录，补上「ctx.ext.mongo.* 真的存在、应用里真能调」这一层证据。
+#
+# 注册：gear tool register --registry <db> -   （stdin 喂本文件）
+# 运行：gear tool run mongo.demo --registry <db> --input '{"host":"127.0.0.1","port":27017,"database":"demo"}'
+#
+# 注：capabilities 声明 [ext.mongo] —— service ext，侧车由内核按 extensions.yaml 的
+#     listen 端口拉起；MCP 工具数 +0。host/port 每次传（侧车刻意不做配置库回退）。
+#     给 uri 会忽略 host/port；本样例按约定要求 host+port。
+id: mongo.demo
+name: MongoDB 数据面往返（ext.mongo）
+runtime: lua
+capabilities: [ext.mongo]
+input_schema:
+  type: object
+  properties:
+    uri: {type: string, description: "完整 mongodb:// URI（给了就忽略 host/port/username/password）"}
+    host: {type: string, description: "主机（不含端口）"}
+    port: {type: number, description: "端口（默认 27017）"}
+    username: {type: string, description: "用户名（给了才带凭据，默认 authSource=admin）"}
+    password: {type: string, description: "密码"}
+    database: {type: string, description: "库名（缺省 demo；禁用 / \\ . 空格 \" $）"}
+    collection: {type: string, description: "集合名（缺省 demo_coll）"}
+  required: [host, port]
+output_schema:
+  type: object
+  properties:
+    ping_ok: {type: string, description: "ping 是否连上（true/false）"}
+    inserted_ok: {type: string, description: "insert_one 是否拿到 inserted_id（true/false）"}
+    found_count: {type: number, description: "find 返回的文档数"}
+    one_name: {type: string, description: "find_one 读回的 name 字段"}
+    total: {type: number, description: "count 全集合条数"}
+    modified: {type: number, description: "update_one 改动的条数"}
+    agg_count: {type: number, description: "aggregate $count 出来的 n"}
+    roles: {type: string, description: "distinct(role) 串成的逗号列表"}
+    index_name: {type: string, description: "create_index 返回的服务端索引名"}
+    collections: {type: string, description: "list_collections 串成的逗号列表"}
+    deleted: {type: number, description: "delete_one 删掉的条数"}
+    bad_collection_rejected: {type: string, description: "非法集合名是否被拒（true/false），供反向验证 fail-closed"}
+    error: {type: string, description: "出错时的原因（正常路径不出现）"}
+versions:
+  - version: 1.0.0
+    state: stable
+entry: |
+  local out = {}
+  local ok, r = pcall(function()
+    -- 连接参数每个方法都要带（侧车刻意不做配置库回退），这里拼一次复用
+    local conn = {
+      uri = ctx.input.uri,
+      host = ctx.input.host,
+      port = ctx.input.port,
+      username = ctx.input.username,
+      password = ctx.input.password,
+      database = ctx.input.database or "demo",
+      collection = ctx.input.collection or "demo_coll",
+    }
+    local function A(extra)
+      local t = {}
+      for k, v in pairs(conn) do t[k] = v end
+      for k, v in pairs(extra or {}) do t[k] = v end
+      return t
+    end
+
+    -- ① ping：真连上才返回 ok（mongo.Connect 不发网络包，ping 才是真的连上了）
+    out.ping_ok = tostring(ctx.ext.mongo.ping(A({})).ok)
+
+    -- ② insert_one：返回 inserted_id（Extended JSON 的 $oid）；这里只验证它非空，不打印 oid 对象
+    local ins = ctx.ext.mongo.insert_one(A({document = {name = "枢", role = "assistant", score = 42}}))
+    out.inserted_ok = tostring(ins.inserted_id ~= nil)
+
+    -- ③ find：documents 是数组，count 是条数
+    local f = ctx.ext.mongo.find(A({filter = {role = "assistant"}, limit = 10}))
+    out.found_count = f.count
+    out.one_name = (f.documents[1] and f.documents[1].name) or ""
+
+    -- ④ find_one：命中返回 document，没命中返回 document=nil（不报错）
+    out.one_name = ctx.ext.mongo.find_one(A({filter = {name = "枢"}})).document.name
+
+    -- ⑤ count：全集合条数
+    out.total = ctx.ext.mongo.count(A({})).count
+
+    -- ⑥ update_one：update 必须带 $inc/$set 等操作符
+    out.modified = ctx.ext.mongo.update_one(A({
+      filter = {name = "枢"},
+      update = {["$inc"] = {score = 1}},
+    })).modified_count
+
+    -- ⑦ aggregate：管道（这里 $match + $count）
+    local agg = ctx.ext.mongo.aggregate(A({
+      pipeline = {
+        {["$match"] = {role = "assistant"}},
+        {["$count"] = "n"},
+      },
+    }))
+    out.agg_count = (agg.documents[1] and agg.documents[1].n) or 0
+
+    -- ⑧ distinct：某字段去重值列表
+    out.roles = table.concat(ctx.ext.mongo.distinct(A({field = "role"})).values, ",")
+
+    -- ⑨ create_index：返回服务端按 key 生成的索引名
+    out.index_name = ctx.ext.mongo.create_index(A({keys = {score = 1}})).name
+
+    -- ⑩ list_collections：本库集合名列表
+    out.collections = table.concat(ctx.ext.mongo.list_collections(A({})).collections, ",")
+
+    -- ⑪ delete_one：清掉演示数据（让样例可重复跑）
+    out.deleted = ctx.ext.mongo.delete_one(A({filter = {name = "枢"}})).deleted_count
+
+    -- ⑫ 负向：集合名含非法字符（/ \ . 空格 " $）应被拒，证明 fail-closed
+    local bad_ok, _ = pcall(function()
+      return ctx.ext.mongo.insert_one(A({collection = "bad/name", document = {x = 1}}))
+    end)
+    out.bad_collection_rejected = tostring(not bad_ok)
+    return true
+  end)
+  if not ok then
+    out.error = tostring(r)
+  end
+  return out

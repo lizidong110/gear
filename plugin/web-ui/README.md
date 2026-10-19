@@ -65,7 +65,18 @@ gear flow register plugin/web_ui_flow.yaml        # web_ui.up
 # 起服（Ctrl+C 一并回收两个长驻服务）
 gear app run web_ui.up
 #  → UI   http://127.0.0.1:8080/      后端 http://127.0.0.1:8787/
+#
+# 启动完成后 Flow 的收尾步（web_ui.done）会把「打开地址」直接打印出来：
+#   app run（前台）   → 实时出现在终端；
+#   app start（后台） → 落到应用日志，且 `app start` / `app status` 输出里显式报「打开地址：…」。
+#   不必再回看本文档才能知道端口。
 ```
+
+> **「启动带网站的服务，不知道到哪儿打开」已修（2026-10-10）**：此前地址只写在本 README 的注释里，
+> 命令本身不回显。现在 `web_ui.up` 用一个 `done` 收尾步（`web_ui.done`）显式打印访问地址——
+> 后台启动时再经 launcher 从日志扫出 `GEAR_OPEN_URL=` 标记、在 `app start` / `app status` 报出。
+> 任何用 `static_site.serve` 起站点的 Flow（例如你自己的 `mindstorm.up`）只要加一个同样的收尾步、
+> 打印一行 `GEAR_OPEN_URL=<url>`，`app start` / `app status` 就会把打开地址显式报出来，无需改内核。
 
 > **不要给 `--registry` 传值**（2026-09-22）：起服进程会把生效的 registry 经环境变量
 > `GEAR_REGISTRY` 注入应用内的步骤，所以 UI 的列表与你 CLI 的 `gear flow list` **必然同源**。

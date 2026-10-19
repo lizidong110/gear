@@ -39,6 +39,40 @@ api:                        # 可选：声明式 REST 路由（FR-3），不写�
   - **不鉴权**。gear 没有用户库（Q1 已拍板：授权是业务的事），资源路由只保证「长得像 REST」。
     真前门请给这个 Tool 挂一条鉴权 Hook。
 
+### 1.1 Lua 沙箱：可用与不可用清单（2026-10-03 补）
+
+沙箱是**白名单**制（`SkipOpenLibs: true` 后逐个重开），实测踩过的坑列在这里：
+
+| 类别 | 可用 | 说明 |
+|---|---|---|
+| 标准库 | `base` `string` `table` `math`（+ `coroutine`，仅 permissive 策略） | `os` / `io` / `package` / `debug` **永不开**，配置项只能「开更多纯计算库」，关不掉沙箱 |
+| 全局函数 | 常规 Lua | `dofile` / `loadfile` / `require` / `module` 一律被置为 `nil`（任何策略下都是） |
+| 时间 | `ctx.time.now({format="unix"})` 等 | **没有 `os.date` / `os.time`**——要时间必须走 `time` 纯函数能力 |
+| 宿主能力（受门禁） | `http` `call` `db` `secret` `event` `subscribe` `config` | **必须在 `capabilities:` 里声明**才能用 |
+| 纯函数能力（免声明） | `time` `template` `crypto` `id` `validate` | 始终可用、无需声明；**声明了反而被拒**（注册期即报错） |
+
+**未声明的能力 = 在 `ctx` 上根本不存在**（取值是 `nil`，不是空表）。这是刻意设计：脚本连
+宿主的能力边界都探测不到。
+
+**但注册期会替你查（2026-10-03 新增）**：`gear_validate` / `gear_apply` / `gear tool register`
+都会扫 Lua entry 的 **AST**（不是文本——注释与字符串里的 `ctx.db` 不算），发现「用了受门禁
+能力却没声明」就报 `LUA_CAP_UNDECLARED`，并点名是哪个能力、脚本第几行、该怎么改：
+
+```yaml
+kind: Tool
+id: myapp__fetch
+runtime: lua
+capabilities: [http]        # ← 诊断会点名要补什么，照抄即可
+entry: |
+  local r = ctx.db.query({ sql = "select 1" })   # ← 诊断里写的就是 entry.lua:1
+  return ctx.http.Request("GET", r.url)
+```
+
+所以不必再靠运行期的报错反推：以前这错只表现成 `attempt to call a non-function object`
+（看着像函数写错了，真因是漏声明），而且 `if ctx.call then … end` 会静默走 else 分支。
+**仍然建议把 `capabilities` 一次写全**——静态校验只覆盖 entry 里**字面**出现的 `ctx.<能力>`，
+经变量/别名间接引用的（`local f = ctx.db; f.query(…)`）扫不出来。
+
 ## 2. Flow
 
 ```yaml

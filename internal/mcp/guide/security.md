@@ -2,24 +2,37 @@
 
 ## 1. 凭据只从调用参数传
 
-- **唯一合法写法是 `${secrets.NAME}`**（Flow 的 `input` 里）或 `secret.get{name}`（Lua 里）。
+- **唯一合法写法是 `${secrets.NAME}`**（Flow 的 `input` 里）或 `ctx.secret.get("NAME")`（Lua 里，位置参数）。
 - **绝不内联明文**：写进 YAML 的密钥会进 registry、进执行记录、进对话上下文。
 - **扩展原子禁止读环境变量**（有机械守卫 `TestExtAtomsMustNotReadEnv`）——这是红线，不是建议。
 
 ## 2. 密钥由人播种，MCP 不写
 
 `gear_app` / `gear_apply` **不提供密钥写入**。bundle 只声明 `requires.secrets: [NAME]`，
-`gear_apply` 检查它是否已存在，**缺了就在 `warnings` 里报 `MISSING_SECRET`**，由人在 CLI 播种。
+`gear_apply` 检查它是否已存在，**缺了就在 `warnings` 里报 `MISSING_SECRET`**（该告警里带可复制的
+播种命令与密钥库落点路径），由人播种。播种有**两条**既有通道，写入同一个库：
 
-这是**刻意保留的人机交接点**：明文一旦经 MCP 传入，就会同时进对话记录、模型上下文与执行记录库；
-而 MCP 的 `--http` 目前**没有鉴权**。所以：
+| 通道 | 写法 | 落点 |
+|---|---|---|
+| CLI | `gear secret set <NAME> <值>` | `<GEAR_HOME>/secrets.db` |
+| REST 执行面 | `PUT /api/secrets/<NAME>`，body `{"value":"…"}` | 同上（`gear secret path` 可查实际路径） |
 
-- 需要密钥的任务，**恰好一次**人工介入是设计的一部分（不是缺陷）；
-- 报告里要明确写出「需要人播种哪个密钥名」，而不是自己想办法绕过去。
+这个「恰好一次人工介入」是**刻意保留的人机交接点**，不是缺陷：明文一旦经 MCP 传入，就会同时进
+对话记录、模型上下文与执行记录库；而 MCP 的 `--http` 目前**没有鉴权**。所以：
+
+- 需要密钥的任务，**恰好一次**人工介入是设计的一部分；
+- 报告里要明确写出「需要人播种哪个密钥名」，而不是自己想办法绕过去；
+- **不要绕**：REST 的 `PUT /api/secrets` 是给宿主/运维用的本机通道，不是给智能体的入口。
 
 ## 3. 网络暴露面
 
 - `gear mcp --http` **只应绑 127.0.0.1**（文档已警告）；当前无鉴权，暴露公网等于把 registry 与执行面交出去。
+- **`gear serve` 的 REST 执行面同样无鉴权**：只绑回环 + 校验 `Origin`，而**不带 `Origin` 的请求照常放行**
+  ⇒ 同一台机器上的任意进程都能调你的执行面（读写 registry、明文 secrets、执行编排）。
+  这是**设计姿态**（平台面只服务本机/受信任环境），不是待修的缺陷：
+  **在这个面上开发的业务应用必须自建登录与权限**（终端用户走 `/api/tools/{id}/run` 与
+  `/api/executions`，用 Hook 拦得住，fail-closed——见 `gear_guide("authoring")` 与
+  `examples/auth-app`）。不要把「Gear 会管鉴权」写进你的应用设计。
 - 应用起服务时默认建议 `host: 127.0.0.1`；改成 `0.0.0.0` 要**明确说明**这会让同网段可访问。
 - 静态站托管的是**你自己的目录**：确认 `dir` 里没有不该对外的东西（如 `.env`、密钥文件、源码）。
 

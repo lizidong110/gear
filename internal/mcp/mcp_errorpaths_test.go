@@ -153,6 +153,15 @@ func TestMCPErrorPathsReportInsteadOfSilentSuccess(t *testing.T) {
 		{"app status 缺 app_id", "gear_app", "BAD_ARGUMENT", map[string]any{"action": "status"}},
 		{"app stop 缺 app_id", "gear_app", "BAD_ARGUMENT", map[string]any{"action": "stop"}},
 		{"app_id 不在台账", "gear_app", "APP_NOT_FOUND", map[string]any{"action": "status", "app_id": "app_nope"}},
+		// 2026-10-04 补：catalog 的 kind 非法此前**没有测试**锁，而它恰恰是最容易被
+		// 写成「静默返回空列表」的地方——空数组会被当成「这个对象真的不存在」，
+		// 于是调用方开始排查一个压根不存在的故障。合法值必须与入参描述同源。
+		{"catalog 的 kind 非法", "gear_catalog", "BAD_ARGUMENT", map[string]any{"kind": "bogus"}},
+		// 能力目录的 kind 传错**刻意不报错**（它返回空清单 + 可用能力名 hint）：
+		// 过滤后为空不是错误——按 name 过滤本就可能什么都不匹配，报 BAD_ARGUMENT 会让
+		// 「查无此能力」与「查错了」混为一谈。故此处**不加** capabilities 的错误用例。
+		// ⚠ 与 gear_catalog 的容错口径**刻意不同**（catalog 对未知 kind 报 BAD_ARGUMENT），
+		// 别为了「统一」把两边改成一个样——两者的空结果语义本就不同。
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

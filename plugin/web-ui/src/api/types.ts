@@ -108,6 +108,8 @@ export interface AppDTO {
   flow_id: string
   restart: string
   started_at: string
+  /** 收尾步带回的「打开地址」（如 web_ui.done），前端直接渲染成可点击链接。 */
+  open_urls?: string[]
 }
 
 /** GET /api/healthz。 */

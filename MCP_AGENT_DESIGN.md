@@ -187,6 +187,12 @@
 
 2. **八条铁律**（v1.2 补了第 3 条与第 7 条；v1.3 补了第 8 条——指向 `gear_guide("security")` 的破坏性清单与密钥规则）：
    1. 写 `step.call` 的「能力.方法」直调前先 `gear_capabilities`，不许猜方法名与参数；
+      写 Tool 的 Lua `entry` 前还要看同一份输出里的 **`invoke_form` / `lua_call`**（2026-10-03 新增）——
+      Lua 侧入参形态是混合的（位置参数 / 单具名 table / 裸函数），只给参数名会编出
+      `ctx.db.query(sql, params)` 或 `ctx.call.Call(...)` 这类**运行期才炸**的调用；
+      用 `kind` 缩小时注意它有**三个**值：`builtin`（受门禁原语，需在 Tool 里声明
+      `capabilities`）/ `pure`（纯函数原子 time/template/crypto/id/validate，**免声明即可调**）/
+      `ext`（扩展原子）——只查 `builtin` 会静默少一层能力；
    2. YAML 先 `gear_validate` 再 `gear_apply`，不要「先写进去再改」；
    3. **起长驻应用只能用 `gear_app(action=start)`**——它会派生后台进程并立即返回；`gear_run` 对 service Flow 一定会拒（不是 bug，是设计）；
    4. 凭据只走 `${secrets.NAME}`，绝不内联明文；扩展原子禁止依赖环境变量；
@@ -248,7 +254,7 @@ var files embed.FS
 
 | 现有 | 目标 | 变更性质 |
 |---|---|---|
-| `list_tools` / `list_flows` / `list_hooks` / `list_executions` | **`gear_catalog`**（`kind`: tool\|flow\|hook\|app\|execution\|all，返回**摘要**） | 合并 + 瘦身 |
+| `list_tools` / `list_flows` / `list_hooks` / `list_executions` | **`gear_catalog`**（`kind`: tool\|flow\|hook\|app\|execution\|all，返回**摘要**；**非法 kind 报 `BAD_ARGUMENT` 并列出合法值，不静默返回空列表**——2026-10-03 收口，「查错了」必须能说出口） | 合并 + 瘦身 |
 | `get_tool` / `get_flow` / `get_execution` | **`gear_describe`**（`kind` + `id`，全量定义） | 合并 |
 | `create_tool` / `create_flow` / `create_hook` | **`gear_apply`**（bundle 多文档、原子、幂等、可选 `dry_run`） | 合并 + 升级 |
 | `validate_flow` | **`gear_validate`**（接收 **YAML 文本**，不落库，返回结构化诊断） | 升级 |
@@ -262,7 +268,7 @@ var files embed.FS
 | — | **`gear_app`**（`action`: start\|stop\|status\|list）**默认开启**（v1.2 由「可选」升为「必需」，见 §6.2⑤） | 新增（C′） |
 | — | **`gear_doctor`** | 新增（问题 P7） |
 | — | **`gear_invoke`**（`name`/`method`/`args`，能力直调；禁 `secret.*`） | 新增（v1.3，评审 I-8：等价 REST 的 `POST /api/capabilities/invoke`） |
-| — | **`gear_export`**（`app_id`/`out_dir`/`format`，导出可移植产物） | 新增（v1.4，产物可交付性，见下） |
+| — | **`gear_export`**（`app_id`/`out_dir`/`format`/`include_static`/`static_root`，导出可移植产物；`app_id` 可为入口 Flow id，无 App 清单时临时合成清单） | 新增（v1.4，产物可交付性，见下） |
 | — | **`gear_import`**（`source`/`overwrite`/`dry_run`/`apps_dir`，导回产物） | 新增（v1.4，产物可交付性，见下） |
 
 **15 个 = 1 guide + 6 目录/写入/直调 + 2 执行/观察 + 1 app + 1 doctor + 1 promote + 1 invoke + 2 产物。**
@@ -377,6 +383,8 @@ gear_app(action: start|stop|status|list,
 ```
 
 智能体排障的第一站；`ext.serve` 起不来时，一次调用就能区分「YAML 写错」与「环境没准备好」。
+
+> **2026-10-03：判据本体已抽到 `internal/doctor`，CLI 侧 `gear doctor` 用的是同一份**（`Report.Map()` 保持上面这个形状逐字不变，`Report.Text()` 是 CLI 的渲染）。此前 doctor 只有 MCP 侧，于是「从命令行排查」的人看不到它，而能在 CLI 做的事（看路径、重建、改配置）偏偏都在 CLI 侧——一处真实的不对称。两份实现必然漂移，而 doctor 一旦漂移就再也不能被信任。
 
 **⑦ `gear_` 前缀与破坏性变更（已拍板：一次性全量统一）**
 MCP 无别名机制，一次性重命名。**Server `Version` 从 `0.1.0` 升到 `0.2.0`**，README §12 与 `REQUIREMENTS.md` 同步。

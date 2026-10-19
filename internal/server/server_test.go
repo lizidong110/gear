@@ -25,10 +25,13 @@ func newTestServer(t *testing.T) (*Server, *registry.Registry) {
 		t.Fatalf("打开 registry 失败: %v", err)
 	}
 	t.Cleanup(func() { _ = reg.Close() })
-	srv, err := New(reg)
+	// secrets.db 注入临时库，避免 New 默认落真实 <GEAR_HOME>/secrets.db。
+	secretsDB := filepath.Join(t.TempDir(), "secrets.db")
+	srv, err := New(reg, WithSecretsDBPath(secretsDB))
 	if err != nil {
 		t.Fatalf("构造 Server 失败: %v", err)
 	}
+	t.Cleanup(func() { _ = srv.Close() })
 	return srv, reg
 }
 

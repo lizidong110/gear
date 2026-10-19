@@ -52,3 +52,12 @@ steps:
       proxy:
         - path: /api
           target: http://127.0.0.1:8787
+  # 收尾：把访问地址显式抛出来（否则「启动带网站的服务」后看不到打开地址）。
+  # 取 site 步的 url（static_site.serve 经 sidecar 返回），由 web_ui.done 打印到 stdout /
+  # 应用日志，并由 launcher 在 app start / app status 输出里显式报「打开地址：…」。
+  - id: done
+    call: web_ui.done
+    depends_on: [site]
+    input:
+      url: ${steps.site.output.url}
+      backend: http://127.0.0.1:8787

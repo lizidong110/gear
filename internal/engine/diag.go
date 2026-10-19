@@ -60,6 +60,33 @@ const (
 	// 与 ROUTE_INVALID 的区别：这里两边**各自都合法**，只是不能同时存在——所以诊断要
 	// 点名两个 Tool，且整包拒绝（原子语义不变）。
 	CodeRouteConflict = "ROUTE_CONFLICT"
+	// CodeLuaCapUndeclared = Lua entry 用了某个受门禁 capability，而 Tool 的
+	// `capabilities:` 没声明它。
+	//
+	// 为什么单列一个码而不并进 BAD_TOOL_STRUCTURE：这一类的**修法完全不同**（加一行
+	// capabilities），而 BAD_TOOL_STRUCTURE 的 hint 指向「字段表 / runtime 取值」——
+	// 智能体照着那个 hint 改三轮也改不对。给专属码，它就能一次自愈（2026-10-03 外部实测 P1-4：
+	// 这类错误原先只表现成运行期的 `attempt to call a non-function object`）。
+	//
+	// 判据与实现见 internal/luacap（扫 AST，不扫文本；判据接在 model.Tool.Validate 上，
+	// 故 MCP / REST / CLI 三个注册口口径一致）。
+	CodeLuaCapUndeclared = "LUA_CAP_UNDECLARED"
+)
+
+const (
+	// ---- REST 兜底码（2026-10-03）----
+	//
+	// REST 面的错误码取法：**有诊断就用诊断里的真码**，没有才按 HTTP 状态落到下面这几个
+	// （见 internal/server.restErrorCode）。它们存在的意义是「诚实地说出这一类」，
+	// 而不是给每个状态编一个更精确的名字——不假装知道原因。
+	//
+	// ⚠ 不在 diag 的「Code 语义错误」清单里凑数：那些码描述的是**发生了什么**（TX_* 等），
+	// 而这几个只描述「请求没被接受」这一层事实。调用方该做的是看 message 与 detail。
+	CodeRESTBadRequest       = "BAD_REQUEST"
+	CodeRESTConflict         = "CONFLICT"
+	CodeRESTInternal         = "INTERNAL"
+	CodeRESTMethodNotAllowed = "METHOD_NOT_ALLOWED"
+	CodeRESTUnavailable      = "UNAVAILABLE"
 )
 
 // Diagnostic 是一条机器可读的校验诊断。

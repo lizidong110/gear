@@ -28,6 +28,50 @@ entry: |
   return { ready = true }
 
 ---
+# 起服收尾提示：把「打开地址」显式抛出来。
+#
+# 为什么需要（2026-10-10）：static_site.serve 经 sidecar 返回了 url，但 web_ui.up 此前
+# 没有收尾步把它告诉用户——跑完 `app start` 后「不知道到哪儿打开」。本步把地址 print 出来：
+#   · app run（前台）    → 实时进终端，启动完一眼看到；
+#   · app start（后台）  → 落应用日志，launcher 扫 `GEAR_OPEN_URL=` 标记后在
+#                          `app start` / `app status` 输出里显式报「打开地址：…」。
+# 任何「启动带网站的服务」的 Flow 都可复用这个约定（打印一行 GEAR_OPEN_URL=<url> 即可），
+# 不必改内核——launcher 只做「把它捞出来报一下」这一件小事。
+id: web_ui.done
+name: Web UI 起服完成提示（打印打开地址）
+description: 收尾步：把静态站访问地址（及可选后端地址）显式打印出来，让「启动带网站的服务」后能立刻看到打开地址；同时回显 url 供 Flow 结果取用。
+runtime: lua
+capabilities: []
+input_schema:
+  type: object
+  properties:
+    url: {type: string, description: "静态站访问地址（来自 static_site.serve 的 url）"}
+    backend: {type: string, description: "后端 REST 基址（可选，一并提示）"}
+  required: [url]
+output_schema:
+  type: object
+  properties:
+    url: {type: string, description: "网站访问地址"}
+    backend: {type: string, description: "后端地址（若提供）"}
+versions:
+  - version: "1.0.0"
+    state: stable
+entry: |
+  local url = ctx.input.url
+  local backend = ctx.input.backend
+  -- print 走 fmt.Println → 进程 stdout：app run 实时可见；app start 落到应用日志。
+  print("")
+  print("========================================")
+  print(" Web UI 已就绪 —— 浏览器打开：" .. url)
+  if backend and backend ~= "" then
+    print(" 后端 REST：" .. backend)
+  end
+  print("========================================")
+  -- launcher 约定标记：app start / app status 会把它捞出来作为「打开地址」显式报出。
+  print("GEAR_OPEN_URL=" .. url)
+  return { url = url, backend = backend }
+
+---
 # UI 的后端（其「后台」）：用 process 长驻起 gear REST 执行面。
 #
 # entry 里的可执行文件路径是**相对于本 Flow 的 cwd 约定（仓库根）**的。

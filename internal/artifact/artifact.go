@@ -35,12 +35,20 @@
 // 保持既有边界「gear 从不持有静态资源，那是调用方文件工具的职责」。
 // 传 AppsDir 才落地，且会**重写** App 清单的 layout 指向落地位置（否则导进来的应用
 // 指向的路径在这台机器上根本不存在）。
+//
+// ## 2026-10-10 的两处放宽（都是「让 export 真的能用」）
+//
+//   - **没有 App 清单也能导**：用户的多数应用只有 Flow，把 appID 当入口 Flow 解析并临时
+//     合成清单（不写库）；静态资源按入口 Flow 的 static_site.serve 的 dir 推断。
+//   - **基准目录自动上溯**：不传 StaticRoot 时从 cwd 逐级向上找能解析声明路径的目录。
+//     清单里的路径通常相对仓库根写，而用户常在子目录（build/）里跑 gear。
 package artifact
 
 import (
 	"archive/zip"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -376,6 +384,131 @@ func staticRelPath(a *model.App, declared string) string {
 	return strings.TrimPrefix(p, "./")
 }
 
+// ---- 应用解析：App 清单优先，缺失则按 Flow 合成 ----
+
+// resolveExportApp 取出「要导出的 App 清单」。
+//
+// 优先 registry 里的 kind: App 清单；没有则退一步把 appID 当作**入口 Flow** 的 id
+// 解析（见 findEntryFlow），并按该 Flow 临时**合成**一份清单（**不写库**）。
+//
+// ## 为什么允许合成（2026-10-10）
+//
+// 用户的绝大多数应用是「只注册了 Flow」就跑起来的（`gear app run/start`），从来没有
+// kind: App 清单——于是 `gear export wms` 直接 NOT_FOUND，而用户要的只是「把这个应用的
+// 定义带走」。合成让 export 对任何已注册的入口立即可用；静态资源按入口 Flow 的
+// static_site.serve 步推断（见 inferLayoutFromFlow）。
+//
+// 合成**不写库**：export 是只读操作，产物里的 app.yaml 就是这份合成清单，
+// 导回（`gear import`）时才会真正落进 registry。
+//
+// 返回的第二个值是合成说明（非空表示走了合成路径），由调用方并进 Warnings——
+// 产物能用，但清单是推断出来的，用户有权知道。
+func resolveExportApp(reg *registry.Registry, appID string) (*model.App, string, error) {
+	a, err := reg.GetApp(appID)
+	if err != nil {
+		return nil, "", fmt.Errorf("读取应用 %s 失败: %w", appID, err)
+	}
+	if a != nil {
+		return a, "", nil
+	}
+	flow, err := findEntryFlow(reg, appID)
+	if err != nil {
+		return nil, "", err
+	}
+	if flow == nil {
+		return nil, "", engine.Diagf("NOT_FOUND", "app_id",
+			"用 gear_catalog(kind=app) 看有哪些 App 清单；只有 Flow 没有清单的应用，"+
+				"直接用入口 Flow 的 id 也能导（如 wms 或 wms.up）",
+			"应用 %s 不存在：registry 里既没有它的 App 清单，也没有可对应的 Flow", appID)
+	}
+	lay := inferLayoutFromFlow(flow)
+	app := &model.App{
+		ID:          appID,
+		Name:        flow.Name,
+		Description: flow.Description,
+		EntryFlow:   flow.ID,
+		Layout:      lay,
+	}
+	note := fmt.Sprintf("registry 里没有 %s 的 App 清单，已按入口 Flow %s 临时合成一份用于导出（不写库）", appID, flow.ID)
+	if len(lay.Files) > 0 {
+		note += fmt.Sprintf("；静态资源按该 Flow 的 static_site.serve dir=%s 推断", lay.Files[0].Path)
+	} else {
+		note += "；该 Flow 未服务静态站，产物只含定义"
+	}
+	note += "。要固化这份清单，用 gear_apply 提交 kind: App 定义。"
+	return app, note, nil
+}
+
+// findEntryFlow 把一个「应用 id」解析成入口 Flow：精确 id → `<id>.up` → 唯一 `<id>.` 前缀。
+//
+// 多个前缀命中即报歧义：宁可让用户把 id 说清楚，也不猜一个——猜错会导出一个
+// 名字对不上的产物，而错在哪要等导回时才发现。
+func findEntryFlow(reg *registry.Registry, appID string) (*model.Flow, error) {
+	if f, err := reg.GetFlow(appID); err != nil {
+		return nil, err
+	} else if f != nil {
+		return f, nil
+	}
+	if f, err := reg.GetFlow(appID + ".up"); err != nil {
+		return nil, err
+	} else if f != nil {
+		return f, nil
+	}
+	flows, err := reg.ListFlows()
+	if err != nil {
+		return nil, err
+	}
+	var hits []string
+	for _, f := range flows {
+		if strings.HasPrefix(f.ID, appID+".") {
+			hits = append(hits, f.ID)
+		}
+	}
+	switch len(hits) {
+	case 0:
+		return nil, nil
+	case 1:
+		return reg.GetFlow(hits[0])
+	default:
+		sort.Strings(hits)
+		return nil, engine.Diagf("BAD_ARGUMENT", "app_id",
+			"用入口 Flow 的**完整 id** 再导一次即可消歧",
+			"%s 对应多个 Flow（%s），无法确定哪个是入口", appID, strings.Join(hits, ", "))
+	}
+}
+
+// inferLayoutFromFlow 从入口 Flow 的 static_site.serve 步推断静态资源布局。
+//
+// 约定与手写清单一致：把 dir 的父目录当 workdir、dir 本身声明为一个「目录」项，
+// 产物内便是 dir 的末段（`apps/wms/www` → workdir `apps/wms` → 产物内 `www/`）。
+// 绝对 dir 也照推断：源解析时绝对路径绕过基准目录，产物仍是自包含的。
+//
+// dir 为空或含模板（`${...}`）时**不推断**——猜一个会静默带上错目录，
+// 不如留空并让说明里讲清「产物只含定义」。
+func inferLayoutFromFlow(f *model.Flow) model.AppLayout {
+	for _, s := range f.Steps {
+		if s.Call != "static_site.serve" {
+			continue
+		}
+		raw, _ := s.Input["dir"].(string)
+		raw = strings.TrimSpace(raw)
+		if raw == "" || strings.Contains(raw, "${") {
+			return model.AppLayout{}
+		}
+		clean := filepath.Clean(raw)
+		dir := filepath.ToSlash(clean)
+		wd := filepath.ToSlash(filepath.Dir(clean))
+		if wd == "." {
+			wd = ""
+		}
+		return model.AppLayout{
+			Workdir: wd,
+			Files:   []model.AppFile{{Path: dir, Required: false, Dir: true}},
+		}
+	}
+	return model.AppLayout{}
+}
+
 // ---- 导出 ----
 
 // ExportOptions 是导出的入参。
@@ -407,6 +540,11 @@ type ExportResult struct {
 	Files []string `json:"files"`
 	// Warnings 是「不影响导出成功，但产物不完整」的提示（例如声明的文件在磁盘上找不到）。
 	Warnings []string `json:"warnings"`
+	// StaticRoot 是本次解析静态资源**实际使用**的基准目录（清单里有静态声明时才有值）。
+	// 让调用方看得见「gear 到底拿哪个目录去拼声明的路径」——这正是最容易出错、又最难猜的一环。
+	StaticRoot string `json:"static_root,omitempty"`
+	// StaticRootAuto 为 true 表示 StaticRoot 是自动向上查找得到的（调用方没显式指定）。
+	StaticRootAuto bool `json:"static_root_auto,omitempty"`
 }
 
 // Export 把一个应用导出成可移植产物。
@@ -431,14 +569,9 @@ func Export(reg *registry.Registry, o ExportOptions) (*ExportResult, error) {
 		return nil, engine.Diagf("BAD_ARGUMENT", "format", "只支持 dir 与 zip", "format 只能是 dir 或 zip（实际: %s）", o.Format)
 	}
 
-	a, err := reg.GetApp(appID)
+	a, synthNote, err := resolveExportApp(reg, appID)
 	if err != nil {
-		return nil, fmt.Errorf("读取应用 %s 失败: %w", appID, err)
-	}
-	if a == nil {
-		return nil, engine.Diagf("NOT_FOUND", "app_id",
-			"先用 gear_catalog(kind=app) 确认 id；只跑过 gear_app(start) 而没 apply 过 kind: App 清单的应用没有清单，导不了",
-			"应用 %s 不存在（registry 里没有它的 App 清单）", appID)
+		return nil, err
 	}
 	if err := a.Validate(); err != nil {
 		return nil, engine.Diagf("ARTIFACT_INVALID", "app("+appID+")", "先修正清单再导出", "App 清单非法: %v", err)
@@ -480,9 +613,62 @@ func Export(reg *registry.Registry, o ExportOptions) (*ExportResult, error) {
 	}
 
 	res := &ExportResult{
-		AppID: appID, Format: format, Components: *comp,
+		AppID: appID, Format: format, Components: Components{},
 		Files: []string{}, Warnings: []string{},
 	}
+	// 走了「按 Flow 合成清单」那条路就说出来：产物能用，但清单是推断的，用户有权知道。
+	if synthNote != "" {
+		res.Warnings = append(res.Warnings, synthNote)
+	}
+
+	// ---- 静态资源清单（展开目录）----
+	// layout.files 支持 `dir: true` 单项声明「整个目录递归拷贝」，避免把带 hash 的
+	// 构建产物（dist/assets/*.js）逐个列名——那种写法一旦重新构建就全失效。
+	// 展开后的实际文件写入 comp.StaticFiles，保证导出的 meta 与落地一致
+	// （import 端按 meta 逐文件落地，列目录会让它拿不到文件）。
+	//
+	// 基准目录（StaticRoot）：显式传的照用；没传则**从 cwd 逐级向上找**能解析声明路径的
+	// 祖先目录（见 findStaticRoot）——用户常在仓库子目录（build/）里跑 gear，而死守 cwd
+	// 会把 build/dist 拼成 build/build/dist。绝对路径的声明与基准目录无关，原样用。
+	root := strings.TrimSpace(o.StaticRoot)
+	autoRoot := root == ""
+	if autoRoot {
+		root = findStaticRoot(a.Layout.Files)
+	}
+	if len(a.Layout.Files) > 0 {
+		res.StaticRoot, res.StaticRootAuto = root, autoRoot
+	}
+	entries := make([]staticEntry, 0, len(a.Layout.Files))
+	for _, f := range a.Layout.Files {
+		rel := staticRelPath(a, f.Path)
+		src := staticSrc(root, f.Path)
+		if f.Dir {
+			sub, err := expandDir(src, rel)
+			if err != nil {
+				// 目录项缺失：仍把声明路径记进组成清单（meta 要反映意图），
+				// 但产物里不会有内容，按 required 给不同级别的警告。
+				comp.StaticFiles = append(comp.StaticFiles, rel)
+				level := "warning"
+				if f.Required {
+					level = "**required**"
+				}
+				res.Warnings = append(res.Warnings, fmt.Sprintf(
+					"静态资源目录 %s（%s）在静态根 %s 下找不到，产物里不会有它："+
+						"gear 不持有静态资源，只按 layout.files 声明的路径去拷；"+
+						"用 --root 指向它所在的目录再导出", f.Path, level, root))
+				continue
+			}
+			entries = append(entries, sub...)
+			continue
+		}
+		entries = append(entries, staticEntry{rel: rel, src: src, required: f.Required})
+	}
+	// 组成清单的静态文件列表用**展开后的实际文件**，保证导出的 meta 与落地一致。
+	comp.StaticFiles = comp.StaticFiles[:0]
+	for _, e := range entries {
+		comp.StaticFiles = append(comp.StaticFiles, e.rel)
+	}
+	sort.Strings(comp.StaticFiles)
 
 	// ---- staging ----
 	stage, err := os.MkdirTemp("", "gear-export-")
@@ -499,31 +685,25 @@ func Export(reg *registry.Registry, o ExportOptions) (*ExportResult, error) {
 		return nil, err
 	}
 	if !o.NoStatic {
-		root := strings.TrimSpace(o.StaticRoot)
-		if root == "" {
-			root = "."
-		}
-		for _, f := range a.Layout.Files {
-			rel := staticRelPath(a, f.Path)
-			src := filepath.Join(root, filepath.FromSlash(strings.TrimSpace(f.Path)))
-			if _, err := os.Stat(src); err != nil {
+		for _, e := range entries {
+			if _, err := os.Stat(e.src); err != nil {
 				level := "warning"
-				if f.Required {
+				if e.required {
 					level = "**required**"
 				}
 				res.Warnings = append(res.Warnings, fmt.Sprintf(
-					"静态资源 %s（%s）在 %s 下找不到，产物里不会有它："+
+					"静态资源 %s（%s）在磁盘上找不到，产物里不会有它："+
 						"gear 不持有静态资源，只按 layout.files 声明的路径去拷；"+
-						"换 static_root 指向它所在的目录再导出", f.Path, level, root))
+						"用 --root 指向它所在的目录再导出", e.src, level))
 				continue
 			}
-			if err := copyFile(src, filepath.Join(stage, filepath.FromSlash(rel))); err != nil {
-				return nil, fmt.Errorf("拷贝静态资源 %s 失败: %w", f.Path, err)
+			if err := copyFile(e.src, filepath.Join(stage, filepath.FromSlash(e.rel))); err != nil {
+				return nil, fmt.Errorf("拷贝静态资源 %s 失败: %w", e.src, err)
 			}
-			res.Files = append(res.Files, rel)
+			res.Files = append(res.Files, e.rel)
 		}
 		sort.Strings(res.Files)
-	} else if len(a.Layout.Files) > 0 {
+	} else if len(entries) > 0 {
 		res.Warnings = append(res.Warnings,
 			"仅导出定义（no_static）：，静态资源未拷入产物，这个产物不能当交付物用")
 	}
@@ -549,6 +729,9 @@ func Export(reg *registry.Registry, o ExportOptions) (*ExportResult, error) {
 	}
 	abs, _ := filepath.Abs(dst)
 	res.Path = abs
+	// 在末尾再回填组成清单：Components 含展开后的静态文件列表，且不能在 res 创建时
+	// 用 `*comp` 浅拷贝（slice 头会共享底层数组，前面 staticRelPath 的展开会污染它）。
+	res.Components = *comp
 	return res, nil
 }
 
@@ -605,6 +788,101 @@ func ensureDirTarget(dst string) error {
 		return fmt.Errorf("创建目标目录失败: %w", err)
 	}
 	return nil
+}
+
+// findStaticRoot 在**调用方没显式指定基准目录**时，为声明的静态路径挑一个根。
+//
+// ## 为什么不是简单的 cwd（2026-10-10 实测）
+//
+// 用户常在仓库的子目录里跑 gear（典型：`build>`），而 layout.files 的路径是相对**仓库根**
+// 写的（`build/dist`、`apps/wms/www`）。若死守 cwd，`build> gear export web_ui` 会把
+// `build/dist` 拼成 `build/build/dist`，报「找不到」——而这几乎总是用户想要的导出。
+// 于是从 cwd 起**逐级向上**找，取第一个能让任一「相对」声明路径存在的祖先目录；
+// 一个都找不到就退回 cwd，让警告如实报出实际用的根（参数问题仍需用户用 --root 明说）。
+//
+// 只看相对路径：绝对路径的解析与基准目录无关（见 staticSrc）。都不存在时退回 cwd。
+func findStaticRoot(files []model.AppFile) string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	rels := make([]string, 0, len(files))
+	for _, f := range files {
+		p := strings.TrimSpace(f.Path)
+		if p == "" || filepath.IsAbs(p) {
+			continue
+		}
+		rels = append(rels, filepath.FromSlash(p))
+	}
+	if len(rels) == 0 {
+		return cwd
+	}
+	for dir := cwd; ; {
+		for _, rel := range rels {
+			if _, err := os.Stat(filepath.Join(dir, rel)); err == nil {
+				return dir
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return cwd
+}
+
+// staticSrc 解析一份静态资源在磁盘上的位置：绝对路径原样用（与基准目录无关），
+// 相对路径挂到 root 下。
+func staticSrc(root, declared string) string {
+	p := filepath.FromSlash(strings.TrimSpace(declared))
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(root, p)
+}
+
+// staticEntry 是导出时「一个待拷的静态资源项」：rel=产物内相对路径（已剥 workdir），
+// src=磁盘源路径，required=缺失是否阻断。目录项展开后每个文件都是一个 staticEntry。
+type staticEntry struct {
+	rel      string
+	src      string
+	required bool
+}
+
+// expandDir 把一个目录展开成「逐文件」的 staticEntry 列表。
+//
+// rel 是目录在产物内的相对路径（已剥 workdir 前缀），其下的每个文件保持相对结构
+// （dist → dist/index.html、dist/assets/x.js）。源路径不存在或不是目录则返回错误，
+// 由调用方转成警告（目录项缺失不应让导出失败）。
+func expandDir(src, rel string) ([]staticEntry, error) {
+	info, err := os.Stat(src)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("%s 不是目录", src)
+	}
+	var out []staticEntry
+	err = filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		sub := strings.TrimPrefix(filepath.ToSlash(p[len(src):]), "/")
+		out = append(out, staticEntry{
+			rel:      filepath.ToSlash(filepath.Join(rel, sub)),
+			src:      p,
+			required: true,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // copyFile 拷贝单个文件（自动建目标目录）。
@@ -886,20 +1164,50 @@ func Import(reg *registry.Registry, o ImportOptions) (*ImportResult, error) {
 	appsDir := strings.TrimSpace(o.AppsDir)
 	for _, rel := range l.Meta.Components.StaticFiles {
 		src := filepath.Join(l.Dir, filepath.FromSlash(rel))
-		if _, err := os.Stat(src); err != nil {
+		info, err := os.Stat(src)
+		if err != nil {
 			res.StaticMissing = append(res.StaticMissing, rel)
 			continue
 		}
+		if !info.IsDir() {
+			// 单文件：直接落地。
+			if appsDir == "" {
+				continue
+			}
+			dst := filepath.Join(appsDir, a.ID, filepath.FromSlash(rel))
+			if !o.DryRun {
+				if err := copyFile(src, dst); err != nil {
+					return nil, fmt.Errorf("落地静态资源 %s 失败: %w", rel, err)
+				}
+			}
+			res.StaticLanded = append(res.StaticLanded, rel)
+			continue
+		}
+		// 目录项：递归落地每个文件，rel 展开成「目录/子路径」，与导出端一致。
 		if appsDir == "" {
 			continue
 		}
-		dst := filepath.Join(appsDir, a.ID, filepath.FromSlash(rel))
-		if !o.DryRun {
-			if err := copyFile(src, dst); err != nil {
-				return nil, fmt.Errorf("落地静态资源 %s 失败: %w", rel, err)
+		err = filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
 			}
+			if d.IsDir() {
+				return nil
+			}
+			sub := strings.TrimPrefix(filepath.ToSlash(p[len(src):]), "/")
+			frel := filepath.ToSlash(filepath.Join(rel, sub))
+			dst := filepath.Join(appsDir, a.ID, filepath.FromSlash(frel))
+			if !o.DryRun {
+				if err := copyFile(p, dst); err != nil {
+					return fmt.Errorf("落地静态资源 %s 失败: %w", frel, err)
+				}
+			}
+			res.StaticLanded = append(res.StaticLanded, frel)
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("落地静态资源目录 %s 失败: %w", rel, err)
 		}
-		res.StaticLanded = append(res.StaticLanded, rel)
 	}
 	if appsDir != "" && len(res.StaticLanded) > 0 {
 		wd := filepath.ToSlash(filepath.Join(appsDir, a.ID))

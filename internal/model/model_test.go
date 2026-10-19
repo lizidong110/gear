@@ -1,6 +1,7 @@
 package model
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -377,6 +378,32 @@ func TestFlowValidate(t *testing.T) {
 	for _, c := range cases {
 		if err := c.f.Validate(); err == nil {
 			t.Errorf("%s 应被拒绝", c.name)
+		}
+	}
+}
+
+// TestToolValidateMissingVersionsGivesFieldExample（2026-10-03 报错误导收口）。
+//
+// 写 `version: "1.0.0"` 标量的人看到的原文只有「至少要有一个 version」，
+// 看不出字段名是 versions **列表**、也不知道条目长什么样——注册期是唯一能免费
+// 给出正确写法的地方，所以字段结构必须写进错误里。
+func TestToolValidateMissingVersionsGivesFieldExample(t *testing.T) {
+	tl := &Tool{ID: "novers", Runtime: RuntimeProcess,
+		InputSchema: objectSchema(), OutputSchema: objectSchema()}
+	err := tl.Validate()
+	if err == nil {
+		t.Fatal("缺 versions 应被拒绝")
+	}
+	msg := err.Error()
+	for _, want := range []string{"versions", `versions: [{version: "1.0.0", state: stable}]`} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("报错缺字段结构示例 %q，实际: %s", want, msg)
+		}
+	}
+	// 负向：state 取值清单必须与 ValidStates 同源（不能写死一份字面量后漂移）。
+	for s := range ValidStates {
+		if !strings.Contains(msg, string(s)) {
+			t.Fatalf("报错未列出合法 state %q（清单应从 ValidStates 生成）: %s", s, msg)
 		}
 	}
 }

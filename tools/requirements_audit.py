@@ -28,7 +28,13 @@ SKIP_DIRS = (".git", "build", "node_modules", "dist", ".workbuddy", "__pycache__
 # 例外白名单：{需求ID: 理由}。只放「文档自己已说明原因」的条目，别把待修漂移塞进来。
 EXCEPTIONS = {}
 
-ROW = re.compile(r"^\| (REQ-[A-Z0-9-]+) \|")
+# 需求行的 ID 列**允许写成 ` + "`REQ-XXX`" + ` （反引号包裹）。
+#
+# 2026-10-03 实测踩到：原先只匹配裸 ID，于是文档里 25 行带反引号的需求**整行被跳过**——
+# 包括当轮刚写的 4 行。闸门照样报「全部引用存在」并退出 0，看起来绿，实际什么都没查。
+# 这正是本项目最忌讳的那类假绿：不静默放过未校验的东西。
+# 反引号可有可无，故两种写法都必须进审计。
+ROW = re.compile(r"^\| `?(REQ-[A-Z0-9-]+)`? \|")
 FILE_REF = re.compile(r"[A-Za-z0-9_./-]+\.(?:go|py|mjs|md|yaml)\b")
 TEST_REF = re.compile(r"\bTest[A-Za-z0-9_]+\b")
 

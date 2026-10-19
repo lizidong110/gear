@@ -22,6 +22,7 @@ import (
 	"gear/internal/cmdline"
 	"gear/internal/engine"
 	"gear/internal/gearhome"
+	"gear/internal/luacap"
 	"gear/internal/model"
 	"gear/internal/registry"
 )
@@ -141,8 +142,22 @@ func (s *Server) validateBundle(text string) *validateResult {
 	// Tool / Hook 用 model 层校验（与注册期同一份规则）。
 	for _, t := range b.Tools {
 		if err := t.Validate(); err != nil {
-			res.Diags = append(res.Diags, wrapModelDiag(engine.CodeBadToolStructure, t.ID, "tool 定义非法", err, "tool",
-				"对照 gear_guide(\"authoring\") 的 Tool 字段表；runtime 只支持 process / lua / go-host")...)
+			// 「Lua 用了却没声明 capability」单列一个码（2026-10-03）：它的修法是加一行
+			// capabilities，与「字段表写错」毫无关系——混在 BAD_TOOL_STRUCTURE 里，
+			// 智能体会照着「对照字段表 / runtime 取值」的 hint 反复改错地方。
+			if luacap.Missing(t.Entry, t.Capabilities) != nil && t.Runtime == model.RuntimeLua {
+				res.Diags = append(res.Diags, engine.Diagnostic{
+					Code:    engine.CodeLuaCapUndeclared,
+					Field:   fmt.Sprintf("tool(%s).capabilities", t.ID),
+					Message: err.Error(),
+					Hint: "给这个 Tool 加 capabilities（列出 entry 里用到的受门禁原语），" +
+						"或者删掉 entry 里那次调用。纯函数原子（time/template/crypto/id/validate）无需声明；" +
+						"ctx.* 与 ctx.caller / ctx.json 也不是能力，不在声明范围内",
+				})
+			} else {
+				res.Diags = append(res.Diags, wrapModelDiag(engine.CodeBadToolStructure, t.ID, "tool 定义非法", err, "tool",
+					"对照 gear_guide(\"authoring\") 的 Tool 字段表；runtime 只支持 process / lua / go-host")...)
+			}
 		}
 		// process 型 Tool 的 entry 可达性：把「路径写错」从运行期提前到写作期。
 		ed, ew := checkToolEntryResolvable(t)
@@ -404,8 +419,15 @@ func (s *Server) appManifestWarnings(a *appManifest) []string {
 		}
 	}
 	for _, name := range a.Requires.Secrets {
-		out = append(out, fmt.Sprintf("[MISSING_SECRET] %s 需要密钥 %s：MCP 不写密钥，请人在 CLI 播种（"+
-			"Flow 里用 ${secrets.%s} 引用）", a.ID, name, name))
+		// 报错误导（2026-10-03 外部实测）：原文只说「请人在 CLI 播种」，
+		// 而播种点有两条、落点路径也没给——使用者会以为无路可走，转而去 rebuild 二进制碰运气。
+		// 这里给**可复制的命令**（CLI 与 REST 各一条，因为两者都真实可用）与密钥库落点。
+		out = append(out, fmt.Sprintf("[MISSING_SECRET] %s 需要密钥 %s，但密钥库里没有它。"+
+			"播种命令（任选一条，都写入同一个库 %s）：`gear secret set %s <值>`（CLI）；"+
+			"或向 gear serve 的执行面发 `PUT /api/secrets/%s`（默认 127.0.0.1:8787）。"+
+			"MCP 面刻意不提供播种入口（明文会进对话记录与执行记录库，见 gear_guide(\"security\")）；"+
+			"Flow 里用 ${secrets.%s} 或 ctx.secret.get(\"%s\") 引用",
+			a.ID, name, gearhome.SecretsDBPath(), name, name, name, name))
 	}
 	for _, sc := range a.Requires.Sidecars {
 		base := strings.TrimPrefix(sc, "ext.")
@@ -466,8 +488,8 @@ func (s *Server) registerWriteTools(ms *mcp.Server) {
 
 	mcp.AddTool(ms, &mcp.Tool{
 		Name: "gear_export",
-		Description: "把应用导出成可移植产物（目录或 .gearapp 包）：清单 + 名下 Tool/Flow/Hook + 静态资源，" +
-			"用于备份、换机器、交付。目录形态可 diff 可版本化，是默认形态。",
+		Description: "把应用导出成可移植产物（目录/.gearapp）：清单 + 名下 Tool/Flow/Hook + 静态资源，" +
+			"用于备份、换机器、交付。目录可 diff 可版本化；只有 Flow 应用也能导。",
 		Annotations:  &mcp.ToolAnnotations{Title: "导出应用产物"},
 		OutputSchema: outExport,
 	}, s.handleExport)
@@ -584,7 +606,9 @@ func (s *Server) handleApply(ctx context.Context, _ *mcp.CallToolRequest, in App
 		"applied":     applied,
 		"created":     created,
 		"updated":     updated,
-		"next":        "接着用 gear_app(action=start, flow_id=…, ports=[…]) 起应用（写入 ≠ 运行）",
+		"next": "接着用 gear_app(action=start, flow_id=…, ports=[…]) 起应用（写入 ≠ 运行）。" +
+			"⚠ 静态资源（应用清单 layout.files 里的 www/ 等）**必须由你自己的文件工具落盘**——" +
+			"MCP 面不提供文件读写，纯 MCP 建应用时这一环要你自己接上（apply 只登记、不落地）",
 	}, nil
 }
 
@@ -689,12 +713,13 @@ func (s *Server) handleExport(ctx context.Context, _ *mcp.CallToolRequest, in Ex
 		return toolErrorFrom("EXPORT_FAILED", err), nil, nil
 	}
 	return nil, map[string]any{
-		"app_id":     res.AppID,
-		"path":       res.Path,
-		"format":     res.Format,
-		"components": res.Components,
-		"files":      res.Files,
-		"warnings":   res.Warnings,
+		"app_id":      res.AppID,
+		"path":        res.Path,
+		"format":      res.Format,
+		"components":  res.Components,
+		"files":       res.Files,
+		"warnings":    res.Warnings,
+		"static_root": res.StaticRoot,
 		"next": "产物已落地。zip 形态可直接发给别人；目录形态可 git 版本化。" +
 			"到另一台机器用 gear_import(source=<path>) 导回（静态资源默认不落地，传 apps_dir 才落地）",
 	}, nil

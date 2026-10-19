@@ -506,7 +506,7 @@ func defaultAISchemas() map[string]MethodSchema {
 			"max_retries": {Type: "number", Description: "最大重试次数（可选，默认配方值）"},
 		}},
 		"capabilities": {Description: "返回内核原语（builtin + pure 两类）与已注册 ext.* 的方法级参数 schema（锚定 ctx.* 语义）", Parameters: map[string]ParamSchema{}},
-		"react": {Description: "ReAct 智能体：LLM 逐步调用内核原语（builtin + pure）与已注册 ext.* 完成任务，返回 {answer,steps,used_tools}", Parameters: map[string]ParamSchema{
+		"react": {Description: "ReAct 智能体：LLM 逐步调用内核原语（builtin + pure）与已注册 ext.* 完成任务，返回 {answer,steps,used_tools,gaps,recovery_log}。工具失败按七类分类分层恢复（瞬时重试/换通道/信号回灌/缺口作答），失败不静默", Parameters: map[string]ParamSchema{
 			"task":        {Type: "string", Description: "任务描述", Required: true},
 			"max_steps":   {Type: "number", Description: "最大步数（可选，默认 6）"},
 			"allow":       {Type: "array", Description: "限制可用工具（可选）。项可以是能力名（http / ext.redis，该能力全部方法）或方法名（ext.redis.set，只开这一个）；不给则用默认集（通用能力，不是全目录）；给 \"*\" 表示不设限。工具数超上限会报错，请用方法级 allow 收窄"},
@@ -544,9 +544,18 @@ type ParamSchema struct {
 }
 
 // MethodSchema 描述扩展原语某个方法的参数结构，agent 生成 tool 的 entry 时据此知道 ctx.ext.<x>.<method> 吃什么字段。
+//
+// InvokeForm / LuaCall 是**派生字段**（2026-10-03 加）：Lua 侧的调用形态是混合的
+// （位置参数 / 单具名 table / 裸函数），只给参数名会让人编出 `ctx.db.query(sql, params)`
+// 这类到运行期才炸的调用。它们由 invokeFormFor 在渲染时填，**不写在这里**——
+// 写进来就成了第二份真相源，与 ai_agent.go 的三处渲染各判一次必然漂移。
+// 零值（空串）表示「本方法没有派生形态信息」，渲染方按原样省略即可。
 type MethodSchema struct {
 	Description string                 `yaml:"description" json:"description,omitempty"`
 	Parameters  map[string]ParamSchema `yaml:"parameters" json:"parameters,omitempty"` // 参数名 -> schema
+
+	InvokeForm string `yaml:"-" json:"invoke_form,omitempty"` // positional / table / bare（派生，见上）
+	LuaCall    string `yaml:"-" json:"lua_call,omitempty"`    // 可直接复制的完整调用，如 ctx.db.query({ sql = string })
 }
 
 // ExtSpec 是 extensions.yaml 中一个扩展原语的配置。
@@ -569,6 +578,16 @@ type ExtSpec struct {
 	// Source 声明该 ext 承载的「事件源名」（通用订阅原语 ctx.subscribe 用，首批 mqtt）。
 	// 非空且 Listen 非空时，SetupExtensions 会把对应源工厂登记进 CapabilityRegistry.Sources。
 	Source string `yaml:"source"`
+
+	// Describe 声明「本扩展的 methods / schemas 由侧车自己说」（自描述，2026-10-09）。
+	//
+	// 为真时 extensions.yaml **不许再写 schemas**（写了即 fail-closed 报错），
+	// methods 可写可不写：不写则全取侧车的，写了则必须与侧车一致（不一致点名报错）。
+	// 加载时跑一次 `<cmd> --describe` 取回（见 internal/engine/describe.go）。
+	//
+	// 目的不是少写字，而是让「描述」与「真正读参数的源码」同处一处——此前两份
+	// 手工同步，漂移不报错，只在 agent 照着过期描述组装入参时才炸。
+	Describe bool `yaml:"describe"`
 }
 
 // builtinCapabilitySchemas 是**内核原语**的「方法级参数 schema」硬编码单一来源。
@@ -681,6 +700,9 @@ var builtinCapabilitySchemas = map[string]map[string]MethodSchema{
 
 // builtinCapabilitySummaries 返回内核原语的能力摘要（门禁：kind=builtin；纯函数：kind=pure），
 // 顺序取 allBuiltinPrimitives（单一来源）。
+//
+// 方法上挂 invoke_form / lua_call（派生，见 withInvokeForm）：只在这一处填，
+// 于是 capabilityCatalog / 能力目录接口 / 提示词渲染看到的形态必然一致。
 func builtinCapabilitySummaries() []CapabilitySummary {
 	out := make([]CapabilitySummary, 0, len(gatedPrimitiveOrder)+len(purePrimitiveOrder))
 	for _, p := range allBuiltinPrimitives() {
@@ -688,7 +710,27 @@ func builtinCapabilitySummaries() []CapabilitySummary {
 		if !ok {
 			continue
 		}
-		out = append(out, CapabilitySummary{Name: p, Kind: primitiveKind(p), Methods: ms})
+		out = append(out, CapabilitySummary{Name: p, Kind: primitiveKind(p), Methods: withInvokeForm(p, ms, nil)})
+	}
+	return out
+}
+
+// withInvokeForm 给一组方法 schema **补上派生形态字段**并返回新 map。
+//
+// 为什么 copy 而不是原地改：builtinCapabilitySchemas 与 extCaps 是进程级共享的
+// 单一真相源，原地填等于让「派生值」污染「声明值」——于是 extensions.yaml 里读到的
+// MethodSchema 也带上了形态，第二个消费方再判一次就开始漂移。
+func withInvokeForm(cap string, ms map[string]MethodSchema, extCaps map[string]map[string]MethodSchema) map[string]MethodSchema {
+	if len(ms) == 0 {
+		return ms
+	}
+	out := make(map[string]MethodSchema, len(ms))
+	for m, sch := range ms {
+		if form, sig, ok := invokeFormFor(cap, m, extCaps); ok {
+			sch.InvokeForm = form
+			sch.LuaCall = sig
+		}
+		out[m] = sch
 	}
 	return out
 }
@@ -708,7 +750,11 @@ func capabilityCatalog(extCaps map[string]map[string]MethodSchema) []map[string]
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		summaries = append(summaries, CapabilitySummary{Name: name, Kind: "ext", Methods: extCaps[name]})
+		summaries = append(summaries, CapabilitySummary{
+			Name: name, Kind: "ext",
+			// ext.* 一律单具名 table（lua.go 的 ctx.ext 装配如此），形态字段同样在渲染时补。
+			Methods: withInvokeForm(name, extCaps[name], extCaps),
+		})
 	}
 	out := make([]map[string]interface{}, 0, len(summaries))
 	for _, s := range summaries {
@@ -818,6 +864,12 @@ func SetupExtensions(capReg *CapabilityRegistry, reg *registry.Registry, cfgPath
 
 	specs, err := LoadExtensionConfig(cfgPath)
 	if err != nil {
+		return nil, err
+	}
+	// 自描述扫描（2026-10-09）：声明了 describe: true 的 ext，其 methods/schemas 由侧车
+	// 自己提供。必须在下面的「schemas 必填」校验**之前**补全，否则会被当成缺失而报错。
+	// fail-closed：扫描失败即中断启动，绝不以「没有 schema 就不校验方法名」的姿态放行。
+	if err := ApplySidecarDescribes(specs); err != nil {
 		return nil, err
 	}
 

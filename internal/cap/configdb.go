@@ -23,7 +23,8 @@ import (
 //   - config 由**宿主**注入落点（gearhome.ConfigDBPath），应用声明 `capabilities: [config]`
 //     即可读写持久化配置，不必知道库在哪，也不必靠环境变量把配置灌进进程。
 //
-// 与 secret 的分工（刻意不合并）：secret 是**只读**密钥源、看不到存储位置、且不落本库；
+// 与 secret 的分工（刻意不合并）：secret 是**只读**密钥源、看不到存储位置、且不落本库
+// （落在独立的 secrets.db，不进本库）；
 // config 是**可读写**的普通配置。API key 这类东西放 config 是为了「界面可改、重启仍在」，
 // 它的安全边界是「本机用户数据目录」，不是「进程不可见」——两者不是一回事，不要互相顶替。
 type Config interface {

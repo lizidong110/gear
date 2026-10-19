@@ -38,6 +38,19 @@ MCP 面管**你自己**（智能体）怎么操作 Gear；REST 面管**你造出
 `/api/executions`（长编排、多步、要日志，异步 + 轮询）。前者是 2026-09-22 补上的——此前
 REST 只有异步入口，前端想复用 Tool 只能把它包成 Flow 再轮询，或干脆绕过 Tool 裸调原子。
 
+**错误响应是结构化的**（2026-10-03；此前只有 `{"error": 一整段文本}`，调用方只能正则剥）：
+
+```json
+{ "error": "…", "code": "TOOL_RUN_FAILED", "message": "…",
+  "detail": "stack traceback: …", "hint": "…" }
+```
+
+- `code` 与 MCP 面同源（诊断优先，无诊断才按 HTTP 状态兜底），错误码表见 `gear_guide("errors")`。
+- `message` + `detail` 合起来与旧文本逐字相同：**拆分只是让人读的主句与技术噪音分开，不丢信息**。
+- `error` 是兼容位（= `message`），既有前端读它。
+- ⚠ `/api/tools/{id}/run` 与资源路由都要求**扁平 body**；包一层 `{"input":{...}}` 会在 `hint` 里收到明确提示
+  （不会自动兼容——自动兼容会让真叫 `input` 的字段产生歧义）。
+
 注册面（与 MCP 的 apply/delete 等价）：
 
 | 方法 | 路径 |
@@ -70,6 +83,10 @@ REST 面**只绑回环**，但「绑回环 ≠ 安全」：浏览器里任意网
    `GEAR_SECRET_*`（人来做），MCP 面不写密钥。
 3. 这**不是完备鉴权**：本机任意进程仍可调用。要把 REST 面暴露到回环之外时，先自己加一层
    鉴权（Gear 不提供 token 体系）。
+4. **业务鉴权归应用自己**（2026-10-03 显式化）：执行面不提供用户与权限模型，
+   在它上面开发的应用必须自建登录与权限（终端用户走 `/api/tools/{id}/run` 与
+   `/api/executions`，在业务侧用 Hook 拦、fail-closed；样板见 `examples/auth-app`）。
+   「Gear 会管鉴权」是一个会造成真实泄露的误解——不是待修的缺陷，是设计姿态。
 
 ## 4. 做带界面的应用：同源反代（唯一可行架构）
 
@@ -90,6 +107,7 @@ steps:
 ```
 
 于是页面与接口**同源**（都在 8088），无跨域；`/api/**` 命中反代，其余回落静态文件。
+前端写法（petite-vue、离线本地引入、模块化结构）见 `gear_guide("frontend")`。
 前端就写 `fetch('/api/tools/myapp__ideate/run', {method:'POST', body:'{"topic":"…"}'})`。
 
 > 把 REST 后端与静态站放进**同一个 Flow**，好处是 stop 一次全停；坏处是「后端没起来」与

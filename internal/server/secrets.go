@@ -13,7 +13,8 @@ package server
 //  2. **写权限只给宿主/运维**，不暴露给沙箱插件：一次覆盖即可劫持后续所有使用者的凭据。
 //  3. 名字会被写进 `${secrets.<NAME>}` 模板，故语法校验在 cap 层统一（cap.ValidSecretName）。
 //
-// 存储为进程内存态、重启即失；启动期由 GEAR_SECRET_<NAME> 播种（见 cap.SecretStore.SeedFromEnv）。
+// 存储持久化到 secrets.db（<GEAR_HOME>/secrets.db，可用 GEAR_SECRETS_DB 覆盖），重启仍在；
+// 启动期由 GEAR_SECRET_<NAME> 播种（仅内存、不落库，见 cap.SecretStore）。
 
 import (
 	"errors"

@@ -199,7 +199,7 @@ var (
 	})
 	outExport = outSchema(map[string]any{
 		"app_id": sStr(), "path": sStr(), "format": sStr(), "components": sObj(),
-		"files": sArr(), "warnings": sArr(), "next": sStr(),
+		"files": sArr(), "warnings": sArr(), "next": sStr(), "static_root": sStr(),
 	})
 	outImport = outSchema(map[string]any{
 		"app_id": sStr(), "valid": sBool(), "dry_run": sBool(), "created": sArr(),
@@ -217,13 +217,13 @@ type IDArgs struct {
 
 // DescribeArgs 是 gear_describe 的入参。
 type DescribeArgs struct {
-	Kind string `json:"kind" jsonschema:"对象类型：tool | flow | hook | app"`
+	Kind string `json:"kind" jsonschema:"对象类型：tool | flow | hook | app（app = 含 mode:service step 的 Flow，见 gear_app(action=list)）"`
 	ID   string `json:"id" jsonschema:"对象 id"`
 }
 
 // CatalogArgs 是 gear_catalog 的入参。
 type CatalogArgs struct {
-	Kind   string `json:"kind,omitempty" jsonschema:"要看哪类：tool | flow | hook | execution | app | all（默认 all）"`
+	Kind   string `json:"kind,omitempty" jsonschema:"要看哪类：tool | flow | hook | execution | app | all（默认 all；传其它值会报 BAD_ARGUMENT 并列出合法值，不静默返回空列表）"`
 	Limit  int    `json:"limit,omitempty" jsonschema:"最多返回条数（默认 100）"`
 	Offset int    `json:"offset,omitempty" jsonschema:"跳过前 N 条再返回（默认 0，用于翻页：结果里 truncated 为 true 时，用返回的 next_offset 续取）"`
 }
@@ -240,7 +240,13 @@ type GuideArgs struct {
 // CapabilitiesArgs 是 gear_capabilities 的入参（评审 I-7：大 payload 需可裁剪）。
 type CapabilitiesArgs struct {
 	Name string `json:"name,omitempty" jsonschema:"只看名字等于该值的能力（如 db / ext.ai；留空=全部）"`
-	Kind string `json:"kind,omitempty" jsonschema:"按类别过滤：builtin（内核原语）| ext（扩展原子）；留空=全部"`
+	// ⚠ `kind` 必须列出代码真正支持的**全部三种**类别。此前只写 builtin | ext，漏了 pure，
+	// 而照 schema 描述办事的调用方会因此整层漏掉纯函数原子（time/template/crypto/id/validate，
+	// 5 能力 22 方法）——它们**不用声明 capabilities 就能调**，看不见就等于不存在。
+	// 此处**刻意不枚举能力名**（名字会随 purefunc.go 新增而漂移），只给类别名与一句定性：
+	// 具体有哪些能力由返回值说话，与 GuideArgs 不枚举 topic 同一条纪律。
+	// 防再次漏写：`TestCapabilitiesKindDescCoversEveryKind` 从代码反查描述必须覆盖全部类别。
+	Kind string `json:"kind,omitempty" jsonschema:"按类别过滤：builtin（受门禁内核原语）| pure（纯函数原子，免 capabilities 声明）| ext（扩展原子）；留空=全部"`
 }
 
 // InvokeArgs 是 gear_invoke 的入参。
@@ -275,11 +281,11 @@ type ApplyArgs struct {
 //
 // ⚠ 标签文案不得以 `WORD=` 开头（见 RunArgs 的说明）。
 type ExportArgs struct {
-	AppID         string `json:"app_id" jsonschema:"要导出的应用 id（App 清单 id）"`
+	AppID         string `json:"app_id" jsonschema:"要导出的应用 id：优先取 registry 里的 App 清单；没有清单时按入口 Flow 解析（id / <id>.up / 唯一 <id>. 前缀）并临时合成一份清单，所以只有 Flow 的应用也能导"`
 	OutDir        string `json:"out_dir" jsonschema:"产物输出路径：dir 形态为要创建的目录（须不存在或为空，gear 不会覆盖非空目录）；zip 形态为包文件路径（扩展名留空会自动补 .gearapp）"`
 	Format        string `json:"format,omitempty" jsonschema:"产物形态：dir（默认，可 diff 可 git 版本化）| zip（打成单个包，便于发送）"`
 	IncludeStatic *bool  `json:"include_static,omitempty" jsonschema:"是否把 layout.files 声明的静态资源拷进产物（默认 true；关掉后产物不自包含，不能当交付物）"`
-	StaticRoot    string `json:"static_root,omitempty" jsonschema:"解析 layout.files 相对路径的根目录；留空表示当前工作目录（gear 不持有静态资源，它在哪只能由调用方告诉）"`
+	StaticRoot    string `json:"static_root,omitempty" jsonschema:"解析 layout.files 相对路径的根目录；留空表示**从当前目录逐级向上找**能解析声明路径的目录（绝对路径的声明不受它影响）。gear 不持有静态资源，它在哪只能由调用方告诉"`
 }
 
 // ImportArgs 是 gear_import 的入参。

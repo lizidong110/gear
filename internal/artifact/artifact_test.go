@@ -559,3 +559,334 @@ func TestExportNoStaticOnlyDefinitions(t *testing.T) {
 		t.Fatal("只导定义却没警告产物不自包含——用户会拿它当交付物")
 	}
 }
+
+// T-artifact-21：layout.files 支持 `dir: true` 整目录递归导出（含子目录），产物自包含。
+func TestExportDirEntryRecurses(t *testing.T) {
+	reg := mustReg(t)
+	root := t.TempDir()
+	a := &model.App{
+		ID: "demo", Name: "demo", EntryFlow: "demo.up",
+		Layout: model.AppLayout{
+			Workdir: "apps/demo",
+			Files:   []model.AppFile{{Path: "apps/demo/www", Dir: true, Required: true}},
+		},
+		Start: model.AppStart{Restart: "always", Ports: []int{8090}},
+	}
+	www := filepath.Join(root, "apps/demo/www")
+	if err := os.MkdirAll(filepath.Join(www, "assets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(www, "index.html"), []byte("<html>demo</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(www, "assets", "app.js"), []byte("console.log(1)"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b := &Bundle{
+		Apps:  []*model.App{a},
+		Tools: []*model.Tool{fxTool("demo__hello")},
+		Flows: []*model.Flow{fxFlow("demo.up", "demo__hello")},
+	}
+	if _, _, _, err := ApplyBundle(reg, b, nil, true); err != nil {
+		t.Fatalf("ApplyBundle 失败: %v", err)
+	}
+
+	out := filepath.Join(t.TempDir(), "artifact")
+	res, err := Export(reg, ExportOptions{AppID: "demo", Out: out, StaticRoot: root})
+	if err != nil {
+		t.Fatalf("Export 失败: %v", err)
+	}
+	if len(res.Files) != 2 {
+		t.Fatalf("dir 导出应递归包含 2 个文件，实际 %v", res.Files)
+	}
+	if _, err := os.Stat(filepath.Join(out, "www", "index.html")); err != nil {
+		t.Fatalf("产物缺 www/index.html: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "www", "assets", "app.js")); err != nil {
+		t.Fatalf("产物缺 www/assets/app.js: %v", err)
+	}
+	// meta 里的组成清单必须是**展开后的逐文件**（import 端据此落地）。
+	if len(res.Components.StaticFiles) != 2 {
+		t.Fatalf("组成清单应展开为 2 个文件，实际 %v", res.Components.StaticFiles)
+	}
+}
+
+// T-artifact-22：dir 声明的静态资源导入后整树落地，且 layout 重写为展开的逐文件路径。
+func TestImportLandsDirAndRewritesLayout(t *testing.T) {
+	reg := mustReg(t)
+	root := t.TempDir()
+	a := &model.App{
+		ID: "demo", Name: "demo", EntryFlow: "demo.up",
+		Layout: model.AppLayout{
+			Workdir: "apps/demo",
+			Files:   []model.AppFile{{Path: "apps/demo/www", Dir: true, Required: true}},
+		},
+		Start: model.AppStart{Restart: "always", Ports: []int{8090}},
+	}
+	www := filepath.Join(root, "apps/demo/www")
+	if err := os.MkdirAll(filepath.Join(www, "assets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(www, "index.html"), []byte("<html>demo</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(www, "assets", "app.js"), []byte("console.log(1)"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b := &Bundle{
+		Apps:  []*model.App{a},
+		Tools: []*model.Tool{fxTool("demo__hello")},
+		Flows: []*model.Flow{fxFlow("demo.up", "demo__hello")},
+	}
+	if _, _, _, err := ApplyBundle(reg, b, nil, true); err != nil {
+		t.Fatalf("ApplyBundle 失败: %v", err)
+	}
+
+	out := filepath.Join(t.TempDir(), "artifact")
+	if _, err := Export(reg, ExportOptions{AppID: "demo", Out: out, StaticRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := mustReg(t)
+	appsDir := t.TempDir()
+	imp, err := Import(dst, ImportOptions{Source: out, AppsDir: appsDir})
+	if err != nil {
+		t.Fatalf("Import 失败: %v", err)
+	}
+	if len(imp.StaticLanded) != 2 {
+		t.Fatalf("dir 静态资源应落地 2 个文件，实际 %v", imp.StaticLanded)
+	}
+	if _, err := os.Stat(filepath.Join(appsDir, "demo", "www", "index.html")); err != nil {
+		t.Fatalf("未落在 www/index.html: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(appsDir, "demo", "www", "assets", "app.js")); err != nil {
+		t.Fatalf("未落在 www/assets/app.js: %v", err)
+	}
+	got, err := dst.GetApp("demo")
+	if err != nil || got == nil {
+		t.Fatalf("导入后 App 不在库里: %v", err)
+	}
+	want := filepath.ToSlash(filepath.Join(appsDir, "demo")) + "/www/index.html"
+	found := false
+	for _, f := range got.Layout.Files {
+		if f.Path == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("layout 未重写为展开文件：%v", got.Layout.Files)
+	}
+	if got.Layout.Workdir != filepath.ToSlash(filepath.Join(appsDir, "demo")) {
+		t.Fatalf("workdir 未重写：%q", got.Layout.Workdir)
+	}
+}
+
+// T-artifact-23：未指定 --root 时，从 cwd **逐级向上**找能解析声明路径的目录。
+//
+// 真实场景：用户在仓库子目录 build/ 里跑 `gear export web_ui`，而清单里写的是相对
+// 仓库根的 `build/dist`。死守 cwd 会拼成 build/build/dist 报「找不到」，而这正是用户
+// 想要的导出。
+func TestExportFindsStaticRootByWalkingUp(t *testing.T) {
+	reg := mustReg(t)
+	root := t.TempDir()
+	a := &model.App{
+		ID: "ui", Name: "ui", EntryFlow: "ui.up",
+		Layout: model.AppLayout{
+			Workdir: "build",
+			Files:   []model.AppFile{{Path: "build/dist", Dir: true, Required: true}},
+		},
+	}
+	p := filepath.Join(root, "build", "dist", "index.html")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("<html>ui</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b := &Bundle{
+		Apps:  []*model.App{a},
+		Tools: []*model.Tool{fxTool("ui__hello")},
+		Flows: []*model.Flow{fxFlow("ui.up", "ui__hello")},
+	}
+	if _, _, _, err := ApplyBundle(reg, b, nil, true); err != nil {
+		t.Fatalf("ApplyBundle 失败: %v", err)
+	}
+
+	// 从子目录里导出，且**不传** StaticRoot。
+	t.Chdir(filepath.Join(root, "build"))
+	out := filepath.Join(t.TempDir(), "artifact")
+	res, err := Export(reg, ExportOptions{AppID: "ui", Out: out})
+	if err != nil {
+		t.Fatalf("Export 失败: %v", err)
+	}
+	if !res.StaticRootAuto {
+		t.Fatal("未指定 --root 时应标记为自动解析")
+	}
+	if res.StaticRoot != root {
+		t.Fatalf("静态根应自动上溯到仓库根 %s，实际 %s", root, res.StaticRoot)
+	}
+	if len(res.Files) != 1 || res.Files[0] != "dist/index.html" {
+		t.Fatalf("静态资源应被找到并归一为 dist/index.html，实际 %v", res.Files)
+	}
+	if _, err := os.Stat(filepath.Join(out, "dist", "index.html")); err != nil {
+		t.Fatalf("产物缺 dist/index.html: %v", err)
+	}
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "找不到") {
+			t.Fatalf("自动上溯找到了资源，不该有「找不到」警告: %s", w)
+		}
+	}
+}
+
+// T-artifact-24：registry 里**只有 Flow 没有 App 清单**时，export 按入口 Flow 临时合成清单
+// （不写库），并从 static_site.serve 推断静态资源——正是 wms/mindstorm 那种"只有 Flow"的应用。
+func TestExportSynthesizesManifestFromFlow(t *testing.T) {
+	reg := mustReg(t)
+	root := t.TempDir()
+	// 故意**不**放 Apps —— 只注册 Tool 与 Flow。
+	flow := &model.Flow{
+		ID: "wms.up", Name: "WMS 起服",
+		Steps: []model.Step{
+			{ID: "site", Call: "static_site.serve", Input: map[string]any{"dir": "apps/wms/www", "port": 8091}},
+			{ID: "api", Call: "wms__hello", DependsOn: []string{"site"}},
+		},
+	}
+	b := &Bundle{
+		Tools: []*model.Tool{fxTool("wms__hello")},
+		Flows: []*model.Flow{flow},
+	}
+	if _, _, _, err := ApplyBundle(reg, b, nil, true); err != nil {
+		t.Fatalf("ApplyBundle 失败: %v", err)
+	}
+	if got, _ := reg.GetApp("wms"); got != nil {
+		t.Fatal("前置条件：这个库里不该有 wms 的 App 清单")
+	}
+	www := filepath.Join(root, "apps/wms/www")
+	if err := os.MkdirAll(filepath.Join(www, "assets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(www, "index.html"), []byte("<html>wms</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(www, "assets", "app.js"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out := filepath.Join(t.TempDir(), "artifact")
+	res, err := Export(reg, ExportOptions{AppID: "wms", Out: out, StaticRoot: root})
+	if err != nil {
+		t.Fatalf("Export 失败（应能按 Flow 合成清单）: %v", err)
+	}
+	if res.Components.EntryFlow != "wms.up" {
+		t.Fatalf("合成清单的 entry_flow 应为 wms.up，实际 %s", res.Components.EntryFlow)
+	}
+	// 静态资源由 flow 的 static_site.serve dir 推断：workdir=apps/wms ⇒ 产物内 www/。
+	if len(res.Files) != 2 || res.Files[0] != "www/assets/app.js" || res.Files[1] != "www/index.html" {
+		t.Fatalf("推断的静态资源不符，实际 %v", res.Files)
+	}
+	warned := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "合成") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("合成清单必须如实告知用户（这是推断的，不是他写的），实际 warnings=%v", res.Warnings)
+	}
+	// 合成清单**不写库**：导出是只读操作。
+	if got, _ := reg.GetApp("wms"); got != nil {
+		t.Fatal("export 不该把合成清单写进库（导出应只读）")
+	}
+
+	// 产物里的 app.yaml 就是这份合成清单 → 导回时才会真正落库。
+	dst := mustReg(t)
+	if _, err := Import(dst, ImportOptions{Source: out}); err != nil {
+		t.Fatalf("Import 失败: %v", err)
+	}
+	got, err := dst.GetApp("wms")
+	if err != nil || got == nil {
+		t.Fatalf("导回后应有 wms 的 App 清单: %v", err)
+	}
+	if got.EntryFlow != "wms.up" {
+		t.Fatalf("导回的 entry_flow 应为 wms.up，实际 %s", got.EntryFlow)
+	}
+}
+
+// T-artifact-24b：短 id 与完整 Flow id 等价（`<id>.up` 是强约定，优先命中）；
+// 没有 `<id>.up`、而多个 `<id>.*` 命中时**报错**而非猜一个。
+func TestExportResolvesFlowIDAndRejectsAmbiguity(t *testing.T) {
+	reg := mustReg(t)
+	root := t.TempDir()
+	b := &Bundle{
+		Tools: []*model.Tool{fxTool("wms__hello")},
+		Flows: []*model.Flow{
+			fxFlow("wms.up", "wms__hello"),
+			fxFlow("wms.extra", "wms__hello"),
+			fxFlow("wm.alpha", "wms__hello"),
+			fxFlow("wm.beta", "wms__hello"),
+		},
+	}
+	if _, _, _, err := ApplyBundle(reg, b, nil, true); err != nil {
+		t.Fatalf("ApplyBundle 失败: %v", err)
+	}
+	// 短 id `wms`：`<id>.up` 强约定优先 → 命中 wms.up（即便还有 wms.extra）。
+	out := filepath.Join(t.TempDir(), "artifact")
+	res, err := Export(reg, ExportOptions{AppID: "wms", Out: out, StaticRoot: root})
+	if err != nil {
+		t.Fatalf("短 id 应命中 wms.up: %v", err)
+	}
+	if res.Components.EntryFlow != "wms.up" {
+		t.Fatalf("短 id 应命中 .up 约定，实际 %s", res.Components.EntryFlow)
+	}
+	// 完整 id 精确命中。
+	if _, err := Export(reg, ExportOptions{AppID: "wms.extra", Out: filepath.Join(t.TempDir(), "e"), StaticRoot: root}); err != nil {
+		t.Fatalf("完整 Flow id 应成功: %v", err)
+	}
+	// `wm`：没有 wm.up，wm.alpha / wm.beta 两个前缀命中 → 必须报 BAD_ARGUMENT（不猜）。
+	if _, err := Export(reg, ExportOptions{AppID: "wm", Out: filepath.Join(t.TempDir(), "x"), StaticRoot: root}); err == nil {
+		t.Fatal("前缀歧义时应报错")
+	} else if code := errCode(t, err); code != "BAD_ARGUMENT" {
+		t.Fatalf("歧义应报 BAD_ARGUMENT，实际 %s（%v）", code, err)
+	}
+}
+
+// T-artifact-25：声明为**绝对路径**的静态资源与基准目录无关，原样解析（含 dir 展开）。
+func TestExportAbsoluteStaticIgnoresRoot(t *testing.T) {
+	reg := mustReg(t)
+	root := t.TempDir()
+	site := filepath.Join(root, "www") // 绝对路径
+	if err := os.MkdirAll(site, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(site, "index.html"), []byte("<html>abs</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := &model.App{
+		ID: "abs", Name: "abs", EntryFlow: "abs.up",
+		Layout: model.AppLayout{
+			Workdir: filepath.ToSlash(root),
+			Files:   []model.AppFile{{Path: filepath.ToSlash(site), Dir: true, Required: true}},
+		},
+	}
+	b := &Bundle{
+		Apps:  []*model.App{a},
+		Tools: []*model.Tool{fxTool("abs__hello")},
+		Flows: []*model.Flow{fxFlow("abs.up", "abs__hello")},
+	}
+	if _, _, _, err := ApplyBundle(reg, b, nil, true); err != nil {
+		t.Fatalf("ApplyBundle 失败: %v", err)
+	}
+
+	out := filepath.Join(t.TempDir(), "artifact")
+	// StaticRoot 指一个**无关**目录：绝对路径不该受它影响。
+	res, err := Export(reg, ExportOptions{AppID: "abs", Out: out, StaticRoot: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Export 失败: %v", err)
+	}
+	if len(res.Files) != 1 || res.Files[0] != "www/index.html" {
+		t.Fatalf("绝对 dir 应被解析并归一为 www/index.html，实际 %v", res.Files)
+	}
+	if _, err := os.Stat(filepath.Join(out, "www", "index.html")); err != nil {
+		t.Fatalf("产物缺 www/index.html: %v", err)
+	}
+}

@@ -227,6 +227,12 @@ type CapabilityEntry struct {
 	Kind        string   `json:"kind"`             // builtin / pure / ext
 	Description string   `json:"description"`      //
 	Params      []string `json:"params,omitempty"` // 参数名：检索信号最强的一部分
+	// InvokeForm / LuaCall 把「在 Lua 侧到底怎么调」带进 find/describe 的结果
+	// （2026-10-03）。find 是 meta 模式与 gear_capabilities(mode=find) 的唯一出口，
+	// 而此前它只给参数名——于是「db.query 有哪些参数」看得见，「它收 table 还是收位置参数」看不见，
+	// 模型只能猜，猜错要到运行期才炸。字段值由 invokeFormFor 统一判（见 invokeform.go）。
+	InvokeForm string `json:"invoke_form,omitempty"`
+	LuaCall    string `json:"lua_call,omitempty"`
 }
 
 // CapabilityHit 是 find 的一个命中：比条目多一个分数，让调用方（与模型）看得出「为什么是这条」。
@@ -261,10 +267,12 @@ func (a *AIAgent) capabilityEntries() []CapabilityEntry {
 			continue
 		}
 		for _, m := range sortedKeys(ms) {
-			out = append(out, CapabilityEntry{
+			e := CapabilityEntry{
 				ID: p + "." + m, Capability: p, Method: m, Kind: primitiveKind(p),
 				Description: ms[m].Description, Params: sortedKeys(ms[m].Parameters),
-			})
+			}
+			e.InvokeForm, e.LuaCall, _ = invokeFormFor(p, m, a.extCaps)
+			out = append(out, e)
 		}
 	}
 	// ext 名来自 map，遍历顺序不稳定——排序后再进数组。顺序不稳会让「同一 query 的 Top-K」
@@ -276,10 +284,12 @@ func (a *AIAgent) capabilityEntries() []CapabilityEntry {
 	sort.Strings(extNames)
 	for _, name := range extNames {
 		for _, m := range sortedKeys(a.extCaps[name]) {
-			out = append(out, CapabilityEntry{
+			e := CapabilityEntry{
 				ID: name + "." + m, Capability: name, Method: m, Kind: primitiveKind(name),
 				Description: a.extCaps[name][m].Description, Params: sortedKeys(a.extCaps[name][m].Parameters),
-			})
+			}
+			e.InvokeForm, e.LuaCall, _ = invokeFormFor(name, m, a.extCaps)
+			out = append(out, e)
 		}
 	}
 	// 全表按（能力名, 方法名）排序：allBuiltinPrimitives 的顺序是给「目录展示」用的

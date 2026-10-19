@@ -12,24 +12,53 @@
 
 **方法名与参数一律以 `gear_capabilities` 为准**——下面只列确信的常用形态，别凭记忆猜。
 
+## 1.1 调用形态：`invoke_form`（写错形态是运行期才炸的那类错）
+
+⚠ **Lua 侧的入参形态是混合的，不是「一律位置参数」**。目录里每个方法都带两个字段说明它：
+
+| 字段 | 取值 | 含义 |
+|---|---|---|
+| `invoke_form` | `positional` / `table` / `bare` | 按位传参 / 单个具名 table / 裸函数 |
+| `lua_call` | 如 `ctx.db.query({ sql = string })` | **可直接复制的完整调用** |
+
+各能力的实际形态（判据唯一实现 `internal/engine/invokeform.go`，与 `lua.go` 的绑定一一对应）：
+
+| 形态 | 成员 | 写法 |
+|---|---|---|
+| `positional` | `http.Request` `secret.get` `event.notify` `event.wait` `subscribe.stop` | `ctx.http.Request(method, url, body, headers)` |
+| `bare` | **`call`** | `ctx.call(target, input)`——**没有 `.Call` 这一段** |
+| `table` | `db.*` `config.*` `subscribe.start` 全部纯函数原子 全部 `ext.*` | `ctx.db.query({ driver=…, sql=…, params={…} })` |
+
+三类典型误用（都会在 Lua 运行期才炸，报错还看不出病因）：
+
+- `ctx.call.Call(target, input)` —— 这是**索引一个函数**，不是调用它。
+- `ctx.db.query(sql, params)` —— `db.*` 收单个具名 table，不是位置参数。
+- `ctx.config.get(key)` —— 同上，`config.*` 也是单 table。
+
+**Flow 的 `step.call` 不受这套形态约束**：它写的是调用目标标识（`db.query`）+ 具名 `args`，
+不带 `ctx.` 前缀、也不是 Lua 表达式（见 `gear_guide("authoring")`）。
+
 ## 2. 受门禁原语的常用方法
 
-| call | 参数（必填加 *） | 返回 |
-|---|---|---|
-| `http.Request` | method*, url*, body, headers | `{status, body, headers}` |
-| `call.Call` | target*, input | 目标的输出 map |
-| `db.query` | sql*, driver, dsn, params | 行集合 `[]map` |
-| `db.exec` | sql*, driver, dsn, params | nil（失败经 err 表达） |
-| `db.batch` | statements*, driver, dsn | `{results, rows_affected, committed}`（**全或无**） |
-| `db.ping` | driver, dsn | 连通性 |
-| `secret.get` | name* | 明文（**只读取**，看不到存储位置） |
-| `event.notify` | name*, payload | 广播（尽力通知） |
-| `event.wait` | name* | 下次通知的 payload |
-| `subscribe.start` / `subscribe.stop` | source*/config*/callback* / handle* | handle / nil |
-| `config.get` | key* | 配置值字符串（**不存在平返回空串**，KV 语义，便于 `or ""` 兜底） |
-| `config.set` | key*, value* | nil（已存在则覆盖；要清除用 `delete`，不是写空串） |
-| `config.delete` | key* | nil（不存在即报错） |
-| `config.list` | prefix（空串 = 全部） | `{key: value}` map |
+| call | 形态 | 参数（必填加 *） | 返回 |
+|---|---|---|---|
+| `http.Request` | positional | method*, url*, body, headers | `{status, body, headers}` |
+| `call.Call` | **bare** | target*, input | 目标的输出 map |
+| `db.query` | table | sql*, driver, dsn, params | 行集合 `[]map` |
+| `db.exec` | table | sql*, driver, dsn, params | nil（失败经 err 表达） |
+| `db.batch` | table | statements*, driver, dsn | `{results, rows_affected, committed}`（**全或无**） |
+| `db.ping` | table | driver, dsn | 连通性 |
+| `secret.get` | positional | name* | 明文（**只读取**，看不到存储位置） |
+| `event.notify` | positional | name*, payload | 广播（尽力通知） |
+| `event.wait` | positional | name* | 下次通知的 payload |
+| `subscribe.start` | table | source*/config*/callback* | handle |
+| `subscribe.stop` | positional | handle* | nil |
+| `config.get` | table | key* | 配置值字符串（**不存在平返回空串**，KV 语义，便于 `or ""` 兜底） |
+| `config.set` | table | key*, value* | nil（已存在则覆盖；要清除用 `delete`，不是写空串） |
+| `config.delete` | table | key* | nil（不存在即报错） |
+| `config.list` | table | prefix（空串 = 全部） | `{key: value}` map |
+
+「形态」列不是装饰——它就是 Lua 侧真实收参的方式，写错要到运行期才炸（见 §1.1）。
 
 用 `db` 连外部库时，口令**优先写 `${secrets.*}`**，不要内联明文。
 
@@ -175,7 +204,28 @@ Tool YAML 里写 `api: {method: GET, path: /api/nodes/{id}}`，引擎就给它**
      必须给产品配一个自己的前门（带 token 的 REST），别指望 gear 的 MCP 替你验身份。
    详见 design 文档 `IDENTITY_CONTEXT_DESIGN.md` §3.5。
 
-## 6. 缺能力时怎么办
+## 6. 数组与数字能经 `gear_invoke` 直接传（2026-10-03 实测锁）
+
+`gear_invoke` 的 `args` 走标准 JSON，**数组与数字都原样穿过 MCP → Lua，不用绕道**：
+
+```jsonc
+// 这三种都实测通过（REQ-INVOKE-TYPE-KEEP，回归锁在 internal/mcp/invoke_type_keep_test.go）
+{"name": "db", "method": "query", "args": {"sql": "SELECT ?", "params": ["A-001"]}}
+{"name": "db", "method": "batch", "args": {"statements": [{"sql": "CREATE TABLE t(k)"}]}}
+{"name": "crypto", "method": "jwt_sign", "args": {"claims": {...}, "key": "...", "alg": "HS256", "ttl": 3600}}
+```
+
+- 数字是 JSON 数字（`3600` 不是 `"3600"`）。传成字符串会得到
+  「参数 "ttl" 必须是数字，实际 string」——**那是调用方自己传错了类型**，不是桥接层压平的。
+- 数组元素按位置读；`statements` 元素可写 `{"sql":..., "params":[...]}` 或裸 SQL 字符串（无参 DDL）。
+- 空数组 `[]` 也能传，但**回程**里空结果与空对象都可能是 `{}`（Lua table 无类型之分的固有边界，
+  已在 `internal/engine/lua.go` 的 `luaArrayMarker` 注释里写明）。
+
+⚠ 若你看到「必须是数字，实际 string」或「缺少必填参数 statements」这类报错，
+**先核自己传的 JSON 类型与形态**（`gear_capabilities` 看 schema + 本文 §1.1 看形态），
+不要归因成「gear 的 MCP 压平了类型」——2026-10-03 已端到端核实过那是误判。
+
+## 7. 缺能力时怎么办
 
 **不许凑**。不允许：
 - ❌ 用 `process` runtime 里 `sh -c` / `cmd /c` 调外部程序绕开能力门禁；

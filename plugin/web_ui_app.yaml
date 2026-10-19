@@ -1,0 +1,32 @@
+# web_ui 应用清单（kind: App）。
+#
+# 为什么需要它：`gear export` 导的是「应用清单」（registry 的 apps 表，聚合 Tool/Flow/Hook
+# + 静态资源布局），不是 Flow。`web_ui.up` 只是个 Flow（flows 表，gear flow register 进的），
+# 所以它不会出现在 apps 表里，export 才报「没有 App 清单」。
+#
+# 落库方式：CLI 没有 `gear app register` / `gear apply` 子命令，App 清单只能经
+#   · MCP 的 gear_apply（bundle 含 kind: App），或
+#   · gear import（先导出过产物，再导回——首次还是要先有清单）
+# 灌入。本文件就是给 gear_apply 用的 App 那一段（可塞进一个 bundle 一起 apply）。
+#
+# 静态资源：web_ui 的站点是 build/dist（前端构建产物，41 个带 hash 的文件），不进版本库。
+# 用 `dir: true` 声明「整个目录递归导出」，避免把 dist/assets/*.js 逐个列名（重建即变名）。
+# 导出时务必从**仓库根**执行（或传 --root 指向仓库根），因为下方 path 是相对仓库根解析的
+# （与 web_ui.up 里 static_site.serve 的 dir: build/dist 同源）。
+kind: App
+id: web_ui
+name: Web UI 起服
+description: 用 ext.serve 把 web-ui 的 dist 托管为静态站并把 /api 反代到后端，用 process 起 gear REST 后端；一个 Flow 管两个长驻服务，静态与接口同源。
+entry_flow: web_ui.up
+layout:
+  workdir: build
+  files:
+    - path: build/dist
+      dir: true
+      required: true
+start:
+  restart: always
+  ports: [8080]
+requires:
+  sidecars: [serve]
+  capabilities: [ext.serve]

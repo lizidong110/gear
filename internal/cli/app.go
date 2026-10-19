@@ -133,6 +133,9 @@ func appStartCmd() *cobra.Command {
 			for _, p := range res.Ports {
 				fmt.Printf("  port %-6d listening=%v\n", p.Port, p.Listening)
 			}
+			for _, u := range res.OpenURLs {
+				fmt.Printf("  打开地址：%s\n", u)
+			}
 			for _, ln := range res.LastLogs {
 				fmt.Printf("  │ %s\n", ln)
 			}
@@ -334,6 +337,9 @@ func printAppStatus(s app.StatusResult) {
 	}
 	for _, p := range s.Ports {
 		fmt.Printf("  port %-6d listening=%v\n", p.Port, p.Listening)
+	}
+	for _, u := range s.OpenURLs {
+		fmt.Printf("  打开地址：%s\n", u)
 	}
 	if s.LogPath != "" {
 		fmt.Printf("  log: %s\n", s.LogPath)

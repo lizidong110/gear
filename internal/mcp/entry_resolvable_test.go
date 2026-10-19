@@ -1,7 +1,6 @@
 package mcp
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -238,33 +237,10 @@ func TestDoctorReportsAIReadiness(t *testing.T) {
 	}
 }
 
-// TestDoctorMissingSidecarsAreStructured 锁住「结构化字段不能是空对象」。
-//
-// 2026-09-22 实测：missing_sidecars 返回 `[{},{},{}]`——sidecarIssue 的字段全未导出，
-// Marshal 出来就是空对象，真正的内容只藏在 warnings 的中文文本里。
-// 智能体要的是可解析的清单，不该逼它去正则匹配告警。
-func TestDoctorMissingSidecarsAreStructured(t *testing.T) {
-	b, err := json.Marshal(sidecarIssue{
-		Ext:      "ext.email",
-		Expected: `/build/email-sidecar`,
-		Searched: []string{"/build", "/build/plugin"},
-	})
-	if err != nil {
-		t.Fatalf("序列化失败: %v", err)
-	}
-	if string(b) == "{}" {
-		t.Fatal("sidecarIssue 序列化成了空对象——字段必须导出且带 json tag")
-	}
-	var got map[string]any
-	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatal(err)
-	}
-	for _, k := range []string{"ext", "expected", "searched"} {
-		if got[k] == nil {
-			t.Fatalf("缺字段 %s: %s", k, b)
-		}
-	}
-}
+// 注：原先这里的 TestDoctorMissingSidecarsAreStructured 已随 doctor 判据本体迁到
+// internal/doctor（2026-10-03）。它断言的是「missing_sidecars 不许序列化成 [{}]」——
+// 而结构体现在由 doctor 包的 SidecarIssue 与 Report.Map() 负责，留在 mcp 包只会让它
+// 依赖一个已不存在的本地类型。
 
 func hasWarningWith(warnings []string, sub string) bool {
 	for _, w := range warnings {

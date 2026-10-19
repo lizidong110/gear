@@ -1,10 +1,13 @@
-package mcp
+package doctor
 
-// caps_check_test.go —— doctor 新增的「声明 ↔ 实现」/caps 校验。
+// caps_check_test.go —— doctor 的「声明 ↔ 实现」/caps 校验。
 //
-// 覆盖 extensionServiceSpecs 与 probeServiceCaps，四种状态各一例，并带判据自检：
+// 覆盖 ExtensionServiceSpecs 与 ProbeServiceCaps，四种状态各一例，并带判据自检：
 // 只验「能跑通」的测试抓不到写反的比对（例如永远返回 ok），故 ok 用例额外断言
 // Implemented 非空——若 /caps 压根没被解析却仍判 ok，说明判据是空的。
+//
+// 2026-10-03 从 internal/mcp 迁到 internal/doctor：判据本体已搬进本包（CLI 的 gear doctor
+// 也要用同一份），测试跟着判据走，不留在调用方。
 
 import (
 	"net/http"
@@ -41,7 +44,7 @@ ext.svc_nolisten:
 	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got := extensionServiceSpecs(p)
+	got := ExtensionServiceSpecs(p)
 	if len(got) != 1 {
 		t.Fatalf("应只有 1 个可探测的 service ext，实际 %d: %+v", len(got), got)
 	}
@@ -61,14 +64,14 @@ ext.svc_nolisten:
 
 func TestExtensionServiceSpecsBadConfigReturnsEmpty(t *testing.T) {
 	// 负向：空路径 / 语法错都不该 panic，也不该假装校验过（返回空即未校验）。
-	if got := extensionServiceSpecs(""); len(got) != 0 {
+	if got := ExtensionServiceSpecs(""); len(got) != 0 {
 		t.Fatalf("空路径应返回空，实际 %+v", got)
 	}
 	p := filepath.Join(t.TempDir(), "bad.yaml")
 	if err := os.WriteFile(p, []byte("ext.x: [unbalanced"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := extensionServiceSpecs(p); len(got) != 0 {
+	if got := ExtensionServiceSpecs(p); len(got) != 0 {
 		t.Fatalf("语法错应返回空（装配期会报更准的错），实际 %+v", got)
 	}
 }
@@ -118,7 +121,7 @@ func TestProbeServiceCapsFourStates(t *testing.T) {
 			srv := httptest.NewServer(tc.handler)
 			defer srv.Close()
 			listen := strings.TrimPrefix(srv.URL, "http://")
-			got := probeServiceCaps(serviceExtSpec{Name: "ext.svc", Listen: listen, Methods: tc.declared})
+			got := ProbeServiceCaps(ServiceExtSpec{Name: "ext.svc", Listen: listen, Methods: tc.declared})
 			if got.State != tc.want {
 				t.Fatalf("state = %q，要 %q（missing=%v implemented=%v）", got.State, tc.want, got.Missing, got.Implemented)
 			}
@@ -134,8 +137,8 @@ func TestProbeServiceCapsFourStates(t *testing.T) {
 
 func TestProbeServiceCapsNotRunningIsNotAnError(t *testing.T) {
 	// 端口 1 没人听，connect 应立刻 refused —— 侧车未运行**不是错误**
-	// （service ext 只在应用运行时才被拉起），报成错误会淹掉真问题。
-	got := probeServiceCaps(serviceExtSpec{Name: "ext.svc", Listen: "127.0.0.1:1", Methods: []string{"a"}})
+	//（service ext 只在应用运行时才被拉起），报成错误会淹掉真问题。
+	got := ProbeServiceCaps(ServiceExtSpec{Name: "ext.svc", Listen: "127.0.0.1:1", Methods: []string{"a"}})
 	if got.State != "sidecar_not_running" {
 		t.Fatalf("侧车未运行应报 sidecar_not_running，实际 %q", got.State)
 	}

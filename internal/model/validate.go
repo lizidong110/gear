@@ -3,9 +3,11 @@ package model
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"gear/internal/cap"
+	"gear/internal/luacap"
 )
 
 // semverRegex 匹配 SemVer：x.y.z，可选前置 v、预发布与构建元数据。
@@ -41,6 +43,19 @@ var VersionTransitions = map[ToolVersionState][]ToolVersionState{
 	StateStable:     {StateDeprecated, StateTesting, StateRejected},
 	StateDeprecated: {StateStable, StateRejected},
 	StateRejected:   {StateDraft},
+}
+
+// sortedStateNames 把合法 state 名按字典序拼成 "a | b | c"（错误信息用）。
+//
+// 从 ValidStates 生成而不是另写一份字面量：状态机加了新值而这里忘了同步，
+// 错误信息就会教人写一个会被注册期拒绝的 state——比不提示更糟。
+func sortedStateNames() string {
+	names := make([]string, 0, len(ValidStates))
+	for s := range ValidStates {
+		names = append(names, string(s))
+	}
+	sort.Strings(names)
+	return strings.Join(names, " | ")
 }
 
 // CanPromote 报告从 from 迁移到 to 是否为合法状态迁移。
@@ -80,7 +95,12 @@ func (t Tool) Validate() error {
 		return fmt.Errorf("tool %s 的 runtime=%q 尚未实现（已实现：process / lua / go-host；wasm 计划 V3）；请勿注册跑不起来的 Tool", t.ID, t.Runtime)
 	}
 	if len(t.Versions) == 0 {
-		return fmt.Errorf("tool %s 至少要有一个 version", t.ID)
+		// 报错误导（2026-10-03 外部实测）：写 `version: "1.0.0"` 标量的人看到的原文只有
+		// 「至少要有一个 version」，看不出**字段名是 versions 列表**、也不知道条目长什么样。
+		// 字段结构直接写进错误里——注册期是唯一能免费给出正确写法的地方。
+		return fmt.Errorf("tool %s 至少要有一个 version（字段是 versions **列表**，不是 version 标量；"+
+			"正确写法：versions: [{version: \"1.0.0\", state: stable}]，state 取 %s）",
+			t.ID, sortedStateNames())
 	}
 	for i, v := range t.Versions {
 		if err := v.Validate(); err != nil {
@@ -90,6 +110,23 @@ func (t Tool) Validate() error {
 	// capability 精确放行：注册期即拒绝未知原语，杜绝「文档说有、代码无」的漂移（红线 15）。
 	if _, err := cap.GrantsFromStrings(t.Capabilities); err != nil {
 		return fmt.Errorf("tool %s: %w", t.ID, err)
+	}
+	// 反向也静态查一遍：Lua entry 用了却没声明的受门禁能力，注册期拒（红线：能静态
+	// 校验的不留到运行期）。
+	//
+	// 为什么必须在这里：未声明的能力在 ctx 上**压根不注入**（值 nil，见 cap 与 lua.go 的
+	// grants 判定，这是「宿主能力边界不可探测」的刻意设计），于是运行期报的是
+	// `attempt to call a non-function object` —— 看着像函数写错了，真因是漏声明，
+	// 排查成本全在运行期（2026-10-03 外部实测的 P1-4）。
+	//
+	// 放在 model 层（而不是 engine / registry）：这三个包互相不可达（engine→registry、
+	// model→cap），而 model.Tool.Validate 是**所有**注册路径的唯一必经口
+	// （registry.UpsertTool → MCP gear_apply / REST POST / CLI register 都经它）。
+	// 只放一处，三面口径必然一致。
+	if t.Runtime == RuntimeLua {
+		if err := luacap.ToolCapsError(t.ID, luacap.Missing(t.Entry, t.Capabilities)); err != nil {
+			return err
+		}
 	}
 	if err := validateSchema(t.InputSchema, "input_schema"); err != nil {
 		return err

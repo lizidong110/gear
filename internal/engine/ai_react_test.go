@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gear/internal/model"
 	"gear/internal/registry"
@@ -31,37 +32,47 @@ type scriptedLLM struct {
 	i     int
 	got   []LLMRequest
 	err   error
+	// errs 是**逐次调用**的错误序列（按下标消费，与 texts 并行）：errs[n] 非 nil 时第 n 次
+	// 调用返回该错误。用于驱动恢复层——「前两次瞬时失败、第三次成功」这类脚本。
+	errs []error
 }
 
 func (s *scriptedLLM) Complete(_ context.Context, req LLMRequest) (string, error) {
 	s.got = append(s.got, req)
+	n := s.i
+	s.i++
+	if n < len(s.errs) && s.errs[n] != nil {
+		return "", s.errs[n]
+	}
 	if s.err != nil {
 		return "", s.err
 	}
-	if s.i >= len(s.texts) {
-		return "", fmt.Errorf("脚本已耗尽（第 %d 次调用）", s.i+1)
+	if n >= len(s.texts) {
+		return "", fmt.Errorf("脚本已耗尽（第 %d 次调用）", n+1)
 	}
-	t := s.texts[s.i]
-	s.i++
-	return t, nil
+	return s.texts[n], nil
 }
 
 // CompleteTools 复用同一份脚本：texts[i] 作正文，calls[i]（若有）作该轮的工具调用。
 // 走它与走 Complete 消耗同一个下标，因此「先调工具、再给答案」这类多轮脚本可以一次写全。
 func (s *scriptedLLM) CompleteTools(_ context.Context, req LLMRequest, _ []ToolSpec) (ChatResult, error) {
 	s.got = append(s.got, req)
+	n := s.i
+	s.i++
+	if n < len(s.errs) && s.errs[n] != nil {
+		return ChatResult{}, s.errs[n]
+	}
 	if s.err != nil {
 		return ChatResult{}, s.err
 	}
-	if s.i >= len(s.texts) {
-		return ChatResult{}, fmt.Errorf("脚本已耗尽（第 %d 次调用）", s.i+1)
+	if n >= len(s.texts) {
+		return ChatResult{}, fmt.Errorf("脚本已耗尽（第 %d 次调用）", n+1)
 	}
-	t := s.texts[s.i]
+	t := s.texts[n]
 	var calls []ToolCall
-	if s.i < len(s.calls) {
-		calls = s.calls[s.i]
+	if n < len(s.calls) {
+		calls = s.calls[n]
 	}
-	s.i++
 	return ChatResult{Text: t, ToolCalls: calls}, nil
 }
 
@@ -106,6 +117,8 @@ func newReactAgent(t *testing.T, llm LLM) (*AIAgent, *[]string) {
 		*entries = append(*entries, entry)
 		return map[string]interface{}{"result": "ok"}, nil
 	}
+	// 恢复层的机械重试零退避：测试要确定性，不能靠睡一会儿「看起来对了」。
+	a.retryBackoff = func(int) time.Duration { return 0 }
 	return a, entries
 }
 
@@ -225,29 +238,41 @@ func TestReactMalformedOutputAndMaxSteps(t *testing.T) {
 }
 
 func TestReactPropagatesExecutorErrorAsObservation(t *testing.T) {
-	llm := &scriptedLLM{texts: []string{actionJSON("db.exec", `{"sql":"SELECT 1"}`)}}
+	// 执行器错误 → 分类后作为失败信号回灌（循环继续，不当场崩）；原因原文必须留在信号里。
+	llm := &scriptedLLM{texts: []string{actionJSON("db.exec", `{"sql":"SELECT 1"}`), "Final Answer: 放弃"}}
 	a, _ := newReactAgent(t, llm)
 	a.exec = func(context.Context, string, map[string]interface{}) (map[string]interface{}, error) {
 		return nil, errors.New("插件崩了")
 	}
-	res, _ := a.React(context.Background(), "任务", ReactOpts{MaxSteps: 1})
+	res, _ := a.React(context.Background(), "任务", ReactOpts{MaxSteps: 2})
 	steps, _ := res.(map[string]interface{})["steps"].([]map[string]interface{})
-	if !strings.Contains(fmt.Sprint(steps[0]["observation"]), "工具执行错误") {
-		t.Fatalf("执行器错误应作为 observation 回灌（循环继续，不当场崩），实际 %v", steps[0]["observation"])
+	obs := fmt.Sprint(steps[0]["observation"])
+	if !strings.Contains(obs, "失败信号") || !strings.Contains(obs, "插件崩了") {
+		t.Fatalf("执行器错误应分类回灌且保留原因原文，实际 %q", obs)
+	}
+	// 判不出类别的错误归 unrecoverable（兜底绝不吞）——不得重试（重试确定性错误是白烧预算）。
+	if !strings.Contains(obs, "unrecoverable") {
+		t.Fatalf("未知错误应按 unrecoverable 处置，实际 %q", obs)
 	}
 }
 
 func TestReactBuildActionEntryFailureIsSurfaced(t *testing.T) {
-	// 编不出 Lua 入口（例如内置原语没有该方法）→ 作为 observation 回灌，不能 panic。
-	llm := &scriptedLLM{texts: []string{actionJSON("db.nope", `{}`)}}
+	// 编不出 Lua 入口（例如内置原语没有该方法）→ 作为结构化失败信号回灌，不能 panic。
+	// 2026-10-19 起失败统一走「失败信号」格式（类型/范围/原因/建议），见 REQ-REACT-RECOVERY：
+	// 裸错误文本把分类整个推给模型，它最常见的反应是原样重发直到撞重复调用守卫。
+	llm := &scriptedLLM{texts: []string{actionJSON("db.nope", `{}`), "Final Answer: 放弃"}}
 	a, entries := newReactAgent(t, llm)
-	res, _ := a.React(context.Background(), "任务", ReactOpts{MaxSteps: 1})
+	res, _ := a.React(context.Background(), "任务", ReactOpts{MaxSteps: 2})
 	if len(*entries) != 0 {
 		t.Fatal("构建失败的调用不得执行")
 	}
 	steps, _ := res.(map[string]interface{})["steps"].([]map[string]interface{})
-	if !strings.Contains(fmt.Sprint(steps[0]["observation"]), "构建工具调用失败") {
-		t.Fatalf("构建失败必须回灌给模型，实际 %v", steps[0]["observation"])
+	obs := fmt.Sprint(steps[0]["observation"])
+	if !strings.Contains(obs, "失败信号") {
+		t.Fatalf("构建失败必须以失败信号回灌给模型，实际 %v", obs)
+	}
+	if !strings.Contains(obs, "bad_input") {
+		t.Fatalf("选错方法属于模型可自愈的 bad_input，实际 %v", obs)
 	}
 }
 
