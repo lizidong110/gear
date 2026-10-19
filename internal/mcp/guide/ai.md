@@ -143,6 +143,7 @@ react 的每一步都可能失败：工具报错、provider 限流、模型给�
 | L1 结构化信号 | 其余可恢复失败（bad_input / upstream_bad / semantic_empty） | 回灌分类 + 范围 + 原因 + 建议，由模型重决策 | 信号本身不烧，模型下一步才烧 |
 | 震荡守卫 | 同一动作同类型失败连续达阈值 | 封禁该动作 + 记缺口，不再烧预算 | 否 |
 | 兜底 | auth / unrecoverable 立即记缺口；其余阈值到了记 | 步数耗尽的答案带缺口清单（带缺失作答） | 否 |
+| 收尾补全 | 循环结束 | 最后以失败收尾的动作统一转缺口——单次失败后模型放弃作答也留痕（`gaps=[]` 但答案缺了数据 = 静默残缺） | 否 |
 
 七类失败：`transient` / `channel` / `bad_input` / `upstream_bad` / `semantic_empty` / `auth` /
 `unrecoverable`，每类一张声明式策略表；判不出的一律 `unrecoverable`——**方向选不可恢复**：
@@ -154,13 +155,18 @@ react 的每一步都可能失败：工具报错、provider 限流、模型给�
 - `gaps`：缺口清单（哪个动作、哪类失败、原因）。auth 与 unrecoverable 立即进；其余震荡后才进。
 - `recovery_log`：恢复流水（重试几次、换了什么通道、封禁了什么），排查「它为什么这么答」用。
 
-三个反直觉点，都是踩出来的：
+四个反直觉点，都是踩出来的：
 
 - **`ctx.http.Request` 不把非 2xx 当错误**，status 在 body 里。不接住 body，L0 对 HTTP 类工具
   等于不存在——这是七类里 transient 最常见来源，却最容易漏。
 - **引擎重试与模型重发必须分开**：重复调用守卫只拦模型（同工具同参数），不拦引擎的 L0——否则
   重试第一步就被自己人拦下，恢复层形同虚设。
 - **`max_steps` 计数的是 invoke**，机械重试不占步数。烧的是 provider 配额，不是执行步预算。
+- **错误文案跨平台不一样**：Windows 的连接拒绝是
+  `connectex: No connection could be made because the target machine actively refused it`，
+  不含 "connection refused" 子串。分类器的关键词表两套文案都收了（2026-10-19 E2E 实测：
+  只认 Unix 文案时，Windows 上死端口拒绝会被误判成 unrecoverable，L0 重试从不发生）。
+  自己的 tool 要精确分类，实现 `RecoverableError` 接口——实现方最懂自己的错误。
 
 ## 3. 路径二：手写 Lua 循环（真正自建）
 

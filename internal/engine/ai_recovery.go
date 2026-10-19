@@ -111,19 +111,32 @@ func classifyToolFailure(action string, err error) reactFailure {
 	// ③ channel：能力在目录里、实现没装配（ErrCapabilityUnavailable 的文案）
 	case containsAny(s, "已授权但尚未实现", "尚未实现", "not implemented", "未装配"):
 		f.Class = FailChannel
-	// ④ transient：网络抖动与限流——重试（带退避）是标准解
+	// ④ transient：网络抖动与限流——重试（带退避）是标准解。
+	// ⚠ Windows 的 syscall 错误文案与 Unix 完全不同：ECONNREFUSED 在 Unix 是
+	// "connection refused"，在 Windows 是 "connectex: No connection could be made
+	// because the target machine actively refused it"；ECONNRESET 是 "wsarecv: An
+	// existing connection was forcibly closed by the remote peer"。2026-10-19 E2E
+	// 实测（Windows 真机跑死端口）：只写 Unix 味关键词时，整个网络分支在这台机器上
+	// 全是死的——连接拒绝掉到 unrecoverable 兜底，L0 重试从未发生。两边都要覆盖。
 	case containsAny(s, "timeout", "timed out", "deadline exceeded", "connection refused",
 		"connection reset", "broken pipe", "no route to host", "temporary failure",
-		"too many requests", "rate limit", "429", "503", "service unavailable", "eof"):
+		"too many requests", "rate limit", "429", "503", "service unavailable", "eof",
+		"actively refused", "no connection could be made", "connection attempt failed",
+		"did not properly respond", "failed to respond", "forcibly closed", "unreachable",
+		"wsarecv", "wsasend", "wsaeconnreset", "wsaeconnaborted", "wsaeconnrefused"):
 		f.Class = FailTransient
 	// ⑤ unrecoverable：资源/方法不存在，重来还一样
 	case containsAny(s, "404", "not found", "不存在", "no such method", "unknown method",
 		"unsupported", "unknown tool", "无法识别"):
 		f.Class = FailUnrecoverable
-	// ⑥ bad_input：调用方（模型）能自愈的那类——缺参数、形态不对、SQL 写错
+	// ⑥ bad_input：调用方（模型）能自愈的那类——缺参数、形态不对、SQL 写错。
+	// DNS 硬失败（no such host）也归这里：URL 是模型自己选的，最常见原因是域名
+	// 写错——改对域名就能好，重试同一个域名毫无意义；DNS 真故障时由震荡守卫兜底
+	// （同动作连续失败即封禁+缺口），代价有界。区分于「temporary failure in name
+	// resolution」——那是软故障，已由 ④ 接走，重试确实有用。
 	case containsAny(s, "缺少必填参数", "需传入", "不是合法 json", "invalid json", "cannot unmarshal",
 		"参数", "argument", "syntax error", "no such table", "no such column",
-		"类型不符", "type mismatch", "必填"):
+		"类型不符", "type mismatch", "必填", "no such host"):
 		f.Class = FailBadInput
 	}
 	return f
@@ -176,6 +189,7 @@ type reactBoard struct {
 	sigCount       map[string]int    // 失败签名（动作|类型）→ 次数：震荡守卫的判据
 	blocked        map[string]string // 被震荡守卫封禁的动作 → 封禁原因
 	lastEvidenceOK bool              // 最近一次证据是否可用（空/失败 → false）：scope=upstream 的判据
+	outcome        map[string]bool   // 动作 → 最后一次的结局（收尾补全缺口的判据，见 finalizeGaps）
 }
 
 // 恢复层常量。都是「便宜的上限」：机械动作不烧 LLM，但也不能无限。
@@ -212,7 +226,40 @@ func (b *reactBoard) scopeHint() string {
 }
 
 // noteEvidence 更新「最近一次证据是否可用」。空结果与工具失败都算不可用。
-func (b *reactBoard) noteEvidence(ok bool) { b.lastEvidenceOK = ok }
+// noteEvidence 记一次动作的结果走向：lastEvidenceOK 供 scopeHint 判「根因在上游还是本节点」，
+// outcome 供收尾补全判「这个动作最后成没成」。
+func (b *reactBoard) noteEvidence(action string, ok bool) {
+	b.lastEvidenceOK = ok
+	if b.outcome == nil {
+		b.outcome = map[string]bool{}
+	}
+	b.outcome[action] = ok
+}
+
+// finalizeGaps 收尾补全：跑完后仍以失败收尾的动作，统一转成缺口。
+//
+// 为什么需要它：即时缺口只覆盖 auth/unrecoverable（首败即记）与震荡阈值（连续 3 次）。
+// 单次 transient 失败后模型干脆放弃、改用别的路子作答时，两条路都不触发——gaps 是空的，
+// 而答案里缺的那块数据只有模型正文提过。按「静默残缺比明说缺失坏得多」，结构化缺口必须
+// 收口：**最后结局是失败的动作就得在 gaps 里有一笔**（2026-10-19 E2E 实测发现：
+// Windows 死端口单次失败后 gaps=[]，调用方无从知道数据没拿到）。
+//
+// 判据是「该动作最后的结局」而非「历史上失败过」：失败后换参数重试成功的动作不记
+// （数据拿到了，没有缺口）。模型绕路用别的动作拿到等效数据时，这里仍会记一笔——
+// 但那笔录的是「这个动作没成」这个事实，不是「答案不完整」的断言，排查时正是要看的。
+func (b *reactBoard) finalizeGaps() {
+	// 每个动作只保留最后一次失败（reason 取最新的，与 outcome 的结局对应）。
+	last := map[string]reactFailure{}
+	for _, f := range b.failures {
+		last[f.Action] = f
+	}
+	for action, f := range last {
+		if b.outcome[action] {
+			continue // 最后成功了——没有缺口
+		}
+		b.addGap(f)
+	}
+}
 
 // spendRetry 消耗一次全局机械重试预算；预算耗尽返回 false（调用方不得再重试）。
 func (b *reactBoard) spendRetry() bool {

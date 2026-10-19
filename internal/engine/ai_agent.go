@@ -681,7 +681,7 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 				f.Scope = board.scopeHint()
 				f.Attempts = attempts
 				board.noteFailure(f)
-				board.noteEvidence(false)
+				board.noteEvidence(action, false)
 				return record(failureSignal(f))
 			}
 			attempts++
@@ -692,10 +692,10 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 		if isEmptyToolResult(out) {
 			board.noteFailure(reactFailure{Class: FailSemanticEmpty, Action: action,
 				Reason: "工具返回空结果", Scope: board.scopeHint()})
-			board.noteEvidence(false)
+			board.noteEvidence(action, false)
 			return record("【空结果】查询未返回任何数据。如确认目标不存在，请直接说明「未找到」，不要换参数反复查询。")
 		}
-		board.noteEvidence(true)
+		board.noteEvidence(action, true)
 		var obs string
 		if r, ok := out["result"]; ok {
 			obs = stableJSON(r)
@@ -963,6 +963,9 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 		msgs = append(msgs, map[string]any{"role": "user", "content": "Observation: " + obs})
 	}
 
+	// 收尾补全：最后以失败收尾的动作统一转成缺口（finalizeGaps 的理由见其注释）。
+	// 必须在兜底答案拼装之前——「步数耗尽 + 未能获取的数据」那段要含补全后的缺口。
+	board.finalizeGaps()
 	if finalAnswer == "" {
 		finalAnswer = fmt.Sprintf("（达到最大步数 %d，未给出 Final Answer）", opts.MaxSteps)
 		// 带缺失作答：步数耗尽时若有缺口，答案必须带上——静默残缺比明说缺失坏得多。

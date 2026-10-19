@@ -97,6 +97,29 @@ func TestRenderHelpers(t *testing.T) {
 		t.Fatal("超长 observation 必须截断（否则撑爆终端/日志）")
 	}
 
+	// 恢复流水与缺口必须上屏（REQ-REACT-RECOVERY ⑤）：引擎记了、面不显示 = 没记。
+	out2 := renderReactResult(map[string]interface{}{
+		"answer":       "部分数据没拿到，如实说明",
+		"recovery_log": []string{"L0 重试 http.Request（transient，第 1 次）：connection refused"},
+		"gaps": []map[string]interface{}{
+			{"action": "http.Request", "type": "transient", "reason": "connection refused", "human": false},
+			{"action": "secret.get", "type": "auth", "reason": "secret 不存在", "human": true},
+		},
+	})
+	if !strings.Contains(out2, "L0 重试") || !strings.Contains(out2, "恢复流水") {
+		t.Fatalf("恢复流水必须渲染，实际:\n%s", out2)
+	}
+	if !strings.Contains(out2, "transient") || !strings.Contains(out2, "connection refused") {
+		t.Fatalf("缺口清单必须渲染（类型+原因），实际:\n%s", out2)
+	}
+	if !strings.Contains(out2, "需人工介入") {
+		t.Fatal("需人工的缺口必须显式标注（auth 类要人去配凭据，模型修不了）")
+	}
+	// 无缺口无流水时不得渲染空节（干净输出）。
+	if out3 := renderReactResult(map[string]interface{}{"answer": "x"}); strings.Contains(out3, "缺口") || strings.Contains(out3, "恢复流水") {
+		t.Fatalf("无缺口/流水时不应出现空节，实际:\n%s", out3)
+	}
+
 	// 非 map 形态 → 退化为 YAML（不猜结构）
 	yamlOut := renderReactResult([]string{"a", "b"})
 	if !strings.Contains(yamlOut, "- a") {

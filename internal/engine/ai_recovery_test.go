@@ -38,6 +38,12 @@ func TestClassifyToolFailureCoversSevenClasses(t *testing.T) {
 		{"连接拒绝归 transient", errors.New("dial tcp 127.0.0.1:8096: connection refused"), FailTransient},
 		{"429 归 transient（退避重试是标准解）", errors.New("429 too many requests"), FailTransient},
 		{"503 归 transient", errors.New("503 service unavailable"), FailTransient},
+		{"Windows 连接拒绝归 transient（E2E 实测原文）", errors.New("lua 执行失败: <string>:1: http 请求失败: Get \"http://127.0.0.1:9/\": dial tcp 127.0.0.1:9: connectex: No connection could be made because the target machine actively refused it."), FailTransient},
+		{"Windows 连接超时归 transient", errors.New("dial tcp 10.0.0.1:80: connectex: A connection attempt failed because the connected party did not properly respond after a period of time"), FailTransient},
+		{"Windows 连接重置归 transient", errors.New("wsarecv: An existing connection was forcibly closed by the remote peer"), FailTransient},
+		{"DNS 硬失败归 bad_input（域名是模型选的，可自愈）", errors.New("dial tcp: lookup nope.example.com: no such host"), FailBadInput},
+		{"DNS 软故障归 transient（重试有用，先于 bad_input 匹配）", errors.New("lookup x.com: temporary failure in name resolution"), FailTransient},
+		{"网络不可达归 transient", errors.New("connect: network is unreachable"), FailTransient},
 		{"能力未装配归 channel", errors.New("capability 已授权但尚未实现"), FailChannel},
 		{"缺必填参数归 bad_input", errors.New("db.exec 缺少必填参数 sql"), FailBadInput},
 		{"SQL 语法错归 bad_input", errors.New("near \"SELCT\": syntax error"), FailBadInput},
@@ -518,6 +524,66 @@ func TestReactResultAlwaysCarriesGapsAndRecoveryLog(t *testing.T) {
 	}
 	if _, ok := m["used_tools"].([]string); !ok {
 		t.Error("used_tools 形状不得变")
+	}
+}
+
+// TestReactAbandonedFailureFinalizesGap：单次 transient 失败后模型放弃作答 →
+// 收尾补全必须把该动作转成缺口。2026-10-19 E2E 实测（Windows 死端口）发现：
+// 只有一次失败、够不上震荡阈值时 gaps 是空的——答案缺了数据，结构化缺口却查不到，
+// 正是「静默残缺」。finalizeGaps 按「动作最后结局」补这一笔。
+func TestReactAbandonedFailureFinalizesGap(t *testing.T) {
+	llm := &scriptedLLM{texts: []string{
+		actionJSON("http.Request", `{"url":"http://127.0.0.1:9/"}`),
+		"Final Answer: 连不上，拿不到数据",
+	}}
+	a, _ := newReactAgent(t, llm)
+	attempts := 0
+	a.exec = func(_ context.Context, _ string, _ map[string]interface{}) (map[string]interface{}, error) {
+		attempts++
+		// E2E 实测原文（Windows ECONNREFUSED）——分类器必须认它，否则 L0 不存在。
+		return nil, errors.New("http 请求失败: Get \"http://127.0.0.1:9/\": dial tcp 127.0.0.1:9: connectex: No connection could be made because the target machine actively refused it")
+	}
+	res, err := a.React(context.Background(), "任务", ReactOpts{MaxSteps: 4})
+	if err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("transient 应先机械重试（1+2），实际执行 %d 次", attempts)
+	}
+	gaps, _ := res.(map[string]interface{})["gaps"].([]map[string]interface{})
+	if len(gaps) != 1 || gaps[0]["action"] != "http.Request" || gaps[0]["type"] != "transient" {
+		t.Fatalf("被放弃的失败动作必须补成缺口（transient），实际 %v", gaps)
+	}
+}
+
+// TestReactFailureThenSuccessLeavesNoGap：失败后换参数成功 → 不留缺口。
+// finalizeGaps 判的是「最后结局」而非「历史上有过失败」——重试成功不留缺口，
+// 否则每次自愈都在 gaps 里留痕，缺口清单失去信号价值。
+func TestReactFailureThenSuccessLeavesNoGap(t *testing.T) {
+	llm := &scriptedLLM{texts: []string{
+		actionJSON("db.exec", `{}`),                 // 缺参数 → bad_input（不机械重试）
+		actionJSON("db.exec", `{"sql":"SELECT 1"}`), // 模型按信号修正后成功
+		"Final Answer: 完成",
+	}}
+	a, _ := newReactAgent(t, llm)
+	calls := 0
+	a.exec = func(_ context.Context, _ string, _ map[string]interface{}) (map[string]interface{}, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("db.exec 缺少必填参数 sql")
+		}
+		return map[string]interface{}{"result": "ok"}, nil
+	}
+	res, err := a.React(context.Background(), "任务", ReactOpts{MaxSteps: 4})
+	if err != nil {
+		t.Fatalf("React 失败: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("bad_input 不应机械重试（重试同样输入无意义），实际执行 %d 次", calls)
+	}
+	gaps, _ := res.(map[string]interface{})["gaps"].([]map[string]interface{})
+	if len(gaps) != 0 {
+		t.Fatalf("失败后成功不应留缺口，实际 %v", gaps)
 	}
 }
 

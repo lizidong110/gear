@@ -176,6 +176,21 @@ func renderReactResult(res interface{}) string {
 			sb.WriteString(fmt.Sprintf("\n[%d] 行动: %s\n    观察: %s\n", i+1, act, truncateForCLI(obs, 500)))
 		}
 	}
+	// 恢复流水与缺口是「带缺失作答」的凭据：引擎记了却不在面上显示，等于没记
+	//（REQ-REACT-RECOVERY ⑤）。排步骤之后展示，排查「它为什么这么答」看这两段。
+	if log, ok := m["recovery_log"].([]string); ok && len(log) > 0 {
+		sb.WriteString("\n恢复流水：\n- " + strings.Join(log, "\n- ") + "\n")
+	}
+	if gaps, ok := m["gaps"].([]map[string]interface{}); ok && len(gaps) > 0 {
+		sb.WriteString("\n缺口（回答未能获取的数据/能力）：\n")
+		for _, g := range gaps {
+			human := ""
+			if h, _ := g["human"].(bool); h {
+				human = "（需人工介入）"
+			}
+			sb.WriteString(fmt.Sprintf("- [%v] %v：%v%s\n", g["type"], g["action"], g["reason"], human))
+		}
+	}
 	return sb.String()
 }
 
