@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -69,9 +70,12 @@ var failureRecovery = map[FailureClass]recoveryPlan{
 
 // reactFailure 是一次失败的完整记录：类型 + 动作 + 原因 + 范围 + 已机械重试几次。
 // Scope 是给 replanner（这里是模型）的 scope_hint：self = 本步自己错；upstream = 根因在上游产出。
+// GapKey 非空时缺口以它为键（REWOO 的节点级缺口：同一动作可被多个节点使用，动作级键会互相
+// 抵消/串味；震荡守卫等其余判据仍用 Action）。
 type reactFailure struct {
 	Class    FailureClass
 	Action   string // 「能力.方法」；LLM 调用失败记 "llm"
+	GapKey   string // 非空时缺口以此为键（默认同 Action）
 	Reason   string
 	Scope    string // "self" | "upstream"
 	Attempts int    // 已发生的机械重试次数
@@ -120,7 +124,8 @@ func classifyToolFailure(action string, err error) reactFailure {
 	// 全是死的——连接拒绝掉到 unrecoverable 兜底，L0 重试从未发生。两边都要覆盖。
 	case containsAny(s, "timeout", "timed out", "deadline exceeded", "connection refused",
 		"connection reset", "broken pipe", "no route to host", "temporary failure",
-		"too many requests", "rate limit", "429", "503", "service unavailable", "eof",
+		"too many requests", "rate limit", "429", "502", "503", "504",
+		"service unavailable", "bad gateway", "gateway timeout", "eof",
 		"actively refused", "no connection could be made", "connection attempt failed",
 		"did not properly respond", "failed to respond", "forcibly closed", "unreachable",
 		"wsarecv", "wsasend", "wsaeconnreset", "wsaeconnaborted", "wsaeconnrefused"):
@@ -179,7 +184,13 @@ type reactBudget struct {
 // reactBoard 是 react 循环的黑板：失败、恢复流水、缺口、降级、震荡计数集中在一处。
 // 它同时是**可观测面**——每轮 KS（这里是循环体）触发后的 diff 直接进 steps / recovery_log /
 // gaps，UI 或调用方拿到的就是完整恢复史，不必从 observation 文本里抠。
+//
+// 并发说明：react 自己是单线程循环，但 REWOO（ai_rewoo.go）的 worker 按拓扑层并行执行节点、
+// 多 goroutine 共写这一块黑板——所以全部读写方法都过 mu。锁只在这些短临界区上，不持有锁
+// 做 LLM/工具调用（那会串行化整层并行）。内部 *Locked 版本供已持锁的路径复用，避免自锁。
 type reactBoard struct {
+	mu sync.Mutex
+
 	budget reactBudget
 
 	failures []reactFailure           // 全部失败（含已恢复的），按发生序
@@ -219,16 +230,19 @@ func newReactBoard(maxSteps int) *reactBoard {
 // 这只是提示（模型仍可能自己判断错），但比一律标 self 强——「修本节点」与「修上游」
 // 是两种完全不同的下一步。
 func (b *reactBoard) scopeHint() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.lastEvidenceOK {
 		return "self"
 	}
 	return "upstream"
 }
 
-// noteEvidence 更新「最近一次证据是否可用」。空结果与工具失败都算不可用。
 // noteEvidence 记一次动作的结果走向：lastEvidenceOK 供 scopeHint 判「根因在上游还是本节点」，
 // outcome 供收尾补全判「这个动作最后成没成」。
 func (b *reactBoard) noteEvidence(action string, ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.lastEvidenceOK = ok
 	if b.outcome == nil {
 		b.outcome = map[string]bool{}
@@ -248,6 +262,8 @@ func (b *reactBoard) noteEvidence(action string, ok bool) {
 // （数据拿到了，没有缺口）。模型绕路用别的动作拿到等效数据时，这里仍会记一笔——
 // 但那笔录的是「这个动作没成」这个事实，不是「答案不完整」的断言，排查时正是要看的。
 func (b *reactBoard) finalizeGaps() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	// 每个动作只保留最后一次失败（reason 取最新的，与 outcome 的结局对应）。
 	last := map[string]reactFailure{}
 	for _, f := range b.failures {
@@ -257,12 +273,14 @@ func (b *reactBoard) finalizeGaps() {
 		if b.outcome[action] {
 			continue // 最后成功了——没有缺口
 		}
-		b.addGap(f)
+		b.addGapLocked(f)
 	}
 }
 
 // spendRetry 消耗一次全局机械重试预算；预算耗尽返回 false（调用方不得再重试）。
 func (b *reactBoard) spendRetry() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.budget.retriesLeft <= 0 {
 		return false
 	}
@@ -271,13 +289,23 @@ func (b *reactBoard) spendRetry() bool {
 }
 
 // recordRecovery 记一条恢复流水（L0/L1.5 的动作），供 recovery_log 与 UI 展示。
-func (b *reactBoard) recordRecovery(s string) { b.recovery = append(b.recovery, s) }
+func (b *reactBoard) recordRecovery(s string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.recovery = append(b.recovery, s)
+}
 
 // noteFailure 登记一次失败并跑恢复决策：立即可缺口的类型（auth/unrecoverable）当场记缺口；
 // 任何类型累计到震荡阈值都封禁 + 记缺口。绝不出现「失败了但没有任何记录」的路径。
 // 注意「立即记缺口」不替代震荡守卫：缺口让模型**知道**拿不到，封禁让循环**停止**在同一个
 // 动作上烧步数——模型拿不同参数反复撞同一个 404 是常见形态，两件事都要做。
 func (b *reactBoard) noteFailure(f reactFailure) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.noteFailureLocked(f)
+}
+
+func (b *reactBoard) noteFailureLocked(f reactFailure) {
 	b.failures = append(b.failures, f)
 	sig := f.Action + "|" + string(f.Class)
 	b.sigCount[sig]++
@@ -285,7 +313,7 @@ func (b *reactBoard) noteFailure(f reactFailure) {
 	// 机械恢复注定无效的两类（auth 需人工 / unrecoverable 重来还一样）：立即记缺口，
 	// 不等阈值——等的只是让循环在它身上白烧步数。
 	if plan.human || f.Class == FailUnrecoverable {
-		b.addGap(f)
+		b.addGapLocked(f)
 	}
 	if b.sigCount[sig] >= maxSameSignature {
 		why := fmt.Sprintf("连续 %d 次失败（类型=%s）", b.sigCount[sig], f.Class)
@@ -293,21 +321,33 @@ func (b *reactBoard) noteFailure(f reactFailure) {
 			why = fmt.Sprintf("连续 %d 次查询无结果", b.sigCount[sig])
 		}
 		b.blocked[f.Action] = why
-		b.addGap(f)
-		b.recordRecovery(fmt.Sprintf("震荡守卫：%s %s，已停止调用并记缺口", f.Action, why))
+		b.addGapLocked(f)
+		b.recovery = append(b.recovery, fmt.Sprintf("震荡守卫：%s %s，已停止调用并记缺口", f.Action, why))
 	}
 }
 
 // addGap 记一个缺口（按 动作|类型 去重）。需人工与否由策略表推导（auth/channel）。
 func (b *reactBoard) addGap(f reactFailure) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.addGapLocked(f)
+}
+
+func (b *reactBoard) addGapLocked(f reactFailure) {
 	key := f.Action + "|" + string(f.Class)
+	action := f.Action
+	if f.GapKey != "" {
+		key = f.GapKey + "|" + string(f.Class)
+		action = f.GapKey // 缺口记录带上 GapKey（REWOO 的节点身份）：同动作多节点时，
+		// 只记 "http.Request" 说不出是哪个 #E 败了，排查与作答都要点名到节点
+	}
 	for _, g := range b.gaps {
 		if fmt.Sprint(g["action"], "|", g["type"]) == key {
 			return
 		}
 	}
 	b.gaps = append(b.gaps, map[string]interface{}{
-		"action": f.Action,
+		"action": action,
 		"type":   string(f.Class),
 		"reason": f.Reason,
 		"scope":  f.Scope,
@@ -315,8 +355,19 @@ func (b *reactBoard) addGap(f reactFailure) {
 	})
 }
 
+// clearGaps 清空缺口清单。REWOO 用它在收尾前重建缺口：运行中 noteFailure 记的是动作级
+// 即时缺口（供震荡守卫等判据），而重规划会把失败节点换成新节点——旧节点的即时缺口可能已经
+// 过时（数据最终拿到了）。最终缺口只认**最后计划状态**，所以在收尾时清空重算，避免陈账。
+func (b *reactBoard) clearGaps() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.gaps = nil
+}
+
 // blockedNotice 报告某动作是否已被震荡守卫封禁；封禁时返回要给模型的说明。
 func (b *reactBoard) blockedNotice(action string) (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	why, ok := b.blocked[action]
 	if !ok {
 		return "", false
@@ -327,6 +378,8 @@ func (b *reactBoard) blockedNotice(action string) (string, bool) {
 
 // gapNotice 是给模型的缺口通知：回答时必须如实说明、不得编造。
 func (b *reactBoard) gapNotice() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	var sb strings.Builder
 	sb.WriteString("已知缺口（以下数据/能力未能获取）：回答时必须如实说明这些缺口，不得编造：\n")
 	for i, g := range b.gaps {
@@ -337,6 +390,23 @@ func (b *reactBoard) gapNotice() string {
 		fmt.Fprintf(&sb, "%d. [%s] %s：%s%s\n", i+1, g["type"], g["action"], g["reason"], human)
 	}
 	return sb.String()
+}
+
+// gapsSnapshot / recoverySnapshot 是结果装配用的快照读（拷贝，避免调用方与并发写入共享底层数组）。
+func (b *reactBoard) gapsSnapshot() []map[string]interface{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]map[string]interface{}, len(b.gaps))
+	copy(out, b.gaps)
+	return out
+}
+
+func (b *reactBoard) recoverySnapshot() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]string, len(b.recovery))
+	copy(out, b.recovery)
+	return out
 }
 
 // failureSignal 是把失败回灌给模型（L1）的结构化信号：类型 / 范围 / 动作 / 原因 / 已重试几次 /
@@ -461,10 +531,11 @@ func sleepBackoff(fn func(int) time.Duration, attempt int) {
 //     调用方切掉工具面、重建提示词，下一轮用新通道重问，不额外消耗执行步）；
 //   - 其余（auth/unrecoverable/重试耗尽）返回带分类的错误上抛——机械恢复无效时不硬撑。
 //
+// label 只进错误文案（"react"/"rewoo"），让调用方从报错就能看出是哪条 agent 路径败了。
 // allowDegrade=false（元工具模式）时刻意不降级：meta 的工具面本身就是 4 个元工具，
 // 文本协议表达不了 find→describe→invoke 工作流，硬降级只会得到一个跑偏的循环，
 // 不如明确报错让人换模式或换模型。
-func (a *AIAgent) completeReactStep(ctx context.Context, req LLMRequest, tools []ToolSpec,
+func (a *AIAgent) completeReactStep(ctx context.Context, label string, req LLMRequest, tools []ToolSpec,
 	board *reactBoard, allowDegrade bool) (string, []ToolCall, bool, error) {
 	for attempt := 0; ; attempt++ {
 		var (
@@ -482,13 +553,13 @@ func (a *AIAgent) completeReactStep(ctx context.Context, req LLMRequest, tools [
 			return res.Text, res.ToolCalls, false, nil
 		}
 		if ctx.Err() != nil {
-			return "", nil, false, fmt.Errorf("react 执行上下文已结束（第 %d 次 LLM 调用）: %w", attempt+1, ctx.Err())
+			return "", nil, false, fmt.Errorf("%s 执行上下文已结束（第 %d 次 LLM 调用）: %w", label, attempt+1, ctx.Err())
 		}
 		f := classifyToolFailure("llm", err)
 		if len(tools) > 0 && reactToolsUnsupported(err) {
 			if !allowDegrade {
-				return "", nil, false, fmt.Errorf("react：模型端点不支持工具声明（function calling）：%v；"+
-					"元工具模式（mode=\"meta\"）强依赖它，请改用默认 flat 模式或换一个支持工具调用的模型", err)
+				return "", nil, false, fmt.Errorf("%s：模型端点不支持工具声明（function calling）：%v；"+
+					"元工具模式（mode=\"meta\"）强依赖它，请改用默认 flat 模式或换一个支持工具调用的模型", label, err)
 			}
 			board.recordRecovery(fmt.Sprintf("L1.5 换通道：端点不支持工具声明（%v），降级为文本 Action 协议", err))
 			return "", nil, true, nil
@@ -498,6 +569,6 @@ func (a *AIAgent) completeReactStep(ctx context.Context, req LLMRequest, tools [
 			sleepBackoff(a.retryBackoff, attempt)
 			continue
 		}
-		return "", nil, false, fmt.Errorf("react LLM 调用失败（%s，第 %d 次尝试）: %w", f.Class, attempt+1, err)
+		return "", nil, false, fmt.Errorf("%s LLM 调用失败（%s，第 %d 次尝试）: %w", label, f.Class, attempt+1, err)
 	}
 }

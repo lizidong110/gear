@@ -857,11 +857,25 @@ func clip(s string, maxRunes int) string {
 }
 
 // mockChatText 测试/离线用的确定性 provider：按 system 内容返回结构化 JSON 文本。
+// rewoo 的 planner/replanner 走**纯 user 消息**（提示词自包含契约），故另按 user 内容分流。
 func mockChatText(req LLMRequest) string {
 	var text string
+	userLast := ""
+	for _, m := range req.Messages {
+		if role, _ := m["role"].(string); role != "user" {
+			continue
+		}
+		if c, ok := m["content"].(string); ok {
+			userLast = c
+		}
+	}
 	switch {
 	case strings.Contains(req.System, "规划器"):
 		text = `[{"subtask":"执行步骤","domain":"general"}]`
+	case strings.Contains(userLast, "任务规划器（planner）"):
+		// rewoo planner：一张单节点合法 DAG。刻意选 template.render——纯函数、不联网不要凭据，
+		// 离线测试（CLI 的 GEAR_AI_PROVIDER=mock）能把 planner→worker→solver→渲染整条链跑通。
+		text = `{"steps":[{"id":"#E1","action":"template.render","args":{"text":"mock 计划"},"depends_on":[]}]}`
 	case strings.Contains(req.System, "原子能力") || strings.Contains(req.System, "Tool"):
 		text = `{"id":"demo.generated","name":"生成的工具","description":"示例","runtime":"lua","entry":"--","input_schema":{"type":"object"},"output_schema":{"type":"object"},"versions":[{"version":"1.0.0","state":"draft"}]}`
 	default:

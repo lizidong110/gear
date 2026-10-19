@@ -148,3 +148,78 @@ func TestTruncateForCLI(t *testing.T) {
 		t.Fatalf("应按 rune 截断并标注，实际 %q", got)
 	}
 }
+
+func TestAIRewooRequiresTask(t *testing.T) {
+	err := runCLI(t, "ai", "rewoo")
+	if err == nil || !strings.Contains(err.Error(), "任务描述") {
+		t.Fatalf("缺任务描述时必须报错（不静默跑空规划），实际 %v", err)
+	}
+}
+
+func TestAIRewooRejectsAllowAllWithAllow(t *testing.T) {
+	// 与 react 同口径：两个 allow 语义冲突（不设限 vs 白名单），同给即报错，不静默挑一个
+	err := runCLI(t, "ai", "rewoo", "--allow-all", "--allow", "http", "任务")
+	if err == nil || !strings.Contains(err.Error(), "不能同时给") {
+		t.Fatalf("--allow-all 与 --allow 同给必须报错，实际 %v", err)
+	}
+}
+
+func TestAIRewooRunsWithMockProvider(t *testing.T) {
+	withTempRegistry(t)
+	t.Setenv("GEAR_AI_PROVIDER", "mock")
+	// mock 的 planner 给一张单节点合法 DAG（template.render 是纯函数，不联网不要凭据），
+	// 全链应跑通：planner → worker 执行 → solver → 结果渲染。断言命令本身正常结束。
+	if err := runCLI(t, "ai", "rewoo", "调研三家供应商报价并对比"); err != nil {
+		t.Fatalf("gear ai rewoo（mock）失败: %v", err)
+	}
+	// flag → RewooOpts 接线：模型参数 + allow 收窄 + replan-budget=0 + 并行度 + 节点上限 + 温度
+	if err := runCLI(t, "ai", "rewoo", "--provider", "mock", "--model", "m",
+		"--base-url", "http://127.0.0.1:1", "--api-key", "k", "--allow", "template",
+		"--replan-budget", "0", "--max-parallel", "2", "--max-nodes", "5",
+		"--temperature", "0.5", "任务2"); err != nil {
+		t.Fatalf("带全参数的 rewoo 失败: %v", err)
+	}
+}
+
+// TestRenderRewooResult 覆盖 rewoo 的结果渲染：计划快照 / 节点结局 / 恢复流水 / 缺口
+// 四段都必须在面上（REQ-REWOO⑨：plan 是数据，可存可 diff 可人工审——只活在内存里等于没审）。
+func TestRenderRewooResult(t *testing.T) {
+	out := renderRewooResult(map[string]interface{}{
+		"answer": "A=100 B=120 C=90",
+		"plan": []map[string]interface{}{
+			{"id": "#E1", "action": "http.Request", "depends_on": []string{}, "status": "done"},
+			{"id": "#E2", "action": "db.query", "depends_on": []string{"#E1"}, "status": "failed"},
+			{"id": "#E3", "action": "template.render", "depends_on": []string{"#E1", "#E2"}, "status": "blocked"},
+		},
+		"node_outcomes": []map[string]interface{}{
+			{"id": "#E1", "action": "http.Request", "status": "done", "attempts": 2},
+			{"id": "#E2", "action": "db.query", "status": "failed", "attempts": 1,
+				"error": strings.Repeat("连接被拒", 200), "type": "transient"},
+			{"id": "#E3", "action": "template.render", "status": "blocked", "attempts": 0},
+		},
+		"recovery_log": []string{"L0 重试 db.query（transient，第 1 次）"},
+		"gaps": []map[string]interface{}{
+			{"action": "#E2（db.query）", "type": "transient", "reason": "connection refused", "human": false},
+			{"action": "secret.get", "type": "auth", "reason": "secret 不存在", "human": true},
+		},
+	})
+	for _, want := range []string{
+		"REWOO 结果", "A=100 B=120 C=90",
+		"#E1 [done]", "← 依赖 #E1", "#E1,#E2", // 计划快照：fan-in 依赖要看得见
+		"重试 2 次", "transient", "...(truncated)", // 节点结局：重试次数 + 错误截断
+		"L0 重试", "connection refused", "需人工介入", // 流水 + 缺口（含人工标注）
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("渲染应含 %q，实际:\n%s", want, out)
+		}
+	}
+	// 四段全空时不得渲染空节（干净输出）
+	if clean := renderRewooResult(map[string]interface{}{"answer": "x"}); strings.Contains(clean, "执行计划") ||
+		strings.Contains(clean, "节点结局") || strings.Contains(clean, "缺口") || strings.Contains(clean, "恢复流水") {
+		t.Fatalf("无内容时不应出现空节，实际:\n%s", clean)
+	}
+	// 非 map 形态 → 退化为 YAML（不猜结构）
+	if y := renderRewooResult([]string{"a"}); !strings.Contains(y, "- a") {
+		t.Fatalf("非 map 应退化为 YAML，实际 %q", y)
+	}
+}

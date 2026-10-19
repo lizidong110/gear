@@ -516,6 +516,17 @@ func defaultAISchemas() map[string]MethodSchema {
 			"api_key":     {Type: "string", Description: "API key（可选；缺省回退 env GEAR_AI_API_KEY。优先写 ${secrets.x} 引用密钥源，别把明文落在 Flow 定义里）"},
 			"temperature": {Type: "number", Description: "采样温度（可选）"},
 		}},
+		"rewoo": {Description: "REWOO 智能体：planner 出依赖图（DAG）后并行执行、solver 汇总（LLM 有界：顺利 3 次、最坏 2+2×replan_budget+1），节点可调原生能力或已注册工具，失败分层恢复并带缺口作答。多源/批量/对账类任务用它；单步或强交互任务用 react", Parameters: map[string]ParamSchema{
+			"task":          {Type: "string", Description: "任务描述", Required: true},
+			"max_nodes":     {Type: "number", Description: "DAG 节点数上限（可选，默认 20）"},
+			"replan_budget": {Type: "number", Description: "失败子图重规划次数上限（可选，默认 1；0 = 关闭重规划，失败节点直接落缺口作答）"},
+			"allow":         {Type: "array", Description: "限制可调对象（可选）：能力名 / 「能力.方法」/ 已注册工具或 Flow 的 id（工具项要求本 Tool 声明 call 能力）；不给则用默认能力集 + 全部已注册工具；给 \"*\" 表示不设限"},
+			"provider":      {Type: "string", Description: "模型厂商（可选；缺省回退 env GEAR_AI_PROVIDER，再回退内置默认 siliconflow）"},
+			"model":         {Type: "string", Description: "模型名（可选；缺省回退 env GEAR_AI_MODEL，再回退厂商默认）"},
+			"base_url":      {Type: "string", Description: "API base（可选；缺省回退 env GEAR_AI_BASE_URL，再回退厂商默认）"},
+			"api_key":       {Type: "string", Description: "API key（可选；缺省回退 env GEAR_AI_API_KEY。优先写 ${secrets.x} 引用密钥源，别把明文落在 Flow 定义里）"},
+			"temperature":   {Type: "number", Description: "采样温度（可选，默认 0.2——规划要确定性）"},
+		}},
 	}
 }
 

@@ -2,11 +2,15 @@
 
 ## 1. 先选形态：调内核的，还是自己写
 
-|  | 调 `ctx.ext.ai.react` | 手写 Lua 循环 |
-|---|---|---|
-| 代码量 | 一行 | 约 20 行 |
-| 循环逻辑 | 内核写死，你能调 `max_steps` / `allow` | 完全自己控制（提示词、终止条件、工具集） |
-| 适合 | 任务型：给一句话，让它自己跑完 | 产品型：循环策略本身就是你的差异点 |
+|  | 调 `ctx.ext.ai.react` | 调 `ctx.ext.ai.rewoo` | 手写 Lua 循环 |
+|---|---|---|---|
+| 代码量 | 一行 | 一行 | 约 20 行 |
+| 循环逻辑 | 内核写死，你能调 `max_steps` / `allow` | 内核写死：planner 出 DAG → 分层并行 → solver 汇总 | 完全自己控制（提示词、终止条件、工具集） |
+| LLM 次数 | 每步一次（可到 `max_steps`） | **有界**：顺利 3 次，最坏 2 + 2×replan_budget + 1（默认 5 次） | 每轮一次 |
+| 适合 | 任务型：给一句话，让它自己跑完 | 多源调研 / 大批量同构 / 跨系统对账：fan-in DAG，单点失败不拖垮全局 | 产品型：循环策略本身就是你的差异点 |
+
+**默认走 react**；任务呈「多源 / 批量 / 对账」形态、或成本敏感（定时晨报）再显式选 rewoo
+（选型依据与反例见 §2.7）。单步任务（一次 http + 回答）两个都不用，`complete` 就够。
 
 **第三种形态（在 Flow YAML 里声明循环）不支持**：`model.Step` 没有 `loop`/`retry` 字段，
 且 Flow 的拓扑排序遇到环会直接拒绝。**agent 循环只能活在 Lua 或 Go 里**，不能活在 Flow 声明层。
@@ -167,6 +171,87 @@ react 的每一步都可能失败：工具报错、provider 限流、模型给�
   不含 "connection refused" 子串。分类器的关键词表两套文案都收了（2026-10-19 E2E 实测：
   只认 Unix 文案时，Windows 上死端口拒绝会被误判成 unrecoverable，L0 重试从不发生）。
   自己的 tool 要精确分类，实现 `RecoverableError` 接口——实现方最懂自己的错误。
+
+## 2.7 路径一之三：调 `ctx.ext.ai.rewoo`（先画作战图，再并行推进）
+
+react 是「边走边看」：每步一次 LLM，串行。任务一大就暴露两个问题——**慢**（20 个数据源
+要 20 次 LLM）和**脆**（第 7 步出错，前面 6 步的心智全乱）。rewoo 换个打法：
+
+```
+planner（≤2 次 LLM：生成→校验→带错修正一次）→ DAG 计划
+worker（0 次 LLM）→ 按拓扑层并行执行，单点失败 fail-soft
+solver（1 次 LLM）→ 汇总全部证据作答
+```
+
+```lua
+local r = ctx.ext.ai.rewoo({ task = ctx.input.task })
+return { answer = r.answer }
+```
+
+CLI 等价：`gear ai rewoo "调研三家供应商的报价并对比" --max-parallel 4`。
+
+LLM 调用**有界**：顺利路径 3 次（planner + solver，无失败不重规划），含一次重规划 4 次；
+planner/replanner 各带一次「校验失败才烧」的修正，最坏上限 = 2 + 2×replan_budget + 1
+（默认配置 5 次）。对比 react 的每步一次，这是成本可控承诺的机械保障。
+
+### 2.7.1 什么时候用它（选型表）
+
+| 场景 | 形态 | 为什么不是 react |
+|---|---|---|
+| 多源调研 / 竞品分析 | fan-in DAG：N 个源并行抓取 → 汇聚对比 → 报告 | planner 一次看清全局依赖；react 串行且每步烧 LLM |
+| 大批量同构任务 | 20-50 个同类节点（逐 SKU 查价 / 逐页面抓取） | DAG 层内并行；单节点失败不影响兄弟；react 会烧 N 次且一错就乱 |
+| 跨系统对账 | db + http + 多 API 取数交叉验证 | 对账节点天然 fan-in；失败节点进 gaps 而非整体崩 |
+| 可重放管线 | plan 是数据（JSON DAG），可存、可 diff、可人工审 | react 的决策链只活在 transcript 里，不可审不可复跑 |
+| 成本敏感的定时任务 | 晨报 / 巡检 | LLM 次数有界（顺利 3 次、最坏 5 次），无「模型多绕两步」的不可控 |
+
+**反例**：单步任务（一次 http + 回答）用 `complete`；要中途改主意的强交互任务 react 更合适；
+planner 规划错会全盘错——这类交给 react 的逐步自纠正。
+
+### 2.7.2 节点的调用对象：原生能力，或你自己注册的 Tool
+
+这是自建 agent 的核心诉求——**节点的 `action` 两类都吃**：
+
+- **原生能力**：`"action": "http.Request"` / `"db.query"` / `"ext.ai.complete"`，走 `ctx.*` 沙箱通道；
+- **已注册 Tool / Flow**：`"action": "mindstorm__search"`，经 `ctx.call` 原语调用。
+
+两者执行通道同构。权限口径与 react 一致（§2.4）：不给 `allow` 时用一组通用能力 + 全部已注册
+工具；显式给 `allow` 收窄，能力项不能超出调用方 Tool 声明的 `capabilities`，工具 id 项要求
+声明过 `call` 能力（`ctx.call` 是插件间唯一通信通道）。
+
+```lua
+-- 这个调研 agent 能上网、能查库，且只许调自家注册的两个 Tool
+ctx.ext.ai.rewoo({
+  task = ctx.input.task,
+  allow = { "http", "db.query", "mindstorm__search", "mindstorm__detail" },
+})
+```
+
+节点之间用 `{{#E}}` 引用上游产出：整值引用保留类型（`"args": {"sql": "{{#E1}}"}` 引到的是
+table/对象本身），嵌在更长字符串里转文本，支持字段路径 `{{#E2.src}}`。字段路径钻 **HTTP 信封**
+（http.Request 的产出是 `{status, body, headers}`，body 是 JSON 文本）：直接键、JSON 文本解析、
+钻透 body 三层都认——`{{#E1.origin}}` 和 `{{#E1.body}}` 都能活。引用目标必须是传递依赖——
+计划校验层拦，不会把 `"{{#E1}}"` 当普通字符串传进工具。action 写「能力.方法」原样
+（如 `http.Request`，不带 `ctx.` 前缀；带了他也认，会规范成 canonical 形态）。
+
+### 2.7.3 失败了会怎样（fail-soft，不是全盘崩）
+
+- 单节点失败：只记 failure + 哨兵，**兄弟节点照常跑**（引擎 Flow 的首错 cancel 整层是 Flow
+  语义，这里刻意不复用）；它的下游记 `upstream_bad` 不执行。
+- 失败分类与恢复**复用 react 同款七类 + L0 重试 + 震荡封禁**（§2.6）：瞬时错误引擎直接重试，
+  不烧 LLM 次数。
+- `replan_budget > 0`（默认 1）：对失败节点的**反可达集**做局部重规划——冻结有下游消费者
+  节点的输出契约（`#E` id + 产出形态），内部逻辑可重写；重规划结果与上轮等价则停（震荡守卫，
+  不白烧 budget）。`replan_budget = 0` = 显式关闭重规划，失败直接落缺口。
+- 收尾：每个失败 / 被堵 / 空结果节点一笔**缺口**（点名到节点），solver **带缺失作答**——
+  静默残缺比明说缺失坏得多。
+
+### 2.7.4 返回结构与可观测面
+
+`{answer, plan, evidence, node_outcomes, gaps, recovery_log}`——`gaps` / `recovery_log` 始终
+存在（空切片，不必先判存在性）。`plan` 是执行计划快照（每节点 id / action / depends_on /
+status），`node_outcomes` 是每节点结局（status / 重试几次 / 错误类型与原因），排查「它为什么
+这么答」看这两份加恢复流水。预算默认：`max_nodes` 20（超限报错不截断）、`max_parallel` 4、
+墙钟 5min、`temperature` 0.2（规划要确定性）。
 
 ## 3. 路径二：手写 Lua 循环（真正自建）
 

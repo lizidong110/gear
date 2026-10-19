@@ -860,7 +860,7 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 		// LLM 调用走恢复包装（REQ-REACT-RECOVERY）：provider 侧瞬时错误机械重试（L0）；
 		// 端点不吃工具声明时换通道降级为文本协议（L1.5）。降级是换通道、不是失败，
 		// 所以不返回错误，只把工具面切掉、重建提示词，下一轮用新通道重问。
-		resp, calls, degraded, err := a.completeReactStep(ctx, req, tools, board, !metaMode)
+		resp, calls, degraded, err := a.completeReactStep(ctx, "react", req, tools, board, !metaMode)
 		if err != nil {
 			return nil, err
 		}
@@ -2333,10 +2333,10 @@ type GenResult struct {
 // aiMethodNames 是「注册方法清单」（用于 capabilities 目录与 schema 守卫），含 complete_stream；
 // aiSyncMethods 是「走同步分发的子集」。两者不一致会让静态校验出错，由
 // TestAIMethodNamesMatchDefaultSchemas 守着。
-var aiMethodNames = []string{"complete", "catalog", "domains", "find", "describe", "validate", "generate", "capabilities", "react", "complete_stream"}
+var aiMethodNames = []string{"complete", "catalog", "domains", "find", "describe", "validate", "generate", "capabilities", "react", "rewoo", "complete_stream"}
 
 // aiSyncMethods 是 ext.ai 里「同步分发」的方法（不含回调式的 complete_stream）。
-var aiSyncMethods = []string{"complete", "catalog", "domains", "find", "describe", "validate", "generate", "capabilities", "react"}
+var aiSyncMethods = []string{"complete", "catalog", "domains", "find", "describe", "validate", "generate", "capabilities", "react", "rewoo"}
 
 // callAIMethod 按方法名分发到 AIAgent 的稳定层方法（同步路径），供 Lua / go-host Provider 共用。
 // callerCaps 是调用方 Tool 声明的 capability，只有 react 用它——见 ReactMethod。
@@ -2360,8 +2360,10 @@ func callAIMethod(a *AIAgent, method string, args map[string]interface{}, caller
 		return a.GenerateMethod(args)
 	case "react":
 		return a.ReactMethod(args, callerCaps...)
+	case "rewoo":
+		return a.RewooMethod(args, callerCaps...)
 	default:
-		return nil, fmt.Errorf("ext.ai 不支持的方法 %q（仅 complete/catalog/domains/find/describe/validate/generate/capabilities/react/complete_stream）", method)
+		return nil, fmt.Errorf("ext.ai 不支持的方法 %q（仅 complete/catalog/domains/find/describe/validate/generate/capabilities/react/rewoo/complete_stream）", method)
 	}
 }
 

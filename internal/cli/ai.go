@@ -58,6 +58,27 @@ func aiCmd() *cobra.Command {
 	c.AddCommand(completeC)
 
 	c.AddCommand(reactC)
+	rewooC := &cobra.Command{
+		Use:   "rewoo [任务描述]",
+		Short: "跑 REWOO 智能体（先出 DAG 再分层并行执行，LLM ≤ 3 次）",
+		Long: "用自然语言任务驱动一个 REWOO 循环：planner 出依赖图（DAG，≤2 次 LLM 含一次带错修正），worker 按拓扑层并行执行" +
+			"（0 LLM，单点失败 fail-soft、兄弟节点不受影响），solver 一次 LLM 汇总作答。\n" +
+			"节点可调用原生能力（http.Request / db.query …）或已注册 Tool/Flow（经 ctx.call 原语）。" +
+			"LLM 调用有界：顺利 3 次，最坏 2 + 2×replan_budget + 1（默认 5 次）。\n" +
+			"等价于在 Tool 的 entry 里调 ctx.ext.ai.rewoo({ task = \"...\" })。需要联网 LLM（key/provider 经参数传入，dev CLI 可用 GEAR_AI_* 注入）。",
+		RunE: func(cmd *cobra.Command, args []string) error { return runAIRewoo(cmd, args) },
+	}
+	rewooC.Flags().Int("max-nodes", 20, "DAG 节点数上限（超出报错不截断）")
+	rewooC.Flags().Int("replan-budget", 1, "失败子图重规划的 LLM 调用上限（0 = 关闭重规划，失败直接落缺口）")
+	rewooC.Flags().Int("max-parallel", 4, "层内并行度")
+	rewooC.Flags().StringSlice("allow", nil, "限制可调对象：能力名（http,secret）、「能力.方法」（ext.redis.set）或已注册工具/Flow id；默认一组通用能力 + 全部已注册工具")
+	rewooC.Flags().Bool("allow-all", false, "不设限地开放整个能力目录。慎用：能力越多模型越选不准")
+	rewooC.Flags().String("model", "", "模型名（可选，缺省读 GEAR_AI_MODEL）")
+	rewooC.Flags().String("provider", "", "模型厂商（可选，缺省读 GEAR_AI_PROVIDER）")
+	rewooC.Flags().String("base-url", "", "API base（可选，缺省读 GEAR_AI_BASE_URL）")
+	rewooC.Flags().String("api-key", "", "API key（可选，缺省读 GEAR_AI_API_KEY）")
+	rewooC.Flags().Float64("temperature", 0.2, "planner/solver 采样温度（可选，规划要确定性）")
+	c.AddCommand(rewooC)
 	return c
 }
 
@@ -148,6 +169,145 @@ func runAIReact(cmd *cobra.Command, args []string) error {
 	}
 	cmd.Println(renderReactResult(res))
 	return nil
+}
+
+// runAIRewoo 实现 `ai rewoo "任务"`：构造进程内 ext.ai agent，跑 REWOO DAG 并打印结果。
+// 引擎装配与 runAIReact 完全相同（持久库目录灌内存库、中间产物不落持久库），差异只在调度器
+// 与结果渲染——两命令共用同一份 seedRefRegistry/warnSkipped/cliEngine。
+func runAIRewoo(cmd *cobra.Command, args []string) error {
+	task := strings.Join(args, " ")
+	if strings.TrimSpace(task) == "" {
+		return fmt.Errorf("请提供任务描述：gear ai rewoo \"...\"")
+	}
+	// 1) 持久 registry（只读用途：取真实工具目录给 planner 看）。同 runAIReact 的理由。
+	persist, err := openRegistry()
+	if err != nil {
+		return err
+	}
+	defer persist.Close()
+
+	// 2) 内存 registry 跑 agent：worker 会真的执行工具，避免中间产物落进持久库。
+	reg, err := registry.Open(fmt.Sprintf("file:gear_ai_cli_%d?mode=memory&cache=shared", os.Getpid()))
+	if err != nil {
+		return fmt.Errorf("打开内存 registry 失败: %w", err)
+	}
+	defer reg.Close()
+	// 顺序要紧：先建引擎（SetupExtensions 填充合法 capability 集合），再灌工具目录。
+	eng, err := cliEngine(reg)
+	if err != nil {
+		return err
+	}
+	skipped, err := seedRefRegistry(reg, persist)
+	if err != nil {
+		return fmt.Errorf("灌入真实工具目录失败: %w", err)
+	}
+	warnSkipped(skipped)
+	agent := eng.AIAgent()
+	if agent == nil {
+		return fmt.Errorf("ext.ai 未装配（SetupExtensions 失败？）")
+	}
+	opts := engine.RewooOpts{}
+	opts.MaxNodes, _ = cmd.Flags().GetInt("max-nodes")
+	opts.ReplanBudget, _ = cmd.Flags().GetInt("replan-budget")
+	opts.MaxParallel, _ = cmd.Flags().GetInt("max-parallel")
+	allow, _ := cmd.Flags().GetStringSlice("allow")
+	allowAll, _ := cmd.Flags().GetBool("allow-all")
+	if allowAll && len(allow) > 0 {
+		return fmt.Errorf("--allow-all 与 --allow 不能同时给：前者不设限，后者是白名单，语义冲突")
+	}
+	if allowAll {
+		opts.Allow = []string{engine.ReactAllowAll}
+		opts.AllowSet = true
+	} else if len(allow) > 0 {
+		opts.Allow = allow
+		opts.AllowSet = true
+	}
+	if s, _ := cmd.Flags().GetString("model"); s != "" {
+		opts.Model = s
+	}
+	if s, _ := cmd.Flags().GetString("provider"); s != "" {
+		opts.Provider = s
+	}
+	if s, _ := cmd.Flags().GetString("base-url"); s != "" {
+		opts.BaseURL = s
+	}
+	if s, _ := cmd.Flags().GetString("api-key"); s != "" {
+		opts.APIKey = s
+	}
+	if f, _ := cmd.Flags().GetFloat64("temperature"); f > 0 {
+		opts.Temperature = f
+	}
+	// 开发便利：flag 未给时回退到 GEAR_AI_* 环境变量（原子能力本身只读调用参数，不读 env）。
+	if opts.Provider == "" {
+		opts.Provider = os.Getenv("GEAR_AI_PROVIDER")
+	}
+	if opts.Model == "" {
+		opts.Model = os.Getenv("GEAR_AI_MODEL")
+	}
+	if opts.BaseURL == "" {
+		opts.BaseURL = os.Getenv("GEAR_AI_BASE_URL")
+	}
+	if opts.APIKey == "" {
+		opts.APIKey = os.Getenv("GEAR_AI_API_KEY")
+	}
+	res, err := agent.Rewoo(context.Background(), task, opts)
+	if err != nil {
+		return fmt.Errorf("rewoo 失败: %w", err)
+	}
+	cmd.Println(renderRewooResult(res))
+	return nil
+}
+
+// renderRewooResult 把 Rewoo 返回 {answer,plan,evidence,node_outcomes,gaps,recovery_log}
+// 渲染成可读文本。计划快照与节点结局是「可重放管线」的凭据（REQ-REWOO：plan 是数据，
+// 可存可 diff 可人工审），必须打在面上而不是只活在内存里。
+func renderRewooResult(res interface{}) string {
+	m, ok := res.(map[string]interface{})
+	if !ok {
+		b, _ := yaml.Marshal(res)
+		return string(b)
+	}
+	var sb strings.Builder
+	sb.WriteString("=== REWOO 结果 ===\n")
+	if ans, _ := m["answer"].(string); ans != "" {
+		sb.WriteString("Final Answer:\n" + ans + "\n")
+	}
+	if plan, ok := m["plan"].([]map[string]interface{}); ok && len(plan) > 0 {
+		sb.WriteString(fmt.Sprintf("\n执行计划（%d 节点）：\n", len(plan)))
+		for _, n := range plan {
+			deps, _ := n["depends_on"].([]string)
+			dep := ""
+			if len(deps) > 0 {
+				dep = fmt.Sprintf("  ← 依赖 %s", strings.Join(deps, ","))
+			}
+			sb.WriteString(fmt.Sprintf("- %s [%s] %s%s\n", n["id"], n["status"], n["action"], dep))
+		}
+	}
+	if outs, ok := m["node_outcomes"].([]map[string]interface{}); ok && len(outs) > 0 {
+		sb.WriteString(fmt.Sprintf("\n节点结局（%d）：\n", len(outs)))
+		for _, oc := range outs {
+			sb.WriteString(fmt.Sprintf("- %s [%s] 重试 %v 次", oc["id"], oc["status"], oc["attempts"]))
+			if e, _ := oc["error"].(string); e != "" {
+				sb.WriteString(fmt.Sprintf("；%s: %s", oc["type"], truncateForCLI(e, 200)))
+			}
+			sb.WriteString("\n")
+		}
+	}
+	// 恢复流水与缺口同 react 口径：引擎记了却不在面上显示，等于没记（REQ-REACT-RECOVERY ⑤）。
+	if log, ok := m["recovery_log"].([]string); ok && len(log) > 0 {
+		sb.WriteString("\n恢复流水：\n- " + strings.Join(log, "\n- ") + "\n")
+	}
+	if gaps, ok := m["gaps"].([]map[string]interface{}); ok && len(gaps) > 0 {
+		sb.WriteString("\n缺口（回答未能获取的数据/能力）：\n")
+		for _, g := range gaps {
+			human := ""
+			if h, _ := g["human"].(bool); h {
+				human = "（需人工介入）"
+			}
+			sb.WriteString(fmt.Sprintf("- [%v] %v：%v%s\n", g["type"], g["action"], g["reason"], human))
+		}
+	}
+	return sb.String()
 }
 
 // renderReactResult 把 React 返回 {answer,steps,used_tools} 渲染成可读文本。
