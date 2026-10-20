@@ -63,6 +63,26 @@ func (s *service) handleCaps(w http.ResponseWriter, r *http.Request) {
 
 const defaultMaxPages = 100 // 一次最多抽 100 页：巨 PDF 的护栏，超出在 note 里说明
 
+// splitAbsPathArg 兜底「调用方把绝对路径塞进 path」——2026-10-20 真机事故：
+// `ai rewoo` 总结 D:/BaiduNetdiskDownload/xxx.pdf 时，planner 看了 schema 知道 path
+// 要「相对 root 的文件名」，就**擅自把绝对路径剥成纯文件名**、root 没给 ⇒ 缺省成
+// 侧车进程 CWD（gear 的工作目录）⇒ 「找不到文件」，而调用方看不出为什么。
+//
+// 机械能判的拆分不该让模型猜：盘符（D:/x）或根斜杠（/x）形态直接拆成
+// (root=所在目录, path=文件名)，再走原有 Resolve（.. / 符号链接检查一层不少）。
+// root 参数也给了 ⇒ 语义冲突（到底以谁为准？），明确报错不静默挑一个。
+func splitAbsPathArg(root, path string) (string, string, error) {
+	abs := len(path) >= 2 && path[1] == ':' || strings.HasPrefix(path, "/")
+	if !abs {
+		return root, path, nil
+	}
+	if root != "" {
+		return "", "", fmt.Errorf("path %q 是绝对路径，不能再与 root 一起给："+
+			"要么只给绝对路径（自动拆），要么拆开传 root + 相对文件名", path)
+	}
+	return filepath.Dir(path), filepath.Base(path), nil
+}
+
 func (s *service) handleRead(w http.ResponseWriter, r *http.Request) {
 	args, err := decodeArgs(r)
 	if err != nil {
@@ -71,10 +91,16 @@ func (s *service) handleRead(w http.ResponseWriter, r *http.Request) {
 	}
 	path := strArg(args, "path")
 	if path == "" {
-		writeErr(w, errMissingPath, "path 必填（相对 root 的文件名，如 docs/讲义.pdf）")
+		writeErr(w, errMissingPath, "path 必填（相对 root 的文件名，如 docs/讲义.pdf；给绝对路径则自动拆）")
 		return
 	}
 	root := strArg(args, "root")
+	// 先拆绝对路径兜底，再走 root 缺省：反序会让「只给绝对路径」误报成与 root 冲突。
+	root, path, err = splitAbsPathArg(root, path)
+	if err != nil {
+		writeErr(w, errBadRequest, "%s", err.Error())
+		return
+	}
 	if root == "" {
 		root, err = os.Getwd()
 		if err != nil {
@@ -133,7 +159,7 @@ func (s *service) handleWrite(w http.ResponseWriter, r *http.Request) {
 	}
 	path := strArg(args, "path")
 	if path == "" {
-		writeErr(w, errMissingPath, "path 必填（相对 root 的文件名，如 reports/2026.pdf）")
+		writeErr(w, errMissingPath, "path 必填（相对 root 的文件名，如 reports/2026.pdf；给绝对路径则自动拆）")
 		return
 	}
 	pages, err := parsePages(args["pages"])
@@ -151,6 +177,12 @@ func (s *service) handleWrite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	root := strArg(args, "root")
+	// 与 read 同口径：绝对路径自动拆（root 缺省后置，见 splitAbsPathArg）
+	root, path, err = splitAbsPathArg(root, path)
+	if err != nil {
+		writeErr(w, errBadRequest, "%s", err.Error())
+		return
+	}
 	if root == "" {
 		root, err = os.Getwd()
 		if err != nil {

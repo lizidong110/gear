@@ -533,8 +533,8 @@ ext.excel:
 #   · A4 几何、贪心折行（CJK 间可断）、页码溢出即报错、不写时间戳（可复现）。
 ext.pdf:
   cmd: ["plugin/pdf-sidecar.exe"]        # 真实侧车（plugin/pdf-sidecar）
-  methods: [write]
-  service: true                          # 常驻能力：侧车长驻，按调用写出
+  methods: [write, read]
+  service: true                          # 常驻能力：侧车长驻，按调用读写
   listen: "127.0.0.1:8101"               # coord + RPC 端口
   health_probe:
     kind: tcp
@@ -544,11 +544,17 @@ ext.pdf:
     write:
       description: 写出一份 PDF（A4；CJK 自动嵌入字体子集）
       parameters:
-        path: {type: string, description: "相对 root 的文件名（如 reports/2026.pdf）", required: true}
+        path: {type: string, description: "相对 root 的文件名（如 reports/2026.pdf）；给绝对路径（D:/x/y.pdf）时本侧车自动拆成 root+文件名", required: true}
         pages: {type: array, description: "页数组：元素 {text}（也接受每页一个裸字符串的写法）；text 内 \\n 换行，超出一页自动分页", required: true}
-        root: {type: string, description: "产物根目录（缺省取进程 CWD＝应用 workdir）；path 必须落在其内，越界即拒"}
+        root: {type: string, description: "产物根目录（缺省取侧车进程 CWD——gear 的工作目录，通常不是你想要的落点，建议显式给）；path 必须落在其内，越界即拒"}
         font: {type: string, description: "显式指定字体文件路径（不给则走系统字体候选，首推 simhei.ttf）；TTC / OTF 直接报错"}
         font_size: {type: number, description: "字号（默认 12，可用区间 4~72，超出即拒）"}
+    read:
+      description: 读出 PDF 的文本（按页返回；Identity-H+ToUnicode / 简单字体 / FlateDecode / ObjStm 全覆盖；加密、无 ToUnicode、扫描件明确报错不吐乱码）
+      parameters:
+        path: {type: string, description: "相对 root 的 PDF 文件名（如 docs/讲义.pdf）；若你手里是绝对路径（D:/x/y.pdf 或 /home/x/y.pdf），必须拆开传：root 传所在目录、path 只传文件名（只给绝对路径不传 root 时本侧车也会自动拆，但显式拆开最稳）", required: true}
+        root: {type: string, description: "读取根目录（缺省取侧车进程 CWD——那通常是 gear 的工作目录，不是目标文件所在目录，别依赖缺省）；path 必须落在其内，越界即拒"}
+        max_pages: {type: number, description: "最多抽取的页数（默认 100，超出截断并在返回的 note 里说明）"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ext.oss（2026-09-30）: S3 兼容对象存储 —— 手写 AWS Signature V4，零第三方依赖

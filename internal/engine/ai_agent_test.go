@@ -227,3 +227,134 @@ func TestLuaAgentToolCompilesPrimitives(t *testing.T) {
 		t.Fatalf("tool 模式应至少重试一次（validateCalls>=2），实际 %d", ai.validateCalls)
 	}
 }
+
+// TestBaseCapabilitiesCoverAllBuiltinAndPure 守卫「原子能力组」与能力目录同步：
+// 目录里每个 builtin/pure 能力都必须在 BaseCapabilities 里——否则 `--allow-base`
+// 静默少开一层能力（2026-10-04 P0-2 同型缺陷：描述/清单比实现窄，编译不报错）。
+// 反向也钉：组里不能有目录中不存在的虚构能力（strict 解析会报错，但那是运行期
+// 才炸，守卫要在测试期就红）。
+func TestBaseCapabilitiesCoverAllBuiltinAndPure(t *testing.T) {
+	ai := &AIAgent{}
+	entries := ai.capabilityEntries()
+	atomic := map[string]bool{}
+	for _, e := range entries {
+		if e.Kind == "builtin" || e.Kind == "pure" {
+			atomic[e.Capability] = true
+		}
+	}
+	if len(atomic) == 0 {
+		t.Fatal("能力目录里居然没有 builtin/pure 能力——遍历判据坏了？")
+	}
+	inGroup := map[string]bool{}
+	for _, c := range BaseCapabilities {
+		inGroup[c] = true
+	}
+	for name := range atomic {
+		if !inGroup[name] {
+			t.Fatalf("原子能力 %q（kind=builtin/pure）不在 BaseCapabilities 组里——"+
+				"新增原子能力必须同步进组，否则 --allow-base 少开一层", name)
+		}
+	}
+	if len(atomic) != len(BaseCapabilities) {
+		t.Fatalf("原子能力目录 %d 个与 BaseCapabilities %d 个数量不符——组与目录漂移了",
+			len(atomic), len(BaseCapabilities))
+	}
+	for _, c := range BaseCapabilities {
+		if !ai.knownCapability(c) {
+			t.Fatalf("BaseCapabilities 含 %q：能力目录里没有这个能力（虚构项会在 strict 解析期炸）", c)
+		}
+	}
+}
+
+// TestFlowCapabilitiesAreCallAndRegistry 钉住 flow 组的两个能力：call（调用通道）
+// + ext.registry（发现入口）。少任何一个，「flow 内的能力」就开不全。
+func TestFlowCapabilitiesAreCallAndRegistry(t *testing.T) {
+	// ext.registry 是 SetupExtensions 注册的 ext 壳子（不是 builtin），空 agent 看不见，
+	// 测试里显式装配——与 invokeform_test.go 同手法。
+	ai := &AIAgent{extCaps: map[string]map[string]MethodSchema{
+		"ext.registry": {},
+	}}
+	want := map[string]bool{"call": true, "ext.registry": true}
+	if len(FlowCapabilities) != len(want) {
+		t.Fatalf("FlowCapabilities 应恰为 call+ext.registry 两项，实际 %v", FlowCapabilities)
+	}
+	for _, c := range FlowCapabilities {
+		if !want[c] {
+			t.Fatalf("FlowCapabilities 含意外项 %q（应只有 call/ext.registry）", c)
+		}
+		if !ai.knownCapability(c) {
+			t.Fatalf("FlowCapabilities 含 %q：能力目录里没有（未装配？）", c)
+		}
+	}
+}
+
+// TestReactAllowGroupTokens 钉住 @base/@flow 两个组 token 在引擎层的展开语义：
+// 组 token 是 CLI --allow-base/--allow-flow 与 Lua allow 的共用语（展开唯一实现在
+// 引擎侧，三个执行面不各写一份）。
+func TestReactAllowGroupTokens(t *testing.T) {
+	// ext.registry 是 ext 壳子，空 agent 看不见，显式装配（与 TestFlowCapabilities 同手法）
+	ai := &AIAgent{extCaps: map[string]map[string]MethodSchema{
+		"ext.registry": {},
+	}}
+
+	// @base：12 个原子能力一个不落
+	al, err := ai.resolveReactAllow([]string{ReactAllowBase}, true, true)
+	if err != nil {
+		t.Fatalf("@base 应被接受，实际 %v", err)
+	}
+	if len(al.names) != len(BaseCapabilities) {
+		t.Fatalf("@base 应展开出 %d 个原子能力，实际 %d: %v", len(BaseCapabilities), len(al.names), al.names)
+	}
+
+	// @flow：call + ext.registry 两项
+	al, err = ai.resolveReactAllow([]string{ReactAllowFlow}, true, true)
+	if err != nil {
+		t.Fatalf("@flow 应被接受，实际 %v", err)
+	}
+	if len(al.names) != 2 || !allowContains(al.names, "call") || !allowContains(al.names, "ext.registry") {
+		t.Fatalf("@flow 应展开出 call+ext.registry，实际 %v", al.names)
+	}
+
+	// 叠加去重：@base 已含 http，再显式给 http 不产生重复项
+	al, err = ai.resolveReactAllow([]string{ReactAllowBase, "http"}, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, c := range al.names {
+		if c == "http" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("http 在名单里应恰出现一次（去重），实际 %d 次: %v", n, al.names)
+	}
+
+	// 组 token 与 * 互不混淆：@base 不是全开放
+	if al.all {
+		t.Fatal("@base 不是全开放（all 应为 false）")
+	}
+}
+
+// TestRewooAllowGroupTokens：rewoo 侧同一份组语义——@flow 展开后 tools 仍为空，
+// 按「只给能力没给工具 id」口径 toolsAll=true，即「已注册 Tool/Flow 整组可见」。
+func TestRewooAllowGroupTokens(t *testing.T) {
+	reg := newTestRegistry(t)
+	t.Cleanup(func() { reg.Close() })
+	ai := &AIAgent{reg: reg, extCaps: map[string]map[string]MethodSchema{
+		"ext.registry": {},
+	}}
+	al, err := ai.resolveRewooAllow([]string{ReactAllowBase, ReactAllowFlow}, true)
+	if err != nil {
+		t.Fatalf("rewoo 的组 token 应被接受，实际 %v", err)
+	}
+	if !al.toolsAll {
+		t.Fatal("只给了组 token（能力）没给工具 id：toolsAll 应为 true（工具面不收窄）")
+	}
+	if !al.caps.allows("http", "Request") {
+		t.Fatal("@base 展开后 http.Request 应可调")
+	}
+	if !al.toolAllows("任意未列名工具") {
+		t.Fatal("toolsAll=true 时任何已注册工具都应放行")
+	}
+}

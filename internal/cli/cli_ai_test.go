@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"gear/internal/engine"
 )
 
 // 本文件覆盖 `gear ai` 子命令（ai.go）——此前整文件只有 seedRefRegistry 一个用例，
@@ -291,5 +293,125 @@ func TestRenderRewooResult(t *testing.T) {
 	// 非 map 形态 → 退化为 YAML（不猜结构）
 	if y := renderRewooResult([]string{"a"}); !strings.Contains(y, "- a") {
 		t.Fatalf("非 map 应退化为 YAML，实际 %q", y)
+	}
+}
+
+// aiSubCmd 取 aiCmd 下指定前缀的子命令（flag 注册在它身上，helper 测试必须传它）。
+func aiSubCmd(t *testing.T, use string) *cobra.Command {
+	t.Helper()
+	for _, sub := range aiCmd().Commands() {
+		if strings.HasPrefix(sub.Use, use) {
+			return sub
+		}
+	}
+	t.Fatalf("aiCmd 下找不到 %q 子命令", use)
+	return nil
+}
+
+// TestAIAllowNamesExpandsGroups 钉住三个 allow 维度的组装语义：
+// --allow（细列表）可叠加在两个组开关上，最终汇成一份白名单（组是糖不是新机制）。
+func TestAIAllowNamesExpandsGroups(t *testing.T) {
+	rewoo := aiSubCmd(t, "rewoo")
+	// 只给组：base 12 个原子能力 + flow 2 个（call/ext.registry）
+	if err := rewoo.Flags().Set("allow-base", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rewoo.Flags().Set("allow-flow", "true"); err != nil {
+		t.Fatal(err)
+	}
+	names, all, err := aiAllowNames(rewoo)
+	if err != nil || all {
+		t.Fatalf("组开关不应触发 allowAll，实际 all=%v err=%v", all, err)
+	}
+	// 组开关在此只翻 token（展开逻辑在引擎层）：base+flow → 恰 2 个 token，顺序固定
+	if len(names) != 2 || names[0] != engine.ReactAllowBase || names[1] != engine.ReactAllowFlow {
+		t.Fatalf("base+flow 应翻成 [%s %s] 两个 token，实际 %v",
+			engine.ReactAllowBase, engine.ReactAllowFlow, names)
+	}
+	// 组 + 细列表叠加：ext.pdf 一个不少地进来
+	if err := rewoo.Flags().Set("allow", "ext.pdf"); err != nil {
+		t.Fatal(err)
+	}
+	names, _, err = aiAllowNames(rewoo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, n := range names {
+		if n == "ext.pdf" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("--allow 的细列表项应叠加进组展开结果，实际 %v", names)
+	}
+	// 什么都不给：空名单（走默认集），不是全开放
+	rewoo2 := aiSubCmd(t, "rewoo")
+	names, all, err = aiAllowNames(rewoo2)
+	if err != nil || all || len(names) != 0 {
+		t.Fatalf("无 allow 来源应返回空名单+非全开放，实际 names=%v all=%v err=%v", names, all, err)
+	}
+}
+
+// TestAIAllowAllConflictsWithGroups：--allow-all 与三个白名单来源任一互斥。
+// 全开放 vs 白名单语义冲突，同给必须报错——静默挑一个会让调用方以为开了/没开。
+func TestAIAllowAllConflictsWithGroups(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  map[string]string
+	}{
+		{"与 --allow", map[string]string{"allow": "http"}},
+		{"与 --allow-base", map[string]string{"allow-base": "true"}},
+		{"与 --allow-flow", map[string]string{"allow-flow": "true"}},
+	} {
+		cmd := aiSubCmd(t, "rewoo")
+		if err := cmd.Flags().Set("allow-all", "true"); err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range tc.set {
+			if err := cmd.Flags().Set(k, v); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, _, err := aiAllowNames(cmd)
+		if err == nil || !strings.Contains(err.Error(), "不能同时给") {
+			t.Fatalf("%s 同给必须报错，实际 %v", tc.name, err)
+		}
+	}
+	// react 同口径（两个子命令共用 helper，行为必须一致）
+	cmd := aiSubCmd(t, "react")
+	if err := cmd.Flags().Set("allow-all", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("allow-base", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := aiAllowNames(cmd); err == nil || !strings.Contains(err.Error(), "不能同时给") {
+		t.Fatalf("react 的 --allow-all 与 --allow-base 同给必须报错，实际 %v", err)
+	}
+}
+
+// TestAIAllowGroupsFlagTypoGuard：新 flag 名带连字符，同样纳入 dashFlagTypo 防护
+// （漏 -- 会被 cobra 当位置参数静默吃进 task——2026-10-20 用户真实事故同型）。
+func TestAIAllowGroupsFlagTypoGuard(t *testing.T) {
+	cmd := aiSubCmd(t, "rewoo")
+	for _, flag := range []string{"allow-base", "allow-flow"} {
+		if err := dashFlagTypo(cmd, []string{flag, "任务"}); err == nil ||
+			!strings.Contains(err.Error(), "--"+flag) {
+			t.Fatalf("%s 漏 -- 必须报错，实际 %v", flag, err)
+		}
+	}
+}
+
+// TestAIRewooRunsWithAllowGroups：mock provider 下端到端验证组开关接线
+// （flag → aiAllowNames → RewooOpts.Allow → resolveRewooAllow 全链不断）。
+// 细列项用 template（pure 恒装配）而非 ext.pdf：CLI 测试的 CWD 是 internal/cli，
+// 找不到 plugin/extensions.yaml，ext.pdf 这类侧车能力在该环境确实未装配——
+// strict 解析报错是正确行为（见 resolveRewooAllow 注释），不是缺陷。
+func TestAIRewooRunsWithAllowGroups(t *testing.T) {
+	withTempRegistry(t)
+	t.Setenv("GEAR_AI_PROVIDER", "mock")
+	if err := runCLI(t, "ai", "rewoo", "--allow-base", "--allow-flow", "--allow", "template", "任务"); err != nil {
+		t.Fatalf("gear ai rewoo --allow-base --allow-flow --allow template 失败: %v", err)
 	}
 }

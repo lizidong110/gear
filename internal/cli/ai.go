@@ -39,6 +39,8 @@ func aiCmd() *cobra.Command {
 	reactC.Flags().Int("max-steps", 6, "最大步数")
 	reactC.Flags().String("mode", "", "工具面模式：空（默认）= 扁平全量；meta = 元工具模式（恒定 4 个工具按需检索，规模无关）")
 	reactC.Flags().StringSlice("allow", nil, "限制可用工具：能力名（http,secret）或方法名（ext.redis.set）；默认一组通用能力，不是全目录")
+	reactC.Flags().Bool("allow-base", false, "开放全部原子能力（builtin 门禁原语 + pure 纯函数，引擎自带 12 个能力整组）")
+	reactC.Flags().Bool("allow-flow", false, "开放 flow 内的能力（已注册 Tool/Flow：经 call 调用 + ext.registry 发现）")
 	reactC.Flags().Bool("allow-all", false, "不设限地开放整个能力目录。慎用：工具越多模型越选不准，且很可能撞上内核的工具数上限")
 	reactC.Flags().String("model", "", "模型名（可选，缺省读 GEAR_AI_MODEL）")
 	reactC.Flags().String("provider", "", "模型厂商（可选，缺省读 GEAR_AI_PROVIDER）")
@@ -74,6 +76,8 @@ func aiCmd() *cobra.Command {
 	rewooC.Flags().Int("max-parallel", 4, "层内并行度")
 	rewooC.Flags().Int("wall-clock", 300, "总墙钟秒数（默认 300；慢模型或重任务可调大，0 = 用默认）")
 	rewooC.Flags().StringSlice("allow", nil, "限制可调对象：能力名（http,secret）、「能力.方法」（ext.redis.set）或已注册工具/Flow id；默认一组通用能力 + 全部已注册工具")
+	rewooC.Flags().Bool("allow-base", false, "开放全部原子能力（builtin 门禁原语 + pure 纯函数，引擎自带 12 个能力整组）")
+	rewooC.Flags().Bool("allow-flow", false, "开放 flow 内的能力（已注册 Tool/Flow 整组：DAG 节点可直接以其 id 为动作）")
 	rewooC.Flags().Bool("allow-all", false, "不设限地开放整个能力目录。慎用：能力越多模型越选不准")
 	rewooC.Flags().String("model", "", "模型名（可选，缺省读 GEAR_AI_MODEL）")
 	rewooC.Flags().String("provider", "", "模型厂商（可选，缺省读 GEAR_AI_PROVIDER）")
@@ -127,11 +131,9 @@ func runAIReact(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ext.ai 未装配（SetupExtensions 失败？）")
 	}
 	maxSteps, _ := cmd.Flags().GetInt("max-steps")
-	allow, _ := cmd.Flags().GetStringSlice("allow")
-	allowAll, _ := cmd.Flags().GetBool("allow-all")
-	// --allow-all 与 --allow 互斥：两个都给说明没想清楚要什么，报出来比挑一个静默执行好。
-	if allowAll && len(allow) > 0 {
-		return fmt.Errorf("--allow-all 与 --allow 不能同时给：前者不设限，后者是白名单，语义冲突")
+	allowNames, allowAll, err := aiAllowNames(cmd)
+	if err != nil {
+		return err
 	}
 	opts := engine.ReactOpts{MaxSteps: maxSteps}
 	if s, _ := cmd.Flags().GetString("mode"); s != "" {
@@ -140,8 +142,9 @@ func runAIReact(cmd *cobra.Command, args []string) error {
 	if allowAll {
 		opts.Allow = []string{engine.ReactAllowAll}
 		opts.AllowSet = true
-	} else {
-		opts.Allow = allow
+	} else if len(allowNames) > 0 {
+		opts.Allow = allowNames
+		opts.AllowSet = true
 	}
 	if s, _ := cmd.Flags().GetString("model"); s != "" {
 		opts.Model = s
@@ -221,16 +224,17 @@ func runAIRewoo(cmd *cobra.Command, args []string) error {
 	if wc, _ := cmd.Flags().GetInt("wall-clock"); wc > 0 {
 		opts.WallClock = time.Duration(wc) * time.Second
 	}
-	allow, _ := cmd.Flags().GetStringSlice("allow")
-	allowAll, _ := cmd.Flags().GetBool("allow-all")
-	if allowAll && len(allow) > 0 {
-		return fmt.Errorf("--allow-all 与 --allow 不能同时给：前者不设限，后者是白名单，语义冲突")
+	allowNames, allowAll, err := aiAllowNames(cmd)
+	if err != nil {
+		return err
 	}
 	if allowAll {
 		opts.Allow = []string{engine.ReactAllowAll}
 		opts.AllowSet = true
-	} else if len(allow) > 0 {
-		opts.Allow = allow
+	} else if len(allowNames) > 0 {
+		// flow 组在此只是翻成 @flow token；「已注册 Tool/Flow 整组可见」由引擎层
+		// resolveRewooAllow 兑现（展开成 call+ext.registry 且 tools 不收窄）。
+		opts.Allow = allowNames
 		opts.AllowSet = true
 	}
 	if s, _ := cmd.Flags().GetString("model"); s != "" {
@@ -337,6 +341,39 @@ func dashFlagTypo(cmd *cobra.Command, args []string) error {
 			"若任务确实以该词开头，用 -- 分隔：gear ai rewoo -- %q …（本次未执行）", first, first, first)
 	}
 	return nil
+}
+
+// aiAllowNames 汇总 `gear ai react/rewoo` 的四个 allow 来源，返回最终白名单：
+//
+//	--allow <列表>      细粒度：能力名 / 「能力.方法」/（rewoo）已注册 Tool/Flow id
+//	--allow-base        原子能力组 → 翻成引擎组 token @base（engine.ReactAllowBase）
+//	--allow-flow        flow 内能力组 → 翻成 @flow（engine.ReactAllowFlow）
+//	--allow-all         全开放（*），与以上三者互斥
+//
+// 组开关是**翻译不是展开**：展开逻辑唯一实现在引擎层（resolveReactAllow /
+// resolveRewooAllow 认 @base/@flow），CLI / Lua / REST 三个执行面因此共用同一份
+// 组语义（Lua 侧写 allow = {"@base", "@flow"} 与 CLI 两个 flag 等价）。
+// 互斥而不是静默挑一个：「不设限」与「白名单」语义冲突，同给说明没想清楚要开什么。
+func aiAllowNames(cmd *cobra.Command) (names []string, allowAll bool, err error) {
+	allow, _ := cmd.Flags().GetStringSlice("allow")
+	all, _ := cmd.Flags().GetBool("allow-all")
+	base, _ := cmd.Flags().GetBool("allow-base")
+	flow, _ := cmd.Flags().GetBool("allow-flow")
+	if all && (len(allow) > 0 || base || flow) {
+		return nil, false, fmt.Errorf("--allow-all 与 --allow/--allow-base/--allow-flow 不能同时给：" +
+			"前者不设限，后者是白名单，语义冲突")
+	}
+	if all {
+		return nil, true, nil
+	}
+	names = append(names, allow...)
+	if base {
+		names = append(names, engine.ReactAllowBase)
+	}
+	if flow {
+		names = append(names, engine.ReactAllowFlow)
+	}
+	return names, false, nil
 }
 
 // renderReactResult 把 React 返回 {answer,steps,used_tools} 渲染成可读文本。

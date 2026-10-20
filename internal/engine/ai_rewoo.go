@@ -53,6 +53,14 @@ const (
 	rewooTemperature   = 0.2
 	rewooMaxUserTools  = 40  // planner 提示词里最多列多少个已注册工具（超出注明截断，不静默）
 	rewooMaxPromptTool = 120 // 能力面提示词里最多列多少个方法（同上）
+
+	// rewooSolverEvidenceRunes 是 solver  prompt 里每个节点产出的观测预算。
+	// 2026-10-20 真机事故：单节点计划把 35KB 的 PDF 提取结果直接留给 solver，截断后
+	// 它只看到字体列表还误判成「扫描件」。截断本身没错（prompt 体积约束），错在
+	// ① planner 没排消费节点（已在提示词纪律里教）、② 截断后没把预算与正确路线
+	// 告知 solver（已在 rewooSolverPrompt 里补）。节点间引用不截断——完整产出只有
+	// 消费节点拿得到。
+	rewooSolverEvidenceRunes = 1200
 )
 
 func (o RewooOpts) withDefaults() RewooOpts {
@@ -252,6 +260,7 @@ func (a *AIAgent) resolveRewooAllow(names []string, set bool) (*rewooAllow, erro
 		return al, nil
 	}
 	caps, tools := []string{}, map[string]bool{}
+	toolsAll := true // 只给了能力没给工具 id ⇒ 不收窄（默认全量）；@noflow 显式关
 	for _, raw := range names {
 		x := strings.TrimSpace(raw)
 		if x == "" {
@@ -261,6 +270,28 @@ func (a *AIAgent) resolveRewooAllow(names []string, set bool) (*rewooAllow, erro
 			al.caps = reactAllow{all: true}
 			al.toolsAll = true
 			return al, nil
+		}
+		// 组 token（与 react 同一份语义）：@base 展开原子能力组、@flow 展开
+		// call+ext.registry。flow 组对 rewoo 还有一层：tools 仍为空 ⇒ toolsAll=true，
+		// 「已注册 Tool/Flow 整组可见」自然成立（planner 可查 registry 后以 id 为动作）。
+		if x == ReactAllowBase || x == ReactAllowFlow {
+			group := BaseCapabilities
+			if x == ReactAllowFlow {
+				group = FlowCapabilities
+			}
+			for _, c := range group {
+				if a.knownCapability(c) {
+					caps = append(caps, c)
+				}
+			}
+			continue
+		}
+		// @noflow：显式关掉工具面（toolsAll=false 且白名单为空 ⇒ 一个工具都不给）。
+		// 2026-10-20 真机：`--allow-base --allow ext.pdf` 本意「只要原子能力+pdf」，
+		// 默认语义却把 mindstorm__* 等全部已注册工具也放了出来，planner 白跑无关节点。
+		if x == ReactAllowNoFlow {
+			toolsAll = false
+			continue
 		}
 		if a.knownCapability(x) {
 			caps = append(caps, x)
@@ -287,7 +318,7 @@ func (a *AIAgent) resolveRewooAllow(names []string, set bool) (*rewooAllow, erro
 	}
 	al.caps = rl
 	al.tools = tools
-	al.toolsAll = len(tools) == 0 // 只给了能力没给工具 → 工具面不收窄（保持默认全量）
+	al.toolsAll = toolsAll && len(tools) == 0 // 只给了能力没给工具 → 工具面不收窄（保持默认全量）；@noflow 已把 toolsAll 置 false
 	return al, nil
 }
 
@@ -504,7 +535,12 @@ func (a *AIAgent) rewooPlannerPrompt(task string, al *rewooAllow, opts RewooOpts
 	b.WriteString("2. 参数里可引用上游产出：整个值写 \"{{#E1}}\"（保留原类型），嵌在字符串里则转文本；也可带字段路径 \"{{#E2.src}}\"；\n")
 	b.WriteString("3. 只要引用了某节点的产出，就必须把它列进 depends_on（直接或间接）；\n")
 	b.WriteString(fmt.Sprintf("4. 步骤数 ≤ %d，按「取数 → 加工 → 汇聚」的粒度拆，不要拆到字符串拼接；\n", opts.MaxNodes))
-	b.WriteString("5. 只能使用上面列出的调用；任务不需要的数据不要硬凑步骤。\n")
+	b.WriteString("5. 只能使用上面列出的调用；任务不需要的数据不要硬凑步骤；\n")
+	b.WriteString("6. **任务要求基于某节点的大段产出做总结/分析/改写时，必须安排一个 LLM 消费节点" +
+		"（如 ext.ai.complete）吃它**（用 \"{{#E1}}\" 引用拿完整产出，节点间引用不截断）——" +
+		"solver 只能看到每个节点产出的前 1200 字符，把 read/ext.http 这类大产出直接留给 solver 等于把正文丢掉；\n")
+	b.WriteString("7. 需要 LLM 做总结/加工/改写时，允许集里有 ext.ai.complete 就优先用它——" +
+		"**不要用 http.Request 直搓各家 LLM API**（URL/请求体/鉴权头格式各异，极易 400，2026-10-20 真机实测）；\n")
 	if lastErr != "" {
 		b.WriteString("\n【上次输出未通过校验，请修正后重新输出】\n" + lastErr + "\n")
 	}
@@ -1074,7 +1110,9 @@ func (a *AIAgent) rewooReplanPrompt(task string, p *rewooPlan, scope map[string]
 	b.WriteString("1. id 一律以 \"#E\" 开头跟数字（#E1、#E2…）；#S1、#N1、step1、E1 等写法均非法；\n")
 	b.WriteString("2. 冻结契约里的 id 必须原样沿用；其余新节点从当前计划最大编号之后继续（已有 #E1~#E3 就用 #E4、#E5），**不要从 #E1 重新数**；\n")
 	b.WriteString("3. 引用可复用的产出（含已成功节点）时，同样要列进 depends_on；\n")
-	b.WriteString("4. 同一堵墙（同一个失败原因）不要原样再撞——换工具、换参数或明确放弃该数据。\n")
+	b.WriteString("4. 同一堵墙（同一个失败原因）不要原样再撞——换工具、换参数或明确放弃该数据；\n")
+	b.WriteString("5. **新计划若需要基于某节点的大段产出做总结/分析，同样要安排 LLM 消费节点（如 ext.ai.complete，" +
+		"用 \"{{#E1}}\" 引用拿完整产出）**——solver 只能看到每个节点产出的前 1200 字符，大产出直接留给 solver 等于丢正文。\n")
 	b.WriteString("正例（【当前子图定义】含失败的 #E2 与 #E3，#E1 已成功故不出现）：\n")
 	b.WriteString(`{"steps":[{"id":"#E2","action":"template.render","args":{"text":"改用文字说明"},"depends_on":["#E1"]},{"id":"#E3","action":"http.Request","args":{"url":"https://example.com"},"depends_on":["#E2"]}]}` + "\n")
 	return b.String()
@@ -1192,14 +1230,23 @@ func (a *AIAgent) rewooSolverPrompt(task string, p *rewooPlan, board *reactBoard
 		"对缺口清单里的内容必须明确说明「未获取」及原因，**不得编造**数据。\n\n")
 	b.WriteString("【任务】\n" + task + "\n\n")
 	b.WriteString("【节点产出】\n")
-	for _, n := range p.nodes {
-		if n.status != rewooDone {
+	for _, nd := range p.nodes {
+		if nd.status != rewooDone {
 			continue
 		}
 		evMu.Lock()
-		v := ev[n.id]
+		v := ev[nd.id]
 		evMu.Unlock()
-		fmt.Fprintf(&b, "- %s（%s）→ %s\n", n.id, n.action, truncateObservation(stableJSON(v), 1200))
+		raw := stableJSON(v)
+		fmt.Fprintf(&b, "- %s（%s）→ %s\n", nd.id, nd.action, truncateObservation(raw, rewooSolverEvidenceRunes))
+		// 2026-10-20 真机事故：单节点计划把 35KB 的 PDF 提取结果直接留给 solver，
+		// 截断后它只看到字体列表，还误判成「扫描件/图片型 PDF」——错误归因比没有答案
+		// 更坏。超长产出必须显式告知预算与正确路线（消费节点拿的是完整产出）。
+		if total := len([]rune(raw)); total > rewooSolverEvidenceRunes {
+			fmt.Fprintf(&b, "  ↑ 该产出共 %d 字符，上面只显示前 %d（solver 的观测预算）。"+
+				"若任务需要基于完整产出的结论，应由消费节点（如 ext.ai.complete，用 \"{{#%s}}\" 引用）处理；"+
+				"不要把「只看到开头」当成「产出没有正文」\n", total, rewooSolverEvidenceRunes, nd.id)
+		}
 	}
 	if len(board.gapsSnapshot()) > 0 {
 		b.WriteString("\n【" + board.gapNotice() + "】\n")

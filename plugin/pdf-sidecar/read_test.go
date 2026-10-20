@@ -477,3 +477,65 @@ func TestReadFileSizeGuard(t *testing.T) {
 		t.Fatalf("超大 PDF 必须拒，实际 %v", err)
 	}
 }
+
+// TestSplitAbsPathArg 兜底「绝对路径塞进 path」的拆分语义（2026-10-20 真机事故：
+// planner 把用户的 D:/x/y.pdf 剥成纯文件名、root 缺省成侧车 CWD ⇒ 找不到文件）。
+func TestSplitAbsPathArg(t *testing.T) {
+	absWin := `D:/BaiduNetdiskDownload/讲义.pdf`
+	// 盘符绝对路径：拆成 (目录, 文件名)
+	root, rel, err := splitAbsPathArg("", absWin)
+	if err != nil || root != filepath.Dir(absWin) || rel != "讲义.pdf" {
+		t.Fatalf("盘符绝对路径应拆成 (目录,文件名)，实际 root=%q rel=%q err=%v", root, rel, err)
+	}
+	// 正斜杠盘符（ planner 常见写法）
+	root, rel, err = splitAbsPathArg("", "D:/a/b/c.pdf")
+	if err != nil || rel != "c.pdf" {
+		t.Fatalf("正斜杠盘符也应拆，实际 root=%q rel=%q err=%v", root, rel, err)
+	}
+	// POSIX 绝对路径（Windows 上 Dir 会把 / 归一成 \，期望值自算不手写）
+	absPosix := "/home/x/y.pdf"
+	root, rel, err = splitAbsPathArg("", absPosix)
+	if err != nil || root != filepath.Dir(absPosix) || rel != "y.pdf" {
+		t.Fatalf("POSIX 绝对路径应拆，实际 root=%q rel=%q err=%v", root, rel, err)
+	}
+	// 相对路径：原样不动
+	root, rel, err = splitAbsPathArg("docs", "讲义.pdf")
+	if err != nil || root != "docs" || rel != "讲义.pdf" {
+		t.Fatalf("相对路径应原样，实际 root=%q rel=%q err=%v", root, rel, err)
+	}
+	// root + 绝对路径同给：语义冲突，报错不静默挑一个
+	if _, _, err := splitAbsPathArg("docs", "D:/x/y.pdf"); err == nil {
+		t.Fatal("root 与绝对 path 同给必须报错（以谁为准说不清）")
+	}
+}
+
+// TestHandleReadAbsolutePathAutoSplit 端到端：只给绝对 path 不传 root，
+// handleRead 应自动拆开读到文件（不依赖 root 缺省成 CWD 的运气）。
+func TestHandleReadAbsolutePathAutoSplit(t *testing.T) {
+	root := t.TempDir()
+	writeForRead(t, root, "A 復 中 漢 B")
+	abs := filepath.Join(root, "in.pdf")
+
+	rec := httptest.NewRecorder()
+	(&service{}).handleRead(rec, readReq(t, map[string]interface{}{
+		"path": abs, // 绝对路径，故意不给 root
+	}))
+	errStr, result := decodeResp(t, rec)
+	if errStr != "" {
+		t.Fatalf("绝对 path 无 root 应自动拆分后读到，实际错误 %q", errStr)
+	}
+	page := result["pages"].([]interface{})[0].(map[string]interface{})
+	if !strings.Contains(page["text"].(string), "復") {
+		t.Fatalf("应读到写入的文本，实际 %q", page["text"])
+	}
+
+	// root 与绝对 path 同给：语义冲突，明确报错（不静默挑一个）
+	rec2 := httptest.NewRecorder()
+	(&service{}).handleRead(rec2, readReq(t, map[string]interface{}{
+		"path": abs, "root": root,
+	}))
+	errStr2, _ := decodeResp(t, rec2)
+	if errStr2 == "" || !strings.Contains(errStr2, "绝对路径") {
+		t.Fatalf("root 与绝对 path 同给必须报错，实际 %q", errStr2)
+	}
+}

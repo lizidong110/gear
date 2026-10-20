@@ -83,6 +83,36 @@ CLI 那条路径以前「不给 `--allow` 就是全目录」，现在也收窄�
 重型扩展（ext.redis 29 个、ext.oss 6 个）和 crypto（13 个）不在其中。要全目录请显式
 `--allow-all`，但那多半会撞上 48 的上限——撞了就说明该改用方法级 `--allow`。
 
+**授权粒度三档**（`react` / `rewoo` 同口径，可叠加）：
+
+| 档 | CLI | Lua/REST 的 allow | 语义 |
+|---|---|---|---|
+| 细列表 | `--allow http,ext.redis.set` | `allow = {"http", "ext.redis.set"}` | 逐个点名；rewoo 还吃已注册 Tool/Flow id |
+| 原子能力组 | `--allow-base` | `allow = {"@base"}` | builtin 原语 7 + pure 纯函数 5（引擎自带 12 个整组） |
+| flow 内能力组 | `--allow-flow` | `allow = {"@flow"}` | `call` + `ext.registry`；对 rewoo 即「已注册 Tool/Flow 整组可见」 |
+
+组 token（`@base` / `@flow`）的展开唯一实现在引擎层（`resolveReactAllow` /
+`resolveRewooAllow`），CLI flag 只是把它翻进 allow——三个执行面同一份语义，不会各漂移一份。
+典型组合：`--allow-base --allow-flow ext.pdf`（原子能力 + 我的应用工具 + 只开 pdf 一个侧车），
+既不用列 12 个原子能力名字，也不开 ext.redis 这类无关重型扩展。`--allow-all` 与三个白名单
+来源互斥（同给报错，不静默挑一个）。
+
+**rewoo 的两个注意点**（react 无工具维度，不涉及）：
+
+1. **工具面默认全开**：rewoo 的口径是「只给能力没给工具 id ⇒ 工具面不收窄、全部已注册
+   Tool/Flow 可见」。想排他（如总结 PDF 时别把 mindstorm__* 放进来）用 `@noflow`：
+   `--allow-base --allow @noflow --allow ext.pdf`。
+2. **`ext.ai` 不在原子组**（它是 ext 不是 builtin/pure）：总结/加工类任务要显式
+   `--allow ext.ai`，否则 planner 没有 LLM 消费节点可用。**「总结 PDF」的完整组合**：
+
+```bash
+gear ai rewoo --allow-base --allow @noflow --allow ext.pdf --allow ext.ai '总结这个 PDF'
+```
+
+（2026-10-20 真机：少了 `ext.ai`，planner 拿 `http.Request` 直搓 siliconflow API，
+参数格式错 400 整轮白跑；工具面不排他，planner 白跑 mindstorm 节点——提示词里已教
+「有 ext.ai.complete 优先用它、不要手搓 API」，但允许集里没有时提示词也救不了。）
+
 ### 2.4.2 元工具模式（`mode = "meta"`）：工具面恒定 4 个，与目录规模解耦
 
 上面的「工具越多越降智」还有个更彻底的治法，对应你之前问的「MCP 面为什么只挂 15 个意图级工具、

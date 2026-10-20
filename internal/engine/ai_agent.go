@@ -395,6 +395,21 @@ type reactAllow struct {
 // 与当前任务无关。要全量必须显式写出来。
 const ReactAllowAll = "*"
 
+// ReactAllowBase / ReactAllowFlow 是 allow 里的两个**组 token**：CLI 的
+// `--allow-base` / `--allow-flow` 与 Lua/REST 的 `allow = {"@base", "@flow"}`
+// 共用同一份语义（展开成 BaseCapabilities / FlowCapabilities）。组 token 带 @ 前缀
+// 与能力名空间隔离（不会与未来某个叫 base 的能力冲突），且在引擎层解析——
+// 三个执行面（CLI/Lua/REST）不必各写一份展开。
+const (
+	ReactAllowBase = "@base" // 原子能力组：builtin 原语 + pure 纯函数
+	ReactAllowFlow = "@flow" // flow 内能力组：call + ext.registry（rewoo 即已注册工具整组）
+	// ReactAllowNoFlow 关掉「已注册 Tool/Flow」面（只对 rewoo 有意文：它的默认语义是
+	// 「只给能力没给工具 id ⇒ 工具面不收窄、全部已注册工具可见」，2026-10-20 真机
+	// 实测这让 `--allow-base --allow ext.pdf` 仍混进 mindstorm__* 等一堆无关工具）。
+	// 排他必须显式写出来：把「不给工具 id」从「全开」悄悄改成「全关」会断裂存量行为。
+	ReactAllowNoFlow = "@noflow"
+)
+
 // maxReactTools 是单次 react 允许下发的工具数上限，超出直接报错（不静默截断）。
 //
 // 不截断的理由：截断等于偷偷改了 agent 的能力边界，模型调不到某个工具却不知道为什么，
@@ -411,6 +426,29 @@ var defaultReactCapabilities = []string{
 	"time", "template", "id", "validate",
 	"ext.registry",
 }
+
+// BaseCapabilities 是「原子能力」组：引擎自带的 builtin 门禁原语（7 个）+
+// pure 纯函数（5 个），共 12 个能力。它们是 `--allow-base` / Lua allow 组的语义来源。
+//
+// 与 defaultReactCapabilities 的区别：那是「没显式给 allow 时的精选默认集」
+// （刻意排除 event/subscribe/crypto 等与多数任务无关的重型能力）；这是原子能力
+// 全家桶——要「引擎自带的随便用」就开这一组，不用逐个列 12 个名字。
+// 守卫测试 TestBaseCapabilitiesCoverAllBuiltinAndPure 钉住：目录里每个
+// builtin/pure 能力都必须在本组内（新增原子能力忘记进组会红）。
+var BaseCapabilities = []string{
+	"http", "call", "db", "secret", "event", "subscribe", "config",
+	"time", "template", "crypto", "id", "validate",
+}
+
+// FlowCapabilities 是「flow 内能力」组：让 agent 能用**已注册的 Tool/Flow**
+// （用户自建应用能力，如 wms__location_list）。经两条路开放：
+//   - `call` 原语：实际调用的唯一通道（插件间通信都走它）；
+//   - `ext.registry`：按需发现——agent 先查目录里有什么 Tool/Flow，再决定调谁。
+//
+// rewoo 侧还有一层：Tool/Flow id 可直接作 DAG 节点动作，其 `resolveRewooAllow`
+// 对「只给了能力没给工具 id」的口径是工具面不收窄——故本组对 rewoo 同样展开成
+// 这两个能力名，「已注册工具整组可见」自然成立，无需另设工具白名单开关。
+var FlowCapabilities = []string{"call", "ext.registry"}
 
 // resolveReactAllow 由调用方给定的原始 allow 与「是否显式给定」解析出允许集。
 //
@@ -443,6 +481,27 @@ func (a *AIAgent) resolveReactAllow(names []string, set, strict bool) (reactAllo
 		}
 		if x == ReactAllowAll {
 			return reactAllow{all: true}, nil
+		}
+		// 组 token：展开成整组能力名（与 CLI --allow-base/--allow-flow 同一份语义）。
+		// 放在 knownCapability/splitCapMethod 之前——@base 不是能力名也不是「能力.方法」，
+		// 漏了这层会被当未知项 strict 报错。
+		if x == ReactAllowBase || x == ReactAllowFlow {
+			group := BaseCapabilities
+			if x == ReactAllowFlow {
+				group = FlowCapabilities
+			}
+			for _, c := range group {
+				// 未装配项跳过（与 set=false 的默认集同口径）：组 token 表达的是意图，
+				// 具体能开什么由本进程目录决定；塞一个目录里没有的能力名进去只会空转。
+				if !a.knownCapability(c) {
+					continue
+				}
+				if !seen[c] {
+					seen[c] = true
+					caps = append(caps, c)
+				}
+			}
+			continue
 		}
 		if a.knownCapability(x) {
 			if !seen[x] {

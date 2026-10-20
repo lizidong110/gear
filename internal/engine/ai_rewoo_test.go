@@ -678,3 +678,107 @@ func mustAllowAll(t *testing.T, a *AIAgent) *rewooAllow {
 	}
 	return al
 }
+
+// TestRewooPlannerPromptRequiresConsumerNode —— 2026-10-20 真机事故：planner 排了
+// 单节点计划（只 ext.pdf.read），35KB 产出直接留给 solver，截断后 solver 只看到
+// 字体列表还误判成「扫描件」。提示词必须教「大产出要配 LLM 消费节点」这条纪律。
+func TestRewooPlannerPromptRequiresConsumerNode(t *testing.T) {
+	a, _ := newRewooAgent(t, &scriptedLLM{})
+	al, err := a.resolveRewooAllow(nil, false)
+	if err != nil {
+		t.Fatalf("resolveRewooAllow 失败: %v", err)
+	}
+	prompt := a.rewooPlannerPrompt("总结这个 PDF", al, RewooOpts{MaxNodes: 20}, "")
+	for _, want := range []string{"必须安排一个 LLM 消费节点", "ext.ai.complete", "{{#E1}}", "前 1200"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("planner 提示词必须含 %q（大产出消费纪律），实际:\n%s", want, prompt)
+		}
+	}
+}
+
+// TestRewooSolverPromptMarksOversizedEvidence —— solver 对超长产出必须显式标注
+// 预算与正确路线：只说「已截断」不够，模型会把「只看到开头」误判成「产出没有正文」
+// （真机实测误报成扫描件）。截断本身没错，错在截完不给行动信息。
+func TestRewooSolverPromptMarksOversizedEvidence(t *testing.T) {
+	a, _ := newRewooAgent(t, &scriptedLLM{})
+	al, err := a.resolveRewooAllow(nil, false)
+	if err != nil {
+		t.Fatalf("resolveRewooAllow 失败: %v", err)
+	}
+	plan := &rewooPlan{byID: map[string]*rewooNode{}}
+	n1 := rewooTestNode("#E1", "ext.pdf.read", nil)
+	n1.status = rewooDone
+	plan.nodes = []*rewooNode{n1}
+	plan.byID["#E1"] = n1
+	board := newReactBoard(0)
+	ev := map[string]interface{}{
+		"#E1": map[string]interface{}{"text": strings.Repeat("汉", rewooSolverEvidenceRunes+500)},
+	}
+	var evMu sync.Mutex
+	prompt := a.rewooSolverPrompt("总结 PDF", plan, board, ev, &evMu)
+	if !strings.Contains(prompt, "上面只显示前 1200") {
+		t.Fatalf("超长产出必须标注观测预算，实际:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "不要把「只看到开头」当成「产出没有正文」") {
+		t.Fatalf("必须点破「只看到开头 ≠ 没有正文」，实际:\n%s", prompt)
+	}
+	// negcheck：短产出不加标注（不制造噪音）
+	ev2 := map[string]interface{}{"#E1": map[string]interface{}{"text": "短"}}
+	prompt2 := a.rewooSolverPrompt("总结 PDF", plan, board, ev2, &evMu)
+	if strings.Contains(prompt2, "上面只显示前") {
+		t.Fatalf("短产出不应带预算标注，实际:\n%s", prompt2)
+	}
+	_ = al
+}
+
+// TestRewooAllowNoFlowToken —— @noflow 显式关掉工具面。2026-10-20 真机：
+// `--allow-base --allow ext.pdf` 本意「只要原子能力+pdf」，默认语义（只给能力没给
+// 工具 id ⇒ 工具面不收窄）却把 mindstorm__* 全部放出来，planner 白跑无关节点。
+// 排他必须显式：把默认从「全开」偷偷改成「全关」会断裂存量行为。
+func TestRewooAllowNoFlowToken(t *testing.T) {
+	a, _ := newRewooAgent(t, &scriptedLLM{})
+	reg := newTestRegistry(t)
+	t.Cleanup(func() { reg.Close() })
+	a.reg = reg
+
+	al, err := a.resolveRewooAllow([]string{ReactAllowBase, ReactAllowNoFlow}, true)
+	if err != nil {
+		t.Fatalf("@noflow 应被接受，实际 %v", err)
+	}
+	if al.toolsAll {
+		t.Fatal("@noflow 后 toolsAll 应为 false")
+	}
+	if al.toolAllows("任意工具") {
+		t.Fatal("@noflow 后任何已注册工具都不应放行")
+	}
+	// 能力面不受影响：@base 仍展开
+	if !al.caps.allows("http", "Request") {
+		t.Fatal("@noflow 只关工具面，不应影响 @base 展开的能力")
+	}
+	// negcheck：不给 @noflow 时保持默认全开（存量行为不断裂）
+	al2, err := a.resolveRewooAllow([]string{ReactAllowBase}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !al2.toolsAll {
+		t.Fatal("只给能力不给 @noflow 时 toolsAll 应保持 true（默认语义未改）")
+	}
+}
+
+// TestRewooPlannerPromptPrefersExtAIOverHTTP —— planner 提示词必须教「有 ext.ai.complete
+// 就别用 http.Request 手搓 LLM API」。2026-10-20 真机：允许集里没开 ext.ai，planner
+// 用 http 直搓 siliconflow API，参数格式错 → 400，整轮白跑。
+func TestRewooPlannerPromptPrefersExtAIOverHTTP(t *testing.T) {
+	a, _ := newRewooAgent(t, &scriptedLLM{})
+	al, err := a.resolveRewooAllow(nil, false)
+	if err != nil {
+		t.Fatalf("resolveRewooAllow 失败: %v", err)
+	}
+	prompt := a.rewooPlannerPrompt("总结 PDF", al, RewooOpts{MaxNodes: 20}, "")
+	if !strings.Contains(prompt, "优先用") || !strings.Contains(prompt, "ext.ai.complete") {
+		t.Fatalf("planner 提示词必须教「优先 ext.ai.complete」，实际:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "不要用 http.Request 直搓") {
+		t.Fatalf("必须点名禁止 http 手搓 LLM API，实际:\n%s", prompt)
+	}
+}
