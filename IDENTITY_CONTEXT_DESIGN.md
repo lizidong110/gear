@@ -388,11 +388,19 @@ Hook 拿到 `ctx.caller` 后如何拒绝：**引擎侧已有 fail-closed 通道*
 
 **实施时撞出来的五点（§4.2/§4.3 都没预料到）**：
 
-1. ★ **原语直调必须排除在守卫之外**，否则开了 scope 的应用连自己的入口都跑不起来。
+1. ★ **平台级能力必须排除在守卫之外**，否则开了 scope 的应用连自己的入口都跑不起来。
    mindstorm 的 `mindstorm.up` 同时调 `mindstorm__config`（registry 对象）与 `static_site.serve`
-   （原语）——按「非本应用即拒」，这条 Flow 一开 scope 就死。
-   ⇒ 守卫只拦 **registry 对象**（能查到 id 的），**不拦原语**。守的语义是「别碰别人应用的
-   定义」，不是「别用平台」。
+   （平台级）——按「非本应用即拒」，这条 Flow 一开 scope 就死。
+   ⇒ 守卫只拦 **别人应用的 registry 对象**（能归属到某个 App 的），**不拦平台级**。守的语义是
+   「别碰别人应用的定义」，不是「别用平台」。
+   ⚠ 2026-10-21 修正：本条原写「不拦**原语**」，把 `static_site.serve` 归进了原语——它其实是
+   **注册 Tool**（走 `resolveStepCallView` 的 ① 分支），原实现连它一起毙（实测
+   `tool run <无前缀id> --scope wms` 被拒）。豁免实为两类：① cap 原语（从不进守卫函数）；
+   ② **平台级注册 Tool**（第一段不归属任何 App 的无前缀对象）。② 此前只写在 `guardScope`
+   注释里、代码没兑现，与注释直接矛盾，S-1~S-10 无一覆盖。现已按「命名空间第一段不是任何
+   已注册 App ⇒ 放行」补齐（S-11/S-12 钉住：豁免不放宽跨应用）。目录面同口径——
+   `tool/flow/hook list --scope x` 分「本应用名下 / 平台级（可用）/ 他人的（隐藏但报数）」
+   三组（REQ-APP-SCOPE-LISTVIEW），「列得出来却跑不了」是最坏组合。
 2. **entry_flow 必须豁免**（`guardFlowScope` 增补了 `guardScope` 的 Flow 版本）。清单里声明的
    入口 Flow 按约定可以**不带前缀**（`artifact.Composition` 同样豁免它），少了这条，
    `gear app start --scope mindstorm` 连自己的入口都跑不起来。

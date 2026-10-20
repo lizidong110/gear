@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -348,11 +349,18 @@ func (e *Engine) Scope() string { return e.scope }
 //
 // ## 不守什么（同样是设计的一部分）
 //
-// **原语直调**（`ext.serve` / `static_site.serve` / `db.query`）**不在守卫范围内**。
-// 它们不是 registry 对象，是 gear 自带的平台能力；把平台能力按应用前缀一刀切，
-// 会让任何一个开了 `--scope` 的应用连自己的 Flow 都跑不起来（mindstorm 的入口 Flow
-// 同时调用了 `mindstorm__config` 与 `static_site.serve`）。守的语义是「别碰**别人应用的
+// **平台级能力不在守卫范围内**，两类：
+// ① cap 原语直调（`time.now` / `db.query` 等——它们根本不是 registry 对象，走
+// `resolveStepCallView` 的 ② 分支，从不进入本函数）；
+// ② **平台自带的注册 Tool**（`ext.serve` / `static_site.serve` / `web_ui.api`——
+// 无应用前缀、第一段不归属任何 App）。把平台能力按应用前缀一刀切，会让任何一个
+// 开了 `--scope` 的应用连自己的 Flow 都跑不起来（mindstorm 的入口 Flow 同时调用了
+// `mindstorm__config` 与 `static_site.serve`）。守的语义是「别碰**别人应用的
 // 定义**」，不是「别用平台」。
+//
+// ② 的判定 = 命名空间第一段（`namespaceHead`）不是任何已注册 App。⚠ 2026-10-21 前
+// 只兑现了 ①：注释承诺 ②、代码却把 ext.serve 这类注册 Tool 一并毙掉（实测
+// `tool run <无前缀id> --scope wms` 被拒），承诺与实现直接矛盾。现已补齐，S-11 钉住。
 //
 // ## 空 scope
 //
@@ -381,10 +389,39 @@ func (e *Engine) guardScope(id string) error {
 	if (&model.App{ID: e.scope}).Owns(id) {
 		return nil
 	}
-	return diagWrap(CodeScopeViolation,
-		fmt.Errorf("命名空间守卫：本进程 scope=%q 不允许引用 %q", e.scope, id),
-		"", "scope",
-		fmt.Sprintf("把 %q 改成 %s__ 开头，或去掉 --scope 关闭守卫；要确认可用 id 用 gear_catalog(kind=tool)", id, e.scope))
+	// 平台级豁免（2026-10-21 补）：id 的命名空间第一段不归属任何已注册 App ⇒ 它不是
+	// 「别人应用的定义」，拦它没有保护意义，只会误杀 ext.serve / static_site.serve /
+	// web_ui.api 这类**平台自带的注册 Tool**。注释一直承诺此豁免，实现直到本次才补上
+	// （resolveStepCallView 的 ① 分支对任何已注册 Tool 无条件调本函数，承诺与代码
+	// 曾直接矛盾；S-11 钉住）。
+	//
+	// 口径与 model.App.Owns 同源（第一段 = 第一个 `__` 或 `.` 前，取更靠前者）：
+	// 第一段命中某个 App 且不是自己 ⇒ 别人的定义，拦；未命中/查不到 ⇒ 平台级，放行。
+	if head := namespaceHead(id); head != e.scope {
+		if app, err := e.reg.GetApp(head); err == nil && app != nil {
+			return diagWrap(CodeScopeViolation,
+				fmt.Errorf("命名空间守卫：本进程 scope=%q 不允许引用 %q", e.scope, id),
+				"", "scope",
+				fmt.Sprintf("把 %q 改成 %s__ 开头，或去掉 --scope 关闭守卫；要确认可用 id 用 gear_catalog(kind=tool)", id, e.scope))
+		}
+	}
+	return nil
+}
+
+// namespaceHead 取 id 的命名空间第一段：第一个 `__` 或第一个 `.` 之前的部分（取更靠前
+// 者）。与 model.App.Owns 的前缀判定同口径——Owns 用 HasPrefix(id, appID+"__") /
+// HasPrefix(id, appID+".")，所以 App.ID 含单个下划线（web_ui）的形态必须按 `__`/`.`
+// 切，不能按 `_`/`.` 切（`web_ui.api` 的第一段是 `web_ui` 不是 `web`）。
+func namespaceHead(id string) string {
+	if i := strings.Index(id, "__"); i >= 0 {
+		if j := strings.Index(id, "."); j < 0 || i < j {
+			return id[:i]
+		}
+	}
+	if j := strings.Index(id, "."); j >= 0 {
+		return id[:j]
+	}
+	return id
 }
 
 // guardFlowScope 是 guardScope 的 Flow 版本：**额外放行应用自己的 entry_flow**。

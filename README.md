@@ -185,7 +185,7 @@ type Hook struct {
 |---|---|---|
 | `--registry <path>` | 注册库路径 | `<GEAR_HOME>/registry.db`（`GEAR_HOME` 未设时取 `<HOME>/.gear`，**不随 cwd 变化**） |
 | `--addr <host:port>` | REST 执行面地址（也可用环境变量 `GEAR_ADDR` 覆盖） | `127.0.0.1:8787` |
-| `--scope <app-id>` | 运行期命名空间守卫：本进程只引用该 App 名下的定义 | 空（不启用） |
+| `--scope <app-id>` | 运行期命名空间守卫：本进程只引用该 App 名下的定义（平台级对象——cap 原语与 `ext.serve` 这类无前缀注册 Tool——不受管；`tool/flow/hook list` 同口径分组，详见 `IDENTITY_CONTEXT_DESIGN.md` §4.3） | 空（不启用） |
 | `--log-file <path>` | 诊断日志档案（可选）：记录命令生命周期与内核事件；空=不写 | 空（零行为变化） |
 | `--log-level <lvl>` | 诊断日志级别 `debug\|info\|warn\|error`（仅 `--log-file` 给了才生效） | `info` |
 

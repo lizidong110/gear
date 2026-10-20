@@ -46,7 +46,7 @@
 | `UNKNOWN_KIND` | 某份文档的 `kind` 不是 App / Tool / Flow / Hook / Migrations | 第一份通常是 `kind: App` 清单，其余是 `kind: Tool` / `kind: Flow` / `kind: Hook`，还有可选的 `kind: Migrations`（库怎么演进，见 `gear_guide("authoring")` §4） |
 | `BAD_APP_MANIFEST` | App 清单缺 id / 缺 `entry_flow` / 出现多份 App | 一个 bundle 只放一份 `kind: App`，并给上 id 与 entry_flow |
 | `ID_NAMESPACE_VIOLATION` | bundle 里的 id 未带应用前缀 | 全部 id 以 `<app-id>__` 或 `<app-id>.` 开头 |
-| `SCOPE_VIOLATION` | 运行期命名空间守卫（`--scope`）拦下的跨应用引用：本进程 scope 只认自己名下的已注册对象（Tool / Flow / Hook 的 action） | 把被拒的 id 改成 `<app-id>__` 或 `<app-id>.` 开头；或去掉 `--scope` 关闭守卫。**注意**：这一码只在 CLI / Flow 层能查到，经 `ctx.call` 触发时错误已被 Lua 边界拍成文本 |
+| `SCOPE_VIOLATION` | 运行期命名空间守卫（`--scope`）拦下的跨应用引用：本进程 scope 只认自己名下的已注册对象（Tool / Flow / Hook 的 action） | 把被拒的 id 改成 `<app-id>__` 或 `<app-id>.` 开头；或去掉 `--scope` 关闭守卫。**平台级对象不会被此码拦**：cap 原语与无前缀注册 Tool（`ext.serve` / `static_site.serve` 这类共享基建）第一段不归属任何 App，照常可用——若被拦，说明它的第一段确实撞了某个已注册 App 的 id。**注意**：这一码只在 CLI / Flow 层能查到，经 `ctx.call` 触发时错误已被 Lua 边界拍成文本 |
 | `APPLY_CONFLICT` | 对象已存在且内容不同，而 `overwrite=false` | 确需覆盖就显式传 `overwrite=true`；否则换个 id（带应用前缀） |
 | `ENTRY_EXE_UNRESOLVED` | process 型 Tool 的 entry 首 token 指向的可执行文件**不存在** | 改路径（Windows 下正斜杠、反斜杠都可，反斜杠不会被当转义符）。只有绝对路径才报此码；相对路径与裸名字只给告警——运行时 cwd / PATH 可能与校验时不同 |
 | `PORTABLE_PATH_HARDCODED` | 应用定义里出现机器相关绝对路径（`C:\...` / `/Users/...` / `/d/gadern/...`，**含 Lua 脚本体内的 dsn**） | 改用相对锚点：db dsn 用相对库名（`mindstorm.db`→GEAR_APP_DATA）、process entry 用裸名（`gear serve ...`→exe 目录）、ext.serve dir 用相对安装根（`apps/<app>/www`→InstallRoot）；详见 `gear_guide("portability")` 与 REQ-APP-PORTABLE |

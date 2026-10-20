@@ -22,6 +22,11 @@ func TestScopeGuardBlocksForeignTool(t *testing.T) {
 	putFlow(t, reg, &model.Flow{ID: "mindstorm.up", Steps: []model.Step{
 		{ID: "s1", Call: "other__x", Input: map[string]interface{}{"k": "v"}},
 	}})
+	// other 必须是**已注册 App**：无主 id（第一段不在 apps 表）按平台级豁免放行，
+	// 不补这条注册，本用例测的就不是「跨应用」而是「平台级」了。
+	if err := reg.UpsertApp(&model.App{ID: "other", EntryFlow: "other.up"}); err != nil {
+		t.Fatalf("注册 App 失败: %v", err)
+	}
 
 	eng := New(reg, WithScope("mindstorm"))
 	if eng.Scope() != "mindstorm" {
@@ -100,6 +105,9 @@ func TestScopeGuardBlocksForeignFlowRun(t *testing.T) {
 	if err := reg.UpsertApp(&model.App{ID: "mindstorm", EntryFlow: "mindstorm.up"}); err != nil {
 		t.Fatalf("注册 App 失败: %v", err)
 	}
+	if err := reg.UpsertApp(&model.App{ID: "other", EntryFlow: "other.up"}); err != nil {
+		t.Fatalf("注册 App 失败: %v", err)
+	}
 
 	_, err := New(reg, WithScope("mindstorm")).RunFlowResult("other.up")
 	if err == nil {
@@ -142,6 +150,9 @@ func TestScopeGuardBlocksForeignHookAction(t *testing.T) {
 		ID: "mindstorm__h1", Target: "mindstorm__echo",
 		Stage: model.StageBeforeStep, Action: "other__x",
 	})
+	if err := reg.UpsertApp(&model.App{ID: "other", EntryFlow: "other.up"}); err != nil {
+		t.Fatalf("注册 App 失败: %v", err)
+	}
 	putFlow(t, reg, &model.Flow{ID: "mindstorm.up", Steps: []model.Step{
 		{ID: "s1", Call: "mindstorm__echo", Input: map[string]interface{}{"k": "v"}},
 	}})
@@ -167,6 +178,9 @@ func TestScopeGuardBlocksForeignCallTarget(t *testing.T) {
 	defer reg.Close()
 	// 主 Flow：一步用 call 原语去够别的应用的 Tool。
 	putTool(t, reg, luaTool("other__x", `return ctx.input`, objSchema(), objSchema()))
+	if err := reg.UpsertApp(&model.App{ID: "other", EntryFlow: "other.up"}); err != nil {
+		t.Fatalf("注册 App 失败: %v", err)
+	}
 	putFlow(t, reg, &model.Flow{ID: "mindstorm.up", Steps: []model.Step{
 		{ID: "s1", Call: "call.Call", Input: map[string]interface{}{
 			"target": "other__x",
@@ -194,6 +208,9 @@ func TestScopeGuardBlocksDirectToolRun(t *testing.T) {
 	reg := newTestRegistry(t)
 	defer reg.Close()
 	putTool(t, reg, luaTool("other__x", `return ctx.input`, objSchema(), objSchema()))
+	if err := reg.UpsertApp(&model.App{ID: "other", EntryFlow: "other.up"}); err != nil {
+		t.Fatalf("注册 App 失败: %v", err)
+	}
 
 	_, err := New(reg, WithScope("mindstorm")).RunTool("other__x", map[string]interface{}{"k": "v"})
 	if err == nil {
@@ -216,5 +233,53 @@ func TestScopeGuardAllowsOwnDirectToolRun(t *testing.T) {
 	}
 	if _, ok := out["k"]; !ok {
 		t.Fatalf("输出应回显输入，实际: %v", out)
+	}
+}
+
+// S-11：平台级注册 Tool（无应用前缀、第一段不归属任何 App）在 scope 下必须放行。
+// 2026-10-21 真机事故：`tool list --scope wms` 列出 ext.serve / static_site.serve /
+// web_ui.api，用户顺理成章调用——却被守卫毙掉（注释承诺豁免，实现直到本次才补）。
+// 平台级对象不是「别人应用的定义」，拦它没有保护意义只有破坏：任何调平台 Tool 的
+// 应用（web 类标配）一开 --scope 就崩。step.call 与 tool run 两条路径都钉。
+func TestScopeGuardAllowsPlatformLevelTool(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	putTool(t, reg, luaTool("ext.serve", `return { ok = "platform" }`, objSchema(), objSchema()))
+	putTool(t, reg, luaTool("web_ui.api", `return { ok = "platform" }`, objSchema(), objSchema()))
+
+	eng := New(reg, WithScope("mindstorm"))
+	// 路径 1：step.call（resolveStepCallView 的 ① 分支——事故正是这里）
+	putFlow(t, reg, &model.Flow{ID: "mindstorm.up", Steps: []model.Step{
+		{ID: "s1", Call: "ext.serve", Input: map[string]interface{}{}},
+	}})
+	res, err := eng.RunFlowResult("mindstorm.up")
+	if err != nil {
+		t.Fatalf("平台级注册 Tool 经 step.call 应放行，实际报错: %v", err)
+	}
+	if _, ok := res.Steps["s1"]["output"].(map[string]interface{}); !ok {
+		t.Fatalf("step 无 output: %v", res.Steps["ss1"])
+	}
+	// 路径 2：tool run（RunToolExec——S-9 补的那条捷径，豁免口径必须一致）
+	out, err := eng.RunTool("web_ui.api", map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("平台级注册 Tool 经 tool run 应放行，实际报错: %v", err)
+	}
+	if out["ok"] != "platform" {
+		t.Fatalf("输出不符: %v", out)
+	}
+}
+
+// S-12：边界——第一段是别的已注册 App 时仍拦（豁免不放松「跨应用」）。
+// 与 S-11 互为两面：无主 id 放行 ≠ 别人的定义也放行。
+func TestScopeGuardStillBlocksForeignAfterPlatformExemption(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	putTool(t, reg, luaTool("other__x", `return ctx.input`, objSchema(), objSchema()))
+	if err := reg.UpsertApp(&model.App{ID: "other", EntryFlow: "other.up"}); err != nil {
+		t.Fatalf("注册 App 失败: %v", err)
+	}
+
+	if _, err := New(reg, WithScope("mindstorm")).RunTool("other__x", map[string]interface{}{}); err == nil {
+		t.Fatal("别的应用的 Tool 仍应被拒（平台级豁免不放松跨应用）")
 	}
 }

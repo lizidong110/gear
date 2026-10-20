@@ -109,9 +109,20 @@ func flowListCmd() *cobra.Command {
 				fmt.Println("（无 Flow）")
 				return nil
 			}
+			byID := make(map[string]*model.Flow, len(flows))
+			ids := make([]string, 0, len(flows))
 			for _, f := range flows {
-				fmt.Printf("- %-16s %-20s steps=%d\n", f.ID, f.Name, len(f.Steps))
+				byID[f.ID] = f
+				ids = append(ids, f.ID)
 			}
+			apps, err := reg.ListApps()
+			if err != nil {
+				return err
+			}
+			printScopedList(apps, ids, func(id string) {
+				f := byID[id]
+				fmt.Printf("- %-16s %-20s steps=%d\n", f.ID, f.Name, len(f.Steps))
+			})
 			return nil
 		},
 	}

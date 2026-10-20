@@ -154,9 +154,20 @@ func toolListCmd() *cobra.Command {
 				fmt.Println("（无 Tool）")
 				return nil
 			}
+			byID := make(map[string]*model.Tool, len(tools))
+			ids := make([]string, 0, len(tools))
 			for _, t := range tools {
-				fmt.Printf("- %-16s %-20s [%s] versions=%d\n", t.ID, t.Name, t.Runtime, len(t.Versions))
+				byID[t.ID] = t
+				ids = append(ids, t.ID)
 			}
+			apps, err := reg.ListApps()
+			if err != nil {
+				return err
+			}
+			printScopedList(apps, ids, func(id string) {
+				t := byID[id]
+				fmt.Printf("- %-16s %-20s [%s] versions=%d\n", t.ID, t.Name, t.Runtime, len(t.Versions))
+			})
 			return nil
 		},
 	}

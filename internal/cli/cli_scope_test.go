@@ -33,6 +33,7 @@ func TestScopeFlagReachesEngine(t *testing.T) {
 	if err := runCLI(t, "tool", "register", writeTempYAML(t, toolYAMLForScope("other__x"))); err != nil {
 		t.Fatalf("注册 Tool 失败: %v", err)
 	}
+	seedScopeApp(t, "other", "other.up")
 	if err := runCLI(t, "flow", "register", writeTempYAML(t, flowYAMLForScope("mindstorm.up", "other__x"))); err != nil {
 		t.Fatalf("注册 Flow 失败: %v", err)
 	}
@@ -73,6 +74,7 @@ func TestScopeFlagBlocksDirectToolRun(t *testing.T) {
 	if err := runCLI(t, "tool", "register", writeTempYAML(t, toolYAMLForScope("other__x"))); err != nil {
 		t.Fatalf("注册 Tool 失败: %v", err)
 	}
+	seedScopeApp(t, "other", "other.up")
 	err := runCLI(t, "tool", "run", "--scope", "mindstorm", "other__x", "--input", `{"name":"x"}`)
 	if err == nil {
 		t.Fatal("`gear tool run --scope mindstorm` 不应能执行别应用的 Tool")

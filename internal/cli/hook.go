@@ -62,10 +62,21 @@ func hookListCmd() *cobra.Command {
 				fmt.Println("（无 Hook）")
 				return nil
 			}
+			byID := make(map[string]*model.Hook, len(hooks))
+			ids := make([]string, 0, len(hooks))
 			for _, h := range hooks {
+				byID[h.ID] = h
+				ids = append(ids, h.ID)
+			}
+			apps, err := reg.ListApps()
+			if err != nil {
+				return err
+			}
+			printScopedList(apps, ids, func(id string) {
+				h := byID[id]
 				fmt.Printf("- %-16s %-12s target=%-14s action=%-14s %s order=%d\n",
 					h.ID, h.Stage, h.Target, h.Action, h.EffectiveCriticality(), h.Order)
-			}
+			})
 			return nil
 		},
 	}
