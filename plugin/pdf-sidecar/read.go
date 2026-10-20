@@ -48,9 +48,11 @@ type pdfReadResult struct {
 	Pages []pdfPageText
 	Fonts []string // 文件里出现的字体名（去重升序）——调用方看得见「读的是哪颗字体」
 	CID   bool     // 是否存在 Identity-H 双字节编码的页面
-	// Unreliable 是「用了字体但抽不出可靠文本」的页码（1-based）。典型是 Type0/CIDFontType2
-	// 没有 ToUnicode 映射——CID 落不到 Unicode，硬抽就是乱码。这些页在 Pages 里 text 为空，
-	// 由调用方（尤其是 agent）据 note 换路线（OCR / 问用户要文本），而不是照着空文本硬总结。
+	// Unreliable 是「文本流里实际掉了字」的页码（1-based）。判定只看 writeGlyphs 真实
+	// 丢弃的字形数（Identity-H 无 ToUnicode、或有 ToUnicode 的字体里个别码查不到映射），
+	// **不看资源表里有没有不可靠字体**——后者会把只列了字体却没真用的页误报整页标红。
+	// 掉字的页仍会尽量抽其余可读文本（不会整页留空），只是文本可能不完整；由调用方
+	// （尤其是 agent）据 note 决定要不要换路线（OCR / 问用户要文本）。
 	// 整页完全没用任何字体（纯图片扫描件）不算 Unreliable——那种属于扫描件，看 allEmpty 判定。
 	Unreliable []int
 }
@@ -995,9 +997,9 @@ func (lx *pdfLexer) readDict() lexItem {
 // 操作符消费整个栈（PDF 的操作数不跨操作符累积）。**不能**边 range 边截断
 // 底层切片——range 绑定的是原切片的头/长度，截断会让遍历跳位（第一版就这么
 // 错的：TJ 数组整段被跳过，测试里 usedFont 直接是 false）。
-func extractPageText(content []byte, fonts map[string]*pdfFont) (string, bool) {
+func extractPageText(content []byte, fonts map[string]*pdfFont) (string, bool, int, int) {
 	if len(content) == 0 {
-		return "", false
+		return "", false, 0, 0
 	}
 	tokens := lexContent(content)
 
@@ -1007,6 +1009,8 @@ func extractPageText(content []byte, fonts map[string]*pdfFont) (string, bool) {
 	haveY := false
 	curFont := ""
 	usedFont := false
+	dropped := 0 // 本页实际丢弃的字形数（见 writeGlyphs）
+	shown := 0   // 本页试图显示的字形总数（用于算掉字占比）
 
 	flushLine := func() {
 		line := strings.TrimRight(cur.String(), " ")
@@ -1056,7 +1060,9 @@ func extractPageText(content []byte, fonts map[string]*pdfFont) (string, bool) {
 		return ""
 	}
 	writeRaw := func(raw []byte) {
-		writeGlyphs(&cur, raw, fonts, curFont)
+		d, s := writeGlyphs(&cur, raw, fonts, curFont)
+		dropped += d
+		shown += s
 		usedFont = true
 	}
 
@@ -1138,11 +1144,22 @@ func extractPageText(content []byte, fonts map[string]*pdfFont) (string, bool) {
 	}
 	flushLine()
 	if sb.Len() == 0 {
-		return "", usedFont
+		return "", usedFont, dropped, shown
 	}
-	return strings.TrimRight(sb.String(), "\n"), true
+	return strings.TrimRight(sb.String(), "\n"), true, dropped, shown
 }
-func writeGlyphs(sb *strings.Builder, raw []byte, fonts map[string]*pdfFont, fontName string) {
+
+// writeGlyphs 把一段显示字符串（raw）按字体解码写入 sb，返回 (dropped, shown)：
+// dropped = 实际丢弃（抽不出可靠 Unicode）的字形数；shown = 本段试图显示的字形总数。
+//
+// 丢弃只发生在两种「抽不出可靠 Unicode」的情形：
+//  1. Identity-H 双字节码但无 ToUnicode——整段吞掉，按 CID 码元计掉字；
+//  2. 有 ToUnicode 的字体里个别码查不到映射（子集字体漏映的码元）——落成 0xFFFD 记一次。
+//
+// shown 用来算「掉字占比」：掉一两个字（shown 很大）不该把整页判不可靠，掉了半页才该标。
+// 这是「该页确实掉字了吗、掉了几成」的唯一真相来源：Unreliable 据此判断，
+// 不再看「资源表里有没有不可靠字体」——后者会把只列了字体却没真用的页误报整页标红。
+func writeGlyphs(sb *strings.Builder, raw []byte, fonts map[string]*pdfFont, fontName string) (dropped int, shown int) {
 	f := fonts[fontName]
 	if f == nil {
 		f = fonts["/F1"]
@@ -1151,27 +1168,31 @@ func writeGlyphs(sb *strings.Builder, raw []byte, fonts map[string]*pdfFont, fon
 		// 字体未知（没在资源表里）：没有可靠解码手段，按 Latin-1 兜底（数字/英文/标点
 		// 一般 1:1，中文会失真），至少不崩；下游看到非预期字符也能察觉而非空白。
 		sb.Write(raw)
-		return
+		return 0, len(raw)
 	}
 	if f.identity {
 		// 2 字节 CID（Identity-H）：必须有 ToUnicode 才解码，否则吞掉不吐乱码。
+		units := len(raw) / 2
 		if len(f.toUni) == 0 {
-			return
+			return units, units // 整段按 CID 码元计掉字
 		}
+		dropped := 0
 		for i := 0; i+1 < len(raw); i += 2 {
 			code := uint32(binary.BigEndian.Uint16(raw[i:]))
 			if s, ok := f.toUni[code]; ok {
 				sb.WriteString(s)
 			} else {
 				sb.WriteRune(0xFFFD)
+				dropped++
 			}
 		}
-		return
+		return dropped, units
 	}
 	// 1 字节编码（Type3 / 简单字体 / 子集字体都走这）：
 	// 有 ToUnicode 就逐字节查（子集/Type3 自定义编码，原样是乱码——本用户 PDF 就是这个坑）；
 	// 没有 ToUnicode 的标准字体（WinAnsi/Latin-1）才原样即可读。
 	if len(f.toUni) > 0 {
+		dropped := 0
 		for _, b := range raw {
 			if s, ok := f.toUni[uint32(b)]; ok {
 				sb.WriteString(s)
@@ -1179,11 +1200,13 @@ func writeGlyphs(sb *strings.Builder, raw []byte, fonts map[string]*pdfFont, fon
 				sb.WriteByte(b) // 查不到但属 ASCII：数字/标点通常 1:1，照写
 			} else {
 				sb.WriteRune(0xFFFD) // 子集自定义编码里查不到的高字节：替换，绝不污染 UTF-8 流
+				dropped++
 			}
 		}
-		return
+		return dropped, len(raw)
 	}
 	sb.Write(raw) // 标准字体：WinAnsi ≈ Latin-1
+	return 0, len(raw)
 }
 
 // ---- 顶层 ----
@@ -1214,18 +1237,14 @@ func extractPDFText(data []byte, maxPages int) (*pdfReadResult, error) {
 		if ferr != nil {
 			return nil, ferr
 		}
-		// 该页是否有「Identity-H 双字节编码但无 ToUnicode」的字体——这种字体抽出来必是乱码，
-		// 不能 fail-fast 整本（Word 导出的 PDF 普遍如此），只能标这一页不可靠、尽力抽其余。
-		pageHasUnreliable := false
+		// 资源表里是否有 Identity-H 字体（仅用于 res.CID 这个**信息性**标记，
+		// 不影响 Unreliable 判定——判定只看「文本流里实际掉了几个字」）。
 		for _, f := range fonts {
 			if f.name != "" {
 				fontSet[f.name] = true
 			}
 			if f.identity {
 				res.CID = true
-				if len(f.toUni) == 0 {
-					pageHasUnreliable = true
-				}
 			}
 		}
 		var content []byte
@@ -1244,18 +1263,30 @@ func extractPDFText(data []byte, maxPages int) (*pdfReadResult, error) {
 			res.Pages = append(res.Pages, pdfPageText{Page: idx + 1, Text: ""})
 			continue
 		}
-		text, usedFont := extractPageText(content, fonts)
+		text, _, dropped, shown := extractPageText(content, fonts)
+		// 掉字占比：dropped 占 shown 的比例。少数几个字形掉（比如一页几百字里掉两三个）
+		// 不该把整页判不可靠——那会让调用方（尤其是 agent）把已抽出的好文本一并丢弃。
+		// 掉了「过半」才算整页不可靠；少量缺字则保留文本、不标红。
+		ratio := 0.0
+		if shown > 0 {
+			ratio = float64(dropped) / float64(shown)
+		}
+		const unreliableRatio = 0.5
+		isUnreliable := dropped > 0 && (shown == 0 || ratio >= unreliableRatio)
 		if strings.TrimSpace(text) == "" {
-			// 文本全空：要么该页字体都不可靠（usedFont=true），要么纯图片（usedFont=false）。
-			// 两者都不吐乱码——前者计入 Unreliable，后者属于扫描件；交由 allEmpty 分支统一说明。
-			if usedFont || pageHasUnreliable {
+			// 文本全空：要么字体用了却抽不出（dropped>0），要么压根没有文本操作
+			// （纯图片扫描件）。前者标 Unreliable，后者交给 allEmpty
+			// 分支按扫描件说明——两者都不吐乱码。
+			if isUnreliable {
 				res.Unreliable = append(res.Unreliable, idx+1)
 			}
 			res.Pages = append(res.Pages, pdfPageText{Page: idx + 1, Text: ""})
 			continue
 		}
-		if pageHasUnreliable {
-			res.Unreliable = append(res.Unreliable, idx+1) // 部分抽出，但仍有不可靠字体，标注供调用方参考
+		// 抽出了大量可读文本，但本页掉字占比过半 → 标这一页供调用方知悉文本不完整；
+		// 仅少量缺字则不标（保留好文本，agent 可照常总结）。
+		if isUnreliable {
+			res.Unreliable = append(res.Unreliable, idx+1)
 		}
 		res.Pages = append(res.Pages, pdfPageText{Page: idx + 1, Text: text})
 	}

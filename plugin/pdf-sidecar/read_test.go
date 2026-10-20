@@ -56,7 +56,7 @@ func TestExtractPageTextTJSpacingAndLineBreaks(t *testing.T) {
 	// 简单字体：literal string 直接是 Latin-1；TJ 数组里 -300 应变成空格，
 	// Td 的 y 变化应换行。
 	content := []byte("BT /F1 12 Tf 72 720 Td (Hello World) Tj 0 -20 Td [(A) -300 (B)] TJ ET")
-	text, used := extractPageText(content, nil)
+	text, used, _, _ := extractPageText(content, nil)
 	if !used {
 		t.Fatal("有文本操作必须 used=true")
 	}
@@ -223,6 +223,80 @@ func TestReadNonPDFRejected(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "%PDF-") {
 		t.Fatalf("非 PDF 必须报文件头错误，实际 %v", err)
 	}
+}
+
+// TestReadUnreliableFlagOnlyWhenGlyphsDropped：回归测试——Unreliable 只看「文本流里
+// 实际掉了字且占比过半」，不看「资源表里有没有不可靠字体」，也不因「掉了两三个字」
+// 就把整页判不可靠。本用户 PDF 的真实误报：资源表列了一批无 ToUnicode 的 Identity-H
+// 字体且被少量用到，但出字的主体是带 ToUnicode 的 Type3 字体——旧逻辑把 18 页全标红，
+// 新逻辑按占比判定（实测 0 个 U+FFFD、文本完整）不标红。
+func TestReadUnreliableFlagOnlyWhenGlyphsDropped(t *testing.T) {
+	tuF1 := `begincmap
+1 beginbfchar
+<41> <0041>
+endbfchar
+endcmap`
+
+	// 构造一页 PDF：可靠字体 F1（带 ToUnicode）+ 不可靠字体 F2（Identity-H 无 ToUnicode）。
+	mkPDF := func(content string) []byte {
+		var b strings.Builder
+		b.WriteString("%PDF-1.4\n")
+		b.WriteString("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+		b.WriteString("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+		b.WriteString("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] " +
+			"/Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 7 0 R >>\nendobj\n")
+		b.WriteString("4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Reliable /ToUnicode 8 0 R >>\nendobj\n")
+		b.WriteString("5 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H " +
+			"/DescendantFonts [6 0 R] >>\nendobj\n")
+		b.WriteString("6 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X >>\nendobj\n")
+		fmt.Fprintf(&b, "7 0 obj\n<< /Length %d >>\nstream\n%s\nendstream\nendobj\n", len(content), content)
+		fmt.Fprintf(&b, "8 0 obj\n<< /Length %d >>\nstream\n%s\nendstream\nendobj\n", len(tuF1), tuF1)
+		b.WriteString("trailer\n<< /Size 9 /Root 1 0 R >>\n%%EOF\n")
+		return []byte(b.String())
+	}
+
+	// Case 1：文本流只用 F1。期望：抽出文本、Unreliable 为空（不可靠字体没真用）。
+	func() {
+		res, err := extractPDFText(mkPDF("BT /F1 12 Tf 72 720 Td (A) Tj ET"), 10)
+		if err != nil {
+			t.Fatalf("Case1 读失败: %v", err)
+		}
+		if strings.TrimSpace(res.Pages[0].Text) == "" {
+			t.Fatalf("Case1 文本不应为空: %q", res.Pages[0].Text)
+		}
+		if len(res.Unreliable) != 0 {
+			t.Fatalf("Case1 不可靠字体未真用，Unreliable 应为空，实际 %v", res.Unreliable)
+		}
+	}()
+
+	// Case 2：F2 真用但只占少数（F1 出 "Hello"，F2 掉 1 个字）。期望：占比 < 50% → 不标红，
+	// 已抽出的好文本保留，agent 可照常总结（正是用户担心的「别因掉两字废弃好文本」）。
+	func() {
+		res, err := extractPDFText(mkPDF("BT /F1 12 Tf 72 720 Td (Hello) Tj /F2 12 Tf <0001> Tj ET"), 10)
+		if err != nil {
+			t.Fatalf("Case2 读失败: %v", err)
+		}
+		if !strings.Contains(res.Pages[0].Text, "Hello") {
+			t.Fatalf("Case2 应抽出自 Hello，实际 %q", res.Pages[0].Text)
+		}
+		if len(res.Unreliable) != 0 {
+			t.Fatalf("Case2 掉字占比极小，Unreliable 应为空，实际 %v", res.Unreliable)
+		}
+	}()
+
+	// Case 3：F2 占多数（掉 4 个字），F1 只出 "Hi"。期望：占比 >= 50% → 标红该页。
+	func() {
+		res, err := extractPDFText(mkPDF("BT /F2 12 Tf 72 720 Td <0001000200030004> Tj /F1 12 Tf (Hi) Tj ET"), 10)
+		if err != nil {
+			t.Fatalf("Case3 读失败: %v", err)
+		}
+		if !strings.Contains(res.Pages[0].Text, "Hi") {
+			t.Fatalf("Case3 应抽出自 Hi，实际 %q", res.Pages[0].Text)
+		}
+		if len(res.Unreliable) != 1 || res.Unreliable[0] != 1 {
+			t.Fatalf("Case3 掉字占比过半，Unreliable 应为 [1]，实际 %v", res.Unreliable)
+		}
+	}()
 }
 
 // TestReadScannedPageNoText：图片型 PDF（无文本流）——说清楚是扫描件，

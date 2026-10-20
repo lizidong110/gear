@@ -110,7 +110,7 @@ func (s *service) handleRead(w http.ResponseWriter, r *http.Request) {
 		if note != "" {
 			note += "；"
 		}
-		note += fmt.Sprintf("第 %s 页含无 ToUnicode 的字体（CID 落不到 Unicode），对应字符已留空、其余文本已正常提取——如需补全可走 OCR 或问用户要文本", unrel)
+		note += fmt.Sprintf("第 %s 页有少量字形因无 ToUnicode（CID 落不到 Unicode）无法解码、已用占位符替换；其余文本已正常提取——如需补全可走 OCR 或问用户要文本", unrel)
 	}
 	writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
 		"path":       target,
