@@ -1,13 +1,17 @@
-// Command pdf-sidecar 是 ext.pdf 的常驻侧车（service ext）：把正文写成 A4 的 PDF。
+// Command pdf-sidecar 是 ext.pdf 的常驻侧车（service ext）：把正文写成 A4 的 PDF，
+// 也能把 PDF 的文本读出来。
 //
-// 四条口径（PRD §4.5）：
-//  1. **零第三方依赖**：PDF 语法与 TrueType 子集全部手写，go.mod / go.sum 一字不变
-//     （AC-E4-4 可机械验证）。
+// 五条口径（PRD §4.5）：
+//  1. **零第三方依赖**：PDF 语法、TrueType 子集与 PDF 解析全部手写，go.mod / go.sum
+//     一字不变（AC-E4-4 可机械验证）。
 //  2. **CJK 靠运行时读系统 TTF + 按字子集嵌入**（2026-09-29 拍板，胜出理由是
 //     零捆绑 + 覆盖跟系统字体走）：不把 10MB 字体塞进仓库，也不把 PDF 撑成 10MB。
 //     代价是 `font.go` 里那段手写子集化——PRD §4.5 风险登记的就是它。
 //  3. **文本超出一页即报错**，不偷偷补页：pages 是调用方给的，它对自己会拿到几页有预期。
 //  4. **确定性输出**：不写时间戳。同样的输入必须得到同样的字节，归档时可比对哈希。
+//  5. **读面（read.go）不静默吐乱码**：加密 PDF、Type0 无 ToUnicode、扫描件，
+//     三种「读不出真文本」的情形全部明确报错——调用方（尤其是 agent）拿到错误
+//     能换路线，拿到乱码只会照着胡说。
 //
 // 环境变量：COORD_ADDR（默认 127.0.0.1:8101），由引擎按 extensions.yaml 注入。
 package main
@@ -44,13 +48,78 @@ type service struct{}
 func (s *service) Handlers() map[string]http.HandlerFunc {
 	return map[string]http.HandlerFunc{
 		"/write": s.handleWrite,
+		"/read":  s.handleRead,
 		"/caps":  s.handleCaps,
 	}
 }
 
 func (s *service) handleCaps(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
-		"methods": []string{"write"},
+		"methods": []string{"write", "read"},
+	}})
+}
+
+// ---- read ----
+
+const defaultMaxPages = 100 // 一次最多抽 100 页：巨 PDF 的护栏，超出在 note 里说明
+
+func (s *service) handleRead(w http.ResponseWriter, r *http.Request) {
+	args, err := decodeArgs(r)
+	if err != nil {
+		writeErr(w, errBadRequest, "请求体不是合法 JSON: %v", err)
+		return
+	}
+	path := strArg(args, "path")
+	if path == "" {
+		writeErr(w, errMissingPath, "path 必填（相对 root 的文件名，如 docs/讲义.pdf）")
+		return
+	}
+	root := strArg(args, "root")
+	if root == "" {
+		root, err = os.Getwd()
+		if err != nil {
+			writeErr(w, errIOFailed, "取不到进程工作目录: %v", err)
+			return
+		}
+	}
+	target, err := outpath.Resolve(root, path)
+	if err != nil {
+		writeErr(w, errPathEscape, "%s", err.Error())
+		return
+	}
+	if err := outpath.RejectFinalSymlink(target); err != nil {
+		writeErr(w, errPathEscape, "%s", err.Error())
+		return
+	}
+	maxPages := defaultMaxPages
+	if v, ok := args["max_pages"].(float64); ok && int(v) > 0 {
+		maxPages = int(v)
+	}
+
+	res, err := readPDFFile(target, maxPages)
+	if err != nil {
+		writeErr(w, errBadPDF, "读 %s 失败: %v", path, err)
+		return
+	}
+	note := ""
+	if len(res.Pages) >= maxPages {
+		note = fmt.Sprintf("只抽了前 %d 页（max_pages 上限）；后续页未处理", maxPages)
+	}
+	if len(res.Unreliable) > 0 {
+		unrel := strings.Trim(strings.Replace(fmt.Sprint(res.Unreliable), " ", ",", -1), "[]")
+		if note != "" {
+			note += "；"
+		}
+		note += fmt.Sprintf("第 %s 页含无 ToUnicode 的字体（CID 落不到 Unicode），对应字符已留空、其余文本已正常提取——如需补全可走 OCR 或问用户要文本", unrel)
+	}
+	writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
+		"path":       target,
+		"page_count": len(res.Pages),
+		"pages":      res.Pages,
+		"fonts":      res.Fonts,
+		"cid":        res.CID,
+		"unreliable": res.Unreliable,
+		"note":       note,
 	}})
 }
 

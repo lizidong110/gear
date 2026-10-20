@@ -242,7 +242,7 @@ type Hook struct {
 - `ai gen flow` / `ai gen tool`：`--intent` / 位置参数、`--register`（自动落库）
 - `ai capabilities`：打印当前能力目录（内核原语 + 已注册 `ext.*`）。内核原语分两类：**受门禁的 builtin 7 个**（http/call/db/secret/event/subscribe/config，需在 Tool 里声明 `capabilities`）+ **始终可用的 pure 5 个**（time/template/crypto/id/validate，无需声明）。目录由代码单一来源渲染（`allBuiltinPrimitives` + `capabilityCatalog`），不再各写一份字面量清单。每个方法另带 **`invoke_form`** 与 **`lua_call`** 两个派生字段，直接告诉你 Lua 侧怎么调（判据唯一实现在 `internal/engine/invokeform.go`，与 `lua.go` 的绑定一一对应）——位置参数（`ctx.http.Request(a,b,c)`）/ 单具名 table（`ctx.db.query({sql=…})`）/ 裸函数（`ctx.call(target, input)`，**没有 `.Call`**）三种，别凭印象猜
 - `ai react "任务"`：跑一个 ReAct 循环（每步思考→调工具→看结果，直到 Final Answer）。`--max-steps`（默认 6）/ `--allow`（限制可用能力：能力名如 `http,secret`，或方法名如 `ext.redis.set`）/ `--allow-all`（不设限开放整个能力目录）/ `--mode meta`（元工具模式：工具面恒定 4 个、按需检索，规模无关）。等价于在 Tool 的 entry 里调 `ctx.ext.ai.react({ task = "..." })`（同款 `mode` 字段）——**用它打造自己的 agent 是最短路径**
-- `ai rewoo "任务"`：跑一个 REWOO 循环（planner 出依赖图 DAG → worker 按拓扑层**并行**执行、0 LLM、单点失败 fail-soft → solver 一次 LLM 汇总）。`--max-nodes`（默认 20）/ `--replan-budget`（默认 1，**0 = 关闭重规划**）/ `--max-parallel`（默认 4）/ `--allow` / `--allow-all` / `--temperature`。LLM 调用**有界**：顺利 3 次、最坏 2+2×replan_budget+1（默认 5 次；planner/replanner 各带一次校验失败才烧的修正）。**节点的 action 两类都吃**：「能力.方法」（`http.Request`/`db.query`…，走 `ctx.*` 沙箱通道）或**已注册 Tool/Flow id**（经 `ctx.call` 原语）——用户自建 agent 的调用对象可以是原生能力，也可以是自己定义的 tool。节点间用 `{{#E}}` 引用上游产出（整值保留类型、嵌串转文本、支持字段路径 `{{#E2.src}}`，HTTP 信封可钻透到 body 字段）。返回 `{answer, plan, evidence, node_outcomes, gaps, recovery_log}`——plan 是数据，可存可 diff 可人工审。**多源调研 / 大批量同构 / 跨系统对账 / 成本敏感的定时任务**用它；单步或强交互任务走 react（选型表与反例见 `internal/mcp/guide/ai.md` §2.7）
+- `ai rewoo "任务"`：跑一个 REWOO 循环（planner 出依赖图 DAG → worker 按拓扑层**并行**执行、0 LLM、单点失败 fail-soft → solver 一次 LLM 汇总）。`--max-nodes`（默认 20）/ `--replan-budget`（默认 1，**0 = 关闭重规划**）/ `--max-parallel`（默认 4）/ `--wall-clock`（总墙钟秒数，默认 300；慢模型/重任务调大——耗尽时 planner 阶段报明确错误、solver 阶段带部分结果返回）/ `--allow` / `--allow-all` / `--temperature`。⚠ flag 前必须带 `--`（`allow-all` 漏破折号会被当位置参数，命令会检测并报错）。LLM 调用**有界**：顺利 3 次、最坏 2+2×replan_budget+1（默认 5 次；planner/replanner 各带一次校验失败才烧的修正）。**节点的 action 两类都吃**：「能力.方法」（`http.Request`/`db.query`…，走 `ctx.*` 沙箱通道）或**已注册 Tool/Flow id**（经 `ctx.call` 原语）——用户自建 agent 的调用对象可以是原生能力，也可以是自己定义的 tool。节点间用 `{{#E}}` 引用上游产出（整值保留类型、嵌串转文本、支持字段路径 `{{#E2.src}}`，HTTP 信封可钻透到 body 字段）。返回 `{answer, plan, evidence, node_outcomes, gaps, recovery_log}`——plan 是数据，可存可 diff 可人工审。**多源调研 / 大批量同构 / 跨系统对账 / 成本敏感的定时任务**用它；单步或强交互任务走 react（选型表与反例见 `internal/mcp/guide/ai.md` §2.7）
 - `ai complete "prompt"`：单轮补全（无记忆、无工具）。仅做「一次问答」时用，多步任务请走 `ai react`
   > **react 走原生 function calling**：工具声明由能力目录自动生成并随请求下发（`ToolSpec`），模型用 `tool_calls` 回调用意图，引擎不再从自由文本里抠 JSON 围栏。工具名里的「.」会被压成「_」（`http.Request` → `http_Request`，OpenAI 的 function name 字符集所限）。
   > **`ai react` 会先灌入持久 registry 的目录**（与 `ai gen` 同一手法）：agent 看得到真实的 Tool/Flow 定义，写操作仍隔离在内存库里。库里若有声明了不存在原语的过期定义，会被跳过并在 stderr 点名（不会让整个命令失败）。
@@ -574,6 +574,16 @@ ctx.ext.excel.write({path, sheets:[{name, rows:[[cell]]}], root?}) → {path, si
 ```
 ctx.ext.pdf.write({path, pages:[{text}], root?}) → {path, size}
 ```
+
+另提供 `read`（2026-10-20 补上，闭环「agent 总结 PDF 不再猜」——此前 planner 在能力面只看到 write、只能赌 `ext.pdf` 能读，结果选错方向）：
+
+```
+ctx.ext.pdf.read({path, root?, max_pages?}) → {path, page_count, pages:[{page, text}], fonts, cid, note}
+```
+
+`read` 同样零第三方依赖——**手写 PDF 解析器**（go.mod 一字不变）：对象扫描不信任 xref（增量更新/xref 偏移脱节的 PDF 用「扫 `N 0 obj`」照样成立）、展开 ObjStm 对象流；内容流词法（`Tj`/`TJ`/`'`/`"`）+ 行结构启发；字体层覆盖简单字体（`WinAnsi`/`StandardEncoding` 原样即可读）+ **子集/Type3 字体（自定义 1 字节编码，必须走 ToUnicode 还原——真实 PDF 里中文就藏在这种字体里，原样写字节会整页乱码，已修）** + Type0/CIDFontType2（`Identity-H` 双字节码 + ToUnicode CMap 的 `bfchar`/`bfrange`，UTF-16 码元按 4 hex 解；未压缩 ToUnicode 也兜底）；FlateDecode 解压（zlib + raw deflate 双试）。
+
+**三类「读不出真文本」明确报错、绝不吐乱码**——加密 PDF（`/Encrypt`）、Type0 无 ToUnicode（CID 落空）、扫描件（解出文本为空且未用任何字体）：agent 拿到结构化错误能换路线（例如先 OCR 或问用户要文本），拿到乱码只会照着胡说。`max_pages` 默认 100（超出截断并在 `note` 说明），文件大小护栏默认 50MB 超出拒绝。
 
 口径（PRD §4.5 + §6 Q6 字体方案）：
 

@@ -190,6 +190,13 @@ return { answer = r.answer }
 
 CLI 等价：`gear ai rewoo "调研三家供应商的报价并对比" --max-parallel 4`。
 
+Lua 侧可传 `wall_clock`（总墙钟秒数，默认 300）；CLI 对应 `--wall-clock`。慢模型或重任务
+（LLM 要跑满 4~5 次的路径）调大它——墙钟耗尽时 planner 阶段报明确错误，solver 阶段则带
+部分结果（计划 + 节点结局 + 缺口）返回，不把整轮执行埋掉。
+
+⚠ CLI 的 flag 前必须带 `--`：`gear ai rewoo allow-all "任务"`（漏破折号）会被 cobra 当成
+位置参数静默吃进 task——命令会检测这种写法并报错指出来。
+
 LLM 调用**有界**：顺利路径 3 次（planner + solver，无失败不重规划），含一次重规划 4 次；
 planner/replanner 各带一次「校验失败才烧」的修正，最坏上限 = 2 + 2×replan_budget + 1
 （默认配置 5 次）。对比 react 的每步一次，这是成本可控承诺的机械保障。

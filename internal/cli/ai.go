@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -71,6 +72,7 @@ func aiCmd() *cobra.Command {
 	rewooC.Flags().Int("max-nodes", 20, "DAG 节点数上限（超出报错不截断）")
 	rewooC.Flags().Int("replan-budget", 1, "失败子图重规划的 LLM 调用上限（0 = 关闭重规划，失败直接落缺口）")
 	rewooC.Flags().Int("max-parallel", 4, "层内并行度")
+	rewooC.Flags().Int("wall-clock", 300, "总墙钟秒数（默认 300；慢模型或重任务可调大，0 = 用默认）")
 	rewooC.Flags().StringSlice("allow", nil, "限制可调对象：能力名（http,secret）、「能力.方法」（ext.redis.set）或已注册工具/Flow id；默认一组通用能力 + 全部已注册工具")
 	rewooC.Flags().Bool("allow-all", false, "不设限地开放整个能力目录。慎用：能力越多模型越选不准")
 	rewooC.Flags().String("model", "", "模型名（可选，缺省读 GEAR_AI_MODEL）")
@@ -87,6 +89,9 @@ func runAIReact(cmd *cobra.Command, args []string) error {
 	task := strings.Join(args, " ")
 	if strings.TrimSpace(task) == "" {
 		return fmt.Errorf("请提供任务描述：gear ai react \"...\"")
+	}
+	if err := dashFlagTypo(cmd, args); err != nil {
+		return err
 	}
 	// 1) 持久 registry（只读用途：取真实工具目录给 agent 看）。
 	//
@@ -179,6 +184,9 @@ func runAIRewoo(cmd *cobra.Command, args []string) error {
 	if strings.TrimSpace(task) == "" {
 		return fmt.Errorf("请提供任务描述：gear ai rewoo \"...\"")
 	}
+	if err := dashFlagTypo(cmd, args); err != nil {
+		return err
+	}
 	// 1) 持久 registry（只读用途：取真实工具目录给 planner 看）。同 runAIReact 的理由。
 	persist, err := openRegistry()
 	if err != nil {
@@ -210,6 +218,9 @@ func runAIRewoo(cmd *cobra.Command, args []string) error {
 	opts.MaxNodes, _ = cmd.Flags().GetInt("max-nodes")
 	opts.ReplanBudget, _ = cmd.Flags().GetInt("replan-budget")
 	opts.MaxParallel, _ = cmd.Flags().GetInt("max-parallel")
+	if wc, _ := cmd.Flags().GetInt("wall-clock"); wc > 0 {
+		opts.WallClock = time.Duration(wc) * time.Second
+	}
 	allow, _ := cmd.Flags().GetStringSlice("allow")
 	allowAll, _ := cmd.Flags().GetBool("allow-all")
 	if allowAll && len(allow) > 0 {
@@ -308,6 +319,24 @@ func renderRewooResult(res interface{}) string {
 		}
 	}
 	return sb.String()
+}
+
+// dashFlagTypo 检测「带连字符的 flag 漏写 -- 被 cobra 当成位置参数」。
+//
+// 2026-10-20 用户真实事故：`gear ai rewoo allow-all '任务'` 跑成了 task="allow-all 任务"、
+// allow 什么都没开——静默跑偏比报错贵得多。收窄到带连字符的 flag 名（allow-all /
+// max-nodes / base-url…）：任务几乎不可能以这类词开头，而单词 flag（model/temperature）
+// 真有可能是任务开头，不拦。
+func dashFlagTypo(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 || !strings.Contains(args[0], "-") {
+		return nil
+	}
+	first := args[0]
+	if cmd.Flags().Lookup(first) != nil {
+		return fmt.Errorf("第一个参数 %q 是本命令的 flag 名：flag 前要加 --（如 --%s）。"+
+			"若任务确实以该词开头，用 -- 分隔：gear ai rewoo -- %q …（本次未执行）", first, first, first)
+	}
+	return nil
 }
 
 // renderReactResult 把 React 返回 {answer,steps,used_tools} 渲染成可读文本。

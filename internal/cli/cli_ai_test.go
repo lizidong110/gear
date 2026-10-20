@@ -3,6 +3,8 @@ package cli
 import (
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 // 本文件覆盖 `gear ai` 子命令（ai.go）——此前整文件只有 seedRefRegistry 一个用例，
@@ -179,6 +181,74 @@ func TestAIRewooRunsWithMockProvider(t *testing.T) {
 		"--temperature", "0.5", "任务2"); err != nil {
 		t.Fatalf("带全参数的 rewoo 失败: %v", err)
 	}
+}
+
+// TestAIRewooFlagTypoRejected 锁死「flag 漏 -- 被当位置参数」的防护。
+// 2026-10-20 用户真实事故：`gear ai rewoo allow-all '任务'` 静默跑成 task="allow-all 任务"、
+// allow 什么都没开。报错指出来比照跑便宜——这是防静默跑偏，不是防手滑。
+func TestAIRewooFlagTypoRejected(t *testing.T) {
+	err := runCLI(t, "ai", "rewoo", "allow-all", "帮我总结 PDF")
+	if err == nil || !strings.Contains(err.Error(), "--allow-all") {
+		t.Fatalf("allow-all 漏 -- 必须报错提示，实际 %v", err)
+	}
+	// react 同坑同防
+	if err := runCLI(t, "ai", "react", "max-steps", "3", "任务"); err == nil ||
+		!strings.Contains(err.Error(), "--max-steps") {
+		t.Fatalf("react 的 flag 漏 -- 也必须报错，实际 %v", err)
+	}
+}
+
+func TestDashFlagTypo(t *testing.T) {
+	// helper 在 RunE 里收到的是**子命令**（flag 注册在它身上），测试也必须传子命令
+	var cmd *cobra.Command
+	for _, sub := range aiCmd().Commands() {
+		if strings.HasPrefix(sub.Use, "rewoo") {
+			cmd = sub
+		}
+	}
+	if cmd == nil {
+		t.Fatal("aiCmd 下找不到 rewoo 子命令")
+	}
+	// 带连字符的 flag 名：拦（用户真实踩的坑）
+	if err := dashFlagTypo(cmd, []string{"allow-all", "任务"}); err == nil ||
+		!strings.Contains(err.Error(), "--allow-all") {
+		t.Fatalf("allow-all 漏 -- 必须报错，实际 %v", err)
+	}
+	// 单词 flag 名不拦：任务真可能以 model/temperature 这类词开头
+	if err := dashFlagTypo(cmd, []string{"model", "是什么意思"}); err != nil {
+		t.Fatalf("单词参数不应被误伤，实际 %v", err)
+	}
+	// 带连字符但非 flag 名：不拦
+	if err := dashFlagTypo(cmd, []string{"re-plan", "一下"}); err != nil {
+		t.Fatalf("非 flag 的连字符词不应被误伤，实际 %v", err)
+	}
+	// -- 分隔后整个任务是一个 token：不拦
+	if err := dashFlagTypo(cmd, []string{"allow-all 帮我总结"}); err != nil {
+		t.Fatalf("-- 后的整句任务不应被误伤，实际 %v", err)
+	}
+	// 无参数：不拦
+	if err := dashFlagTypo(cmd, nil); err != nil {
+		t.Fatalf("无参数不应报错，实际 %v", err)
+	}
+}
+
+// TestAIRewooWallClockFlagRegistered 锁死墙钟 flag 的接线。2026-10-20 实测：重任务路径
+// LLM 要跑 4~5 次（planner 1 + replanner 2 + solver 1，共 159s），默认 5 分钟墙钟在稍慢的
+// 端点/模型下就被砍——而 CLI 原先没有任何 flag 能放宽，用户只能干等超时。
+func TestAIRewooWallClockFlagRegistered(t *testing.T) {
+	for _, sub := range aiCmd().Commands() {
+		if strings.HasPrefix(sub.Use, "rewoo") {
+			f := sub.Flags().Lookup("wall-clock")
+			if f == nil {
+				t.Fatal("rewoo 必须注册 --wall-clock：重任务/慢模型下用户唯一能放宽墙钟的口子")
+			}
+			if f.DefValue != "300" {
+				t.Fatalf("--wall-clock 默认应为 300 秒，实际 %q", f.DefValue)
+			}
+			return
+		}
+	}
+	t.Fatal("aiCmd 下找不到 rewoo 子命令")
 }
 
 // TestRenderRewooResult 覆盖 rewoo 的结果渲染：计划快照 / 节点结局 / 恢复流水 / 缺口

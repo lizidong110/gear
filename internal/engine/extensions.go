@@ -520,6 +520,7 @@ func defaultAISchemas() map[string]MethodSchema {
 			"task":          {Type: "string", Description: "任务描述", Required: true},
 			"max_nodes":     {Type: "number", Description: "DAG 节点数上限（可选，默认 20）"},
 			"replan_budget": {Type: "number", Description: "失败子图重规划次数上限（可选，默认 1；0 = 关闭重规划，失败节点直接落缺口作答）"},
+			"wall_clock":    {Type: "number", Description: "总墙钟秒数（可选，默认 300；慢模型或重任务调大。墙钟耗尽时 planner 报明确错误、solver 阶段则带部分结果返回）"},
 			"allow":         {Type: "array", Description: "限制可调对象（可选）：能力名 / 「能力.方法」/ 已注册工具或 Flow 的 id（工具项要求本 Tool 声明 call 能力）；不给则用默认能力集 + 全部已注册工具；给 \"*\" 表示不设限"},
 			"provider":      {Type: "string", Description: "模型厂商（可选；缺省回退 env GEAR_AI_PROVIDER，再回退内置默认 siliconflow）"},
 			"model":         {Type: "string", Description: "模型名（可选；缺省回退 env GEAR_AI_MODEL，再回退厂商默认）"},

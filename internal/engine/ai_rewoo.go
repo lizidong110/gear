@@ -19,6 +19,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -563,6 +564,13 @@ func (a *AIAgent) rewooUserToolText(al *rewooAllow) string {
 			return
 		}
 		n++
+		// 空描述的工具对模型是黑盒：它只能按 id 猜用途。2026-10-20 实测 ext.pdf
+		// （name/description 全空）被 planner 选中去「提取 PDF」，而它其实只会
+		// 写 PDF——猜错方向一半责任在目录没说话。显式标注，让模型知道这是
+		// 无信息项，也提醒用户去补定义。
+		if strings.TrimSpace(desc) == "" {
+			desc = "（注册时未写描述，用途未知，谨慎选用）"
+		}
 		fmt.Fprintf(&b, "- %s：%s（input: %s）\n", id, desc, rewooInputBrief(in))
 	}
 	if tools, err := a.reg.ListTools(); err == nil {
@@ -1062,11 +1070,13 @@ func (a *AIAgent) rewooReplanPrompt(task string, p *rewooPlan, scope map[string]
 		evMu.Unlock()
 		fmt.Fprintf(&b, "- %s → %s\n", k, truncateObservation(stableJSON(v), 600))
 	}
-	b.WriteString("\n【输出契约】同 planner：只输出 JSON {\"steps\":[...]}。规则：\n")
-	b.WriteString("1. 冻结契约里的 id 必须全部出现（产出形态保持一致）；\n")
-	b.WriteString("2. 内部节点可增删重构，但新 id 不得与已成功节点冲突；\n")
-	b.WriteString("3. 引用可复用的产出时，同样要列进 depends_on；\n")
+	b.WriteString("\n【输出契约】只输出 JSON {\"steps\":[...]}。**只输出需要重新规划的节点**（即上面【当前子图定义】列出的那些），已成功节点不要输出。规则：\n")
+	b.WriteString("1. id 一律以 \"#E\" 开头跟数字（#E1、#E2…）；#S1、#N1、step1、E1 等写法均非法；\n")
+	b.WriteString("2. 冻结契约里的 id 必须原样沿用；其余新节点从当前计划最大编号之后继续（已有 #E1~#E3 就用 #E4、#E5），**不要从 #E1 重新数**；\n")
+	b.WriteString("3. 引用可复用的产出（含已成功节点）时，同样要列进 depends_on；\n")
 	b.WriteString("4. 同一堵墙（同一个失败原因）不要原样再撞——换工具、换参数或明确放弃该数据。\n")
+	b.WriteString("正例（【当前子图定义】含失败的 #E2 与 #E3，#E1 已成功故不出现）：\n")
+	b.WriteString(`{"steps":[{"id":"#E2","action":"template.render","args":{"text":"改用文字说明"},"depends_on":["#E1"]},{"id":"#E3","action":"http.Request","args":{"url":"https://example.com"},"depends_on":["#E2"]}]}` + "\n")
 	return b.String()
 }
 
@@ -1248,7 +1258,9 @@ func (a *AIAgent) Rewoo(ctx context.Context, task string, opts RewooOpts) (inter
 
 	plan, err := a.rewooPlanner(ctx, task, al, opts, board)
 	if err != nil {
-		return nil, err
+		// planner 阶段还没有计划可展示，只能报错——但「context deadline exceeded」本身
+		// 不说是谁的 deadline、能不能调、该查什么。墙钟耗尽必须落到可行动文案上。
+		return nil, rewooCtxNote(err, ctx, opts.WallClock, "planner")
 	}
 	ev := map[string]interface{}{}
 	var evMu sync.Mutex
@@ -1290,7 +1302,19 @@ func (a *AIAgent) Rewoo(ctx context.Context, task string, opts RewooOpts) (inter
 	}
 	answer, err := a.rewooSolver(ctx, task, plan, board, opts, ev, &evMu)
 	if err != nil {
-		return nil, err
+		if ctx.Err() != nil && errors.Is(err, context.DeadlineExceeded) {
+			// 墙钟砍在 solver：计划、节点结局、证据、缺口都已就绪——**带部分结果作答**，
+			// 不把整轮执行的上下文丢干净（fail-soft 的同一精神：失败也要留下证据）。
+			// 直接 return error 的话，用户看到一句「context deadline exceeded」，
+			// 完全不知道计划跑到哪、哪些节点成了、该调什么——那是把 5 分钟埋掉。
+			board.recordRecovery(fmt.Sprintf("墙钟耗尽于 solver 阶段（总墙钟 %s），以下为部分结果", opts.WallClock))
+			board.addGap(reactFailure{Class: FailUnrecoverable, Action: "solver",
+				GapKey: "solver", Reason: err.Error(), Scope: "run"})
+			answer = "REWOO 总墙钟已用尽：执行阶段已跑完但汇总未得出。下面附各节点结局与缺口；" +
+				"慢模型或重任务可调大 wall_clock（CLI --wall-clock 秒数）后重试。"
+			return rewooResult(plan, board, ev, &evMu, answer), nil
+		}
+		return nil, rewooCtxNote(err, ctx, opts.WallClock, "solver")
 	}
 	return rewooResult(plan, board, ev, &evMu, answer), nil
 }
@@ -1329,6 +1353,25 @@ func rewooResult(p *rewooPlan, board *reactBoard, ev map[string]interface{}, evM
 	}
 }
 
+// rewooCtxNote 把「墙钟耗尽」类错误改写成可行动的文案。
+//
+// 用户原话级别的痛点：跑 5 分钟后只看到 "context deadline exceeded"——不知道是谁的
+// deadline、能不能调、该查什么。2026-10-20 实测：重任务路径 LLM 要跑 4~5 次（planner 1 +
+// replanner 2 + solver 1），默认墙钟 5 分钟在稍慢的端点/模型下就会被砍，而 CLI 原先没有
+// 任何 flag 能放宽。文案必须同时给出：① 这是总墙钟 ② 怎么调 ③ 最可能的两个原因
+// （模型慢 / 端点不可达都会等满整个墙钟）。
+func rewooCtxNote(err error, ctx context.Context, wall time.Duration, phase string) error {
+	if err == nil || ctx.Err() == nil {
+		return err
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return fmt.Errorf("REWOO 总墙钟（%s）在 %s 阶段用尽：%w。"+
+		"慢模型或重任务可用 wall_clock 参数（CLI --wall-clock 秒数）放宽；"+
+		"LLM 端点不可达或响应过慢时会等满整个墙钟——先检查 network / base_url / api_key", wall, phase, err)
+}
+
 // RewooMethod 暴露给 Lua ctx.ext.ai.rewoo：解析参数后跑 Rewoo。
 // allow 子集校验与 react 同构：能力项必须是调用方声明的子集；工具 id 项要求调用方声明过
 // call 能力——ctx.call 是插件间唯一通信通道，工具节点的门籍就在那里。
@@ -1343,6 +1386,9 @@ func (a *AIAgent) RewooMethod(args map[string]interface{}, callerCaps ...string)
 	}
 	if v, ok := toFloat(args["replan_budget"]); ok && int(v) >= 0 {
 		opts.ReplanBudget = int(v)
+	}
+	if v, ok := toFloat(args["wall_clock"]); ok && v > 0 {
+		opts.WallClock = time.Duration(v) * time.Second
 	}
 	explicit := toStringSlice(args["allow"])
 	if len(explicit) > 0 && len(callerCaps) > 0 {

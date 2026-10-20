@@ -425,6 +425,14 @@ func TestRewooReplanPromptListsAvailableCalls(t *testing.T) {
 	if !strings.Contains(prompt, "已注册工具") {
 		t.Fatalf("replanner 提示词必须带已注册工具段（用户自建 agent 的第二个调用对象来源），实际:\n%s", prompt)
 	}
+	// 2026-10-20 实测：模型两轮输出 #S1/#N1 都被校验拒——规则文字没有正例、没说编号
+	// 怎么延续，模型按 planner 的「从 #E1 起」惯性重头数。非法前缀清单、编号延续规则与
+	// JSON 正例必须锁在提示词里。
+	for _, want := range []string{"均非法", "不要从 #E1 重新数", "\"steps\":"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("replanner 提示词必须含 %q（正例/编号延续规则），实际:\n%s", want, prompt)
+		}
+	}
 }
 
 // ---- ③ replanner 与全链 ----
@@ -629,6 +637,35 @@ func TestRewooMethodMissingTaskIsRejected(t *testing.T) {
 	a, _ := newRewooAgent(t, &scriptedLLM{})
 	if _, err := a.Rewoo(context.Background(), "", RewooOpts{}); err == nil {
 		t.Fatal("空 task 应报错")
+	}
+}
+
+// TestRewooCtxNoteRewritesDeadline 锁死墙钟耗尽的文案口径。
+// 2026-10-20 用户实战：跑 5 分钟只看到 "context deadline exceeded"——不知道是谁的
+// deadline、能不能调、该查什么。改写必须同时给出三件事：总墙钟、怎么调、最可能的原因。
+func TestRewooCtxNoteRewritesDeadline(t *testing.T) {
+	dead, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-dead.Done()
+	live := context.Background()
+	plain := fmt.Errorf("llm: %w", context.DeadlineExceeded)
+
+	got := rewooCtxNote(plain, dead, 5*time.Minute, "planner")
+	if got == nil || !errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("墙钟耗尽必须仍可被 errors.Is 识别，实际 %v", got)
+	}
+	for _, want := range []string{"总墙钟", "planner", "wall_clock", "network"} {
+		if !strings.Contains(got.Error(), want) {
+			t.Fatalf("墙钟文案必须含 %q，实际 %q", want, got.Error())
+		}
+	}
+	// ctx 没超时（LLM 自身超时/网络错）：原样返回，不偷改成墙钟口径
+	if other := rewooCtxNote(plain, live, 5*time.Minute, "planner"); other == nil || other.Error() != plain.Error() {
+		t.Fatalf("非墙钟错误必须原样返回，实际 %v", other)
+	}
+	// nil 错误不过手
+	if rewooCtxNote(nil, dead, 5*time.Minute, "planner") != nil {
+		t.Fatal("nil 错误应原样返回 nil")
 	}
 }
 

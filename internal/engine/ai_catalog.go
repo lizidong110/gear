@@ -385,7 +385,7 @@ var capabilityKeywords = map[string][]string{
 	"ext.sms":       {"短信", "验证码", "通知"},
 	"ext.webhook":   {"webhook", "回调", "钩子"},
 	"ext.wecom":     {"企业微信", "机器人", "群通知"},
-	"ext.pdf":       {"pdf", "文档", "导出"},
+	"ext.pdf":       {"pdf", "文档", "导出", "读取", "提取文本", "总结"},
 	"ext.excel":     {"excel", "表格", "导出"},
 	"ext.oidc":      {"oidc", "单点登录", "身份认证"},
 	"ext.serve":     {"服务", "http 服务", "监听端口"},
