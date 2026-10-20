@@ -1,0 +1,59 @@
+# 演示 Tool：一次调用走通 ext.pdf.read（PDF 文本提取，零依赖手写解析）。
+#
+# 存在意义同 mongo_demo.yaml：verify 若只直连侧车 HTTP 端点，只证明「侧车二进制写对了」，
+# 证明不了「能力接进引擎了」。本样例经 `gear tool register` + `gear tool run` 走内核的
+# 门禁与能力目录，补上「ctx.ext.pdf.read 真的存在、应用里真能调」这一层证据。
+#
+# 注册：gear tool register -   （stdin 喂本文件）
+# 运行：gear tool run pdf.read.demo --input '{"path":"xxx.pdf","root":"D:/some/dir"}'
+#
+# 注：capabilities 声明 [ext.pdf] —— service ext。**侧车由内核在能力调用路径自动拉起**
+#     （2026-10-20 REQ-EXT-CALL-AUTOSTART）：首次调用前无人监听则本 gear 当 owner 经
+#     processRuntime 拉起，用户/agent 不需要先手工起 sidecar；同主机多 gear 共享单实例。
+#     path 是相对 root 的文件名（outpath 只收相对路径），root 是产物/读取根目录。
+id: pdf.read.demo
+name: PDF 文本提取往返（ext.pdf.read）
+runtime: lua
+capabilities: [ext.pdf]
+input_schema:
+  type: object
+  properties:
+    path: {type: string, description: "相对 root 的文件名（如 2026下半年-系统架构师-论述题-必备知识点.pdf）"}
+    root: {type: string, description: "读取根目录（PDF 必须落在其内，越界即拒）"}
+    max_pages: {type: number, description: "最多读取页数（默认 100）"}
+  required: [path]
+output_schema:
+  type: object
+  properties:
+    page_count: {type: number, description: "PDF 总页数"}
+    pages_read: {type: number, description: "实际返回的页数"}
+    head: {type: string, description: "第 1 页文本前 120 字（人读校验）"}
+    chars: {type: number, description: "全部返回文本的总字符数"}
+    cid: {type: boolean, description: "是否含 CID 字体"}
+    unreliable: {type: string, description: "掉字占比过半的页码列表（逗号分隔；空=没有）"}
+    note: {type: string, description: "侧车给的说明（截断/不可靠页等）"}
+    error: {type: string, description: "出错时的原因（正常路径不出现）"}
+versions:
+  - version: 1.0.0
+    state: stable
+entry: |
+  local out = {}
+  local ok, r = pcall(function()
+    local res = ctx.ext.pdf.read({
+      path = ctx.input.path,
+      root = ctx.input.root,
+      max_pages = ctx.input.max_pages,
+    })
+    out.page_count = res.page_count
+    out.pages_read = #res.pages
+    local first = (res.pages[1] and res.pages[1].text) or ""
+    out.head = string.sub(first, 1, 120)
+    local n = 0
+    for _, p in ipairs(res.pages) do n = n + string.len(p.text) end
+    out.chars = n
+    out.cid = res.cid
+    out.unreliable = table.concat(res.unreliable or {}, ",")
+    out.note = res.note or ""
+  end)
+  if not ok then out.error = tostring(r) end
+  return out

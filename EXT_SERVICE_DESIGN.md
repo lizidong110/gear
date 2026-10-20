@@ -220,6 +220,25 @@ stdin/stdout 换成 HTTP，便于连接复用与并发：
    崩溃按 `RestartAlways/Never` 策略 + 指数退避重启，进程树级联回收（红线 16）；退出时打印退出码 + 输出尾部（`ExitReporter`，见 §11·2026-09-21）；
 4. flow 取消 → `stopAll` 杀掉所有 service 子进程（含该 ext 侧车）。
 
+**能力调用路径同样惰性 + 自动拉起（2026-10-20 补，`internal/engine/svc_ext_call.go`）**：
+上面的机制只覆盖 flow 的 service step；而 planner 选 `ext.<name>.<method>`（`ai rewoo`）、
+Lua `ctx.ext.<name>.<method>`、REST/MCP 调用走的是**能力调用路径**——此前它直接经
+`LocalHTTPTransport` 打 HTTP，侧车没起就是 connection refused：`ai rewoo` 总结 PDF 时
+planner 已能正确选 `ext.pdf.read`，执行期却连不上 `127.0.0.1:8101`，用户还得手工先起
+sidecar。「用户跑 CLI 完成任务」不该要求懂得侧车生命周期——这是产品级缺口，不是使用习惯问题。
+
+修正：`SetupExtensions` 给声明 `listen` 的 service ext 装配 `serviceHTTPTransport`
+（`coord.Client` + `LocalHTTPTransport`，对外契约不变）：
+
+- 首次 `Call` 前经 `RegisterOrStart` 握手（§12.4）：无人监听 → 本 gear 当 owner，
+  经 `processRuntime.Start` 拉起侧车并持有占用（Session watchdog 心跳保活、崩溃自愈重拉）；
+  已有实例 → 退让为 client 复用（同主机多 gear 共享单实例，不抢端口）；
+- 失败返回**可操作**错误（点名 ext 与根因），once 缓存不反复重拉；
+- argv[0] 相对路径按「CWD → gear 可执行文件所在目录」解析：裸 CLI 的 CWD 不保证是
+  build/，不兜底则「自动拉起」变「起不来」；CWD 下已有则原样，存量行为零变化；
+- 生命周期：短命令进程退出即停心跳 → 侧车按 §12.5 自行退场（不留孤儿）；
+  长驻面（`gear serve` / MCP）会话随进程保活，可显式 `Close` 提前注销。
+
 > 注：`gear serve` 的 `RunFlow` 已具备"按 `req.Restart` 选策略 + Supervise + cancel 杀进程"
 > 的完整闭环，本设计**直接复用**，无需新建监管组件。
 

@@ -3,6 +3,7 @@ package engine
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -994,10 +995,18 @@ func SetupExtensions(capReg *CapabilityRegistry, reg *registry.Registry, cfgPath
 				capReg.Sources[spec.Source] = sf
 			}
 
-			// 能力调用路径：listen 存在走本地 HTTP（复用长连接），否则回退子进程（once 兜底）。
+			// 能力调用路径：listen 存在走「coord 保活 + 本地 HTTP 长连接」——首次调用前
+			// 经 RegisterOrStart 确保侧车在线（无人监听时本 gear 当 owner 拉起并持有占用，
+			// watchdog 心跳保活），CLI/REST/MCP 三条执行面都不再要求用户手工先起 sidecar
+			// （2026-10-20 真机缺口：ai rewoo 选 ext.pdf.read 执行期却连接拒绝）。
+			// listen 为空（纯 daemon 守护，引擎不主动调它）才回退 once 子进程。
 			var t SidecarTransport
 			if spec.Listen != "" {
-				t = NewLocalHTTPTransport(spec.Listen)
+				t = newServiceHTTPTransport(name, entry, cli,
+					NewLocalHTTPTransport(spec.Listen),
+					func() (coord.Process, error) {
+						return (&processRuntime{}).Start(context.Background(), entry, nil, nil)
+					})
 			} else {
 				t = &CommandTransport{cmd: spec.Cmd}
 			}
@@ -1035,7 +1044,12 @@ func SetupExtensions(capReg *CapabilityRegistry, reg *registry.Registry, cfgPath
 // listen 为空（纯 daemon 守护，引擎不主动调它）时不注入、不校验，Entry 原样返回 cmd。
 func prepareServiceExt(spec ExtSpec) (string, *model.HealthProbe, error) {
 	parts := make([]string, 0, len(spec.Cmd))
-	for _, c := range spec.Cmd {
+	for i, c := range spec.Cmd {
+		if i == 0 {
+			// argv[0] 解析成「任意 CWD 下都找得到」的形式：裸 CLI 的 CWD 不保证是
+			// build/，相对路径会令自动拉起失败（见 resolveSidecarArgv0）。
+			c = resolveSidecarArgv0(c)
+		}
 		parts = append(parts, quoteCmdToken(c))
 	}
 	entry := strings.Join(parts, " ")

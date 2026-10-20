@@ -216,7 +216,7 @@ type Hook struct {
 **`gear app`**
 - `app run <flow-id>...`：`--restart always|never`（默认 always）、`--max <n>`（并发闸门）。把 Flow 变成受管进程（service 长驻 + 重启策略 + 退避）。
   service 退出时打印**退出码 + 输出尾部**（`✗ step <id> service 退出 (exit=N)` 后的 `│ <行>`），用于定位「拉起即秒退」类故障（端口被占、命令写错、依赖缺失）——不再只报「重启 第 N 次」。
-- **共享侧车不算崩溃**：多个 app 引用同一个 service ext（如 `ext.serve`）时，后起的那个会**退让复用**已经存在的侧车（日志显示 `service 长驻启动 (pid=0)`），本进程手上没有本地进程——这是共享的正常态，不会被判成 service 退出、也不会去抢已被占用的 coord 端口。侧车挂了由 coord 看门狗重握手自愈（必要时本进程接管为 owner）。详见 `EXT_SERVICE_DESIGN.md` §12.10。
+- **共享侧车不算崩溃**：多个 app 引用同一个 service ext（如 `ext.serve`）时，后起的那个会**退让复用**已经存在的侧车（日志显示 `service 长驻启动 (pid=0)`），本进程手上没有本地进程——这是共享的正常态，不会被判成 service 退出、也不会去抢已被占用的 coord 端口。侧车挂了由 coord 看门狗重握手自愈（必要时本进程接管为 owner）。详见 `EXT_SERVICE_DESIGN.md` §12.10。**能力调用路径同样自动**：`ai rewoo` / Lua `ctx.ext.*` / REST / MCP 调 service ext 时，首次调用前也走同一 coord 握手——无人监听则本进程当 owner 拉起，无需用户手工先起 sidecar（2026-10-20）。
 - **registry 沿进程树继承**：`openRegistry()` 会把本次生效的 registry **绝对化**后写进 `GEAR_REGISTRY`，派生的进程（`app start` 的监管进程、`app run` 里 engine 拉起的长驻 Tool 进程）自动读同一个库。所以应用内步骤**不该**写死 `--registry`——写了也仍以显式值为准，但会因「换个 cwd 就静默指向另一个库」在注册/校验期收到 warning。传**相对路径**的 `--registry` 会在 stderr 提示（相对值按调用时 cwd 解析，cwd 是调用方的属性、不是 gear 的属性）。
 - `app start | stop | status | list`：**后台**启动器 + 台账（见下方 `gear mcp` 一节的说明）。
 - `app delete <id>`：注销 App 清单。**刻意不做引用守卫**（App 只是聚合描述，它引用的 Tool/Flow 是独立实体，要求「先拆光 Tool 才能删清单」会堵死清理路径）。它存在是为了让上一条守卫的建议可执行：`flow delete` 会因「是某 App 的 entry_flow」拒绝并提示先注销该 App，而 CLI 面原本没有这个入口（只能走 Web UI / MCP）。
@@ -567,7 +567,7 @@ ctx.ext.excel.write({path, sheets:[{name, rows:[[cell]]}], root?}) → {path, si
 
 ### `ext.pdf`（零依赖 PDF 写出 + CJK 子集，2026-09-29 交付）
 
-`plugin/pdf-sidecar` 是 service ext 的常驻侧车：`write`（`listen` 默认 `127.0.0.1:8101`）。
+`plugin/pdf-sidecar` 是 service ext 的常驻侧车：`write` / `read`（`listen` 默认 `127.0.0.1:8101`）。
 同样零第三方依赖——手写最小 PDF 写出器 + **手写 TTF 子集化**（AC-E4-2 的 CJK 嵌入要求）。
 接口（`ctx.ext.pdf.write`）：
 
@@ -584,6 +584,8 @@ ctx.ext.pdf.read({path, root?, max_pages?}) → {path, page_count, pages:[{page,
 `read` 同样零第三方依赖——**手写 PDF 解析器**（go.mod 一字不变）：对象扫描不信任 xref（增量更新/xref 偏移脱节的 PDF 用「扫 `N 0 obj`」照样成立）、展开 ObjStm 对象流；内容流词法（`Tj`/`TJ`/`'`/`"`）+ 行结构启发；字体层覆盖简单字体（`WinAnsi`/`StandardEncoding` 原样即可读）+ **子集/Type3 字体（自定义 1 字节编码，必须走 ToUnicode 还原——真实 PDF 里中文就藏在这种字体里，原样写字节会整页乱码，已修）** + Type0/CIDFontType2（`Identity-H` 双字节码 + ToUnicode CMap 的 `bfchar`/`bfrange`，UTF-16 码元按 4 hex 解；未压缩 ToUnicode 也兜底）；FlateDecode 解压（zlib + raw deflate 双试）。
 
 **三类「读不出真文本」明确报错、绝不吐乱码**——加密 PDF（`/Encrypt`）、Type0 无 ToUnicode（CID 落空）、扫描件（解出文本为空且未用任何字体）：agent 拿到结构化错误能换路线（例如先 OCR 或问用户要文本），拿到乱码只会照着胡说。`max_pages` 默认 100（超出截断并在 `note` 说明），文件大小护栏默认 50MB 超出拒绝。
+
+**侧车自动拉起（2026-10-20）**：service ext 的**能力调用路径**（planner 选 `ext.pdf.read`、Lua `ctx.ext.pdf.read`、REST/MCP 调用）与 Flow 的 service step 走同一套 coord 握手——首次调用前无人监听则本 gear 当 owner 经 processRuntime 拉起侧车并持有占用（心跳保活、崩溃自愈重拉），已有实例则退让复用（同主机多 gear 共享单实例，不抢端口）。用户跑 `gear ai rewoo '总结这个 PDF'` 不再需要先手工起 sidecar；短命令退出即停心跳，侧车自行退场不留孤儿。启动命令 argv[0] 的相对路径按「当前目录 → gear 可执行文件所在目录」解析，任意 CWD 下都能拉起。
 
 口径（PRD §4.5 + §6 Q6 字体方案）：
 

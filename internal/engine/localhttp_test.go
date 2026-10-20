@@ -243,8 +243,9 @@ func TestSidecarExtension_FallsBackToCommandTransport(t *testing.T) {
 }
 
 // TestServiceExtWithListenUsesLocalHTTPTransport：声明 service:true + listen 的 ext
-// 必须装配 LocalHTTPTransport（keep-alive 长连接），而不是 once 子进程——
-// 这是 service ext 的全部意义（消除 rabbitmq 那种每次重连）。
+// 必须装配「coord 保活载体 + LocalHTTPTransport」——底层仍是 keep-alive 长连接
+// （service ext 的全部意义：消除 rabbitmq 那种每次重连），外层多了首次调用前的
+// RegisterOrStart 自动拉起（2026-10-20：能力调用路径不再要求用户手工起 sidecar）。
 func TestServiceExtWithListenUsesLocalHTTPTransport(t *testing.T) {
 	_, tr := transportOf(t, "ext.svc",
 		"ext.svc:\n"+
@@ -255,7 +256,14 @@ func TestServiceExtWithListenUsesLocalHTTPTransport(t *testing.T) {
 			"  schemas:\n"+
 			"    ping:\n"+
 			"      parameters: {}\n")
-	if _, isHTTP := tr.(*LocalHTTPTransport); !isHTTP {
-		t.Fatalf("service ext 声明 listen 后应走 LocalHTTPTransport，实际 %T", tr)
+	svc, isSvc := tr.(*serviceHTTPTransport)
+	if !isSvc {
+		t.Fatalf("service ext 声明 listen 后应走 serviceHTTPTransport（coord 保活+HTTP），实际 %T", tr)
+	}
+	if svc.base == nil {
+		t.Fatal("底层传输应是 LocalHTTPTransport（长连接复用），实际为 nil")
+	}
+	if svc.cli == nil {
+		t.Fatal("coord 客户端必须随装载一起构造（保活与共享复用都靠它）")
 	}
 }
