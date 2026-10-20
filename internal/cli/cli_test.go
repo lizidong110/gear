@@ -68,7 +68,11 @@ func runCLI(t *testing.T, args ...string) error {
 		args = append([]string{"--registry", testRegistryOverride}, args...)
 	}
 	root.SetArgs(args)
-	return root.Execute()
+	err := root.Execute()
+	// 与 cli.Execute() 同一条收尾路径：档案的「命令完成/失败」行对测试同样生效
+	// （见 logCmdFinish 注释——驱动方显式调用是 cobra 无「无论成败」钩子所致）。
+	logCmdFinish(err)
+	return err
 }
 
 // writeTempYAML 把 YAML 内容落到临时文件，返回路径。

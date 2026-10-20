@@ -146,6 +146,22 @@ REST 错误响应是**结构化**的（2026-10-03，此前只有 `{"error": "一
   修法：**删掉 entry 里的 `--registry`**——起服进程会把生效的 registry 经 `GEAR_REGISTRY`
   注入应用内的一切步骤，于是它与 CLI 必然同源。要固定就写绝对路径（显式值优先）。
 
+## 拿不到现场时：CLI 诊断日志（--log-file）
+
+MCP 面上跑挂的执行，**服务端现场**在 CLI 侧：让用户在（或自己经 shell）跑
+
+```
+gear <子命令> --log-file /tmp/gear-diag.log
+```
+
+档案里记：命令路径 / pid / cwd / **生效的 registry** / 版本、脱敏后的 flag
+（`--api-key` 打码）、截断的位置参数、起止耗时、失败原因；内核侧还有 Flow 执行
+（flow+exec_id+步数+耗时）与 REST 面监听/停止（主动停机 vs 异常退出分开记）。
+
+三条使用纪律：**空 `--log-file` = 不写**（默认零行为变化）；`--log-level` 写错会
+直接失败（别静默兜底）；**文件开不了时主命令照常跑、stderr 明说没有档案**——此时
+不要假装有现场。注意它与执行进度（`✓ step …`，stdout）是两层：stdout 仍可管道。
+
 ## 一条纪律
 
 **任何错误都不允许「绕过」**：不能因为 `UNKNOWN_CALL_TARGET` 就用 shell 外调，不能因为

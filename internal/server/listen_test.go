@@ -3,9 +3,13 @@ package server
 import (
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"gear/internal/gearlog"
 )
 
 // L-addr-1：`--addr :0`（自动分配）时 onListen 必须拿到**真实端口**，
@@ -109,6 +113,48 @@ func TestListenAndServeServesTraffic(t *testing.T) {
 		defer resp.Body.Close()
 		if resp.StatusCode >= 500 {
 			t.Fatalf("健康检查返回 5xx，实际 %d", resp.StatusCode)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待 onListen 超时")
+	}
+}
+
+// TestListenAndServeWritesDiagLog —— REQ-CLI-DIAG-LOG：REST 面监听必须落档案行
+// （排障时「服务到底起没起、听的哪个口」是第一个问题）。停止行（主动停机 vs
+// 异常退出分记）拿不到外部 listener 句柄无法在测试里触发，由代码直读保证。
+func TestListenAndServeWritesDiagLog(t *testing.T) {
+	gearlog.ResetForTest()
+	t.Cleanup(gearlog.ResetForTest)
+
+	srv, _ := newTestServer(t)
+	path := filepath.Join(t.TempDir(), "serve.log")
+	closer, err := gearlog.Setup(path, "info")
+	if err != nil {
+		t.Fatalf("Setup 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	got := make(chan string, 1)
+	srv.onListen = func(realAddr string) { got <- realAddr }
+	go func() { _ = srv.ListenAndServe(":0") }()
+
+	select {
+	case realAddr := <-got:
+		// onListen 回调**先于** gearlog 写入执行（代码顺序），收到信号时档案行
+		// 可能还没落——轮询等它出现，而不是读一次就下结论（竞态假红）。
+		var raw []byte
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			raw, _ = os.ReadFile(path)
+			if strings.Contains(string(raw), "REST 执行面监听") {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		_ = closer.Close()
+		gotStr := string(raw)
+		if !strings.Contains(gotStr, "REST 执行面监听") || !strings.Contains(gotStr, realAddr) {
+			t.Fatalf("档案缺监听行（或地址不符），实际:\n%s", gotStr)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("等待 onListen 超时")

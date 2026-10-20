@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"sort"
@@ -19,6 +20,7 @@ import (
 
 	"gear/internal/cap"
 	"gear/internal/gearhome"
+	"gear/internal/gearlog"
 	"gear/internal/model"
 	"gear/internal/registry"
 )
@@ -819,7 +821,23 @@ func (e *Engine) run(flow *model.Flow, observe ToolObserver, execID string, ance
 // ctx 携带调用上下文（IDENTITY_CONTEXT_DESIGN.md），在**此处**（rc 构造点）被读一次写进
 // runContext.caller，此后整条运行期都从 rc 取——不必再把 ctx 传到最底层的 Hook / step 里。
 // 当前上游公开入口一律传 context.Background()，语义等同改造前的「无身份」。
-func (e *Engine) runWithVars(ctx context.Context, flow *model.Flow, observe ToolObserver, execID string, ancestors []string, varsOverride map[string]interface{}) (*RunResult, error) {
+func (e *Engine) runWithVars(ctx context.Context, flow *model.Flow, observe ToolObserver, execID string, ancestors []string, varsOverride map[string]interface{}) (res *RunResult, err error) {
+	flowStart := time.Now()
+	// 诊断日志（REQ-CLI-DIAG-LOG）：Flow 执行的档案行。与 progressf 正交——
+	// 进度面向盯着看的人（stdout），这里面向事后归档（--log-file）；未启用时
+	// gearlog 是 discard，零副作用。defer + 命名返回值让各 return 点全覆盖。
+	defer func() {
+		elapsed := time.Since(flowStart)
+		if err != nil {
+			gearlog.L().Error("Flow 执行失败",
+				slog.String("flow", flow.ID), slog.String("exec_id", execID),
+				slog.String("err", err.Error()), slog.Duration("elapsed_ms", elapsed))
+			return
+		}
+		gearlog.L().Info("Flow 执行完成",
+			slog.String("flow", flow.ID), slog.String("exec_id", execID),
+			slog.Int("steps", len(flow.Steps)), slog.Duration("elapsed_ms", elapsed))
+	}()
 	// 订阅所属按 Flow/Exec 回收（运行结束 defer）：
 	// 本次运行中经 ctx.subscribe.start 建立的订阅在此一并 StopByOwner。
 	if e.subscriber != nil && flow.ID != "" {

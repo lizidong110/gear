@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -26,6 +27,7 @@ import (
 	"gear/internal/cap"
 	"gear/internal/engine"
 	"gear/internal/gearhome"
+	"gear/internal/gearlog"
 	"gear/internal/httpsafe"
 	"gear/internal/model"
 	"gear/internal/registry"
@@ -268,11 +270,21 @@ func (s *Server) ListenAndServe(addr string) error {
 	if s.onListen != nil {
 		s.onListen(realAddr)
 	}
+	gearlog.L().Info("REST 执行面监听", slog.String("addr", realAddr))
 	srv := &http.Server{
 		Handler:           s.mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	return srv.Serve(ln)
+	serveErr := srv.Serve(ln)
+	// 停机与崩溃必须分开记：ErrServerClosed 是主动关停（INFO），其余是异常退出
+	// （ERROR）——「服务停了」和「服务崩了」在事后回看时是两件事，混为一谈
+	// 会让「昨晚为什么没数据」查错方向。
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		gearlog.L().Info("REST 执行面已停止", slog.String("addr", realAddr))
+	} else {
+		gearlog.L().Error("REST 执行面异常退出", slog.String("addr", realAddr), slog.String("err", fmt.Sprint(serveErr)))
+	}
+	return serveErr
 }
 
 // Shutdown 停止所有受管 app 并**等待其收敛**（供测试与优雅退出使用）。

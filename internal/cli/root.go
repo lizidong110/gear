@@ -5,14 +5,18 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"gear/internal/buildinfo"
 	"gear/internal/gearhome"
+	"gear/internal/gearlog"
 	"gear/internal/registry"
 )
 
@@ -31,6 +35,16 @@ var serverAddr string
 // 的签名里没有 context，按请求切换作用域在那个面上做不到。
 var cliScope string
 
+// logFilePath / logLevel 是诊断日志选型（REQ-CLI-DIAG-LOG）：
+// 空 path = 不启用（零行为变化，存量脚本逐字不受影响）；给了 path 才开文件归档。
+// 与执行进度（Engine.progressf → stdout）正交：进度面向人盯着看，诊断面向事后归档，
+// 合体会毁掉「stdout 结果可管道消费」。level 非法是用户输入错误（尽早死）；
+// 文件开不了是环境问题（主命令照常跑 + stderr 明说，不静默降级）。
+var logFilePath, logLevel string
+
+// cmdStartedAt 是本次命令的起始时刻（Execute 入口记，收尾算耗时）。
+var cmdStartedAt time.Time
+
 // newRootCmd 构造根命令（供 CLI 入口与测试复用）。
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
@@ -48,6 +62,36 @@ func newRootCmd() *cobra.Command {
 		"REST 执行面地址（默认 127.0.0.1:8787，可用 GEAR_ADDR 覆盖）")
 	root.PersistentFlags().StringVar(&cliScope, "scope", "",
 		"运行期命名空间守卫的作用域（registry 里的 App.ID）：本进程只引用它名下的定义；空=不启用")
+	root.PersistentFlags().StringVar(&logFilePath, "log-file", "",
+		"诊断日志文件路径（可选）：记录命令生命周期与内核事件的归档档案；空=不写（默认）")
+	root.PersistentFlags().StringVar(&logLevel, "log-level", "",
+		"诊断日志级别 debug|info|warn|error（可选，默认 info；仅 --log-file 给了才生效）")
+
+	// PersistentPreRunE 是**每条命令执行前**的统一入口（cobra 只会调离执行命令最近的一个，
+	// 挂在 root 上即全树生效）——诊断日志在这里起，后面的告警/错误才有档案可落。
+	// 注意 help/version 不经过 RunE，也不经过这里：它们无诊断价值，不留档案。
+	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		// level 先单独校验：写错级别是**用户输入错误**，直接失败；
+		// 而 Setup 内部的文件错误走降级（下面分开处置）——两类失败处置相反。
+		if _, err := gearlog.ParseLevel(logLevel); err != nil {
+			return err
+		}
+		if _, err := gearlog.Setup(logFilePath, logLevel); err != nil {
+			// 路径开不了（权限/被占/是目录）：主命令照常跑，但必须明说没档案——
+			// 静默降级会让排障时对着一个不存在的文件猜（见 gearlog 包注释红线 2）。
+			fmt.Fprintf(os.Stderr, "⚠ 诊断日志未启用（%v）：本次运行不留档案，主命令继续\n", err)
+		}
+		cwd, _ := os.Getwd()
+		gearlog.L().Info("命令开始",
+			slog.String("cmd", cmd.CommandPath()),
+			slog.Int("pid", os.Getpid()),
+			gearlog.Attr("cwd", cwd),
+			slog.Any("invocation", redactedInvocation(cmd, args)),
+			gearlog.Attr("registry", registryPath),
+			slog.String("version", buildinfo.Version),
+		)
+		return nil
+	}
 
 	// ⚠ 必须保持**单行**：tools/doc_audit.py 的 CLI 双向核对按这一行的文本提取子命令集，
 	//    拆成多行会让它只读到第一行的两个命令，进而把其余十几个全报成「文档有、代码无」。
@@ -65,9 +109,12 @@ func defaultAddr() string {
 
 // Execute 是 CLI 入口。
 func Execute() {
-	if err := newRootCmd().Execute(); err != nil {
-		// `gear doctor` 用哨兵 error 表达「自检跑完了、但有告警」：退出码仍要给 1
-		//（脚本要能判断），但不打印错误文案——告警已经写在报告里了，重复一遍只是噪声。
+	cmdStartedAt = time.Now()
+	err := newRootCmd().Execute()
+	logCmdFinish(err)
+	// `gear doctor` 用哨兵 error 表达「自检跑完了、但有告警」：退出码仍要给 1
+	//（脚本要能判断），但不打印错误文案——告警已经写在报告里了，重复一遍只是噪声。
+	if err != nil {
 		if errors.Is(err, errSilentFailure) {
 			os.Exit(1)
 		}
@@ -78,6 +125,47 @@ func Execute() {
 		}
 		os.Exit(1)
 	}
+}
+
+// logCmdFinish 是命令收尾的档案行（成功/失败都记）。
+//
+// 抽成包级函数而不是内联在 Execute 里：**任何驱动 newRootCmd 的调用方都该拿到收尾行**
+// （测试就是这么绕过一次的——失败没有档案比没有开始更难查）。cobra 没有
+// 「无论成败」的钩子（PersistentPostRunE 只在成功路径跑），所以收尾只能由
+// 驱动方显式调用：Execute 是生产路径，测试助手 runCLI 是测试路径。
+func logCmdFinish(err error) {
+	elapsed := time.Since(cmdStartedAt)
+	if err != nil {
+		// 先落档案再决定退出码：errSilentFailure（doctor 有告警）不打印错误文案，
+		// 但档案里必须有——「静默退出」在事后回看时是最难查的一类。
+		gearlog.L().Error("命令失败", slog.String("err", err.Error()), slog.Duration("elapsed_ms", elapsed))
+		return
+	}
+	gearlog.L().Info("命令完成", slog.Duration("elapsed_ms", elapsed))
+}
+
+// redactedInvocation 把本次调用渲染成可归档的一行：显式给的 flag（值过脱敏）+ 位置参数。
+//
+// 为什么记这个：排障的第一个问题永远是「他到底跑了什么」。os.Args 原样记会把
+// --api-key 的密钥写进档案（gearlog 红线 3），所以逐 flag 过 RedactValue；
+// 位置参数（任务描述）截断 200 字符——那是内容不是标识，全量进档案只会淹掉关键行。
+func redactedInvocation(cmd *cobra.Command, args []string) string {
+	var parts []string
+	cmd.Flags().Visit(func(f *pflag.Flag) {
+		parts = append(parts, "--"+f.Name+"="+gearlog.RedactValue(f.Name, f.Value.String()))
+	})
+	if len(args) > 0 {
+		joined := strings.Join(args, " ")
+		const maxPosArg = 200
+		if len([]rune(joined)) > maxPosArg {
+			joined = string([]rune(joined)[:maxPosArg]) + "…"
+		}
+		parts = append(parts, "args="+joined)
+	}
+	if len(parts) == 0 {
+		return "(无参数)"
+	}
+	return strings.Join(parts, " ")
 }
 
 // defaultRegistry 返回 --registry 的默认值。

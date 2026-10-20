@@ -185,6 +185,11 @@ type Hook struct {
 |---|---|---|
 | `--registry <path>` | 注册库路径 | `<GEAR_HOME>/registry.db`（`GEAR_HOME` 未设时取 `<HOME>/.gear`，**不随 cwd 变化**） |
 | `--addr <host:port>` | REST 执行面地址（也可用环境变量 `GEAR_ADDR` 覆盖） | `127.0.0.1:8787` |
+| `--scope <app-id>` | 运行期命名空间守卫：本进程只引用该 App 名下的定义 | 空（不启用） |
+| `--log-file <path>` | 诊断日志档案（可选）：记录命令生命周期与内核事件；空=不写 | 空（零行为变化） |
+| `--log-level <lvl>` | 诊断日志级别 `debug\|info\|warn\|error`（仅 `--log-file` 给了才生效） | `info` |
+
+诊断日志与执行进度（`✓ step …`）是**正交两层**：进度面向盯着看的人（stdout），诊断面向事后归档（文件）——所以 `gear exec status --log-file run.log` 的 stdout 仍可直接管道给 jq。档案含命令路径/pid/cwd/registry/版本、脱敏后的 flag（`--api-key` 打码为 `<redacted>`，档案是会被随手外传的文件）、截断的位置参数、起止耗时与失败原因。两条处置红线：**level 写错直接失败**（用户输入错误）；**文件开不了则主命令照常跑 + stderr 明说「本次不留档案」**（不静默降级——对着不存在的文件排障是最坏路径）。
 
 ### 命令树
 
