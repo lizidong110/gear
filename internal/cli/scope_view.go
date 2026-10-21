@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 
 	"gear/internal/model"
 )
@@ -35,6 +36,36 @@ func scopeGroupOf(apps []*model.App, id string) scopeGroup {
 	return groupPlatform
 }
 
+// warnScopeUnregistered 在 --scope 指向一个 apps 表里没有行的 App 时，向 stderr
+// 显式告警（REQ-CLI-SCOPE-WARN）。运行期（cliEngine 构造点）与目录面
+// （printScopedList）共用这一份，不存在「一边喊一边不喊」的漂移。
+//
+// 为什么必须喊：scope 名打错（或 App 清单还没 apply）时，守卫不报错也不放空——
+// 除平台级无主对象外的一切（包括你本想保护的本应用定义，如 scope 打成 wms2 时
+// 的 wms__x）都会被判 foreign 误拦。用户看到的是「我的 tool 突然被
+// SCOPE_VIOLATION」，很难联想到根因是 scope 名拼错——此前这一切静默发生。
+//
+// 为什么只喊不拒：「先用 scope 跑起来、App 清单后补」是合法用法（2026-10-21 给
+// mindstorm 们补注册前本机就是这样跑的），直接拒绝会切断这条路。告警的职责是
+// 把静默变显式，不是改变行为——与 REQ-CLI-DIAG-LOG 红线 2 同口径。
+//
+// apps 为 nil（调用方只有单个查询结果）时等价于「未注册」。
+func warnScopeUnregistered(apps []*model.App) {
+	if cliScope == "" {
+		return
+	}
+	for _, a := range apps {
+		if a != nil && a.ID == cliScope {
+			return
+		}
+	}
+	fmt.Fprintf(os.Stderr,
+		"⚠ --scope %s 未注册（registry 里没有这个 App）：守卫将把非平台级对象判为「别人的应用」\n"+
+			"  误拦——包括你本想保护的定义；仅无应用前缀的平台级对象可用。\n"+
+			"  拼写错误？gear tool list（不带 --scope）可看已注册命名空间；确要启用请先 apply App 清单（docs/app-registration.md）。\n",
+		cliScope)
+}
+
 // printScopedList 按分组渲染目录列表（tool/flow/hook list 共用）。
 //
 // 为什么分组而不是单纯过滤：--scope 的语义承诺「本进程只认本应用名下的定义」，
@@ -50,6 +81,7 @@ func printScopedList(apps []*model.App, ids []string, render func(id string)) {
 		}
 		return
 	}
+	warnScopeUnregistered(apps)
 	var own, platform []string
 	hidden := 0
 	for _, id := range ids {

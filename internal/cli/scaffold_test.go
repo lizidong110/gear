@@ -2,6 +2,7 @@ package cli
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gear/internal/model"
@@ -81,6 +82,52 @@ func TestScaffoldHookYAMLValid(t *testing.T) {
 	h.Stage = "nonsense"
 	if err := h.Validate(); err == nil {
 		t.Fatal("非法 stage 应通过 Validate 失败")
+	}
+}
+
+// TestScaffoldAppYAMLValid 断言 App 清单骨架通过 model.App.Validate()（id /
+// entry_flow 必填）——「生成即可 gear import」。负向一并钉住：掏空 entry_flow
+// 必须 Validate 失败，证明上面的通过不是空过。
+func TestScaffoldAppYAMLValid(t *testing.T) {
+	content := scaffoldAppYAML("my-app", "my-app.up")
+	if !strings.Contains(content, "kind: App") {
+		t.Fatalf("骨架必须以 kind: App 开头（apply 链路按它路由）:\n%s", content)
+	}
+	var app model.App
+	if err := yaml.Unmarshal([]byte(content), &app); err != nil {
+		t.Fatalf("YAML 解析失败: %v\n---\n%s", err, content)
+	}
+	if app.ID != "my-app" || app.EntryFlow != "my-app.up" {
+		t.Fatalf("id/entry_flow 填充不符预期: id=%q entry_flow=%q", app.ID, app.EntryFlow)
+	}
+	if err := app.Validate(); err != nil {
+		t.Fatalf("model.App.Validate 失败: %v\n---\n%s", err, content)
+	}
+	// 负向：entry_flow 掏空后必须过不了 Validate（骨架非空过的证据）。
+	app.EntryFlow = ""
+	if err := app.Validate(); err == nil {
+		t.Fatal("entry_flow 为空应通过 Validate 失败")
+	}
+}
+
+// TestScaffoldAppCmdEntryFlowFlag 断言 --entry-flow 覆盖默认 <name>.up，
+// 且默认路径生成的 entry_flow 与 App id 前缀约定一致（Flow id 须 <app>.x）。
+func TestScaffoldAppCmdEntryFlowFlag(t *testing.T) {
+	def := captureStdout(t, func() {
+		if err := runCLI(t, "scaffold", "app", "my-app"); err != nil {
+			t.Fatalf("scaffold app 失败: %v", err)
+		}
+	})
+	if !strings.Contains(def, "kind: App") || !strings.Contains(def, "entry_flow: my-app.up") {
+		t.Fatalf("默认 entry_flow 应为 <name>.up，实际:\n%s", def)
+	}
+	over := captureStdout(t, func() {
+		if err := runCLI(t, "scaffold", "app", "my-app", "--entry-flow", "web.up"); err != nil {
+			t.Fatalf("scaffold app --entry-flow 失败: %v", err)
+		}
+	})
+	if !strings.Contains(over, "entry_flow: web.up") {
+		t.Fatalf("--entry-flow 应覆盖默认值，实际:\n%s", over)
 	}
 }
 

@@ -46,6 +46,14 @@ func cliEngine(reg *registry.Registry, opts ...func(*engine.Engine)) (*engine.En
 		// 与 REST 面同一个库——同一份配置必须在所有入口可见，否则「界面配了、CLI 读不到」。
 		engine.WithConfigStore(engine.NewDefaultConfigStore()),
 	)
+	// --scope 指向未注册 App 时显式告警（REQ-CLI-SCOPE-WARN）：名字打错时守卫会把
+	// 本应用定义误拦成 foreign（详见 warnScopeUnregistered）。查询失败不阻断主命令——
+	// 告警是 best-effort 的，不能为它把命令搞失败。
+	if cliScope != "" {
+		if app, err := reg.GetApp(cliScope); err == nil && app == nil {
+			warnScopeUnregistered(nil)
+		}
+	}
 	return engine.New(reg, opts...), nil
 }
 
