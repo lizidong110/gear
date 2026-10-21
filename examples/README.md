@@ -29,7 +29,12 @@
 gear scaffold tool my-tool -o my-tool.yaml     # --runtime lua|go-host 切换 runtime
 gear scaffold flow my-flow -o my-flow.yaml
 gear scaffold hook my-hook -o my-hook.yaml
+gear scaffold app my-app -o my-app.yaml       # ⚠ App 清单不走 register：gear apply 落库
 gear scaffold tool --help                       # 内嵌完整字段表 / 取值 / 示例
 ```
 
 生成物填好 `TODO` 注释后即可 `gear tool register` / `flow register` / `hook register`。
+App 清单例外——`tool/flow register` 永远不写 App 行，它走 `gear apply`（CLI）/ `gear_apply`（MCP）。
+注意 `gear import` 只吃 `gear export` 的产物（目录/.gearapp），**不接受单份 YAML**，别把
+App 清单喂给它。入口 Flow 已注册时直接 `gear apply` 即可。App 与 Flow 的分工、三条注册路径见
+[`docs/app-registration.md`](../docs/app-registration.md)。

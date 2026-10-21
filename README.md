@@ -362,6 +362,7 @@ type Hook struct {
 | `tool <name>` | `-o/--output <file>`、`-f/--force`、`--runtime process\|lua\|go-host` | 生成 Tool 骨架（默认 `runtime: process`） |
 | `flow <name>` | `-o`、`-f` | 生成 Flow 骨架（起步 step 用纯函数原子 `crypto.hash`，注册即可跑通） |
 | `hook <name>` | `-o`、`-f` | 生成 Hook 骨架 |
+| `app <name>` | `-o`、`-f`、`--entry-flow <id>` | 生成 App 清单骨架（⚠ 不走 register，落库走 `gear import` / apply，见下） |
 
 默认打印到 stdout（管道友好）；`-o` 落盘，`-f` 覆盖已存在文件。每个子命令的 `--help` 内含该资源的**完整字段表、取值与示例**（等于把本 §8 搬进命令行）。
 
@@ -369,11 +370,16 @@ type Hook struct {
 gear scaffold tool my-tool -o my-tool.yaml && gear tool register my-tool.yaml
 gear scaffold flow my-flow -o my-flow.yaml && gear flow register my-flow.yaml
 gear scaffold hook my-hook -o my-hook.yaml && gear hook register my-hook.yaml
+gear scaffold app my-app -o my-app.yaml   # ⚠ App 清单不能用 register 落库
+gear apply my-app.yaml                   # 入口 Flow 已注册时，这样落库
 # 想看某类资源的完整字段说明：
 gear scaffold tool --help
 gear scaffold flow --help
 gear scaffold hook --help
+gear scaffold app --help
 ```
+
+> App 与 Flow 的分工、App 行的四个消费者、三条注册路径（bundle apply / 补 App 行 / 产物导入），见 [`docs/app-registration.md`](docs/app-registration.md)。
 
 ---
 
@@ -859,15 +865,17 @@ gear app run service_flow --restart always
 **不会写 YAML？用 `gear scaffold` 从零生成骨架**：它产出一份带字段注释、且能直接 register 的模板，不用先去翻文档：
 
 ```bash
-# 生成三类骨架（默认打印到 stdout，-o 落盘，-f 覆盖已存在文件）
+# 生成四类骨架（默认打印到 stdout，-o 落盘，-f 覆盖已存在文件）
 gear scaffold tool my-tool -o my-tool.yaml        # 默认 runtime=process；--runtime lua|go-host 切换
 gear scaffold flow my-flow -o my-flow.yaml        # 起步 step 用 crypto.hash，注册即可跑通
 gear scaffold hook my-hook -o my-hook.yaml
+gear scaffold app my-app -o my-app.yaml           # ⚠ App 不走 register：gear apply 落库（--entry-flow 可改入口）
 
 # 填好 TODO 注释后直接注册、运行
 gear tool register my-tool.yaml
 gear flow register my-flow.yaml
 gear flow run my-flow --var topic=world
+gear apply my-app.yaml                           # App 清单这样落库（tool/flow register 永远不写 App 行）
 
 # 每个子命令 --help 内含该资源的完整字段表、取值与示例
 gear scaffold tool --help

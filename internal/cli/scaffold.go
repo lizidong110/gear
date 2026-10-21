@@ -9,26 +9,27 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// scaffoldCmd 生成 Tool / Flow / Hook 的 YAML 骨架（带字段注释与示例），
+// scaffoldCmd 生成 Tool / Flow / Hook / App 的 YAML 骨架（带字段注释与示例），
 // 让首次使用者在「不知道 YAML 怎么写」时也能拿到一份可直接 register 的模板。
 //
 // 设计原则（与项目红线一致）：
-//   - 生成的文件必须能通过对应 Validate（tool/hook 走 model.Validate，flow 走 engine.ValidateFlowStatic），
-//     否则骨架本身就是个会让人困惑的「错误样本」。
+//   - 生成的文件必须能通过对应 Validate（tool/hook 走 model.Validate，flow 走 engine.ValidateFlowStatic，
+//     app 走 model.App.Validate），否则骨架本身就是个会让人困惑的「错误样本」。
 //   - 默认打印到 stdout（管道友好）；-o/--output 落盘；-f/--force 覆盖已存在文件。
 //   - 字段注释里把「必填 / 取值 / 示例」写清楚，等于把 README §8 的 schema 表搬到了命令里。
 func scaffoldCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "scaffold",
-		Short: "生成 Tool / Flow / Hook 的 YAML 骨架（带字段注释与示例）",
+		Short: "生成 Tool / Flow / Hook / App 的 YAML 骨架（带字段注释与示例）",
 		Long: `scaffold 生成一份「可直接 register」的 YAML 模板，并就地标注每个字段的用途与取值。
 
 用法：
   gear scaffold tool  [name] [-o file] [--runtime process|lua|go-host] [--force]
   gear scaffold flow  [name] [-o file] [--force]
   gear scaffold hook  [name] [-o file] [--force]
+  gear scaffold app   [name] [-o file] [--entry-flow <id>] [--force]
 
-  name 省略时默认 my-tool / my-flow / my-hook。
+  name 省略时默认 my-tool / my-flow / my-hook / my-app。
   -o, --output <file>  写到文件（默认打印到 stdout，便于管道：gear scaffold tool x -o x.yaml）。
   -f, --force          目标文件已存在时覆盖（默认拒绝，避免误覆盖）。
 
@@ -36,10 +37,11 @@ func scaffoldCmd() *cobra.Command {
   gear scaffold tool my-tool -o my-tool.yaml && gear tool register my-tool.yaml
   gear scaffold flow my-flow -o my-flow.yaml && gear flow register my-flow.yaml
   gear scaffold hook my-hook -o my-hook.yaml && gear hook register my-hook.yaml
+  gear scaffold app my-app -o my-app.yaml   # ⚠ App 不走 register，落库用 gear apply（见 gear scaffold app --help）
 
-想看某类资源的完整字段说明，执行 gear scaffold <tool|flow|hook> --help。`,
+想看某类资源的完整字段说明，执行 gear scaffold <tool|flow|hook|app> --help。`,
 	}
-	c.AddCommand(scaffoldToolCmd(), scaffoldFlowCmd(), scaffoldHookCmd())
+	c.AddCommand(scaffoldToolCmd(), scaffoldFlowCmd(), scaffoldHookCmd(), scaffoldAppCmd())
 	return c
 }
 
@@ -209,6 +211,72 @@ stage 合法值（已实现）：
 	return c
 }
 
+// scaffoldAppCmd 生成 App 清单骨架（2026-10-21 新增）。
+//
+// 为什么单列一个子命令：App 清单（kind: App）是 registry apps 表的一行、命名空间
+// 户主（--scope 守卫 / app start 端口回退 / export / 入口豁免四个消费者都读它），
+// 但 `gear tool register` / `gear flow register` 按设计只写 Tool/Flow 行——「导入了
+// flow 却不是 app」的困惑正源于此。骨架在文件头把落库路径（apply / MCP gear_apply，
+// 不是 register / import）写死，让人第一眼看到正确路径；字段表见 Long 与
+// docs/app-registration.md。
+func scaffoldAppCmd() *cobra.Command {
+	var output, entryFlow string
+	var force bool
+	c := &cobra.Command{
+		Use:   "app [name]",
+		Short: "生成 App（应用清单）YAML 骨架",
+		Long: `App 是「这是什么」：registry apps 表里的一行清单，把 Tool/Flow/Hook 收拢成一个
+有名字的应用。Flow 是「怎么跑」；两者分工详见 docs/app-registration.md。
+
+⚠ App 清单**不能**用 gear tool register / gear flow register 落库——那两个命令只写
+  Tool/Flow 行，永远不产 App 行。落库用 gear apply（或 MCP gear_apply）：
+  1) 入口 Flow 已注册：gear apply <本文件>
+  2) 连同 Tool/Flow 打成一个多文档 bundle 一次 apply（一个 bundle 只能一份 App 清单）
+  ⚠ gear import 只吃 gear export 的产物（目录/.gearapp），**不接受单份 YAML**——别把
+    本文件喂给 import。
+
+  entry_flow 指向的 Flow 必须先注册（否则 apply 时校验不过）：
+    gear scaffold flow <name>.up -o flow.yaml && gear flow register flow.yaml
+  （注意默认 entry_flow 是 <name>.up，所以 Flow 的 id 也要取这个，前后才能对上）
+
+App 字段（YAML tag）：
+  id          string   必填  唯一 ID。它就是命名空间户主：所有 Tool id 须 <id>__x，
+                           Flow id 须 <id>.x——先想好再注册 tools，改 id 等于搬家
+  name        string   选填  显示名
+  description string   选填  用途说明
+  entry_flow  string   必填  入口 Flow id（须已注册，或与本清单同一个 bundle）
+  layout      object   选填  静态资源清单：workdir + files[{path, required, dir}]
+                           ⚠ gear 只查存在性、不持有内容，文件由你自己的文件工具写
+  start       object   选填  restart(always|on-failure|"") + ports（app start 不传
+                           --port 时的探活回退）
+  requires    object   选填  secrets / sidecars / capabilities——gear_doctor 与启动前校验用
+
+命令入参口径：app start 收 **flow id**（靠 entry_flow 反查清单拿端口），app stop /
+app status 收 **app id**。apply 只登记、不运行——跑还是 app start <flow> / flow run <flow>。
+
+示例：
+  gear scaffold app my-app -o my-app.yaml
+  gear apply my-app.yaml                           # 落库（entry_flow 已注册时）
+  gear app start my-app.up --wait 10               # 起服验证`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := "my-app"
+			if len(args) > 0 && args[0] != "" {
+				name = args[0]
+			}
+			if entryFlow == "" {
+				entryFlow = name + ".up"
+			}
+			content := scaffoldAppYAML(name, entryFlow)
+			return emitScaffold(cmd, content, output, force)
+		},
+	}
+	c.Flags().StringVarP(&output, "output", "o", "", "写到文件而非 stdout（默认打印）")
+	c.Flags().StringVar(&entryFlow, "entry-flow", "", "入口 Flow id（默认 <name>.up；须已注册或与本清单同 bundle）")
+	c.Flags().BoolVarP(&force, "force", "f", false, "目标文件已存在时覆盖")
+	return c
+}
+
 // emitScaffold 把生成的骨架写到文件（带 force 守卫）或 stdout。
 func emitScaffold(cmd *cobra.Command, content, output string, force bool) error {
 	if output == "" {
@@ -329,6 +397,43 @@ steps:
   #     url: https://example.com
 `
 	return fmt.Sprintf(tmpl, name, name, name)
+}
+
+// scaffoldAppYAML 返回一份可通过 model.App.Validate()（id / entry_flow 必填）的
+// App 清单骨架。落库路径写死在文件头注释：apply / MCP gear_apply，不是 tool/flow register
+// 也不是 gear import（import 只吃 export 产物）——「导入了 flow 却不是 app」的困惑就源于
+// 那条路到顶只写 Tool/Flow 行。
+func scaffoldAppYAML(name, entryFlow string) string {
+	const tmpl = `# Gear App 清单骨架 —— 由 gear scaffold app %s 生成
+# ⚠ 本清单**不能**用 gear tool register / gear flow register 落库（它们只写 Tool/Flow
+#   行，永远不产 App 行），也**不能**喂给 gear import（import 只吃 export 产物）。落库用：
+#   1) 入口 Flow 已注册：gear apply <本文件>（或 MCP gear_apply）
+#   2) 连同 Tool/Flow 打成一个多文档 bundle 一次 apply（一个 bundle 只能一份 App 清单）
+# entry_flow 指向的 Flow 须先注册：gear scaffold flow %s -o flow.yaml && gear flow register flow.yaml
+# 校验：model.App.Validate()（id / entry_flow 必填；entry_flow 指向的 Flow 须存在）。
+#   完整说明：docs/app-registration.md。
+kind: App
+id: %s                          # 必填。命名空间户主：Tool id 须 %s__x，Flow id 须 %s.x
+name: %s                        # 选填。显示名
+description: "TODO: 一句话说明这个应用是什么"   # 选填
+entry_flow: %s                  # 必填。入口 Flow（app start 收它反查清单；app stop/status 收 App id）
+layout:                         # 选填。静态资源清单：gear 只查存在性，内容由你自己的文件工具写
+  workdir: apps/%s
+  files:
+    - {path: apps/%s/www/index.html, required: true}   # dir: true 表示整个目录递归导出
+start:                          # 选填。app start 不传 --port 时的探活回退
+  restart: always               # always | on-failure | ""（不自动重启）
+  ports: [8080]                 # 探活用端口；实际端口以 app start --port 为准
+requires:                       # 选填。依赖声明：gear_doctor 与启动前校验用
+  secrets: []                   # 需要哪些密钥（gear secret set <name> 播种）
+  sidecars: [serve]             # 依赖哪些侧车
+  capabilities: [ext.serve]     # 依赖哪些能力（Tool 侧还须各自声明 capabilities）
+#
+# 注册后验证：
+#   gear tool list --scope %s      # 你的定义应出现在「%s 名下」组（不再是平台级）
+#   gear app start %s --wait 10    # 起服并探活（ports_source: bundle 时不带 --port 也能探）
+`
+	return fmt.Sprintf(tmpl, name, name, name, name, name, name, entryFlow, name, name, name, name, entryFlow)
 }
 
 // scaffoldHookYAML 返回一份可直接 gear hook register 的 Hook 骨架。

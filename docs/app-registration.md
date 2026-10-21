@@ -8,8 +8,9 @@
 
 - **Flow = 怎么跑**（steps 的有向图）；**App = 这是什么**（一份清单：户主 id、入口 Flow、端口、静态资源、依赖）。
 - 两者在 registry 里**各写各行**：Flow 进 `flows` 表，App 进 `apps` 表，互不产生。
-- **App 行只有一个写入口**：`gear_apply`（MCP）/ `gear import`。`gear tool register` / `gear flow register`
+- **App 行只有一个写入口**：`gear apply`（CLI）/ `gear_apply`（MCP）。`gear tool register` / `gear flow register`
   **永远不写 App 行**——这就是「我导入了一个 flow，为什么还不是 app」的直接原因。
+  （`gear import` 只吃 `gear export` 的产物，**不接受单份 YAML**，别把 App 清单喂给它。）
 - 没有 App 行的应用**能跑**（`flow run` / `app start` 都收 Flow id），但它的 tools **没有户主**：
   会被算成「平台级」，任何 `--scope` 都能引用，命名空间守卫对它失效。
 
@@ -21,7 +22,7 @@ registry（默认 `~/.gear/registry.db`，一个 sqlite 库）有三张定义表
 |---|---|---|
 | `tools` | Tool 定义（能力原子） | `gear tool register` / apply / import |
 | `flows` | Flow 定义（steps DAG） | `gear flow register` / apply / import |
-| `apps` | **App 清单**（户主元数据） | **只有 apply / import** |
+| `apps` | **App 清单**（户主元数据） | **只有 `gear apply`（CLI）/ `gear_apply`（MCP）/ `gear import`（仅 export 产物）** |
 
 ```yaml
 # 同一个应用，两种文档，两张表：
@@ -51,7 +52,7 @@ entry_flow: myapp.up
 
 ### 路线 A：一整套 bundle 一次 apply（新建应用的标准路径）
 
-写一个多文档 YAML（`kind: App` + Tools + Flow 都在里面），用 MCP `gear_apply` 落库。
+写一个多文档 YAML（`kind: App` + Tools + Flow 都在里面），用 CLI `gear apply` 或 MCP `gear_apply` 落库。
 
 - **一个 bundle 只能带一份 App 清单**——带两份报 `BAD_APP_MANIFEST`；多应用分多次 apply。
 - `entry_flow` 可指向**同一 bundle 里的 Flow**，也可指向**已注册的 Flow**。
@@ -61,7 +62,7 @@ entry_flow: myapp.up
 ### 路线 B：tools/flows 已注册，只补 App 行
 
 顺序无所谓——App 行后补完全合法（2026-10-21 给 mindstorm / federation / wms 补注册实测通过）。
-写一份**只有 App** 的文档 apply 即可，`entry_flow` 指向已注册的那个 flow。
+写一份**只有 App** 的文档，用 `gear apply` 落库即可，`entry_flow` 指向已注册的那个 flow。
 
 ### 路线 C：从产物导入
 
@@ -71,7 +72,11 @@ entry_flow: myapp.up
 ### 走不通的路
 
 `gear tool register` / `gear flow register` 只收**纯 Tool/Flow 文档**（混合文档会被拒），
-且按设计不产生 App 行。`gear scaffold` 也只生成 Tool/Flow/Hook 骨架，没有 App 骨架。
+且按设计不产生 App 行。
+
+骨架从命令生成：`gear scaffold app my-app -o my-app.yaml`（2026-10-21 新增）产出带字段
+注释的 App 清单，`--entry-flow` 可覆盖默认 `<name>.up`；文件头注释写死了落库路径
+（`gear apply` / `gear_apply`，不是 register，也不是 `gear import`），生成即过 `model.App.Validate()`。
 
 ## 4. 最小 App 文档
 
@@ -104,8 +109,10 @@ requires:                      # 可选。依赖声明
 4. **覆盖语义**：`gear_apply` 默认拒绝「已存在且内容不同」的覆盖（整批拒绝，原子）；
    确需覆盖显式传 `overwrite=true`。
 5. **删 App 用 `gear_delete(kind=app)`**（注销清单，不做引用守卫）；私有 Tool 不会自动清，孤儿只能靠人发现。
-6. **`--scope` 打错名字是静默的**：scope 指向一个未注册的 App 时，所有无主 id 照常放行
-   （守卫只拦「第一段命中某个已注册 App 且不是自己」的对象）。
+6. **`--scope` 打错名字不再静默**（2026-10-21 起）：scope 指向一个未注册的 App 时，
+   stderr 会显式告警并点名字 + 说清后果——守卫将把非平台级对象（包括你本想保护的
+   本应用定义）判为「别人的应用」误拦，仅无主 id 照常放行。只告警不拒绝：
+   「先用起来、App 清单后补」是合法用法。运行期与 `list` 目录面共用同一份判定。
 
 ## 6. 验证注册成功
 
