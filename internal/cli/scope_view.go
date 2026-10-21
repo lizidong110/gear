@@ -38,7 +38,7 @@ func scopeGroupOf(apps []*model.App, id string) scopeGroup {
 // printScopedList 按分组渲染目录列表（tool/flow/hook list 共用）。
 //
 // 为什么分组而不是单纯过滤：--scope 的语义承诺「本进程只认本应用名下的定义」，
-// 但平台级对象（ext.serve / static_site.serve / web_ui.api）scope 内**确实可用**
+// 但平台级对象（ext.serve / static_site.serve / pdf.read.demo）scope 内**确实可用**
 // （守卫对无主 id 豁免）——全隐藏会让人误判能力边界，全列出又回到「列出了别的
 // 应用」的老问题。分组 + 标注是唯一同时满足两者的口径。
 //

@@ -9,7 +9,7 @@ gear 只提供**机制**，不提供**策略**：
 | 能力原语的统一入口与门禁（`ctx.*`） | 具体业务逻辑（那属于你自己的 Tool） |
 | Flow 的编排与执行语义（并行/条件/长驻） | 领域 DSL 或行业模板 |
 | Hook 的生命周期插入点 | 内置审批流、内置调度策略 |
-| registry（Tool/Flow/Hook 的唯一真相源） | 内置业务实体（**没有 App 实体**，见 §5） |
+| registry（Tool/Flow/Hook/App 的唯一真相源） | 内置业务实体（App 只是清单一行，不含业务策略，见 §5） |
 
 ## 2. 四层模型
 
@@ -54,7 +54,10 @@ ext.*（须注册 + 须声明）
 
 ## 5. 「应用」的定义与一个完整范式
 
-**没有 App 实体。** 应用 = **一个含 `mode: service` 长驻 step 的 Flow**，由 `gear_app` 以后台进程监管。
+**运行时没有独立的 App 进程。** 应用 = **一个含 `mode: service` 长驻 step 的 Flow**，由 `gear_app` 以后台进程监管。
+**注册时 App 是实体**：`kind: App` 清单经 `gear_apply` / `gear import` 落 registry 的 `apps` 表——它是命名空间
+户主（`App.id` 是所有 id 的前缀来源），`--scope` 守卫、列表分组、`app start` 端口回退、`gear export` 都读它。
+只注册 Flow 不注册 App，tools 会被算成「平台级」：任何 `--scope` 都能引用，守卫失效。
 
 一个真实的四步范式（仓库里的 `plugin/web_ui_flow.yaml`）：
 

@@ -201,8 +201,8 @@ Tool / Flow / Hook 一旦多起来，「这是谁的、谁在用」全靠 id 自
 - bundle 含 `kind: App` 清单时，其余 id 必须以 `<app-id>__` / `<app-id>.` 开头——这是引擎强制的（`ID_NAMESPACE_VIOLATION`）。
 - 运行期另有一层 `gear ... --scope <app-id>`：`--scope` 非空时，引擎拒绝引用不属于该应用的
   已注册对象（`SCOPE_VIOLATION`）。默认不传 = 不启用。**平台级对象不受它管**——cap 原语
-  （`db.query` 这类）与无应用前缀的注册 Tool（`static_site.serve` / `ext.serve` / `web_ui.api`
-  这类共享基建）照用，所以开了 scope 的应用仍能跑自己的入口 Flow。⚠ 2026-10-21 前后者
+  （`db.query` 这类）与命名空间第一段不归属任何已注册 App 的注册 Tool（`static_site.serve` /
+  `ext.serve` / `pdf.read.demo` 这类共享基建）照用，所以开了 scope 的应用仍能跑自己的入口 Flow。⚠ 2026-10-21 前后者
   （平台级**注册 Tool**）只写在注释里没实现——列得出来、调用被毙，本次已补齐（S-11 钉住）。
 - `gear_apply` / `gear_validate` 对**无 App 清单**的裸注册会给 warnings 提醒补前缀（合法但会提示）。
 - 删除一个应用 / Flow 时，**连同它的私有 Tool 一起删**——引擎目前不做孤儿检测，孤儿只能靠人发现。

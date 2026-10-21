@@ -2,7 +2,8 @@
 #
 # 为什么需要它：`gear export` 导的是「应用清单」（registry 的 apps 表，聚合 Tool/Flow/Hook
 # + 静态资源布局），不是 Flow。`web_ui.up` 只是个 Flow（flows 表，gear flow register 进的），
-# 所以它不会出现在 apps 表里，export 才报「没有 App 清单」。
+# 只有 Flow 没有 App 清单时 export 才报「没有 App 清单」（也会按入口 Flow 临时合成，见
+# REQ-APP-ARTIFACT）。本文件已于 2026-10-10 经 gear_apply 灌入——web_ui 现在 apps 表里。
 #
 # 落库方式：CLI 没有 `gear app register` / `gear apply` 子命令，App 清单只能经
 #   · MCP 的 gear_apply（bundle 含 kind: App），或

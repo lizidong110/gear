@@ -56,7 +56,7 @@ type bundle = artifact.Bundle
 //
 // 分类规则（**优先看 kind，无 kind 时退化为字段启发式**）：
 //
-//	kind: App  → 应用清单（仅 apply/validate 识别）
+//	kind: App  → 应用清单（apply/import 落 registry apps 表，命名空间户主）
 //	kind: Tool/Flow/Hook → 对应类型
 //	无 kind    → 有 steps 视为 Flow，有 stage 视为 Hook，否则视为 Tool
 //	              （后两条兼容仓库里 examples/*.yaml 的历史写法）

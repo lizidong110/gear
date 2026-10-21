@@ -948,6 +948,7 @@ gear mcp
 |---|---|
 | `插件化自动化编排框架_PRD_v40.md` | 产品需求文档（核心概念、模型语义、架构、用例），文档与代码漂移时以 `REQUIREMENTS.md` 为准 |
 | `REQUIREMENTS.md` | 需求可追溯矩阵（可执行规格契约），为每条 PRD 行为打需求 ID + 状态 + 断言测试 |
+| `docs/app-registration.md` | App 注册手册：Flow 与 App 的分工、App 行的四个消费者、三条注册路径与最小清单 |
 | `GEAR_工程方法_v1.md` | 交付宪法：17 条红线与质量闸门，贡献代码前必读 |
 | `extensions.example.yaml` | 扩展原语配置模板（复制为 `extensions.yaml` 启用自定义扩展） |
 | `examples/` | 面向用户的演示 / 种子 YAML（`hello_tool` / `hello_flow` / `sleeper_tool` / `service_flow` / `news-top10` / `ai-create-flow`），可 `gear serve --seed examples/<file>.yaml` 灌入；旧 Go 示例（slack-sidecar / news-demo / gear-ai-sidecar）**已移除**。AI 配方**默认内嵌**在 `internal/engine/recipes/`，`examples/ai/recipes/` 只是可选覆盖目录（默认不存在） |

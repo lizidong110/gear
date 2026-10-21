@@ -2,8 +2,17 @@
 
 ## 1. 什么是「应用」
 
-**没有 App 实体。** 应用 = **一个含 `mode: service` 长驻 step 的 Flow**，由 `gear_app(action=start)`
-派生一个独立后台进程（`gear app run`）来监管。写入（`gear_apply`）与运行（`gear_app start`）是**两个独立动作**。
+**运行时没有独立的「App 进程」**：应用跑起来 = **一个含 `mode: service` 长驻 step 的 Flow**，由 `gear_app(action=start)`
+派生一个独立后台进程（`gear app run`）来监管。
+
+**但注册时 App 是实体**：`kind: App` 清单（id / entry_flow / start.ports / layout / requires）经
+`gear_apply` / `gear import` 落进 registry 的 `apps` 表——**它是命名空间户主**：
+`App.id` 是所有 tool/flow id 的前缀来源（`<id>__x` / `<id>.x`），`--scope` 守卫、列表分组、
+`app start` 端口回退、`gear export` 四处都读它。没有这一行的应用，它的 tools 会被当成
+「平台级」——任何 `--scope` 都能引用（2026-10-21 用户实测踩到：只注册了 tool/flow，
+mindstorm__* 在 `--scope wms` 下列成平台级且拦不住）。
+
+写入（`gear_apply`）与运行（`gear_app start`）是**两个独立动作**。
 
 三种 step 形态：
 
@@ -81,9 +90,10 @@ gear_app(action: start|stop|status|list, flow_id?, app_id?, restart?, replace?, 
 ## 6. App Bundle（交付形态）
 
 「创建应用」建议用一个多文档 YAML 交付：第一份是 `kind: App` 清单，其余是标准 Tool/Flow/Hook 文档。
+（App 清单怎么落库、只补 App 行怎么办、字段全表——人类用户看 `docs/app-registration.md`。）
 
 ```yaml
-kind: App                       # 仅 apply/validate 识别，不入 registry
+kind: App                       # 应用清单：apply 后落 registry 的 apps 表（命名空间户主）
 id: mynews
 name: 我的新闻站
 description: 抓热搜 + 静态站托管

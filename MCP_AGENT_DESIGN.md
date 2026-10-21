@@ -406,10 +406,16 @@ MCP 无别名机制，一次性重命名。**Server `Version` 从 `0.1.0` 升到
 
 「创建应用」需要一个**明确的交付形态**。定义 Gear App Bundle：一个多文档 YAML，第一份是 `kind: App` 清单，其余是标准 Tool/Flow/Hook 文档。
 
-> **不引入 App 实体**：bundle 只是**多文档 YAML 的组织约定 + 依赖声明**，落到 registry 后仍然只有 Tool/Flow/Hook。这保持了 PRD 的非目标（「只有 Flow + `app run`」，`PRD_v40.md:60`）与 `GEAR_工程方法_v1.md` 的单一真相源原则。
+> ⚠ **本节决策已被推翻（2026-09-26，见 `APP_ARTIFACT_DESIGN.md` §2）**：App 实体已入 registry
+> （`apps` 表，`model.App`），`gear_apply` / `gear import` 会写这一行——它是命名空间户主
+> （`App.id` 是 tool/flow id 的前缀来源），`--scope` 守卫、列表分组、`app start` 端口回退、
+> `gear export` 四处都读它。当时「不引入 App 实体」的取舍在 gear 自用时成立，但
+> 「没有 App 实体」等价于「没有产品」——别人无法在 gear 上交付应用。以下保留为设计史。
+>
+> **（原决策，2026-09-26 前有效）不引入 App 实体**：bundle 只是**多文档 YAML 的组织约定 + 依赖声明**，落到 registry 后仍然只有 Tool/Flow/Hook。这保持了 PRD 的非目标（「只有 Flow + `app run`」，`PRD_v40.md:60`）与 `GEAR_工程方法_v1.md` 的单一真相源原则。
 
 ```yaml
-kind: App                       # ← 唯一新增的文档类型（仅 apply/validate 识别，不入 registry）
+kind: App                       # ← 唯一新增的文档类型（当时仅 apply/validate 识别；2026-09-26 起落 registry apps 表）
 id: mynews
 name: 我的新闻站
 description: 抓热搜 + 静态站托管

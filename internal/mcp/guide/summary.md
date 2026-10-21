@@ -1,7 +1,8 @@
 # Gear 心智模型（常驻摘要）
 
 Gear 是「机制内核」：只给 能力原语 + Tool（执行单元）+ Flow（编排）+ Hook（切面），不含业务策略。
-「应用」= 一个含 `mode: service` 长驻 step 的 Flow，用 `gear_app(action=start)` 起为后台进程。
+「应用」运行时 = 一个含 `mode: service` 长驻 step 的 Flow，用 `gear_app(action=start)` 起为后台进程；
+注册时还有一份 `kind: App` 清单落 registry `apps` 表（命名空间户主，`--scope` 守卫与 `app start` 端口回退都读它）。
 **「跨会话存活」不是无条件的**（Windows）：未能脱离调用方 Job Object 时，`start` 会返回 `escaped_job:false`
 并附 warning——该进程会随**发起启动的那次会话**结束被回收。它是 running，但活不到会话之后。
 

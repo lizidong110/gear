@@ -352,8 +352,8 @@ func (e *Engine) Scope() string { return e.scope }
 // **平台级能力不在守卫范围内**，两类：
 // ① cap 原语直调（`time.now` / `db.query` 等——它们根本不是 registry 对象，走
 // `resolveStepCallView` 的 ② 分支，从不进入本函数）；
-// ② **平台自带的注册 Tool**（`ext.serve` / `static_site.serve` / `web_ui.api`——
-// 无应用前缀、第一段不归属任何 App）。把平台能力按应用前缀一刀切，会让任何一个
+// ② **平台自带的注册 Tool**（`ext.serve` / `static_site.serve` / `pdf.read.demo`——
+// 命名空间第一段不归属任何已注册 App）。把平台能力按应用前缀一刀切，会让任何一个
 // 开了 `--scope` 的应用连自己的 Flow 都跑不起来（mindstorm 的入口 Flow 同时调用了
 // `mindstorm__config` 与 `static_site.serve`）。守的语义是「别碰**别人应用的
 // 定义**」，不是「别用平台」。
@@ -391,7 +391,7 @@ func (e *Engine) guardScope(id string) error {
 	}
 	// 平台级豁免（2026-10-21 补）：id 的命名空间第一段不归属任何已注册 App ⇒ 它不是
 	// 「别人应用的定义」，拦它没有保护意义，只会误杀 ext.serve / static_site.serve /
-	// web_ui.api 这类**平台自带的注册 Tool**。注释一直承诺此豁免，实现直到本次才补上
+	// pdf.read.demo 这类**平台自带的注册 Tool**。注释一直承诺此豁免，实现直到本次才补上
 	// （resolveStepCallView 的 ① 分支对任何已注册 Tool 无条件调本函数，承诺与代码
 	// 曾直接矛盾；S-11 钉住）。
 	//
