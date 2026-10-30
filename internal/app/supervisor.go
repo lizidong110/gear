@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -38,6 +40,16 @@ const (
 	//（避免一次偶发崩溃让后续重启被永久惩罚）。
 	stableWindow = time.Second
 )
+
+// superviseGrace 是收到停止信号后等待各 Flow 监管 goroutine 收敛的上限。
+//
+// 为什么必须有界：superviseOne 已在所有阻塞点响应 ctx，但「响应」不等于「立刻返回」——
+// 重启退避最多再睡 5s、ProcKill 要跑 taskkill、once step 要等子进程被杀收尸。
+// 没有上限时，一个卡在启动阶段的 Flow 能把整个 `app run` / `Server.Shutdown()`
+// 永久挂住（2026-10-29 审出，属停机挂死类缺陷）。
+// 超时**绝不静默**：未收敛的 Flow 逐个点名打印，把「谁没停干净」暴露出来。
+// 设为变量便于测试注入短时限。
+var superviseGrace = 15 * time.Second
 
 // nextBackoff 计算该 service 本次重启前应等待的时长。
 // 若本次存活时长 ≥ stableWindow，说明不是崩溃循环，退避计数归零（只等 restartBase）。
@@ -76,11 +88,19 @@ type Supervisor struct {
 	active      int
 	maxObserved int
 	restarts    int // 累计重启次数（restart=always 时 > 0，测试可观测）
+
+	// probes 记录每个 handle 当前探针的停止函数（**一 handle 一探针**）。
+	// 为什么需要它：旧实现在每次 Relaunch 后无差别 `go probeLoop(...)`，而探针只在
+	// ctx 取消或「连续失败把进程杀掉」时才退出。健康服务因外部原因崩溃重启时，
+	// 旧探针既不退出也没有被通知 ⇒ 同一 handle 上探针 goroutine 逐次累积
+	// （2026-10-29 审出）。这里改为起新探针前先停掉同一 handle 的旧探针。
+	probeMu sync.Mutex
+	probes  map[*engine.ServiceHandle]*probeToken
 }
 
 // New 构造 Supervisor。maxConcurrent < 1 表示不限（由 Supervise 按 flow 数兜底）。
 func New(eng *engine.Engine, policy RestartPolicy, maxConcurrent int) *Supervisor {
-	return &Supervisor{eng: eng, policy: policy, maxConcurrent: maxConcurrent}
+	return &Supervisor{eng: eng, policy: policy, maxConcurrent: maxConcurrent, probes: map[*engine.ServiceHandle]*probeToken{}}
 }
 
 // MaxObserved 返回监管期间同时运行的 Flow 数的峰值（测试并发闸门用）。
@@ -117,6 +137,8 @@ func (s *Supervisor) Supervise(ctx context.Context, flowIDs []string) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
+	// running 记录尚未收敛的 Flow，供等待超时后点名（绝不静默吞掉「谁没停干净」）。
+	running := map[string]bool{}
 
 	for _, fid := range flowIDs {
 		select {
@@ -128,6 +150,14 @@ func (s *Supervisor) Supervise(ctx context.Context, flowIDs []string) error {
 		go func(fid string) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			mu.Lock()
+			running[fid] = true
+			mu.Unlock()
+			defer func() {
+				mu.Lock()
+				delete(running, fid)
+				mu.Unlock()
+			}()
 			if err := s.superviseOne(ctx, fid); err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -139,8 +169,38 @@ func (s *Supervisor) Supervise(ctx context.Context, flowIDs []string) error {
 		}(fid)
 	}
 done:
-	wg.Wait()
+	if !waitGroup(&wg, superviseGrace) {
+		mu.Lock()
+		pending := make([]string, 0, len(running))
+		for fid := range running {
+			pending = append(pending, fid)
+		}
+		mu.Unlock()
+		sort.Strings(pending)
+		fmt.Printf("! 停止信号已发出 %s，以下 Flow 仍未收敛（其 service 子进程可能仍在运行）: %s\n",
+			superviseGrace, strings.Join(pending, ", "))
+	}
 	return firstErr
+}
+
+// waitGroup 有界等待一组 goroutine 结束；超时返回 false（不等到底，不留死等）。
+//
+// 注意：超时后等待用的那一个 goroutine 仍在 wg.Wait() 上——它随进程退出而消失，
+// 且每次调用至多一个，不像「每轮泄漏 N 个」那样会随时间累积。
+func waitGroup(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		wg.Wait()
+	}()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 func (s *Supervisor) superviseOne(ctx context.Context, flowID string) error {
@@ -156,7 +216,9 @@ func (s *Supervisor) superviseOne(ctx context.Context, flowID string) error {
 		s.mu.Unlock()
 	}()
 
-	res, err := s.eng.Supervise(flowID)
+	// ctx 穿进启动阶段：停机时 once step 的子进程会随 ctx 被杀，
+	// 监管器不会卡在一个永不返回的启动上（2026-10-29 修）。
+	res, err := s.eng.Supervise(ctx, flowID)
 	if err != nil {
 		return err
 	}
@@ -166,8 +228,11 @@ func (s *Supervisor) superviseOne(ctx context.Context, flowID string) error {
 
 	// 为每个 service 句柄启动健康检查探针（REQ-APP-HEALTH / #75）；nil 探针不启动。
 	for _, h := range res.Services {
-		go s.probeLoop(ctx, h)
+		s.startProbe(ctx, h)
 	}
+	// 本 Flow 监管结束（无论是停机、restart=never 还是出错）都停掉它的探针：
+	// 探针只在 ctx 取消或主动 stop 时退出，少了这一句，正常退出的 Flow 会留下常驻探针。
+	defer s.stopProbes(res.Services)
 
 	for {
 		select {
@@ -203,8 +268,9 @@ func (s *Supervisor) superviseOne(ctx context.Context, flowID string) error {
 		s.restarts++
 		s.mu.Unlock()
 		fmt.Printf("↻ step %s service 重启 (第 %d 次)\n", h.StepID, h.Restarts)
-		// 重启后该 handle 的进程已换柄，启动新一轮探针（旧探针循环已在 procKill 后退出）。
-		go s.probeLoop(ctx, h)
+		// 重启后该 handle 的进程已换柄：起新探针前先停掉同一 handle 的旧探针
+		//（旧探针只在 ctx 取消或 kill 后退出，放任不管会逐次累积）。
+		s.startProbe(ctx, h)
 	}
 }
 
@@ -261,8 +327,73 @@ func (s *Supervisor) waitAny(ctx context.Context, handles []*engine.ServiceHandl
 	}
 }
 
+// probeToken 是一代探针的身份凭据（指针即身份），用于「只摘自己的牌」。
+//
+// 为什么需要身份：探针退出时要把自己从 s.probes 摘掉，但此刻登记项可能已经是
+// 新一代探针（崩溃 → 重启 → 新探针），直接 delete 会误删后来者的登记，
+// 让 stopProbes 停不掉新探针。按指针比对，只删自己那一代。
+type probeToken struct {
+	stop  chan struct{}
+	once  sync.Once
+	stops func()
+}
+
+func newProbeToken() *probeToken {
+	t := &probeToken{stop: make(chan struct{})}
+	t.stops = func() { t.once.Do(func() { close(t.stop) }) }
+	return t
+}
+
+// startProbe 为 handle 启动健康检查探针，**保证同一 handle 至多一个探针在跑**。
+//
+// 旧实现每次 Relaunch 都直接 `go probeLoop(...)`：探针只在 ctx 取消或「连续失败后
+// 把进程杀掉」时退出，于是「进程因外部原因崩溃 → 重启」这条最普通的路径上，
+// 旧探针既不退出也没被通知，探针 goroutine 随重启次数线性累积（2026-10-29 审出）。
+// 这里先停旧的再起新的，并把它登记进 s.probes 供 stopProbes 收尾。
+// h.Probe 为 nil（未配置探针）时直接返回——与 probeLoop 内的判据保持单一处语义。
+func (s *Supervisor) startProbe(ctx context.Context, h *engine.ServiceHandle) {
+	if h.Probe == nil {
+		return
+	}
+	tok := newProbeToken()
+
+	s.probeMu.Lock()
+	if old, ok := s.probes[h]; ok {
+		old.stops() // 停掉同一 handle 的上一代探针
+	}
+	s.probes[h] = tok
+	s.probeMu.Unlock()
+
+	go func() {
+		s.probeLoop(ctx, tok.stop, h)
+		s.probeMu.Lock()
+		if cur, ok := s.probes[h]; ok && cur == tok {
+			delete(s.probes, h)
+		}
+		s.probeMu.Unlock()
+	}()
+}
+
+// stopProbe 停掉单个 handle 的探针并摘牌（无探针则 no-op）。
+func (s *Supervisor) stopProbe(h *engine.ServiceHandle) {
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if tok, ok := s.probes[h]; ok {
+		tok.stops()
+		delete(s.probes, h)
+	}
+}
+
+// stopProbes 停掉一批 handle 的探针（监管结束时收尾）。
+func (s *Supervisor) stopProbes(handles []*engine.ServiceHandle) {
+	for _, h := range handles {
+		s.stopProbe(h)
+	}
+}
+
 func (s *Supervisor) stopAll(handles []*engine.ServiceHandle) {
 	for _, h := range handles {
+		s.stopProbe(h)
 		_ = h.ProcKill()
 		// service ext：杀进程后 Deregister 自身 PID；占用列表空则侧车自动退出
 		//（EXT_SERVICE_DESIGN.md §12）。Coord 为 nil 时（非 service ext）no-op。

@@ -1,9 +1,15 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -11,6 +17,7 @@ import (
 	"gear/internal/model"
 	"gear/internal/registry"
 	"gear/internal/server"
+	"gear/internal/webui"
 )
 
 // serveCmd 启动 REST 执行面。监听地址复用根命令的持久 --addr 标志
@@ -20,12 +27,19 @@ import (
 // 有明文 secrets（PUT/GET /api/secrets/{name}）与 registry 写入——比 MCP 面写得还多，
 // 没理由 MCP 拒绑全网卡而这里放行。非回环地址（含空 host `:8787`，等价 0.0.0.0）默认拒绝，
 // 确有远程需求时显式 --allow-remote。
+// serveNoUI / serveNoOpen 是 serve（与 ui 命令共享）的 UI 相关开关，提升为包级变量，
+// 以便 `gear ui` 复用 serveCmd 时能通过 Flags().Set 强制开启 UI。
+var (
+	serveNoUI   bool
+	serveNoOpen bool
+)
+
 func serveCmd() *cobra.Command {
 	var seed string
 	var allowRemote bool
 	c := &cobra.Command{
 		Use:   "serve",
-		Short: "启动 REST 执行面（PRD §11；执行面无鉴权，默认只绑回环）",
+		Short: "启动 REST 执行面并同源托管 Web 管理界面（PRD §11；执行面无鉴权，默认只绑回环）",
 		Long: "启动 REST 执行面（PRD §11）。\n\n" +
 			"两种执行语义不要混：\n" +
 			"  POST /api/tools/{id}/run   同步——直接返回该 Tool 的输出（200）\n" +
@@ -47,27 +61,39 @@ func serveCmd() *cobra.Command {
 					return err
 				}
 			}
+			// Web UI 处理器（REQ-UI-LAUNCH-SERVE）：默认托管内嵌界面；--no-ui 时传 nil
+			// （Server 据此不注册 / 路由，GET / 返回 404 指引）。
+			var uiHandler http.Handler
+			if !serveNoUI {
+				uiHandler = webui.Handler()
+			}
 			// WithRegistryPath：POST /api/apps/prune 要按「本进程真正在用的」registry 定位
 			// 落盘台账；不注入的话它会退回 gearhome 默认值，去清另一个库的台账。
-			srv, err := server.New(reg, server.WithRegistryPath(registryPath), server.WithOnListen(func(realAddr string) {
-				// 顺序不可换：port 行必须是 stdout 的**第一行非空行**，否则 process runtime
-				// 在长驻子进程 stdout 里找首行 JSON 时会解析到 banner。
-				// banner 带**库内计数**：不带的话，「指向了一个空库」这件事完全静默——
-				// 页面只是空列表，日志一个字都没有（2026-09-22 实测：应用自带的 REST 面读的是
-				// 另一次实验留下的空库，排查花了一整轮）。起服时打印一行 flows=0 就够了。
-				if line := servePortLine(realAddr); line != "" {
-					fmt.Print(line)
-				}
-				fmt.Print(serveBanner(realAddr, registryPath, reg))
-			}))
+			srv, err := server.New(reg, server.WithRegistryPath(registryPath), server.WithUI(uiHandler), server.WithOnListen(serveOnListen(registryPath, reg)))
 			if err != nil {
 				return err
 			}
-			return srv.ListenAndServe(serverAddr)
+			// 接信号，实现优雅停机（P0-1，2026-10-29 修）：此前 gear serve 全程没有
+			// signal.NotifyContext，Go 默认行为收到 SIGINT 是直接终止、defer 都不跑 ⇒
+			// 受管 app 的 service 子进程成孤儿、端口继续被占、execs/secrets.db 文件锁不释放。
+			// 收到信号后主动触发 Server.Shutdown（停监听 → 取消在途执行 → 停受管 app →
+			// 有界等待收敛 → 释放句柄），让 ListenAndServe 经 ErrServerClosed 正常返回。
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			go func() {
+				<-ctx.Done()
+				_ = srv.Shutdown()
+			}()
+			if err := srv.ListenAndServe(serverAddr); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
 		},
 	}
 	c.Flags().StringVar(&seed, "seed", "", "启动时从 YAML 灌入示例 Tool/Flow（多文档，每篇一个 Tool 或 Flow），如 examples/news-top10.yaml")
 	c.Flags().BoolVar(&allowRemote, "allow-remote", false, "允许监听非回环地址（当前无鉴权，明文 secrets 与 registry 写入会暴露给局域网）")
+	c.Flags().BoolVar(&serveNoUI, "no-ui", false, "不托管 Web 管理界面（默认同源托管，浏览器打开即出界面）")
+	c.Flags().BoolVar(&serveNoOpen, "no-open", false, "不自动打开浏览器（仍会打印 GEAR_OPEN_URL= 供手动打开）")
 	return c
 }
 
@@ -100,6 +126,37 @@ func serveBanner(addr, registry string, reg *registry.Registry) string {
 	tools, _ := reg.ListTools()
 	return fmt.Sprintf("Gear REST 服务监听 %s（registry=%s, flows=%d, tools=%d）\n",
 		addr, registry, len(flows), len(tools))
+}
+
+// serveOnListen 是 gear serve 监听就绪后的回调（REQ-UI-LAUNCH-OPENURL / REQ-UI-LAUNCH-AUTOOPEN）：
+// 打印端口声明（长驻子进程给父进程看的首行 JSON）、起服横幅、可点击的管理界面地址，
+// 并在未禁用时自动打开浏览器。抽成纯函数以便断言——它承载的是一条排障/可用性判据，不是装饰。
+// 测试（internal/cli/ui_test.go 的 TestServePrintsOpenURL）复用本函数，确保锁住的是 gear serve
+// 真正执行的同一段打印逻辑，而非一份会漂移的副本。
+func serveOnListen(registryPath string, reg *registry.Registry) func(string) {
+	return func(realAddr string) {
+		// 顺序不可换：port 行必须是 stdout 的**第一行非空行**，否则 process runtime
+		// 在长驻子进程 stdout 里找首行 JSON 时会解析到 banner。
+		// banner 带**库内计数**：不带的话，「指向了一个空库」这件事完全静默——
+		// 页面只是空列表，日志一个字都没有（2026-09-22 实测：应用自带的 REST 面读的是
+		// 另一次实验留下的空库，排查花了一整轮）。起服时打印一行 flows=0 就够了。
+		if line := servePortLine(realAddr); line != "" {
+			fmt.Print(line)
+		}
+		fmt.Print(serveBanner(realAddr, registryPath, reg))
+		// Web UI：打印可点击地址，并在非 --no-open 时自动打开浏览器。开浏览器放在延迟 goroutine 里，
+		// 避开 onListen 早于 Serve 的竞态（浏览器可能在监听就绪前就打到端口）。
+		if !serveNoUI {
+			openURL := "http://" + realAddr + "/"
+			fmt.Printf("GEAR_OPEN_URL=%s\n", openURL)
+			if !serveNoOpen {
+				go func(u string) {
+					time.Sleep(400 * time.Millisecond)
+					_ = openBrowser(u)
+				}(openURL)
+			}
+		}
+	}
 }
 
 // seedExamples 把示例 YAML 里的 Tool/Flow 灌入注册表（供 GET /api/news 等端点开箱即用）。

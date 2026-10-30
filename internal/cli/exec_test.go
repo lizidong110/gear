@@ -73,7 +73,7 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 	ts := httptest.NewServer(srv.Handler())
 	// 先停 HTTP，再 Shutdown（后者会关闭 ExecStore 释放 SQLite 句柄，使 t.TempDir 清理成功）。
 	t.Cleanup(ts.Close)
-	t.Cleanup(srv.Shutdown)
+	t.Cleanup(func() { _ = srv.Shutdown() })
 	return ts, strings.TrimPrefix(ts.URL, "http://")
 }
 

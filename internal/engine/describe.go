@@ -37,6 +37,12 @@ const describeMaxBytes = 4 << 20
 // 否则一个超时用例就要真等 10 秒。
 var describeTimeout = 10 * time.Second
 
+// DescribeTimeout 对外暴露自描述探测的时限。
+//
+// 存在理由：`gear ext scan` 要把「最多等多久」打印给人看。让 CLI 自己写一句「10s」
+// 就是又一份会漂移的副本——改这里、忘那里，文案就开始说谎。
+func DescribeTimeout() time.Duration { return describeTimeout }
+
 // describeCache 按「可执行文件 + 它的 mtime + size」缓存扫描结果。
 //
 // 缓存键**必须带上 mtime/size**：这正是 2026-10-08 那次事故的形态——MCP 面长期跑着

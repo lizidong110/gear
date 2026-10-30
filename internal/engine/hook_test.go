@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -294,7 +295,7 @@ func TestHookAppliesToServiceStep(t *testing.T) {
 		{ID: "keep", Call: "sleepy", Mode: "service", Input: map[string]interface{}{}},
 	}})
 
-	res, err := New(reg).Supervise("f")
+	res, err := New(reg).Supervise(context.Background(), "f")
 	if err != nil {
 		t.Fatalf("Supervise 失败: %v", err)
 	}

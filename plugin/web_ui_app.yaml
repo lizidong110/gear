@@ -5,10 +5,10 @@
 # 只有 Flow 没有 App 清单时 export 才报「没有 App 清单」（也会按入口 Flow 临时合成，见
 # REQ-APP-ARTIFACT）。本文件已于 2026-10-10 经 gear_apply 灌入——web_ui 现在 apps 表里。
 #
-# 落库方式：CLI 没有 `gear app register` / `gear apply` 子命令，App 清单只能经
-#   · MCP 的 gear_apply（bundle 含 kind: App），或
-#   · gear import（先导出过产物，再导回——首次还是要先有清单）
-# 灌入。本文件就是给 gear_apply 用的 App 那一段（可塞进一个 bundle 一起 apply）。
+# 落库方式：App 清单只有一个写入口——`gear apply <file.yaml>`（CLI）/ `gear_apply`（MCP）。
+# `gear tool register` / `gear flow register` 只写各自那一行，**永远不写 App 行**；
+# `gear import` 只吃 `gear export` 的产物（首次仍要先有清单）。详见 docs/app-registration.md。
+# 本文件就是那份 App 清单（可单独 apply，也可塞进一个 bundle 一起 apply）。
 #
 # 静态资源：web_ui 的站点是 build/dist（前端构建产物，41 个带 hash 的文件），不进版本库。
 # 用 `dir: true` 声明「整个目录递归导出」，避免把 dist/assets/*.js 逐个列名（重建即变名）。

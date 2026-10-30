@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -211,7 +212,7 @@ func TestWhenSkipsServiceStep(t *testing.T) {
 		{ID: "keep", Call: "sleepy", Mode: "service", When: "false", Input: map[string]interface{}{}},
 	}})
 
-	res, err := New(reg).Supervise("f")
+	res, err := New(reg).Supervise(context.Background(), "f")
 	if err != nil {
 		t.Fatalf("跳过 service 不应视为失败: %v", err)
 	}

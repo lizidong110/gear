@@ -77,3 +77,23 @@ func TestConcurrencyGateStopWaitsForInFlight(t *testing.T) {
 		t.Fatal("Stop 应在在途任务完成后返回")
 	}
 }
+
+// TestConcurrencyGateStopWithTimeoutReturnsFalseWhenStuck 验证 StopWithTimeout 在
+// 在途任务不肯退出时能**超时返回 false**而非死等（2026-10-29 修：此前 Server.Shutdown
+// 经无界 gate.Stop 卡死，一个长跑 Flow 就能把停机拖成永久挂起）。
+func TestConcurrencyGateStopWithTimeoutReturnsFalseWhenStuck(t *testing.T) {
+	block := make(chan struct{})
+	g := NewConcurrencyGate(1, 0)
+	g.Submit(func() { <-block }) // 占住唯一 worker 且不退出
+	time.Sleep(20 * time.Millisecond)
+
+	start := time.Now()
+	if g.StopWithTimeout(150 * time.Millisecond) {
+		t.Fatal("worker 卡住时 StopWithTimeout 应返回 false")
+	}
+	if elapsed := time.Since(start); elapsed > 600*time.Millisecond {
+		t.Fatalf("StopWithTimeout 不应远超时限（实耗 %v）", elapsed)
+	}
+	// 收尾：放行 worker，避免测试泄漏 goroutine。
+	close(block)
+}

@@ -86,6 +86,30 @@ GEAR_LDFLAGS="-X gear/internal/buildinfo.Version=$GEAR_VER"
 GEAR_LDFLAGS="$GEAR_LDFLAGS -X gear/internal/buildinfo.Commit=$GEAR_SHA"
 GEAR_LDFLAGS="$GEAR_LDFLAGS -X gear/internal/buildinfo.BuildTime=$GEAR_TS"
 
+# 前端 Web UI 构建（REQ-UI-NF-EMBED-PIPE）：把 plugin/web-ui 的构建产物拷入 internal/webui/public，
+# 供 Go 侧 //go:embed 编译进二进制（同源托管，零 CORS）。
+#   仅当 pnpm 可用且依赖已装（node_modules 存在）时才构建；否则跳过并告警——
+#   此时 internal/webui/public 只有占位页 _placeholder.html，运行期访问 / 返回 503 指引，而不是空白。
+#   拷入前先清掉上次的真实产物（index.html / assets / 各类静态文件），避免残留旧构建；
+#   _placeholder.html 永不被清，保证 embed 始终能编译。
+UI_DIST="internal/webui/public"
+if command -v pnpm >/dev/null 2>&1 && [ -d "plugin/web-ui/node_modules" ]; then
+  echo "── 构建 Web UI (plugin/web-ui) → $UI_DIST"
+  if (cd plugin/web-ui && pnpm run build); then
+    rm -f "$UI_DIST/index.html" "$UI_DIST"/*.js "$UI_DIST"/*.css "$UI_DIST"/*.json 2>/dev/null || true
+    rm -rf "$UI_DIST/assets" 2>/dev/null || true
+    if cp -r plugin/web-ui/dist/. "$UI_DIST/"; then
+      echo "✅ Web UI 产物已拷入 $UI_DIST"
+    else
+      echo "⚠ Web UI 构建成功但产物拷入失败；$UI_DIST 将仅有占位页（运行期 / 返回 503 指引）"
+    fi
+  else
+    echo "⚠ Web UI 构建失败，将使用占位页（运行期访问 / 返回 503 指引）"
+  fi
+else
+  echo "⚠ 跳过 Web UI 构建（pnpm 不可用或未安装依赖 plugin/web-ui/node_modules）；运行期若访问 / 将返回 503 指引"
+fi
+
 echo "══════════ Gear 编译 $(date '+%F %T') ══════════"
 echo "版本注入：Version=$GEAR_VER Commit=$GEAR_SHA BuildTime=$GEAR_TS"
 for t in "${TARGETS[@]}"; do

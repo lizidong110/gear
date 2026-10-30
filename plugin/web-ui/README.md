@@ -8,6 +8,18 @@ Gear 自动化编排框架的 **Web 管理端**。以**插件**形态存在，�
 
 ## 快速开始
 
+### 最快路径（2026-10-21 起）
+
+```bash
+gear ui        # 或直接 gear serve：浏览器打开 http://127.0.0.1:8787/ 即是界面
+```
+
+`gear serve` 默认把本目录的前端产物 `go:embed` 进 Gear 二进制并**同源托管**——
+不需要另起静态服务器、不需要填 API 地址、**不需要任何 CORS 头**（浏览器与 `/api` 同 origin）。
+发布二进制走仓库根 `bash scripts/build.sh`（自动 `pnpm run build` → 拷入 `internal/webui/public` → `go build`）。
+
+下面两条是**开发期**与**独立部署**路径，仍可用。
+
 ### 开发
 
 ```bash
@@ -28,13 +40,19 @@ npm run dev                       # http://localhost:5173
 GEAR_API=http://127.0.0.1:9000 npm run dev
 ```
 
+也可以不跑 dev server、直接让内核托管已构建产物（热更新用）：
+
+```bash
+GEAR_UI_DIR=plugin/web-ui/dist gear serve
+```
+
 ### 生产
 
 ```bash
 npm run build        # 产出 dist/（纯静态，hash 路由，无需服务端 rewrite）
 ```
 
-用任意静态服务器托管 `dist/`，并把 `/api` 反代到内核即可，例如 nginx：
+用任意静态服务器托管 `dist/`，并把 `/api` 反代到内核即可（例如 nginx：
 
 ```nginx
 server {

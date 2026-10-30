@@ -18,7 +18,7 @@ import (
 	"gear/internal/registry"
 )
 
-func newTestServer(t *testing.T) (*Server, *registry.Registry) {
+func newTestServer(t *testing.T, opts ...ServerOption) (*Server, *registry.Registry) {
 	t.Helper()
 	reg, err := registry.Open(filepath.Join(t.TempDir(), "registry.db"))
 	if err != nil {
@@ -27,7 +27,7 @@ func newTestServer(t *testing.T) (*Server, *registry.Registry) {
 	t.Cleanup(func() { _ = reg.Close() })
 	// secrets.db 注入临时库，避免 New 默认落真实 <GEAR_HOME>/secrets.db。
 	secretsDB := filepath.Join(t.TempDir(), "secrets.db")
-	srv, err := New(reg, WithSecretsDBPath(secretsDB))
+	srv, err := New(reg, append([]ServerOption{WithSecretsDBPath(secretsDB)}, opts...)...)
 	if err != nil {
 		t.Fatalf("构造 Server 失败: %v", err)
 	}
@@ -814,7 +814,7 @@ func TestAppsLifecycle(t *testing.T) {
 	if rec, _ := do(t, h, "DELETE", "/api/apps/"+id, nil); rec.Code != http.StatusOK {
 		t.Fatalf("停止 app 期望 200，实际 %d", rec.Code)
 	}
-	s.Shutdown()
+	_ = s.Shutdown()
 	if got := len(doArray(t, h, "GET", "/api/apps")); got != 0 {
 		t.Fatalf("停止后 app 列表应为 0，实际 %d", got)
 	}
@@ -822,6 +822,45 @@ func TestAppsLifecycle(t *testing.T) {
 	if rec, _ := do(t, h, "DELETE", "/api/apps/"+id, nil); rec.Code != http.StatusNotFound {
 		t.Fatalf("停止不存在的 app 期望 404，实际 %d", rec.Code)
 	}
+}
+
+// TestServerShutdownConvergesWhenIdle 验证空闲 Server 的 Shutdown 迅速返回 nil
+// （不挂起、不误报未收敛）。这是「有界停机」的正常路径判据。
+func TestServerShutdownConvergesWhenIdle(t *testing.T) {
+	s, _ := newTestServer(t)
+	start := time.Now()
+	if err := s.Shutdown(); err != nil {
+		t.Fatalf("空闲 Shutdown 应返回 nil，实得: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("空闲 Shutdown 不应耗时过久（实耗 %v）", elapsed)
+	}
+}
+
+// TestServerShutdownIsBounded 验证：当在途执行**不肯退出**时，Shutdown 仍能在
+// shutdownTimeout 内返回（返回 error 如实上报未收敛），而**不会无限期挂起**
+// （2026-10-29 修：此前 gate.Stop / appWG.Wait 都是无限等待，一个长跑 Flow 或一个卡在
+// 启动阶段的监管 goroutine 就能把 `gear serve` 的停机永久拖死）。
+func TestServerShutdownIsBounded(t *testing.T) {
+	s, _ := newTestServer(t, WithShutdownTimeout(120*time.Millisecond))
+	block := make(chan struct{})
+	// 向闸门塞一个占住 worker 且不肯退出的任务（模拟一个声明超长 timeout 的长跑 Flow）。
+	if !s.gate.Submit(func() { <-block }) {
+		t.Fatal("应向闸门提交卡住任务")
+	}
+	time.Sleep(20 * time.Millisecond) // 让 worker 真正进入任务
+
+	start := time.Now()
+	err := s.Shutdown()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("卡住的执行未收敛，Shutdown 应返回 error")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Shutdown 不应远超 shutdownTimeout（实耗 %v）", elapsed)
+	}
+	// 收尾：放行卡住的任务，避免测试泄漏 goroutine。
+	close(block)
 }
 
 // A-12：并发触发同一个 Flow——store 必须并发安全（-race 下运行）。

@@ -38,6 +38,12 @@ extensions.yaml
 **/dist/
 plugin/web-ui/coverage/
 build/
+
+# 编译进二进制的 Web UI 产物（由 build.sh 从 plugin/web-ui/dist 拷入 internal/webui/public，勿提交）。
+# 但 _placeholder.html 必须保留入库——它是 //go:embed all:public 的保底文件，
+# 保证「未构建前端」时二进制仍能编译；运行期若缺真实产物则 / 返回 503 指引。
+internal/webui/public/*
+!internal/webui/public/_placeholder.html
 # 演示目录：提交顶层的演示 YAML 与 README，忽略子目录/临时产物
 examples/*
 !examples/*.yaml

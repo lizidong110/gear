@@ -944,7 +944,7 @@ func (e *Engine) runWithVars(ctx context.Context, flow *model.Flow, observe Tool
 
 	// S4：分层执行——同一层内无依赖的 step 并行调度（PRD §4.3），受 maxParallel 限流。
 	for _, level := range levels {
-		err := e.execLevel(flow.Steps, level, func(ctx context.Context, step model.Step, call resolvedCall) error {
+		err := e.execLevel(ctx, flow.Steps, level, func(ctx context.Context, step model.Step, call resolvedCall) error {
 			if reason, ok := skipReasonFor(step.ID); ok {
 				markSkipped(step.ID, reason)
 				e.progressf("- step %s 跳过（%s）\n", step.ID, reason)
@@ -994,8 +994,14 @@ func (e *Engine) runWithVars(ctx context.Context, flow *model.Flow, observe Tool
 // 失败语义（fail-closed）：首个错误即取消本层上下文（阻止未启动的 step 起跑，
 // 并让在跑的子进程随 ctx 被杀），等待本层全部 goroutine 收尾后返回该错误；
 // 后续层不再执行。
-func (e *Engine) execLevel(steps []model.Step, level []int, fn func(ctx context.Context, step model.Step, call resolvedCall) error) error {
-	lvlCtx, cancel := context.WithCancel(context.Background())
+//
+// ctx 是**调用方**的生命周期上下文（一次性执行 = 请求 ctx；监管启动 = 监管 ctx）。
+// 为什么必须穿进来：此前这里写死 context.Background()，于是「停机 / Ctrl+C」只能靠
+// 上层的 wg.Wait() 干等——启动期的 once step 一旦卡住（无超时的 HTTP、Lua 死循环），
+// 取消信号根本到不了子进程，监管器与 Server.Shutdown 会永久阻塞（2026-10-29 审出）。
+// 层级 ctx 现在是调用方 ctx 的**子**，父取消 ⇒ 本层取消 ⇒ 子进程被 kill。
+func (e *Engine) execLevel(ctx context.Context, steps []model.Step, level []int, fn func(ctx context.Context, step model.Step, call resolvedCall) error) error {
+	lvlCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	sem := make(chan struct{}, e.maxParallel)

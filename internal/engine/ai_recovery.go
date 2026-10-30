@@ -525,6 +525,84 @@ func sleepBackoff(fn func(int) time.Duration, attempt int) {
 	}
 }
 
+// toolExecResult 是「执行 + L0 机械重试」的终局结果。react 的 execute 闭包与 rewoo 的
+// rewooExecNode 共用 execToolWithL0Retry——REQ-REWOO ⑤「失败分层恢复复用 react 同款」
+// 要求两条执行路径的重试语义只有一份实现：两边各写一遍循环，迟早给一边加退避、换判定
+// 或修 Windows 文案而漏另一边，那种漂移在各自的用例里看不出来。
+//
+// 四种终局组合：
+//   - 成功：Out 非 nil、Failure nil、Empty false；
+//   - 空结果：Out 非 nil、Empty true（semantic_empty，不是错误）；
+//   - exec 报错且重试无望：Out nil、Failure 非 nil；
+//   - HTTP 状态码可重试但重试仍失败：Out 非 nil、Failure 非 nil——HTTP 工具对错误的
+//     正常返回形态就是 body，两个调度器对它的终局策略刻意不同（见函数注释）。
+type toolExecResult struct {
+	Out      map[string]interface{}
+	Empty    bool
+	Failure  *reactFailure // 终局失败（Class/Reason/Scope/Attempts 已填好；GapKey 留给调用方）
+	Attempts int           // 实际发生的机械重试次数
+}
+
+// execToolWithL0Retry 执行一个动作入口并做 L0 机械重试，是 react / rewoo 两条执行路径的
+// 唯一实现。重试不烧 LLM 轮次、与模型重发无关（重复调用守卫只拦模型）；ctx 取消立即停止
+// 重试（不再白烧一次调用）。
+//
+// 两类重试触发：① exec 报错按 failureRecovery 策略表判（transient 才值得再试）；
+// ② 结果 body 里带可重试 HTTP 状态码——ctx.http.Request 不把非 2xx 当错误、status 在
+// body 里，不在这里接住，L0 重试对 HTTP 类工具等于不存在。
+//
+// HTTP 重试耗尽时**同时**给 Out 与 Failure，终局策略交给调用方，因为这是两种调度器的
+// 刻意分歧：react 把 429 body 当 observation 交给模型自己决定换路线（失败信号已经在
+// body 里，再记一次失败只是噪声）；rewoo 记节点失败（fail-soft 要求每个失败都有节点级
+// 账，solver 与缺口按它作答）。这个分歧是设计选择不是遗漏，所以显式分叉而不藏隐式约定。
+func (a *AIAgent) execToolWithL0Retry(ctx context.Context, action, entry string, board *reactBoard) toolExecResult {
+	attempts := 0
+	for {
+		out, err := a.exec(ctx, entry, map[string]interface{}{})
+		if err == nil {
+			if code, retry := retryableHTTPStatus(out); retry {
+				// 先分类再判（与 exec 报错路径同一口径）：四类可重试状态码
+				// 429/502/503/504 的分类结果都是 transient，与 retryableHTTPStatus
+				// 的集合判定等价，但「什么算可重试」从此只有一份定义。
+				f := classifyToolFailure(action, fmt.Errorf("HTTP %d %s", code, httpStatusText(code)))
+				if l0Retryable(board, f.Class, attempts, ctx) {
+					attempts++
+					board.recordRecovery(fmt.Sprintf("L0 重试 %s（%s，第 %d 次）：HTTP %d", action, f.Class, attempts, code))
+					sleepBackoff(a.retryBackoff, attempts-1)
+					continue
+				}
+				f.Scope = board.scopeHint()
+				f.Attempts = attempts
+				return toolExecResult{Out: out, Failure: &f, Attempts: attempts}
+			}
+			if isEmptyToolResult(out) {
+				return toolExecResult{Out: out, Empty: true, Attempts: attempts}
+			}
+			return toolExecResult{Out: out, Attempts: attempts}
+		}
+		f := classifyToolFailure(action, err)
+		if l0Retryable(board, f.Class, attempts, ctx) {
+			attempts++
+			board.recordRecovery(fmt.Sprintf("L0 重试 %s（%s，第 %d 次）：%v", action, f.Class, attempts, err))
+			sleepBackoff(a.retryBackoff, attempts-1)
+			continue
+		}
+		f.Scope = board.scopeHint()
+		f.Attempts = attempts
+		return toolExecResult{Failure: &f, Attempts: attempts}
+	}
+}
+
+// l0Retryable 报告这次失败是否值得再试：类别允许 + 未达单次上限 + 全局预算未耗尽 +
+// ctx 未取消。注意 spendRetry 有副作用（扣全局重试预算），必须放最后一个条件——
+// 前面不满足时不白扣（与 Go && 短络同一口径，调用方不得改动条件顺序）。
+func l0Retryable(board *reactBoard, class FailureClass, attempts int, ctx context.Context) bool {
+	return failureRecovery[class].retry &&
+		attempts < maxToolRetries &&
+		board.spendRetry() &&
+		ctx.Err() == nil
+}
+
 // completeReactStep 跑一次 LLM 补全，外面包一层恢复（REQ-REACT-RECOVERY 的 provider 侧）：
 //   - L0：transient（超时/连接/429/503）机械重试，上限 maxLLMRetries，与工具重试共享全局预算；
 //   - L1.5：端点不吃工具声明时换通道——降级为文本 Action 协议（返回 degraded=true，

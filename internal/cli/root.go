@@ -95,7 +95,7 @@ func newRootCmd() *cobra.Command {
 
 	// ⚠ 必须保持**单行**：tools/doc_audit.py 的 CLI 双向核对按这一行的文本提取子命令集，
 	//    拆成多行会让它只读到第一行的两个命令，进而把其余十几个全报成「文档有、代码无」。
-	root.AddCommand(toolCmd(), flowCmd(), appCmd(), hookCmd(), serveCmd(), execCmd(), aiCmd(), mcpCmd(), extCmd(), scaffoldCmd(), configCmd(), secretCmd(), exportCmd(), importCmd(), applyCmd(), historyCmd(), versionCmd(), doctorCmd())
+	root.AddCommand(toolCmd(), flowCmd(), appCmd(), hookCmd(), serveCmd(), uiCmd(), execCmd(), aiCmd(), mcpCmd(), extCmd(), scaffoldCmd(), configCmd(), secretCmd(), exportCmd(), importCmd(), applyCmd(), historyCmd(), versionCmd(), doctorCmd())
 	return root
 }
 

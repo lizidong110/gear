@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -48,7 +49,7 @@ func TestSuperviseLaunchesService(t *testing.T) {
 	if err := reg.UpsertFlow(flow); err != nil {
 		t.Fatalf("注册 Flow 失败: %v", err)
 	}
-	res, err := New(reg).Supervise("s")
+	res, err := New(reg).Supervise(context.Background(), "s")
 	if err != nil {
 		t.Fatalf("Supervise 失败: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestServiceDepGuard(t *testing.T) {
 	if err := reg.UpsertFlow(flow); err != nil {
 		t.Fatalf("注册 Flow 失败: %v", err)
 	}
-	if _, err := New(reg).Supervise("bad"); err == nil {
+	if _, err := New(reg).Supervise(context.Background(), "bad"); err == nil {
 		t.Fatal("依赖 service step 应被拒绝")
 	}
 }
@@ -110,7 +111,7 @@ func TestSupervisePureOnce(t *testing.T) {
 	if err := reg.UpsertFlow(flow); err != nil {
 		t.Fatalf("注册 Flow 失败: %v", err)
 	}
-	res, err := New(reg).Supervise("o")
+	res, err := New(reg).Supervise(context.Background(), "o")
 	if err != nil {
 		t.Fatalf("Supervise 失败: %v", err)
 	}
@@ -149,7 +150,7 @@ func TestSuperviseKillsStartedServicesOnFailure(t *testing.T) {
 		t.Fatalf("注册 Flow 失败: %v", err)
 	}
 
-	res, err := New(reg).Supervise("flaky")
+	res, err := New(reg).Supervise(context.Background(), "flaky")
 	if err == nil {
 		t.Fatal("Flow 含失败 step，Supervise 应返回错误")
 	}

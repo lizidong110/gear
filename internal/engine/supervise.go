@@ -66,9 +66,28 @@ func (h *ServiceHandle) WaitExit(ctx context.Context) <-chan struct{} {
 	go func() {
 		for {
 			if p := h.CurrentProc(); h.HasLocalProc() && p != nil {
-				_ = p.Wait()
-				close(ch)
-				return
+				// 把不可中断的 p.Wait() 放进子 goroutine，本循环据此可被 ctx 打断。
+				//
+				// 为什么必须这层中转：p.Wait() 是 os/exec 的阻塞等待，不接受 ctx。
+				// 直接原地 Wait 的结果是——waitAny 每轮给每个 handle 起一个 goroutine，
+				// ctx 取消后那 N-1 个「等其他 handle」的 goroutine 永久挂着，
+				// 崩溃循环下每轮泄漏 N-1 个（2026-10-29 审出）。
+				//
+				// 代价如实说明：ctx 取消时子 goroutine 仍在 Wait（无法强拆 syscall），
+				// 但泄漏量从「每轮 +N-1」降为「每个停机时仍存活的 service 至多 1 个」，
+				// 且此刻进程正要退出——有界，且不再随重启次数增长。
+				waited := make(chan struct{})
+				go func(p Process) {
+					defer close(waited)
+					_ = p.Wait()
+				}(p)
+				select {
+				case <-waited:
+					close(ch)
+					return
+				case <-ctx.Done():
+					return // 不关 channel：由等待方走 ctx 分支，避免被误读成「进程退出」
+				}
 			}
 			select {
 			case <-ctx.Done():
@@ -107,6 +126,11 @@ type SuperviseResult struct {
 // Supervise 执行 once 步骤并拉起 service 步骤，返回句柄（不阻塞等待）。
 // 实际阻塞 / 重启 / 信号处理由 app.Supervisor 负责（PRD §14.2 / §14.3）。
 //
+// ctx 是**监管周期**的生命周期上下文：它只覆盖「启动阶段」（once 步骤 + 拉起 service），
+// service 子进程本身是长驻的，用 context.Background() 起（见 startServiceStep），不随它取消。
+// 传 ctx 的意义是让停机能打断启动阶段——此前这里完全不接受 ctx，
+// 「Ctrl+C / DELETE app」只能靠上层干等一个可能永不返回的启动（2026-10-29 审出）。
+//
 // 执行期若任一 step 出错（含某 service 启动失败），已拉起的长驻 service 会在返回 error 前
 // 被 stopStartedServices 回收——它们用 context.Background() 起、不随层级 ctx 取消，若在此
 // 不回收即成孤儿进程（见该函数的注释）。
@@ -115,7 +139,7 @@ type SuperviseResult struct {
 //   - service step 不能作为任何 step 的依赖（它永不「完成」，依赖它无意义）
 //   - service 与 once 共用同一 runtime 分发（runtimeFor）；未实现 runtime 由 runtimeFor 统一报错，
 //     本函数不再维护第二份白名单（M10 收口）
-func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
+func (e *Engine) Supervise(ctx context.Context, flowID string) (*SuperviseResult, error) {
 	flow, err := e.reg.GetFlow(flowID)
 	if err != nil {
 		return nil, err
@@ -187,7 +211,7 @@ func (e *Engine) Supervise(flowID string) (*SuperviseResult, error) {
 
 	// S4：与 run() 同样走分层并行；service 与 once 共用同一执行路径。
 	for _, level := range levels {
-		err := e.execLevel(flow.Steps, level, func(ctx context.Context, step model.Step, call resolvedCall) error {
+		err := e.execLevel(ctx, flow.Steps, level, func(ctx context.Context, step model.Step, call resolvedCall) error {
 			if reason, ok := skipReasonFor(step.ID); ok {
 				markSkipped(step.ID, reason)
 				e.progressf("- step %s 跳过（%s）\n", step.ID, reason)

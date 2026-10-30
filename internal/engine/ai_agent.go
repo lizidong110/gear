@@ -450,6 +450,42 @@ var BaseCapabilities = []string{
 // 这两个能力名，「已注册工具整组可见」自然成立，无需另设工具白名单开关。
 var FlowCapabilities = []string{"call", "ext.registry"}
 
+// defaultAllowCaps 是「没显式给 allow」时的默认能力集（Go 直调路径：CLI / 测试 / 宿主）。
+// react 与 rewoo 共用一份——两边各写一遍过滤循环，将来给默认集加一个能力时漏一边，
+// 就是「两种 agent 默认能力不同」的静默漂移（且两边测试各自绿，看不出来）。
+func (a *AIAgent) defaultAllowCaps() []string {
+	caps := make([]string, 0, len(defaultReactCapabilities))
+	for _, c := range defaultReactCapabilities {
+		if a.knownCapability(c) {
+			caps = append(caps, c)
+		}
+	}
+	return caps
+}
+
+// expandAllowGroup 把组 token（@base/@flow）展开成能力名列表；非组 token 返回 (nil, false)。
+// 未装配项跳过（组 token 表达的是意图，具体能开什么由本进程目录决定；塞一个目录里
+// 没有的能力名进去只会空转）。react 与 rewoo 共用——REQ-AI-ALLOW-GROUPS 要求组 token
+// 的展开唯一实现在引擎层，两个入口各写一遍就会漂移。
+func (a *AIAgent) expandAllowGroup(token string) ([]string, bool) {
+	var group []string
+	switch token {
+	case ReactAllowBase:
+		group = BaseCapabilities
+	case ReactAllowFlow:
+		group = FlowCapabilities
+	default:
+		return nil, false
+	}
+	out := make([]string, 0, len(group))
+	for _, c := range group {
+		if a.knownCapability(c) {
+			out = append(out, c)
+		}
+	}
+	return out, true
+}
+
 // resolveReactAllow 由调用方给定的原始 allow 与「是否显式给定」解析出允许集。
 //
 // set=false 不再是「不设限」，而是回到默认集——历史行为会把 115 个方法全塞进请求。
@@ -463,17 +499,17 @@ var FlowCapabilities = []string{"call", "ext.registry"}
 //     把整个 react 打挂，代价与问题严重性不匹配。
 func (a *AIAgent) resolveReactAllow(names []string, set, strict bool) (reactAllow, error) {
 	if !set {
-		caps := make([]string, 0, len(defaultReactCapabilities))
-		for _, c := range defaultReactCapabilities {
-			if a.knownCapability(c) {
-				caps = append(caps, c)
-			}
-		}
-		return reactAllow{names: caps}, nil
+		return reactAllow{names: a.defaultAllowCaps()}, nil
 	}
 	caps := []string{}
 	methods := map[string]bool{}
 	seen := map[string]bool{}
+	addCap := func(c string) {
+		if !seen[c] {
+			seen[c] = true
+			caps = append(caps, c)
+		}
+	}
 	for _, raw := range names {
 		x := strings.TrimSpace(raw)
 		if x == "" {
@@ -482,32 +518,18 @@ func (a *AIAgent) resolveReactAllow(names []string, set, strict bool) (reactAllo
 		if x == ReactAllowAll {
 			return reactAllow{all: true}, nil
 		}
-		// 组 token：展开成整组能力名（与 CLI --allow-base/--allow-flow 同一份语义）。
-		// 放在 knownCapability/splitCapMethod 之前——@base 不是能力名也不是「能力.方法」，
+		// 组 token：展开成整组能力名（与 CLI --allow-base/--allow-flow、rewoo 的
+		// resolveRewooAllow 同一份语义，expandAllowGroup 是唯一实现）。放在
+		// knownCapability/splitCapMethod 之前——@base 不是能力名也不是「能力.方法」，
 		// 漏了这层会被当未知项 strict 报错。
-		if x == ReactAllowBase || x == ReactAllowFlow {
-			group := BaseCapabilities
-			if x == ReactAllowFlow {
-				group = FlowCapabilities
-			}
+		if group, ok := a.expandAllowGroup(x); ok {
 			for _, c := range group {
-				// 未装配项跳过（与 set=false 的默认集同口径）：组 token 表达的是意图，
-				// 具体能开什么由本进程目录决定；塞一个目录里没有的能力名进去只会空转。
-				if !a.knownCapability(c) {
-					continue
-				}
-				if !seen[c] {
-					seen[c] = true
-					caps = append(caps, c)
-				}
+				addCap(c)
 			}
 			continue
 		}
 		if a.knownCapability(x) {
-			if !seen[x] {
-				seen[x] = true
-				caps = append(caps, x)
-			}
+			addCap(x)
 			continue
 		}
 		// 不是能力名，按「<能力>.<方法>」解析：方法名不含点，取最后一段为方法名
@@ -520,10 +542,7 @@ func (a *AIAgent) resolveReactAllow(names []string, set, strict bool) (reactAllo
 			return reactAllow{}, fmt.Errorf("react 的 allow 含 %q：既不是已知能力，也不是「已知能力.方法」；"+
 				"可用 gear ai capabilities 或 ext.ai.capabilities() 看目录", x)
 		}
-		if !seen[capName] {
-			seen[capName] = true
-			caps = append(caps, capName)
-		}
+		addCap(capName)
 		methods[x] = true
 	}
 	return reactAllow{names: caps, methods: methods}, nil
@@ -716,39 +735,25 @@ func (a *AIAgent) React(ctx context.Context, task string, opts ReactOpts) (inter
 			board.noteFailure(f)
 			return record(failureSignal(f))
 		}
-		// L0：执行 + 机械重试。两类触发：exec 报 transient 错；结果带可重试 HTTP 状态码
-		// （ctx.http.Request 不把非 2xx 当错误、status 在 body 里，不接住 L0 就对 HTTP 工具不存在）。
-		var out map[string]interface{}
-		var execErr error
-		attempts := 0
-		for {
-			out, execErr = a.exec(ctx, entry, map[string]interface{}{})
-			if execErr == nil {
-				if _, retryable := retryableHTTPStatus(out); !retryable ||
-					attempts >= maxToolRetries || !board.spendRetry() || ctx.Err() != nil {
-					break
-				}
-				attempts++
-				board.recordRecovery(fmt.Sprintf("L0 重试 %s（HTTP 状态码可重试，第 %d 次）", action, attempts))
-				sleepBackoff(a.retryBackoff, attempts-1)
-				continue
-			}
-			f := classifyToolFailure(action, execErr)
-			if !failureRecovery[f.Class].retry || attempts >= maxToolRetries ||
-				!board.spendRetry() || ctx.Err() != nil {
-				// 不可机械恢复（或重试耗尽）→ 登记失败 + 回灌结构化信号，下一步交给模型（L1）。
-				f.Scope = board.scopeHint()
-				f.Attempts = attempts
-				board.noteFailure(f)
-				board.noteEvidence(action, false)
-				return record(failureSignal(f))
-			}
-			attempts++
-			board.recordRecovery(fmt.Sprintf("L0 重试 %s（%s，第 %d 次）：%v", action, f.Class, attempts, execErr))
-			sleepBackoff(a.retryBackoff, attempts-1)
+		// L0：执行 + 机械重试（react / rewoo 两条执行路径的唯一实现，见
+		// execToolWithL0Retry）。两类触发：exec 报 transient 错；结果带可重试 HTTP
+		// 状态码（ctx.http.Request 不把非 2xx 当错误、status 在 body 里，不接住 L0
+		// 就对 HTTP 工具不存在）。
+		r := a.execToolWithL0Retry(ctx, action, entry, board)
+		out := r.Out
+		if r.Failure != nil && r.Out == nil {
+			// exec 报错且重试无望：登记失败 + 回灌结构化信号，下一步交给模型（L1）。
+			board.noteFailure(*r.Failure)
+			board.noteEvidence(action, false)
+			return record(failureSignal(*r.Failure))
+		}
+		if r.Failure != nil {
+			// HTTP 重试耗尽：既定行为是把 body 当 observation 交给模型自己决定换
+			// 路线（失败信号已在 body 里）——与 rewoo 的「记节点失败」是两种调度器
+			// 的刻意分歧，见 execToolWithL0Retry 注释。
 		}
 		// 空结果：不是错误（确实没数据就是正确答案），只登记 semantic_empty 供震荡守卫计数。
-		if isEmptyToolResult(out) {
+		if r.Empty {
 			board.noteFailure(reactFailure{Class: FailSemanticEmpty, Action: action,
 				Reason: "工具返回空结果", Scope: board.scopeHint()})
 			board.noteEvidence(action, false)
@@ -1237,17 +1242,21 @@ func (a *AIAgent) reactMetaSystemPrompt(maxSteps int) string {
 //
 // brief=false（没有 function calling 可依赖的文本兜底路径）必须给全：那时模型只能从这段
 // 文本知道有什么工具、每个方法收什么参数。
-func (a *AIAgent) reactToolsText(al reactAllow, brief bool) string {
-	// allowedMethods 按序取出该能力下被允许的方法名。
-	allowedMethods := func(capName string, ms map[string]MethodSchema) []string {
-		out := []string{}
-		for _, m := range sortedKeys(ms) {
-			if al.allows(capName, m) {
-				out = append(out, m)
-			}
+// allowedMethods 返回该能力下被 allow 允许的方法名（按名排序，保证同一份输入总是
+// 同一份提示词）。reactToolsText 与 rewooCapabilityText 共用——两个 prompt 面的过滤
+// 口径必须一致，不然模型在 react 里能调的方法在 rewoo 里看不到（或反过来），
+// 而这种不一致在两边各自的用例里都是绿的。
+func allowedMethods(al reactAllow, capName string, ms map[string]MethodSchema) []string {
+	out := []string{}
+	for _, m := range sortedKeys(ms) {
+		if al.allows(capName, m) {
+			out = append(out, m)
 		}
-		return out
 	}
+	return out
+}
+
+func (a *AIAgent) reactToolsText(al reactAllow, brief bool) string {
 	var sb strings.Builder
 	// 与 capabilitiesText 同源（allBuiltinPrimitives 单一来源），不再写死 6+1 个名字——
 	// 这样 subscribe / 纯函数 time/template/crypto/id/validate 都会自然进入 ReAct 工具清单，
@@ -1257,7 +1266,7 @@ func (a *AIAgent) reactToolsText(al reactAllow, brief bool) string {
 		if !ok {
 			continue
 		}
-		names := allowedMethods(p, ms)
+		names := allowedMethods(al, p, ms)
 		if len(names) == 0 {
 			continue
 		}
@@ -1279,7 +1288,7 @@ func (a *AIAgent) reactToolsText(al reactAllow, brief bool) string {
 		}
 		sort.Strings(extNames)
 		for _, name := range extNames {
-			names := allowedMethods(name, a.extCaps[name])
+			names := allowedMethods(al, name, a.extCaps[name])
 			if len(names) == 0 {
 				continue
 			}
@@ -2001,8 +2010,11 @@ func (a *AIAgent) capabilitiesText() string {
 	if len(a.extCaps) > 0 {
 		sb.WriteString("# ctx.ext.<name>.<method> 只接受「单个具名 table」参数（字段名见下，" +
 			"按当前已注册 ext.* 实时列出，非写死；新增扩展会自动出现在这里）：\n")
-		for name, ms := range a.extCaps {
-			for m, sch := range ms {
+		// ext 名来自 map，遍历顺序不稳定——排序后再渲染（与 reactToolsText 同口径）：
+		// 同一份目录渲染两次不一致，生成结果与测试都会随机漂移。
+		for _, name := range sortedCapNames(a.extCaps) {
+			for _, m := range sortedKeys(a.extCaps[name]) {
+				sch := a.extCaps[name][m]
 				sb.WriteString(fmt.Sprintf("- %s: %s\n", a.callSignature(name, m, sch), sch.Description))
 				// 参数明细按名排序：map 迭代顺序是随机的，提示词必须可复现
 				// （同一份目录渲染两次不一致 → 生成结果与测试都会随机漂移）。

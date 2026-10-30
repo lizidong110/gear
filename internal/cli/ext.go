@@ -48,7 +48,7 @@ func extCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.AddCommand(extDescribeCmd())
+	c.AddCommand(extDescribeCmd(), extScanCmd())
 	return c
 }
 

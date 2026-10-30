@@ -193,7 +193,9 @@ func TestReactHTTPStatusIsRetriedMechanically(t *testing.T) {
 		t.Fatalf("503 应机械重试后成功，实际执行 %d 次", len(*entries))
 	}
 	log, _ := res.(map[string]interface{})["recovery_log"].([]string)
-	if len(log) != 2 || !strings.Contains(log[0], "HTTP 状态码可重试") {
+	// 文案与 exec 报错路径统一（execToolWithL0Retry 唯一实现）：分类 + 次数 + HTTP 状态码。
+	// 断言「HTTP 503」而不是泛泛的「L0 重试」——要锁住「这是 HTTP 状态码触发的重试」。
+	if len(log) != 2 || !strings.Contains(log[0], "L0 重试") || !strings.Contains(log[0], "HTTP 503") {
 		t.Fatalf("recovery_log 应记录 HTTP 状态码重试，实际 %v", log)
 	}
 }

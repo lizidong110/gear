@@ -68,7 +68,7 @@ func newGateServer(t *testing.T, opts ...ServerOption) (*Server, *httptest.Serve
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	t.Cleanup(srv.Shutdown)
+	t.Cleanup(func() { _ = srv.Shutdown() })
 	return srv, ts
 }
 

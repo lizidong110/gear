@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,14 @@ type AppInstance struct {
 	OpenURLs []string `json:"open_urls"`
 
 	cancel context.CancelFunc
+	// done 在该 app 的监管 goroutine 真正退出时关闭。
+	//
+	// 为什么需要它：`cancel()` 只是「发出停止信号」，stopAll（杀进程树）在 goroutine 里
+	// 异步执行。此前 DELETE /api/apps/{id} 一 cancel 就回 200 stopped，
+	// 于是「端口还没释放 / 进程还没死」被当成成功上报——与 `gear app stop`
+	// 「收不干净如实报 ORPHAN_APP」是两套口径（2026-10-29 审出）。
+	// 有了 done，停应用可以等到真收敛，等不到就如实说等不到。
+	done chan struct{}
 }
 
 // Server 是 REST 执行面。
@@ -53,6 +62,10 @@ type Server struct {
 	execs  *ExecStore
 	engine *engine.Engine
 	mux    *http.ServeMux
+
+	// uiHandler 托管编译进二进制的 Web 管理界面（REQ-UI-LAUNCH-*）。
+	// 非 nil 时在 / 与 /assets/* 注册静态路由；nil 表示 --no-ui（不托管 UI）。
+	uiHandler http.Handler
 
 	// secrets 是密钥源（REQ-API-SECRETS，2026-10-02 改为持久化到 secrets.db）：管理面经
 	// REST /api/secrets 或 CLI `gear secret` 写入 secrets.db，启动期经 GEAR_SECRET_* 环境变量
@@ -93,6 +106,25 @@ type Server struct {
 	// 调用方（CLI）在它返回前无法打印任何东西。没有这个钩子，「我实际在哪个端口」这件事
 	// 对调用方完全不可见——而那正是长驻子进程要向 Flow 上报的东西。
 	onListen func(realAddr string)
+
+	// liveCtx / liveCancel 是所有「在途执行」的父上下文（停机时先取消它）。
+	//
+	// 为什么必须有：此前 handleCreateExecution 提交给闸门的 job 用 context.Background()，
+	// 于是停机只能干等它跑完——一个声明 900s 的 Tool 能把停机整整拖 900s，
+	// 而「停不掉」呈现出来就是进程卡死（2026-10-29 审出）。
+	liveCtx    context.Context
+	liveCancel context.CancelFunc
+
+	// httpSrv 是本进程真正在跑的 http.Server（Serve 时赋值）。
+	// 优雅停机要先停监听（有界 Shutdown），超时再强关（Close）——
+	// 否则一条挂着的 SSE 长连接就能让停机永久等待。
+	httpMu  sync.Mutex
+	httpSrv *http.Server
+
+	// shutdownTimeout 是等待「在途执行 / 受管 app」收敛的上限。
+	// 超时**不再等待**，但会把未收敛清单打印出来并作为 error 返回——
+	// 静默跳过比多等一会儿坏得多：用户会以为停干净了，实际子进程还在跑。
+	shutdownTimeout time.Duration
 }
 
 // ServerOption 调整 Server 的构造期配置（目前仅并发闸门相关）。
@@ -101,6 +133,13 @@ type ServerOption func(*Server)
 // WithMaxConcurrent 设执行入口「同时跑的 Flow 执行数」上限（即 gate worker 数）。
 // 影响的是跨 Flow 的全局并发，不是单 Flow 内 step 并发（那是 S4 maxParallel）。
 func WithMaxConcurrent(n int) ServerOption { return func(s *Server) { s.maxConcurrent = n } }
+
+// WithShutdownTimeout 设停机时等待在途执行 / 受管 app 收敛的上限。
+// 超时不再等待，但未收敛清单会打印出来并由 Shutdown 作为 error 返回（绝不静默）。
+// 主要用于测试注入短时限；生产用默认值（defaultShutdownTimeout）。
+func WithShutdownTimeout(d time.Duration) ServerOption {
+	return func(s *Server) { s.shutdownTimeout = d }
+}
 
 // WithExecQueueSize 设执行入口的有界排队队列长度：worker 全忙时进入排队，
 // 队列满再提交即被拒绝（回 429）。0 表示不排队、满即拒。
@@ -133,6 +172,25 @@ func (s *Server) Close() error {
 // 回调在 Serve 之前同步执行，故可安全地在里面打印（CLI 用它把真实端口吐给父进程解析）。
 func WithOnListen(h func(realAddr string)) ServerOption { return func(s *Server) { s.onListen = h } }
 
+// WithUI 启用内嵌 Web 管理界面托管（REQ-UI-LAUNCH-SERVE）。
+// h 非 nil 时在 / 注册同源静态路由；传 nil 表示 --no-ui（不托管 UI，/ 返回 404 指引）。
+func WithUI(h http.Handler) ServerOption { return func(s *Server) { s.uiHandler = h } }
+
+const (
+	// defaultShutdownTimeout 是停机时等待在途执行与受管 app 收敛的上限。
+	//
+	// 为什么必须有界：此前 Shutdown 是 `gate.Stop(); appWG.Wait()` 两处**无限等待**——
+	// 只要有一个长跑 Flow 或一个卡住的监管 goroutine，停机就永不返回，
+	// 呈现出来就是「Ctrl+C 之后进程卡住」（2026-10-29 审出）。有界之后，
+	// 最坏情况是「等 20s 后打印未收敛清单并退出」，而不是无限期挂起。
+	defaultShutdownTimeout = 20 * time.Second
+
+	// httpShutdownGrace 是 http.Server 优雅停机的等待上限：先停止接受新连接并等
+	// 活动请求收尾，超时则强关（Close）。SSE 流式端点可能长期持连接，
+	// 没有这个上限，一条挂着的长连接就能把停机拖死。
+	httpShutdownGrace = 5 * time.Second
+)
+
 // New 构造 Server（不启动监听）。支持构造期选项（如 WithMaxConcurrent /
 // WithExecQueueSize 调并发闸门，REQ-CONCURRENCY-CROSS / #73）。
 // 扩展原语经 extensions.yaml 配置化加载（含内建 ext.registry；无配置回退默认 ext.ai）；
@@ -143,16 +201,22 @@ func New(reg *registry.Registry, opts ...ServerOption) (*Server, error) {
 		defaultQueueSize     = 256 // 排队缓冲，避免瞬时抖动直接 429
 	)
 	s := &Server{
-		reg:           reg,
-		execs:         NewExecStore(),
-		mux:           http.NewServeMux(),
-		apps:          map[string]*AppInstance{},
-		maxConcurrent: defaultMaxConcurrent,
-		execQueueSize: defaultQueueSize,
+		reg:             reg,
+		execs:           NewExecStore(),
+		mux:             http.NewServeMux(),
+		apps:            map[string]*AppInstance{},
+		maxConcurrent:   defaultMaxConcurrent,
+		execQueueSize:   defaultQueueSize,
+		shutdownTimeout: defaultShutdownTimeout,
 	}
 	for _, o := range opts {
 		o(s)
 	}
+	if s.shutdownTimeout <= 0 {
+		s.shutdownTimeout = defaultShutdownTimeout
+	}
+	// 在途执行的父上下文：停机时先取消它，闸门才有机会快速收敛（见 liveCtx 的注释）。
+	s.liveCtx, s.liveCancel = context.WithCancel(context.Background())
 	// 密钥源（REQ-API-SECRETS）：启动期先从 GEAR_SECRET_* 环境变量播种部署凭据，
 	// 再注入引擎——声明了 secret capability 的 Tool 运行期 ctx.secret.get 可用，
 	// ${secrets.x} 模板可解析；管理面写入经 /api/secrets，运行期只读。
@@ -275,6 +339,11 @@ func (s *Server) ListenAndServe(addr string) error {
 		Handler:           s.mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	// 记住 http.Server：优雅停机（Server.Shutdown）要先停监听，否则停不掉新连接、
+	// 也没法让 Serve 立刻返回——调用方（CLI 的信号处理）正等这个返回。
+	s.httpMu.Lock()
+	s.httpSrv = srv
+	s.httpMu.Unlock()
 	serveErr := srv.Serve(ln)
 	// 停机与崩溃必须分开记：ErrServerClosed 是主动关停（INFO），其余是异常退出
 	// （ERROR）——「服务停了」和「服务崩了」在事后回看时是两件事，混为一谈
@@ -287,26 +356,143 @@ func (s *Server) ListenAndServe(addr string) error {
 	return serveErr
 }
 
-// Shutdown 停止所有受管 app 并**等待其收敛**（供测试与优雅退出使用）。
+// Shutdown 停止监听、取消在途执行、停止所有受管 app，并**有界等待其收敛**。
 //
 // 必须先等 goroutine 退出再让调用方关闭 registry：否则 Supervisor 可能还在读库，
 // 导致 `sql: database is closed` 这类停机竞态。
-func (s *Server) Shutdown() {
+//
+// 等待**有界**（shutdownTimeout，默认 defaultShutdownTimeout），超时不再等：
+// 此前 gate.Stop() 与 appWG.Wait() 都是无限等待，一个长跑 Flow 或一个卡在启动阶段的
+// 监管 goroutine 就能让停机永不返回——用户看到的是「Ctrl+C 之后进程卡住」
+// （2026-10-29 审出）。有界之后最坏情况是「等满超时 → 打印未收敛清单 → 退出」，
+// 而不是无限期挂起。
+//
+// 返回值：全部收敛为 nil；有未收敛项时返回描述它们的 error（已打印，交给调用方决定
+// 是否当作失败）。**绝不因为没收敛就跳过收尾**——execs / secrets 句柄照常释放。
+func (s *Server) Shutdown() error {
+	// ① 停监听：不再接受新请求。有界等待活动请求收尾，超时强关——
+	// 一条挂着的 SSE 长连接不该决定整个进程的生死。
+	s.stopHTTP()
+
+	// ② 取消在途执行：让长跑 Flow 自己中断（子进程随 ctx 被杀），闸门才有机会收敛。
+	if s.liveCancel != nil {
+		s.liveCancel()
+	}
+
+	// ③ 取消受管 app 的监管 ctx，并留一份引用用于事后点名「谁没停干净」。
 	s.appMu.Lock()
-	for _, a := range s.apps {
+	insts := make([]*AppInstance, 0, len(s.apps))
+	for _, id := range s.appSeq {
+		if a := s.apps[id]; a != nil {
+			insts = append(insts, a)
+		}
+	}
+	for _, a := range insts {
 		a.cancel()
 	}
 	s.apps = map[string]*AppInstance{}
 	s.appSeq = nil
 	s.appMu.Unlock()
-	s.appWG.Wait()
-	// 先收敛执行入口闸门：关闭队列并等全部 worker 退出，确保「在途执行」已落终态
-	// （RunFlowExec → execs.Finish）后再释放 ExecStore 句柄，避免 Finish 写到已关的库。
+
+	deadline := time.Now().Add(s.shutdownTimeout)
+	var pending []string
+
+	// ④ 收敛执行入口闸门（等 worker / 在途执行退出）。
 	if s.gate != nil {
-		s.gate.Stop()
+		if !s.gate.StopWithTimeout(time.Until(deadline)) {
+			pending = append(pending, s.pendingExecutionSummary())
+		}
 	}
-	// 释放执行记录库句柄（#70 SQLite 持久化）：停机后不再查询，关闭以解锁 WAL 侧车文件。
+	// ⑤ 收敛受管 app 的监管 goroutine。
+	if !waitWGDeadline(&s.appWG, deadline) {
+		for _, a := range insts {
+			select {
+			case <-a.done:
+			default:
+				pending = append(pending, fmt.Sprintf("app %s（flow=%s）未收敛", a.ID, a.FlowID))
+			}
+		}
+		if len(pending) == 0 {
+			pending = append(pending, "受管 app 未收敛")
+		}
+	}
+
+	// ⑥ 释放执行记录库句柄（#70 SQLite 持久化）：停机后不再查询，关闭以解锁 WAL 侧车文件。
 	_ = s.execs.Close()
+	// ⑦ 释放 secrets.db 句柄：本方法常在测试 cleanup / 优雅退出末尾被调用，
+	// 若只关 execs 不关 secrets，SQLite 持有的文件锁会让临时目录无法删除（Windows cleanup 失败）。
+	_ = s.Close()
+
+	if len(pending) > 0 {
+		msg := fmt.Sprintf("停机等待 %s 后仍未收敛: %s", s.shutdownTimeout, strings.Join(pending, "；"))
+		fmt.Printf("! %s\n", msg)
+		gearlog.L().Warn("REST 执行面停机未完全收敛", slog.String("pending", strings.Join(pending, "；")))
+		return errors.New(msg)
+	}
+	return nil
+}
+
+// stopHTTP 停止 HTTP 监听：先有界优雅停机，超时强关。
+//
+// 为什么必须强兜一层 http.Server.Close()：Shutdown 只保证「不再接受新连接 + 等活动请求
+// 结束」，但 SSE 流式端点（/api/capabilities/invoke/stream）可能长期持有连接，
+// 且 agent 流式调用此前不接受 ctx（无超时）。只调 Shutdown 的结果就是停机被一条连接拖死。
+func (s *Server) stopHTTP() {
+	s.httpMu.Lock()
+	srv := s.httpSrv
+	s.httpMu.Unlock()
+	if srv == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), httpShutdownGrace)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		// 超时（或连接收不了尾）：强关，绝不把停机挂在这一步。
+		gearlog.L().Warn("HTTP 优雅停机超时，强制关闭连接", slog.String("err", fmt.Sprint(err)))
+		_ = srv.Close()
+	}
+}
+
+// pendingExecutionSummary 汇总「停机时仍未落终态」的执行，供未收敛清单点名。
+func (s *Server) pendingExecutionSummary() string {
+	var running []string
+	for _, e := range s.execs.List() {
+		if e.Status == "running" {
+			running = append(running, e.ID)
+		}
+	}
+	if len(running) == 0 {
+		return "在途执行未收敛"
+	}
+	sort.Strings(running)
+	if len(running) > 5 {
+		return fmt.Sprintf("在途执行未收敛（%d 条，前 5: %s）", len(running), strings.Join(running[:5], ", "))
+	}
+	return fmt.Sprintf("在途执行未收敛: %s", strings.Join(running, ", "))
+}
+
+// waitWGDeadline 有界等待一组 goroutine 结束；到 deadline 仍未结束返回 false。
+//
+// 超时后等待用的那一个 goroutine 仍在 wg.Wait() 上——每次调用至多一个，
+// 且此刻进程正要退出，不像「每轮泄漏 N 个」那样会随时间累积。
+func waitWGDeadline(wg *sync.WaitGroup, deadline time.Time) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		wg.Wait()
+	}()
+	d := time.Until(deadline)
+	if d <= 0 {
+		d = 0
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 func (s *Server) routes() {
@@ -355,6 +541,22 @@ func (s *Server) routes() {
 	// 每次都会把服务打挂——挂载点只有一条，就没有「注册即固化」这个坑。
 	for _, m := range []string{"GET", "POST", "PUT", "PATCH", "DELETE"} {
 		s.mux.HandleFunc(m+" /api/{path...}", s.handleToolAPIAny)
+	}
+
+	// Web 管理界面（REQ-UI-LAUNCH-SERVE）：同源托管，浏览器永不跨域 → 内核无需 CORS 头。
+	// 路由特异性保证不干扰 /api/*：`/api/{path...}` 比 `/{path...}` 更具体，工具 API 不被吞。
+	// 兜底用 `GET /{path...}` 一条即可（它天然匹配根路径 `/`，uiHandler 内部再按 path 区分
+	// index.html 与 SPA 兜底）；单独再注册 `GET /` 会与 `/{path...}` 在 `/` 上冲突而 panic。
+	if s.uiHandler != nil {
+		s.mux.Handle("GET /assets/{path...}", s.uiHandler)
+		s.mux.Handle("GET /{path...}", s.uiHandler) // SPA 兜底；/api/* 更具体优先，根路径也由此兜底
+	} else {
+		// --no-ui：/ 返回明确指引而不是静默 404 空白。
+		s.mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, "Web UI 未启用（gear serve --no-ui）。用 `gear serve`（默认带 UI）或 `gear ui` 打开管理界面。\n")
+		})
 	}
 }
 
@@ -959,8 +1161,12 @@ func (s *Server) handleCreateExecution(w http.ResponseWriter, r *http.Request) {
 		// 引擎在加载完 Flow + Hook 快照后回报「本次可能用到的 Tool」，
 		// 作为 §8.2「运行中不可注销」守卫的判据（静态引用可能已被删/改）。
 		// RunFlowExec 带上 exec id，使 step 运行日志经 logSink 落盘（REQ-API-LOGS / #71）。
+		//
+		// 父 ctx 是 s.liveCtx（**不是** context.Background()）：停机时它先被取消，
+		// 长跑执行随之中断，闸门才能收敛。用 Background 的后果是停机只能干等
+		// 最慢的那个执行跑完——一个声明 900s 的 Tool 就把停机拖 900s（2026-10-29 修）。
 		res, runErr := s.engine.RunFlowExecCtx(
-			engine.WithCaller(context.Background(), caller), rec.FlowID, rec.ID, func(toolIDs []string) {
+			engine.WithCaller(s.liveCtx, caller), rec.FlowID, rec.ID, func(toolIDs []string) {
 				s.execs.SetTools(rec.ID, toolIDs)
 			})
 		s.execs.Finish(rec.ID, res, runErr)
@@ -1040,10 +1246,12 @@ func (s *Server) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// 父 ctx 取 s.liveCtx：停机时先取消它，监管循环（以及它拉起的 service 子进程）
+	// 随之中断，不必等 Server.Shutdown 逐个 cancel 才收敛。
+	ctx, cancel := context.WithCancel(s.liveCtx)
 	inst := &AppInstance{
 		ID: newID("app_"), FlowID: req.FlowID,
-		Restart: string(policy), StartedAt: time.Now(), cancel: cancel,
+		Restart: string(policy), StartedAt: time.Now(), cancel: cancel, done: make(chan struct{}),
 	}
 	s.appMu.Lock()
 	s.apps[inst.ID] = inst
@@ -1053,6 +1261,9 @@ func (s *Server) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 	s.appWG.Add(1)
 	go func() {
 		defer s.appWG.Done()
+		// 监管 goroutine 真正退出时才关 done：它是「这个 app 是否真的停干净了」的
+		// 唯一可靠判据（cancel 只是发信号，杀进程树的活儿在 Supervisor 里异步做）。
+		defer close(inst.done)
 		// 复用已装配的 s.engine：service step 同样需要扩展目录 / 密钥源 / 宿主原语，
 		// 新建一次性 engine 会让「经 Apps 拉起的 Flow」比「经 /api/executions 跑的同一个 Flow」能力更弱。
 		sup := app.New(s.engine, policy, 0)
@@ -1084,6 +1295,14 @@ func (s *Server) handleListApps(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// appStopTimeout 是 DELETE /api/apps/{id} 等待「真的停干净」的上限。
+//
+// cancel() 只是发出停止信号，杀进程树（Windows 上走 taskkill /T）在 Supervisor 里异步执行。
+// 此前这里一 cancel 就回 200 stopped，于是「进程还没死 / 端口还没释放」被当成成功——
+// 与 `gear app stop`「收不干净如实报 ORPHAN_APP」是两套口径（2026-10-29 审出）。
+// 现在是：等到真收敛（inst.done）才报成功；等不到就如实报 504 并说明还在跑。
+const appStopTimeout = 10 * time.Second
+
 func (s *Server) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	s.appMu.Lock()
@@ -1097,11 +1316,30 @@ func (s *Server) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.cancel() // 取消 ctx ⇒ Supervisor 停止并杀掉所有 service 子进程
+
+	// 等真的停干净：done 关闭 = 监管 goroutine 已退出 = stopAll 已跑完。
+	// 请求 ctx 也一并听：客户端断开不必继续等。
+	select {
+	case <-a.done:
+	case <-r.Context().Done():
+		writeErr(w, http.StatusGatewayTimeout, fmt.Errorf("等待 app %s 停止时被客户端中断", id))
+		return
+	case <-time.After(appStopTimeout):
+		// 如实上报：绝不说「stopped」——说了就等于告诉调用方端口已释放，而它可能还占着。
+		writeJSON(w, http.StatusGatewayTimeout, map[string]interface{}{
+			"id":      id,
+			"stopped": false,
+			"error":   fmt.Sprintf("已发出停止信号，但 %s 内未收敛：service 子进程可能仍存活，端口可能仍被占用", appStopTimeout),
+			"hint":    "用 gear app list 复核进程与端口；必要时 gear app stop <id> 再收一次",
+		})
+		return
+	}
+
 	// 清理该 Flow 的打开地址缓存，避免留下过期链接（同名 Flow 再次受管时会被重新收集）。
 	if s.engine != nil {
 		s.engine.ClearOpenURLs(a.FlowID)
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"stopped": id})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"stopped": id, "converged": true})
 }
 
 type pruneAppsReq struct {

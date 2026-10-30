@@ -246,16 +246,12 @@ type rewooAllow struct {
 
 // resolveRewooAllow 解析允许集。names 里能力名/方法名进 caps，工具 id 进 tools；
 // "*" 两者全放。未知项显式报错（strict）——静默丢弃会让 planner 以为能用结果执行期才炸。
+// caps 的最终解析委托 resolveReactAllow（组 token 展开、去重、方法级收窄都是它），
+// 这里只做 rewoo 特有的分流：工具 id 识别与 @noflow。
 func (a *AIAgent) resolveRewooAllow(names []string, set bool) (*rewooAllow, error) {
 	al := &rewooAllow{}
 	if !set {
-		caps := make([]string, 0, len(defaultReactCapabilities))
-		for _, c := range defaultReactCapabilities {
-			if a.knownCapability(c) {
-				caps = append(caps, c)
-			}
-		}
-		al.caps = reactAllow{names: caps}
+		al.caps = reactAllow{names: a.defaultAllowCaps()}
 		al.toolsAll = true // 未收窄：已注册工具全部可见（与 generate 的 loadTools 口径一致）
 		return al, nil
 	}
@@ -271,19 +267,12 @@ func (a *AIAgent) resolveRewooAllow(names []string, set bool) (*rewooAllow, erro
 			al.toolsAll = true
 			return al, nil
 		}
-		// 组 token（与 react 同一份语义）：@base 展开原子能力组、@flow 展开
-		// call+ext.registry。flow 组对 rewoo 还有一层：tools 仍为空 ⇒ toolsAll=true，
-		// 「已注册 Tool/Flow 整组可见」自然成立（planner 可查 registry 后以 id 为动作）。
-		if x == ReactAllowBase || x == ReactAllowFlow {
-			group := BaseCapabilities
-			if x == ReactAllowFlow {
-				group = FlowCapabilities
-			}
-			for _, c := range group {
-				if a.knownCapability(c) {
-					caps = append(caps, c)
-				}
-			}
+		// 组 token（与 react 同一份展开，expandAllowGroup 唯一实现）：@base 展开原子
+		// 能力组、@flow 展开 call+ext.registry。flow 组对 rewoo 还有一层：tools 仍为
+		// 空 ⇒ toolsAll=true，「已注册 Tool/Flow 整组可见」自然成立（planner 可查
+		// registry 后以 id 为动作）。
+		if group, ok := a.expandAllowGroup(x); ok {
+			caps = append(caps, group...)
 			continue
 		}
 		// @noflow：显式关掉工具面（toolsAll=false 且白名单为空 ⇒ 一个工具都不给）。
@@ -557,15 +546,8 @@ func (a *AIAgent) rewooCapabilityText(al *rewooAllow) string {
 	var b strings.Builder
 	n := 0
 	emit := func(capName string, methods map[string]MethodSchema) {
-		names := make([]string, 0, len(methods))
-		for m := range methods {
-			names = append(names, m)
-		}
-		sort.Strings(names)
-		for _, m := range names {
-			if !al.caps.allows(capName, m) {
-				continue
-			}
+		// 过滤口径与 reactToolsText 共用 allowedMethods（排序 + allow 判定的唯一实现）。
+		for _, m := range allowedMethods(al.caps, capName, methods) {
 			if n >= rewooMaxPromptTool {
 				fmt.Fprintf(&b, "- …（共超 %d 个方法，已截断；请用 allow 收窄）\n", rewooMaxPromptTool)
 				return
@@ -919,6 +901,9 @@ func (a *AIAgent) rewooWork(ctx context.Context, p *rewooPlan, board *reactBoard
 
 // rewooExecNode 执行单个节点：L0 机械重试（transient 与 body 内可重试 HTTP 状态码，
 // 不烧 LLM、与模型重发无关）→ 空结果记 semantic_empty → 失败分类登记。
+// 重试循环本体是 execToolWithL0Retry（react 同款唯一实现，REQ-REWOO ⑤）；这里只做
+// rewoo 侧的终局策略：失败记节点账（fail-soft），HTTP 重试耗尽同样记失败——
+// 与 react「body 当观测交给模型」的刻意分歧见 execToolWithL0Retry 注释。
 func (a *AIAgent) rewooExecNode(ctx context.Context, n *rewooNode, ev map[string]interface{}, evMu *sync.Mutex, board *reactBoard, al *rewooAllow) {
 	// 震荡封禁：同动作连续失败达阈值后，后续同动作节点直接失败（不执行、不烧配额）
 	if why, ok := board.blockedNotice(n.action); ok {
@@ -966,60 +951,34 @@ func (a *AIAgent) rewooExecNode(ctx context.Context, n *rewooNode, ev map[string
 		return
 	}
 
-	attempts := 0
-	for {
-		out, err := a.exec(ctx, entry, map[string]interface{}{})
-		if err == nil {
-			// ctx.http.Request 不把非 2xx 当错误（status 在 body 里）：可重试状态码要走 L0，
-			// 否则 HTTP 类工具的重试通道等于不存在。
-			if code, retry := retryableHTTPStatus(out); retry {
-				f := classifyToolFailure(n.action, fmt.Errorf("HTTP %d %s", code, httpStatusText(code)))
-				if failureRecovery[f.Class].retry && attempts < maxToolRetries && board.spendRetry() {
-					attempts++
-					board.recordRecovery(fmt.Sprintf("L0 重试 %s（%s，第 %d 次）：HTTP %d", n.action, f.Class, attempts, code))
-					sleepBackoff(a.retryBackoff, attempts-1)
-					continue
-				}
-				a.rewooFailNode(n, board, reactFailure{Class: f.Class, Action: n.action,
-					Reason: fmt.Sprintf("HTTP %d %s", code, httpStatusText(code)), Scope: board.scopeHint(), Attempts: attempts})
-				return
-			}
-			if isEmptyToolResult(out) {
-				// 空结果不是错误（确实没数据就是正确答案）：节点完成、证据即空产出，
-				// 只登记 semantic_empty 供震荡计数与缺口收尾。
-				n.status = rewooDone
-				n.output = out
-				n.empty = true
-				n.attempts = attempts
-				evMu.Lock()
-				ev[n.id] = rewooEvidence(out)
-				evMu.Unlock()
-				board.noteFailure(reactFailure{Class: FailSemanticEmpty, Action: n.action,
-					Reason: "工具返回空结果", Scope: board.scopeHint()})
-				board.noteEvidence(n.action, false)
-				return
-			}
-			n.status = rewooDone
-			n.output = out
-			n.attempts = attempts
-			evMu.Lock()
-			ev[n.id] = rewooEvidence(out)
-			evMu.Unlock()
-			board.noteEvidence(n.action, true)
-			return
-		}
-		f := classifyToolFailure(n.action, err)
-		if failureRecovery[f.Class].retry && attempts < maxToolRetries && board.spendRetry() {
-			attempts++
-			board.recordRecovery(fmt.Sprintf("L0 重试 %s（%s，第 %d 次）：%v", n.action, f.Class, attempts, err))
-			sleepBackoff(a.retryBackoff, attempts-1)
-			continue
-		}
-		n.attempts = attempts
-		a.rewooFailNode(n, board, reactFailure{Class: f.Class, Action: n.action,
-			Reason: err.Error(), Scope: board.scopeHint(), Attempts: attempts})
+	r := a.execToolWithL0Retry(ctx, n.action, entry, board)
+	n.attempts = r.Attempts
+	if r.Failure != nil {
+		// 终局失败（exec 报错重试无望，或 HTTP 可重试状态码重试后仍失败）：
+		// 记节点账——fail-soft 要求每个失败都有节点级记录，solver 与缺口按它作答。
+		a.rewooFailNode(n, board, *r.Failure)
 		return
 	}
+	if r.Empty {
+		// 空结果不是错误（确实没数据就是正确答案）：节点完成、证据即空产出，
+		// 只登记 semantic_empty 供震荡计数与缺口收尾。
+		n.status = rewooDone
+		n.output = r.Out
+		n.empty = true
+		evMu.Lock()
+		ev[n.id] = rewooEvidence(r.Out)
+		evMu.Unlock()
+		board.noteFailure(reactFailure{Class: FailSemanticEmpty, Action: n.action,
+			Reason: "工具返回空结果", Scope: board.scopeHint()})
+		board.noteEvidence(n.action, false)
+		return
+	}
+	n.status = rewooDone
+	n.output = r.Out
+	evMu.Lock()
+	ev[n.id] = rewooEvidence(r.Out)
+	evMu.Unlock()
+	board.noteEvidence(n.action, true)
 }
 
 // rewooFailNode 标记节点失败并登记：哨兵证据进 ev（solver 与缺口有据可查），

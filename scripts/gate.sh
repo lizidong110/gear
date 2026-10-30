@@ -57,6 +57,20 @@ export GOPROXY=https://goproxy.cn,direct
 export GOSUMDB=off
 export GOFLAGS=-mod=mod
 
+# 显式用 go env 登记的 C 编译器，覆盖调用方 shell 里可能被 Windows 环境变量
+# 误设成错误盘符/路径的 CC/CXX（2026-10-29 实踩：某机器 Windows 环境变量
+# CC=C:/Env/mingw64/bin/gcc.exe，而 gcc 实际在 D:/Env/...；进程环境变量优先级
+# 高于 `go env -w CC`，导致 cgo 直奔错误路径而 FAIL）。go env 里存的是正确值，
+# 这里把它导出为进程环境变量，确保 -race 一定能找到编译器。
+_gear_cc="$(go env CC)"
+if [ -n "$_gear_cc" ]; then
+  export CC="$_gear_cc"
+  case "$_gear_cc" in
+    *gcc.exe) export CXX="${_gear_cc%gcc.exe}g++.exe" ;;
+    *)        export CXX="$(go env CXX)" ;;
+  esac
+fi
+
 # 补齐 POSIX 工具链（sh/ls/...）：Windows 的 Git-Bash / CI 沙箱里 PATH 经常不含它们。
 #
 # ⚠ 2026-09-21 起的口径变化：引擎的 process runtime **不再默认依赖 sh**（改走

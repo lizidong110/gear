@@ -20,7 +20,9 @@ import (
 //   - 进程被重启（Proc 换柄）后重置失败计数，避免把「重启后的观察窗口」误算成失败。
 //   - h.Probe 为 nil（未配置探针）时直接返回，不影响既有无探针服务。
 //   - ctx 取消时立即退出，配合 Supervise 的平滑停机。
-func (s *Supervisor) probeLoop(ctx context.Context, h *engine.ServiceHandle) {
+//   - stop 关闭时同样立即退出：**同一 handle 至多一代探针**（见 Supervisor.startProbe）。
+//     缺了 stop 这条出口，重启路径上的旧探针会一直跑到进程结束，逐次累积。
+func (s *Supervisor) probeLoop(ctx context.Context, stop <-chan struct{}, h *engine.ServiceHandle) {
 	probe := h.Probe
 	if probe == nil {
 		return
@@ -40,6 +42,8 @@ func (s *Supervisor) probeLoop(ctx context.Context, h *engine.ServiceHandle) {
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-stop:
 			return
 		case <-ticker.C:
 		}

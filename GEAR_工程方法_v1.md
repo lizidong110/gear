@@ -490,14 +490,14 @@ gear/
 
 **触发**：用户发现 `ai` 生成 Flow 太简单、且默认走本地 Ollama——但本机没装 Ollama，质疑「测试怎么过的」。
 
-**澄清（测试为何能过）**：`ai_test.go` 从不真连 Ollama——`TestOllamaInfer` 用 `httptest` 在内存起假 Ollama；其余 `GenerateFlow` 测试全用 `fakeInferrer`/`mockInferrer` Mock。闸门绿与「本机是否装 Ollama」无关（本就是好的测试隔离），但也因此掩盖了「默认路径实际没跑通」。
+**澄清（测试为何能过）**：`ai_test.go` 从不真连 Ollama——`TestOllamaInfer` 用 `httptest` 在内存起假 Ollama；其余 `GenerateFlow` 测试全用 `fakeInferrer`/`mockInferrer` Mock。闸门绿与「本机是否装 Ollama」无关（本就是好的测试隔离），但也因此掩盖了「默认路径实际没跑通」。（2026-10-21 注：`internal/ai` 包已移除、相关测试名已删除，本段为历史记录）
 
 **改了什么**
 - `internal/ai/ai.go` 新增 `SiliconFlowClient`（OpenAI 兼容 `/v1/chat/completions`）：默认 `deepseek-ai/DeepSeek-V4-Flash`、base `https://api.siliconflow.cn/v1`、Bearer 鉴权；API Key 取环境变量 `SILICONFLOW_API_KEY`。新增 `DefaultInferrer()`：设了 Key 走线上 SiliconFlow，否则回退本地 Ollama。
 - `server.New` 改用 `ai.DefaultInferrer()`（此前硬编码 `ai.NewOllama("", "")`），故 `gear serve` 启动即按环境选推断器。
 - 强化系统提示 `systemPromptText`：约束输出为合法/完整/可注册 Flow——必须有 id+≥1 step、call 用 kebab-case、用 `depends_on` 表达先后、`parallel: true` 标可并行、`step.input` 给具体参数值、除非单步否则给 2-4 步体现真实编排。Ollama 路径也前置该提示。
 - 兼容 DeepSeek 可能的 `<think>…</think>` 思考块：`stripThink` 先剥离再收敛。
-- 测试：`TestSiliconFlowInfer`（httptest 模拟，不联网不依赖 Key，验证请求形态+解析）；`TestSiliconFlowInferLive`（env 守卫，仅设了 Key 才真连，CI 默认跳过）。
+- 测试：`TestSiliconFlowInfer`（httptest 模拟，不联网不依赖 Key，验证请求形态+解析）；`TestSiliconFlowInferLive`（env 守卫，仅设了 Key 才真连，CI 默认跳过）。（2026-10-21 注：这两个测试名已随 `internal/ai` 包移除而删除，本段为历史记录）
 
 **为什么**
 - 用户本地无 Ollama，线上 AI 才是真能跑的通路；把默认从「本地优先」翻成「线上优先、本地兜底」，避免默认路径永远沉默失败。

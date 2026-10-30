@@ -1,0 +1,13 @@
+<!doctype html>
+<!--
+  Gear Web UI 占位页。
+
+  本文件唯一作用是让 internal/webui 的 `//go:embed all:dist` 在「尚未把真实前端构建产物
+  拷入 dist」时仍能编译（embed 要求目录至少含一个文件）。运行时若 dist 里没有非空 assets/
+  目录，Handler() 会进入「未构建」模式，对任何 GET 返回内嵌的占位指引页（见 ui.go 的
+  placeholderHTML），而不是把本文件当真实界面吐出去。
+
+  真实前端由 scripts/build.sh 经 `pnpm --dir plugin/web-ui build` 产出到 plugin/web-ui/dist，
+  再拷入 internal/webui/dist 覆盖之。本文件不会被覆盖、始终保留。
+-->
+<html lang="zh-CN"><head><meta charset="utf-8"><title>Gear</title></head><body></body></html>

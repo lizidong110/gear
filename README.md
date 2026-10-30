@@ -231,6 +231,19 @@ type Hook struct {
 - `serve`：`--seed <examples.yaml>`（启动时灌入示例 Tool/Flow，如 `examples/news-top10.yaml`）。启动 REST 执行面，复用 `--addr`。
   **非回环地址默认拒绝**（与 `gear mcp` 同一份判定；REST 面当前无鉴权，`0.0.0.0` 或空 host `:8787` 会把「读写 registry 与明文 secrets、执行编排」暴露给局域网），
   确有远程需求时显式加 `--allow-remote`（放行时 stderr 留警告）。
+- **`serve` 默认同源托管 Web 管理界面**（2026-10-21，M1）：`plugin/web-ui` 的前端产物被 `go:embed` 进二进制，
+  浏览器打开 `http://127.0.0.1:8787/` 即是管理界面（八页面：概览 / Tools / Flows / Hooks / 执行记录 / Apps / Secrets / 能力目录）。
+  **同源 ⇒ 浏览器不跨域 ⇒ 内核不需要任何 CORS 头**（设计红线：内核不引 CORS）。用户也不用在页面里填 API 地址。
+  - `--no-ui`：不托管界面（`GET /` 返回 404 指引，`/api/*` 不受影响——关界面不是关执行面）。
+  - `--no-open`：不自动开浏览器（仍会打印地址）。
+  - 起服后 stdout 打印 `GEAR_OPEN_URL=http://<addr>/`（机器可读行，可被脚本取用）。
+  - 界面与 API **同源** ⇒ 没有任何鉴权/登录页（信任级别等同本机 CLI）；要远程访问请自配反代与鉴权。
+  - 二进制未嵌前端产物时 `GET /` 返回 **503 + 构建指引**，不是空白页。
+  - `GEAR_UI_DIR=<dir>`：改用外部目录托管（开发期热更新，不重编二进制）。
+
+**`gear ui`**（打开 Web 管理界面，2026-10-21 新增）
+- `gear ui`：本机已在 `--addr` 上跑着 serve ⇒ 直接开浏览器；没跑 ⇒ 先起一个带界面的 serve 再开。
+  `--no-open` 不自动开浏览器。全网卡监听时浏览器连回环 `127.0.0.1`（浏览器打不开通配地址）。
 
 **`gear exec`**（REST 无状态客户端）
 - `exec start <flow_id>` → `POST /api/executions`（202 + id）
@@ -241,6 +254,12 @@ type Hook struct {
 - `gear ext <name>`：按 name 起一个扩展原子进程（`email` / `sms` / `wecom` / `kafka` / `rabbitmq` / `webhook` …），
   走 stdin/stdout JSON 行协议，供引擎 `CommandTransport` 一次性调用。**一般由 `plugin/extensions.yaml`
   里的 `cmd` 自动拉起**，手写调用主要用于调试某个原子的协议。
+- `gear ext describe <ext 名>`：跑一次 `<cmd> --describe` 打印该侧车自报的方法与参数。与内核加载走
+  **同一个** `ProbeSidecarDescribe`——人工核对到的就是内核拿到的。
+- `gear ext scan`：把盘上的侧车二进制与 `extensions.yaml` 对账，为**未登记**的侧车生成 YAML 草稿
+  （`--out` 落盘、`--check` 有未登记或自描述扫描失败即退出码 1、`--no-probe` 纯静态、`--probe-all` 连手抄条目也探）。
+  **只生成草稿，绝不改写 `extensions.yaml`**；`describe: true` 只在探针真的返回合法自描述时才写，
+  否则只出全注释 stub——半激活条目贴进 yaml 会让启动期 fail-closed 把人挡在门外。
   > 红线：这些原子的凭据与连接配置**只从调用参数传**，不读环境变量（由 `internal/ext/email_test.go:TestExtAtomsMustNotReadEnv` 守卫）。
 
 **`gear ai`**（内置 `ext.ai` 进程内 agent）
@@ -741,10 +760,11 @@ ctx.ext.redis.dequeue({key*, batch?, …})                                   →
 
 `plugin/web-ui` 是独立的 Vue 3 + Vite + Naive UI + Pinia + vue-router 前端 SPA，**不进内核**。
 
+- **默认同源托管（2026-10-21，M1 起）**：`gear serve` 默认把前端产物 `go:embed` 进二进制并同源托管——浏览器打开 `http://127.0.0.1:8787/` 即是界面，**不需要另起静态服务器、不需要填 API 地址、不需要任何 CORS 头**。`gear ui` 一条命令也能开（探测已有 serve，没起就起一个）。`--no-ui` 关闭托管、`--no-open` 不自动开浏览器、`GEAR_UI_DIR=<dir>` 指向外部产物目录（开发期热更新）。详见 `WEB_UI_PRD.md` 与 `REQUIREMENTS.md` 的 `REQ-UI-*`。
 - **与内核契约**：纯 REST `/api`（默认同源，因为内核无 CORS 头）。API base 默认空串（同源），可用 `localStorage['gear.apiBase']` 显式设置。
 - **内核地址**：`127.0.0.1:8787`（可用 `GEAR_ADDR` 覆盖）。
-- **构建**：`npm run dev`（端口 5173，Vite 反代 `/api` → `GEAR_API` 或 `http://127.0.0.1:8787`）；`npm run build` → `dist/`。
-- **托管**：`dist/` 由任意静态服务器 / 反向代理托管，并把 `/api` 转发到内核——内核本身**不托管**其构建产物。
+- **构建**：`npm run dev`（端口 5173，Vite 反代 `/api` → `GEAR_API` 或 `http://127.0.0.1:8787`）；`npm run build` → `dist/`。**发布路径**：仓库根 `bash scripts/build.sh` 会自动 `pnpm run build` 并把产物拷进 `internal/webui/public` 后再编 Go 二进制。
+- **托管**：`dist/` 也可由任意静态服务器 / 反向代理托管，并把 `/api` 转发到内核——这是**独立部署**路径（不想把界面编进二进制时用；默认路径已由内核同源托管）。
 - **用 Gear 自己的能力托管（静态 + 反代，推荐）**：`ext.serve`（类 nginx）既托管静态目录，也支持 `proxy` 规则把 `/api` 反代到内核——**静态与接口同源**，正是 dev 下 Vite 代理的生产等价物。仓库自带 Flow `web_ui.up`（`plugin/web_ui_tools.yaml` + `plugin/web_ui_flow.yaml`），用**一个 Flow 起两个长驻服务**（`ext.serve` 静态站 + `/api` 反代 + `process` 起 gear REST 后端）：`GEAR_EXT_CONFIG=plugin/extensions.yaml gear app run web_ui.up`（**在仓库根执行**；**不要**给应用自带的 REST 面写 `--registry`，见下）。详见 `plugin/web-ui/README.md`。**启动后 `web_ui.up` 会用收尾步把「打开地址」显式打印出来**（`app run` 实时进终端；`app start` 后台启动则经 launcher 在 `app start`/`app status` 输出里报「打开地址：…」），不再需要回看文档才知道端口。
 - **多站点（2026-09-24）**：`ext.serve` 侧车可同时托管多个网站（不同 `port`），这是多 app 共享同一侧车的直接收益——`web_ui.up` 托管 8080 的同时 `mindstorm.up` 托管 8090，互不干扰。幂等按「port + dir + host + proxy 全同」判定，同端口换配置 `start` 会 **fail-closed 报错**（绝不静默吞参数——旧单站点代码曾把第二个应用的 `/start` 静默吞掉，页面「成功」却 404）。`stop` 带 `port` 只停该站，省略则停全部（旧语义）。end-to-end 判据：`plugin/verify.py` P3「多站点」项。
 
