@@ -92,6 +92,23 @@ export class ApiClient {
   del<T>(path: string) {
     return this.request<T>('DELETE', path)
   }
+
+  /** 读取**纯文本**响应（导出类端点返回 YAML / 文本而非 JSON，例如 /app-defs/{id}/export）。
+   *  不能走 request<T>：它会对非 JSON 响应抛「响应不是合法 JSON」。
+   *  错误仍按 ApiError 抛出并保留内核原文，避免「导出失败只看到解析错误」。 */
+  async getText(path: string, signal?: AbortSignal): Promise<string> {
+    let res: Response
+    try {
+      res = await fetch(this.url(path), { method: 'GET', signal })
+    } catch (e) {
+      throw new ApiError(0, (e as Error).message || '网络请求失败')
+    }
+    const text = await res.text()
+    if (!res.ok) {
+      throw new ApiError(res.status, extractError(text) ?? `HTTP ${res.status}`, text)
+    }
+    return text
+  }
 }
 
 /** 内核错误体统一是 `{"error": "..."}`；解析失败则回退原文。 */

@@ -356,7 +356,17 @@ func Composition(reg *registry.Registry, a *model.App) *Components {
 		}
 	}
 	for _, f := range a.Layout.Files {
-		c.StaticFiles = append(c.StaticFiles, staticRelPath(a, f.Path))
+		rel := staticRelPath(a, f.Path)
+		if rel == "" {
+			// dir 条目恰好等于 workdir：剥完后为空串（它就是应用根），展示时退回原声明路径，
+			// 否则组成清单会出现一个空项，反而让人以为漏了东西。
+			if f.Dir {
+				rel = filepath.ToSlash(filepath.Clean(strings.TrimSpace(f.Path)))
+			} else {
+				continue
+			}
+		}
+		c.StaticFiles = append(c.StaticFiles, rel)
 	}
 	sort.Strings(c.Tools)
 	sort.Strings(c.Flows)
@@ -377,6 +387,13 @@ func staticRelPath(a *model.App, declared string) string {
 	p := filepath.ToSlash(filepath.Clean(strings.TrimSpace(declared)))
 	wd := filepath.ToSlash(filepath.Clean(strings.TrimSpace(a.Layout.Workdir)))
 	if wd != "" && wd != "." {
+		// 目录项声明恰好等于 workdir（如 layout.files=[{path: apps/study, dir: true}] 且
+		// workdir=apps/study）：它本身就是应用根，产物内相对路径应为空串（文件直接落在
+		// 产物根）。否则导入端 dst=appsDir/<app>/<rel> 会把它拼成 appsDir/<app>/apps/study/…，
+		// 与重写的 workdir 脱节，起服时找不到前端。
+		if p == wd {
+			return ""
+		}
 		if strings.HasPrefix(p, wd+"/") {
 			return strings.TrimPrefix(p, wd+"/")
 		}
@@ -552,6 +569,59 @@ type ExportResult struct {
 // 步骤：读 App 清单 → 反查组成 → 取回名下 Tool/Flow/Hook 定义 → 先写临时目录 →
 // 再整体落到 Out（dir 直接改名、zip 打包）。**先 staging 后落地**是刻意的：
 // 中途失败时不留下一个「看起来像产物」的半截目录。
+// BuildBundle 按 appID 从 registry 组装出「一份应用清单 + 名下全部定义」的内存 Bundle。
+//
+// 抽出来的理由（REQ-API-APP-DEFS）：REST 管理面要把应用导出成可下载的 YAML 文本，
+// 而 Export 落的是磁盘产物；两者若各写一遍「反查组成 → 逐个读定义」，新增一类对象时
+// 必然只改一处，导出内容静默少一层。现在 Export 与 REST 导出共用这一份组装逻辑。
+//
+// 返回值：a=App 清单（registry 没有清单时按入口 Flow 合成，synthNote 如实说明）、
+// comp=组成清单、b=含 App/Tool/Flow/Hook 的 Bundle。
+// 定义按组成清单的字典序读取，保证同样的库导出两次**逐字节相同**（可 diff 的前提）。
+func BuildBundle(reg *registry.Registry, appID string) (*model.App, string, *Components, *Bundle, error) {
+	a, synthNote, err := resolveExportApp(reg, appID)
+	if err != nil {
+		return nil, "", nil, nil, err
+	}
+	if err := a.Validate(); err != nil {
+		return nil, "", nil, nil, engine.Diagf("ARTIFACT_INVALID", "app("+appID+")", "先修正清单再导出", "App 清单非法: %v", err)
+	}
+
+	comp := Composition(reg, a)
+	b := &Bundle{Apps: []*model.App{a}}
+	for _, id := range comp.Tools {
+		t, err := reg.GetTool(id)
+		if err != nil {
+			return nil, "", nil, nil, fmt.Errorf("读取 Tool %s 失败: %w", id, err)
+		}
+		if t == nil {
+			return nil, "", nil, nil, engine.Diagf("NOT_FOUND", "tool("+id+")", "组成清单来自 registry 反查，读到空说明刚被删掉；重试一次", "Tool %s 在组成清单里但已不在 registry", id)
+		}
+		b.Tools = append(b.Tools, t)
+	}
+	for _, id := range comp.Flows {
+		f, err := reg.GetFlow(id)
+		if err != nil {
+			return nil, "", nil, nil, fmt.Errorf("读取 Flow %s 失败: %w", id, err)
+		}
+		if f == nil {
+			return nil, "", nil, nil, engine.Diagf("NOT_FOUND", "flow("+id+")", "组成清单来自 registry 反查，读到空说明刚被删掉；重试一次", "Flow %s 在组成清单里但已不在 registry", id)
+		}
+		b.Flows = append(b.Flows, f)
+	}
+	for _, id := range comp.Hooks {
+		h, err := reg.GetHook(id)
+		if err != nil {
+			return nil, "", nil, nil, fmt.Errorf("读取 Hook %s 失败: %w", id, err)
+		}
+		if h == nil {
+			return nil, "", nil, nil, engine.Diagf("NOT_FOUND", "hook("+id+")", "组成清单来自 registry 反查，读到空说明刚被删掉；重试一次", "Hook %s 在组成清单里但已不在 registry", id)
+		}
+		b.Hooks = append(b.Hooks, h)
+	}
+	return a, synthNote, comp, b, nil
+}
+
 func Export(reg *registry.Registry, o ExportOptions) (*ExportResult, error) {
 	appID := strings.TrimSpace(o.AppID)
 	if appID == "" {
@@ -569,47 +639,9 @@ func Export(reg *registry.Registry, o ExportOptions) (*ExportResult, error) {
 		return nil, engine.Diagf("BAD_ARGUMENT", "format", "只支持 dir 与 zip", "format 只能是 dir 或 zip（实际: %s）", o.Format)
 	}
 
-	a, synthNote, err := resolveExportApp(reg, appID)
+	a, synthNote, comp, b, err := BuildBundle(reg, appID)
 	if err != nil {
 		return nil, err
-	}
-	if err := a.Validate(); err != nil {
-		return nil, engine.Diagf("ARTIFACT_INVALID", "app("+appID+")", "先修正清单再导出", "App 清单非法: %v", err)
-	}
-
-	comp := Composition(reg, a)
-	// 取回定义：按 id 逐个读（registry 只按 id 索引），顺序按组成清单里的字典序，
-	// 保证同样的库导出两次得到**逐字节相同**的产物（可 diff 的前提）。
-	b := &Bundle{Apps: []*model.App{a}}
-	for _, id := range comp.Tools {
-		t, err := reg.GetTool(id)
-		if err != nil {
-			return nil, fmt.Errorf("读取 Tool %s 失败: %w", id, err)
-		}
-		if t == nil {
-			return nil, engine.Diagf("NOT_FOUND", "tool("+id+")", "组成清单来自 registry 反查，读到空说明刚被删掉；重试一次", "Tool %s 在组成清单里但已不在 registry", id)
-		}
-		b.Tools = append(b.Tools, t)
-	}
-	for _, id := range comp.Flows {
-		f, err := reg.GetFlow(id)
-		if err != nil {
-			return nil, fmt.Errorf("读取 Flow %s 失败: %w", id, err)
-		}
-		if f == nil {
-			return nil, engine.Diagf("NOT_FOUND", "flow("+id+")", "组成清单来自 registry 反查，读到空说明刚被删掉；重试一次", "Flow %s 在组成清单里但已不在 registry", id)
-		}
-		b.Flows = append(b.Flows, f)
-	}
-	for _, id := range comp.Hooks {
-		h, err := reg.GetHook(id)
-		if err != nil {
-			return nil, fmt.Errorf("读取 Hook %s 失败: %w", id, err)
-		}
-		if h == nil {
-			return nil, engine.Diagf("NOT_FOUND", "hook("+id+")", "组成清单来自 registry 反查，读到空说明刚被删掉；重试一次", "Hook %s 在组成清单里但已不在 registry", id)
-		}
-		b.Hooks = append(b.Hooks, h)
 	}
 
 	res := &ExportResult{

@@ -24,6 +24,23 @@ var files embed.FS
 // 让 `gear_guide("summary")` 再返回一遍只是浪费 token。
 const SummaryTopic = "summary"
 
+// AppOnlyTopic 是 `--only-exposed`（应用专用面）用的 instructions。
+//
+// 它同样不进 Topics：它不是「按需取的手册主题」，而是另一种工具面的常驻说明。
+// 若混进 topics，标准面的 AI 会看到它、并按其中「本端点没有 gear_* 工具」的口径
+// 去理解一个**明明有** 15 个 gear_* 的端点——两份 instructions 互相打架。
+const AppOnlyTopic = "app-only"
+
+// AppOnly 返回应用专用面的 instructions 全文。
+// 读不到时返回空串；调用方（newMCPServer）据此 fail-closed，不发空 instructions。
+func AppOnly() string {
+	b, err := files.ReadFile(AppOnlyTopic + ".md")
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
 // Summary 返回 instructions 全文（guide/summary.md）。
 // 读不到时返回空串：调用方（New）会据此判定「装配错误」并 fail-closed，而不是静默发空 instructions。
 func Summary() string {
@@ -47,7 +64,7 @@ func Topics() []string {
 			continue
 		}
 		topic := strings.TrimSuffix(name, ".md")
-		if topic == SummaryTopic {
+		if topic == SummaryTopic || topic == AppOnlyTopic {
 			continue
 		}
 		out = append(out, topic)

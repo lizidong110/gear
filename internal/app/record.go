@@ -78,6 +78,17 @@ type Record struct {
 	// 会话结束时被连坐回收，而那看起来和应用自己崩溃一模一样。记下来，`app status`
 	// 才能回答「它为什么没了」。为 nil = 旧记录或本平台无此概念。
 	EscapedJob *bool `json:"escaped_job,omitempty"`
+	// LiveLogs 记录派生时是否注入了实时日志回推 env（REQ-API-APP-LOGS）。
+	// 为 false 时 UI 必须如实提示「该应用未接入实时日志」（通常是启动时尚无 serve，
+	// 或 serve 后来重启换了地址），不能挂一个永远空白的面板让人以为是日志没产生。
+	LiveLogs bool `json:"live_logs,omitempty"`
+	// Restarts 是监管期间 service 的累计重启次数。
+	//
+	// 为什么由监管进程回写而不是 launcher 记：重启发生在 `app run`（被派生的监管进程）
+	// 里，launcher 早已返回、对此不可见。Start 派生时注入台账身份 env（GEAR_APP_LEDGER_*），
+	// 监管进程经 RestartRecorderFromEnv 拿到回调，每次重启后把累计次数写回本记录——
+	// 否则重启次数只在监管进程内存里，UI / CLI 看到的永远是 0（假健康）。
+	Restarts int `json:"restarts,omitempty"`
 }
 
 // AppsDir 返回台账目录：<registry 同目录>/apps。

@@ -143,7 +143,8 @@ plugin/web-ui/
       tool.ts             # Tool/Hook 预检（镜像 model/validate.go）
     stores/               # Pinia：conn / catalog / exec / apps
     components/           # CodeEditor（CodeMirror）/ FlowGraph（只读编排图）/ CheckList / StatusTag
-    views/                # 6 个页面
+    views/                # 10 个页面：概览 / Tools / Flows / Hooks / 执行记录 / Apps 长驻 /
+                          # App 清单（定义 + YAML 导入导出） / Secrets / 配置 / 能力目录
 ```
 
 ## 质量闸门
@@ -277,6 +278,8 @@ pnpm 专属键在 npm 下只是无害警告）。
 | Tools / Flows / Hooks | 持久（内核 SQLite registry） | — |
 | 执行记录 + 日志 | 持久（内核 SQLite，`GEAR_EXEC_DB`，缺省 `<GEAR_HOME>/exec.db`，不随 cwd 变化） | 删库 |
 | **Apps（长驻进程）** | **内核内存态**（`server.apps` map） | 重启 `gear serve` 即清空，子进程不自动恢复 |
+| **后台应用台账**（`gear app start` / MCP `gear_app(start)`） | 持久（`<appsDir>/<appID>.json`） | 清台账（`app prune`）；与上一行的内存态 App **不是同一模型** |
+| **实时日志**（执行记录面 / 台账 App 面） | **纯内存**：SSE 只推订阅后新产生的行，不回放历史、不读日志文件 | 断连/刷新即丢；历史仍在各自的持久化面（执行记录在 SQLite、App 在 `<appID>.log`） |
 | 连接设置 / 主题 | 浏览器 localStorage | 清浏览器数据 |
 
 ## 二期待办

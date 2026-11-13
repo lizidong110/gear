@@ -48,7 +48,7 @@ api:                        # 可选：声明式 REST 路由（FR-3），不写�
 | 标准库 | `base` `string` `table` `math`（+ `coroutine`，仅 permissive 策略） | `os` / `io` / `package` / `debug` **永不开**，配置项只能「开更多纯计算库」，关不掉沙箱 |
 | 全局函数 | 常规 Lua | `dofile` / `loadfile` / `require` / `module` 一律被置为 `nil`（任何策略下都是） |
 | 时间 | `ctx.time.now({format="unix"})` 等 | **没有 `os.date` / `os.time`**——要时间必须走 `time` 纯函数能力 |
-| 宿主能力（受门禁） | `http` `call` `db` `secret` `event` `subscribe` `config` | **必须在 `capabilities:` 里声明**才能用 |
+| 宿主能力（受门禁） | `http` `call` `db` `secret` `event` `subscribe` `config` `fs` | **必须在 `capabilities:` 里声明**才能用 |
 | 纯函数能力（免声明） | `time` `template` `crypto` `id` `validate` | 始终可用、无需声明；**声明了反而被拒**（注册期即报错） |
 
 **未声明的能力 = 在 `ctx` 上根本不存在**（取值是 `nil`，不是空表）。这是刻意设计：脚本连
@@ -207,6 +207,34 @@ Tool / Flow / Hook 一旦多起来，「这是谁的、谁在用」全靠 id 自
 - `gear_apply` / `gear_validate` 对**无 App 清单**的裸注册会给 warnings 提醒补前缀（合法但会提示）。
 - 删除一个应用 / Flow 时，**连同它的私有 Tool 一起删**——引擎目前不做孤儿检测，孤儿只能靠人发现。
 - description 要写清「谁在用」（被哪条 Flow 引用 / 被前端 REST 调用），`gear_catalog` 的摘要里全靠它辨认。
+
+**App 清单的 `mcp:` 策展区（可选）**
+
+`kind: App` 可以写 `mcp.tools`，声明这个应用愿意把哪些注册 Tool 暴露给 MCP 客户端（工具数启动期即确定，不必再手搓 server.js）：
+
+```yaml
+kind: App
+id: study
+entry_flow: study.up
+mcp:
+  tools:
+    - ref: study__plan_propose
+    - ref: study__plan_confirm
+      args: {session: parent}          # 服务端固定注入，AI 看不到也改不掉
+    - ref: study__plan_preview
+      alias: study_plan_preview
+      description: "三段式②：只预览，禁止自动 confirm。"   # 护栏进清单
+```
+
+- `ref` 必须是**本应用命名空间下**、已注册的 Tool；`alias` 是对外工具名（不写则用 ref，须符合 `[A-Za-z0-9_.-]`、≤128）；`description` 覆盖 Tool 描述。
+- `args` 的键必须是该 Tool `input_schema.properties` 里的真参数：注册时从对外 schema 删掉（含 `required`），调用时服务端无条件覆盖客户端传值。
+- 生效方式 `gear mcp --expose tools --scope <app-id>`（`--expose all` 则连 Flow 快照一起）。**这是 MCP 服务端的启动参数，不是 MCP 工具**：智能体无法在会话内开启，写完清单要由人改 MCP 客户端配置并重连。**没有 `--scope`、App 未注册、或没写 `mcp.tools` 时拒绝启动**，不会退回裸暴露全量 Tool；该失败发生在服务端装配期，客户端连不上，不会以 `[CODE]` 形式回到你的会话里。详见 README §12。
+- 只想给业务调用方这几个工具、不想连 15 个常驻 `gear_*`（含 registry 写面）一起交出去时，由人在启动命令加
+  `--only-exposed`（须配 `--expose`）。该端点会换用 `guide/app-only.md` 作 instructions、不挂手册资源；
+  也因此**没有** `gear_doctor` 可自查，排障要另连一个标准 `gear mcp` 实例。见 README §12。
+- 两个自查出口：`gear_doctor` 的 `mcp` 块报本会话 `expose` / `scope` / `curated_tools`（实际装配名）与下一步；
+  `gear_validate` 对「bundle 里有 Tool 但清单没写 `mcp.tools`」给 `MCP_CURATION_ABSENT` advisory（**不影响 valid**，
+  不写策展区也合法）。看到「工具没出现」先查 doctor，别改 YAML。
 
 **❌ 反例（真实事故：46 个 Tool 里 18 个是这种残渣）**
 

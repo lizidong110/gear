@@ -161,6 +161,9 @@ var (
 	outDoctor = outSchema(map[string]any{
 		"registry": sObj(), "extensions": sObj(), "ai": sObj(), "ports": sObj(),
 		"apps": sArr(), "orphan": sArr(), "apps_dir": sStr(), "warnings": sArr(),
+		// MCP 会话自身的暴露装配状态（expose / scope / curated_tools / hint）。
+		// 只由 handleDoctor 附加，CLI `gear doctor` 不产出此键——见 expose_status.go。
+		"mcp": sObj(),
 	})
 	outValidate = outSchema(map[string]any{
 		"valid": sBool(), "diagnostics": sArr(), "warnings": sArr(), "summary": sObj(),

@@ -335,7 +335,7 @@ name: %s
 description: "TODO: 用一句话描述这个原子能力做什么"
 runtime: %s
 %s
-capabilities: []            # 最小权限白名单：http/call/db/secret/event/subscribe/config；ext.* 需 extensions.yaml 登记；time/template/crypto/id/validate 无需声明
+capabilities: []            # 最小权限白名单：http/call/db/secret/event/subscribe/config/fs；ext.* 需 extensions.yaml 登记；time/template/crypto/id/validate 无需声明
 input_schema:
   type: object
   properties:

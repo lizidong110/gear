@@ -47,7 +47,7 @@ function schemaError(s: unknown, field: string): string | null {
   return null
 }
 
-/** capability 是否被内核接受：6 个内置原语，或启动期注册的 ext.* 扩展名。 */
+/** capability 是否被内核接受：8 个内置原语，或启动期注册的 ext.* 扩展名。 */
 export function capabilityKnown(name: string): boolean {
   return (BUILTIN_CAPABILITIES as readonly string[]).includes(name) || name.startsWith('ext.')
 }

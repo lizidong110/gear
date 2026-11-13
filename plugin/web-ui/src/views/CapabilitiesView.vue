@@ -156,7 +156,7 @@ onUnmounted(() => caps.stopPolling())
             </template>
             <div class="pop">
               <p>
-                实时「原子能力目录」：内置 6 原语 + 已注册 <code>ext.*</code>，含方法级参数 schema（类型 / 必填 /
+                实时「原子能力目录」：内置 8 原语 + 已注册 <code>ext.*</code>，含方法级参数 schema（类型 / 必填 /
                 枚举 / 说明）。与 CLI <code>gear ai capabilities</code>、REST
                 <code>GET /api/capabilities</code> 同源，能力可查询、可扩展——新增扩展自动出现在这里。
               </p>
@@ -164,7 +164,8 @@ onUnmounted(() => caps.stopPolling())
                 每个方法可点「调用」直接执行（<code>POST /api/capabilities/invoke</code>，无需先写成 Tool）。
                 执行权限与 <code>react</code> 一致：全量宿主授权 + Lua 沙箱；<code>db</code>
                 为内存态（重启即失）、<code>secret</code> 需内核已注入密钥源、<code>http</code> 可访问任意
-                URL。未知能力 / 方法直接报错，不会静默执行。
+                URL、<code>fs</code> 路径收口在安全根内（主根 <code>GEAR_APP_DATA</code>，附加根经
+                <code>config set fs.roots</code> 配置、重启生效）。未知能力 / 方法直接报错，不会静默执行。
               </p>
             </div>
           </NPopover>

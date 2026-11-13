@@ -54,7 +54,7 @@ func (p *processRuntime) Run(ctx context.Context, entry string, input map[string
 
 // Start 拉起一个长驻 process（service 模式），不等待其结束，返回可监管句柄。
 func (p *processRuntime) Start(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context) (Process, error) {
-	sp, err := startProcess(ctx, entry, input, host)
+	sp, err := startProcess(ctx, entry, input, host, p.stepID, p.sink)
 	if err != nil {
 		return nil, err
 	}
@@ -181,17 +181,17 @@ func runProcess(ctx context.Context, entry string, input map[string]interface{},
 		return nil, procFail(err.Error(), entry, nil, nil)
 	}
 	cmd.Stdin = bytes.NewReader(inBytes)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// 逐行实时上报：logTee 一边累积（供结果解析/错误回显）一边把完整行即时喂给 sink，
+	// 不再等命令结束后才 flush 一次（那是旧实现，实时日志会变成「跑完才吐」，失去排障价值）。
+	// 仅 stdout/stderr 文本进 sink，绝不包含 input（secret 等敏感数据不落日志）。
+	stdout := &logTee{sink: sink, stepID: stepID, stream: "stdout"}
+	stderr := &logTee{sink: sink, stepID: stepID, stream: "stderr"}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	runErr := cmd.Run()
-	// 无论成功失败，都把子进程每行输出上报给日志采集器（REQ-API-LOGS / #71）。
-	// 注意：仅 stdout/stderr 文本，绝不包含 input（secret 等敏感数据不落日志）。
-	if sink != nil {
-		emitLogLines(sink, stepID, "stdout", stdout.String())
-		emitLogLines(sink, stepID, "stderr", stderr.String())
-	}
+	stdout.flush()
+	stderr.flush()
 	if runErr != nil {
 		return nil, procFail(fmt.Sprintf("%v (stderr=%s)", runErr, stderr.String()), entry, stdout.Bytes(), stderr.Bytes())
 	}
@@ -208,16 +208,50 @@ func runProcess(ctx context.Context, entry string, input map[string]interface{},
 	return out, nil
 }
 
-// emitLogLines 把一段输出按行上报给 sink（空行跳过）；stream 标记 stdout/stderr。
-func emitLogLines(sink func(stepID, stream, line string), stepID, stream, buf string) {
-	for _, ln := range strings.Split(buf, "\n") {
-		ln = strings.TrimRight(ln, "\r")
-		if strings.TrimSpace(ln) == "" {
-			continue
+// logTee 把子进程输出同时「累积」（供结果解析/错误回显）与「逐行实时上报」（供实时日志）。
+// 子进程写入是按块到达的，一行可能跨多次 Write，因此用 pend 缓冲尚未遇换行的前缀；
+// 一旦出现换行即把整行交给 sink，命令结束时的 flush 把末尾无换行的残行也发出。
+// 空行/纯空白行不上报（与旧 emitLogLines 口径一致），且绝不累积 input（secret 不落日志）。
+type logTee struct {
+	sink   func(stepID, stream, line string)
+	stepID string
+	stream string
+	buf    bytes.Buffer
+	pend   []byte
+}
+
+func (t *logTee) Write(p []byte) (int, error) {
+	t.buf.Write(p)
+	t.pend = append(t.pend, p...)
+	for {
+		i := bytes.IndexByte(t.pend, '\n')
+		if i < 0 {
+			break
 		}
-		sink(stepID, stream, ln)
+		t.emit(string(t.pend[:i]))
+		t.pend = append(t.pend[:0], t.pend[i+1:]...)
+	}
+	return len(p), nil
+}
+
+func (t *logTee) emit(line string) {
+	line = strings.TrimRight(line, "\r")
+	if strings.TrimSpace(line) == "" {
+		return
+	}
+	if t.sink != nil {
+		t.sink(t.stepID, t.stream, line)
 	}
 }
+
+// flush 把末尾未遇换行的残行发出（命令结束时的最后一行可能没有换行符）。
+func (t *logTee) flush() {
+	t.emit(string(t.pend))
+	t.pend = nil
+}
+
+func (t *logTee) Bytes() []byte  { return t.buf.Bytes() }
+func (t *logTee) String() string { return t.buf.String() }
 
 func lastNonEmptyLine(s string) string {
 	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
@@ -376,7 +410,11 @@ func (f *serviceFirst) wait(procDone func() bool) map[string]interface{} {
 
 // drainServiceTail 把自有管道按行抽干进缓冲，直到 EOF（写端全关时触发）后关闭读端。
 // 第一行非空行额外送进 first（长驻进程的一次性声明），供 step output 使用。
-func drainServiceTail(rc io.ReadCloser, t *serviceTail, first *serviceFirst) {
+// drainServiceTail 把自有管道按行抽干进缓冲，直到 EOF（写端全关时触发）后关闭读端。
+// 第一行非空行额外送进 first（长驻进程的一次性声明），供 step output 使用。
+// sink 非空时，每行（非空）同时实时上报——service 的 stdout/stderr 在 startProcess 里合并到
+// 同一根管道，故统一标 stdout；这行经组合 sink 同时落盘 + 推 broker，让长驻进程的实时输出可见。
+func drainServiceTail(rc io.ReadCloser, t *serviceTail, first *serviceFirst, sink func(stepID, stream, line string), stepID string) {
 	defer rc.Close()
 	sc := bufio.NewScanner(rc)
 	// 单行上限提到 1MB：默认 64KB 会让超长行提前终止抽取，连带丢掉其后（可能含失败原因）的行。
@@ -384,10 +422,13 @@ func drainServiceTail(rc io.ReadCloser, t *serviceTail, first *serviceFirst) {
 	firstLine := true
 	for sc.Scan() {
 		line := sc.Text()
-		t.push(line)
+		t.push(line) // 内存环形缓冲（退出原因诊断），始终保留。
 		if firstLine {
 			firstLine = false
 			first.set(line)
+		}
+		if sink != nil && strings.TrimSpace(line) != "" {
+			sink(stepID, "stdout", line)
 		}
 	}
 }
@@ -404,7 +445,7 @@ type startedProcess struct {
 // input 经 stdin 传入；stdout/stderr 汇入**自有管道**（见 serviceTail：既不继承调用方
 // 管道，也不丢进 DevNull），由父侧 goroutine 抽干进内存缓冲，供监管诊断退出原因。
 // 返回的 startedProcess 由调用方负责在监管结束时 Kill（Supervisor.stopAll）。
-func startProcess(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context) (*startedProcess, error) {
+func startProcess(ctx context.Context, entry string, input map[string]interface{}, host *cap.Context, stepID string, sink func(stepID, stream, line string)) (*startedProcess, error) {
 	input = withHostCapabilities(input, host)
 	inBytes, err := json.Marshal(input)
 	if err != nil {
@@ -439,7 +480,7 @@ func startProcess(ctx context.Context, entry string, input map[string]interface{
 	drained := make(chan struct{})
 	go func() {
 		defer close(drained)
-		drainServiceTail(pr, tail, first)
+		drainServiceTail(pr, tail, first, sink, stepID)
 	}()
 	return &startedProcess{cmd: cmd, tail: tail, drained: drained, first: first}, nil
 }

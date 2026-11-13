@@ -18,11 +18,15 @@ import (
 //
 // 第二个返回值 escaped 在 Unix 上恒为 true：Setsid 没有「请求被拒绝」的退化路径
 // （对比 Windows 的 CREATE_BREAKAWAY_FROM_JOB，见 launch_windows.go）。
-func launchDetached(self string, args []string, dir string, logOut *os.File) (*os.Process, bool, error) {
+func launchDetached(self string, args []string, dir string, logOut *os.File, env []string) (*os.Process, bool, error) {
 	cmd := exec.Command(self, args...)
 	cmd.Dir = dir
 	cmd.Stdout = logOut
 	cmd.Stderr = logOut
+	// env 是追加的回推三元组（discovery.go）；为空则保持原样继承，理由同 Windows 版。
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return nil, false, err

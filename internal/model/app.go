@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // App 是 `kind: App` 应用清单的领域模型：`internal/mcp/tools_write.go` 里 bundle 的
@@ -40,6 +41,92 @@ type App struct {
 	Layout      AppLayout   `yaml:"layout" json:"layout"`
 	Start       AppStart    `yaml:"start" json:"start"`
 	Requires    AppRequires `yaml:"requires" json:"requires"`
+	MCP         AppMCP      `yaml:"mcp,omitempty" json:"mcp,omitempty"`
+}
+
+// AppMCP 是 App 清单的 MCP 策展区（REQ-APP-MCP-CURATE）。
+//
+// 「裸暴露一个 App 名下的全部 Tool」会丢产品护栏：家长三段式、禁止自动 confirm、
+// 固定 parent 会话这类约束只活在应用作者脑子里，或者被写进一份手搓的 server.js。
+// 把它们写进清单后，对外工具面是**策展后的白名单**——工具数在启动期就确定，
+// 且配合 --scope <appId> 天然按应用隔离。
+//
+// 一条规则 = 一个 MCP 工具：ref 指向已注册 Tool，alias/description 覆盖对外名字与描述，
+// args 是服务端固定注入的参数（AI 看不到、也改不了）。
+type AppMCP struct {
+	Tools []AppMCPTool `yaml:"tools" json:"tools"`
+}
+
+// AppMCPTool 是一条 MCP 暴露规则。
+//
+// args 写法：`args: {session: parent}` —— 等价于每次调用都传 session=parent，
+// 但注册时会从对外 inputSchema 里删掉该键，handler 还会无条件覆盖客户端传值（防越权）。
+// 用通用 map 而非专用 session 字段：护栏不止一种，将来固定 tenant/role 不必再改模型。
+type AppMCPTool struct {
+	Ref         string         `yaml:"ref" json:"ref"`
+	Alias       string         `yaml:"alias,omitempty" json:"alias,omitempty"`
+	Description string         `yaml:"description,omitempty" json:"description,omitempty"`
+	Args        map[string]any `yaml:"args,omitempty" json:"args,omitempty"`
+}
+
+// ExposedName 是这条规则最终对外的 MCP 工具名（alias 优先，否则用 ref）。
+func (t AppMCPTool) ExposedName() string {
+	if t.Alias != "" {
+		return t.Alias
+	}
+	return t.Ref
+}
+
+// Validate 校验策展区里**不依赖 bundle 与 registry** 的部分（见 App.Validate 的分工说明）。
+// ref 是否存在、是否属于本 App、args 键是否在该 Tool 的 schema 里，属于 bundle 级判定，
+// 留在 internal/mcp 的 checkAppMCP（那里才有 registry 访问权）。
+func (m AppMCP) Validate() error {
+	seen := make(map[string]bool, len(m.Tools))
+	for i, t := range m.Tools {
+		if strings.TrimSpace(t.Ref) == "" {
+			return fmt.Errorf("mcp.tools[%d].ref 不能为空", i)
+		}
+		name := t.ExposedName()
+		if err := validateMCPToolName(name); err != nil {
+			return fmt.Errorf("mcp.tools[%d] 对外工具名 %q 非法: %w", i, name, err)
+		}
+		if seen[name] {
+			return fmt.Errorf("mcp.tools[%d] 对外工具名 %q 与前面的规则重名", i, name)
+		}
+		seen[name] = true
+		for k := range t.Args {
+			if strings.TrimSpace(k) == "" {
+				return fmt.Errorf("mcp.tools[%d].args 含空键", i)
+			}
+		}
+		// 描述是产品护栏的载体（例如「三段式②、禁止自动 confirm」），不套 240 字符的
+		// 常驻工具描述预算；但也不能无限长，否则一次 tools/list 就能吃掉整个上下文。
+		if n := utf8.RuneCountInString(t.Description); n > 2000 {
+			return fmt.Errorf("mcp.tools[%d].description 有 %d 字符，超过 2000 上限", i, n)
+		}
+	}
+	return nil
+}
+
+// validateMCPToolName 与 MCP 规范/go-sdk 的工具名判据一致：`[A-Za-z0-9_.-]` 且 ≤128。
+// 放在 model 而不是 MCP 包：App.Validate 是注册期最后一道闸，不能依赖协议层才判得出来。
+func validateMCPToolName(name string) error {
+	if name == "" {
+		return fmt.Errorf("工具名不能为空")
+	}
+	if len(name) > 128 {
+		return fmt.Errorf("工具名 %d 字节，超过 128 上限", len(name))
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '_', r == '.', r == '-':
+			continue
+		default:
+			return fmt.Errorf("含非法字符 %q（只允许字母/数字/_/./-）", r)
+		}
+	}
+	return nil
 }
 
 // AppLayout 描述应用的静态资源清单。
@@ -92,6 +179,9 @@ func (a *App) Validate() error {
 	}
 	if strings.TrimSpace(a.EntryFlow) == "" {
 		return fmt.Errorf("App %s 的 entry_flow 不能为空", a.ID)
+	}
+	if err := a.MCP.Validate(); err != nil {
+		return fmt.Errorf("App %s 的 mcp 策展区非法: %w", a.ID, err)
 	}
 	return nil
 }

@@ -24,10 +24,14 @@
 // 工具实现分文件：tools_read.go（只读 5 个）/ tools_write.go（写 6 个）/ tools_invoke.go（能力直调 1 个）/
 // tools_run.go（执行 2 个）/ tools_app.go（应用 1 个）；公共部件（结构化错误、入参类型、输出 schema）在 common.go。
 //
+// 以上是 **15 个常驻工具**（登记表、工具数预算、描述预算均只管这一层）。`--expose {flows,tools,all}`
+// 可另挂「反向暴露」工具：flows = flow__{id} 快照，tools = App 清单 mcp.tools 白名单；
+// 它们默认全关、按 App 隔离、不占常驻预算，实现见 expose_tools.go。
+//
 // 设计取舍：
 //   - MCP 只做**协议翻译**：删除守卫（PRD §8.2）、schema 校验、版本状态机、静态校验全部在
 //     registry/engine/app 层，本包不重复实现（守卫必须只有一份，否则各执行面会漂移）。
-//   - **能力原语的边界**（§9.2 四类）：受门禁 7（http/call/db/secret/event/subscribe/config）、
+//   - **能力原语的边界**（§9.2 四类）：受门禁 8（http/call/db/secret/event/subscribe/config/fs）、
 //     免门禁纯函数 3（time/template/crypto，声明了反而被拒）、`json` 只是 Lua 绑定不是能力、
 //     `ext.*` 须注册且须声明。这四条最容易写错，`gear_guide("atoms")` 有完整表。
 //   - **长驻子进程不得出现在本进程树内**（§9.1 第 5 条）：`gear_app(start)` 派生 detach 的
@@ -94,14 +98,27 @@ type Server struct {
 	registryPath string
 	// appsDir 是应用台账目录；空 = <registry 同目录>/apps。
 	appsDir string
-	// exposeFlows 控制是否把已注册 Flow 反向暴露为 flow__{id} 工具（默认关闭）。
-	// 关闭理由：启动时快照（新建 Flow 本次不可用）、与 gear_run 语义重复、工具数不可预测，
-	// 三者都损害工具选择准确率（§1「负资产」）。
-	exposeFlows bool
+	// expose 控制反向暴露面（--expose {flows,tools,all}）。空 = 全关（默认）。
+	// 关闭理由（针对 flows）：启动时快照（新建 Flow 本次不可用）、与 gear_run 语义重复、
+	// 工具数不可预测，三者都损害工具选择准确率（§1「负资产」）。
+	// tools 模式不靠快照保证确定性：它只读 App 清单的 mcp.tools 白名单，见 expose_tools.go。
+	expose ExposeMode
+	// scope 是 --scope <appId>：决定读哪份 App 清单做 MCP 策展。运行期命名空间守卫由
+	// cliEngine 装配（同一份 cliScope），这里只用于定位清单与隔离工具面。
+	scope string
+	// exposedToolNames 是本次装配**实际挂上去**的策展工具名，供 gear_doctor 自查
+	// （为什么 tools/list 里没有我的工具）。只在 New 的注册期写、serve 之后只读；
+	// 装配失败时 New 直接返回 error，不会有半截状态被读到。
+	exposedToolNames []string
 	// allowRemote 允许监听非回环地址（默认 false = 只许 127.0.0.1）。
 	// MCP 面当前无鉴权，绑全网卡等于把「写 registry / 删对象 / 执行编排」的能力暴露给局域网，
 	// 故默认 fail-closed，需要远程接入必须显式打开（评审 B-2）。
 	allowRemote bool
+	// onlyExposed = `--only-exposed`：不注册 15 个常驻 gear_* 工具，只挂 --expose 带进来的
+	// 白名单/快照工具。用途是把「应用专用 MCP 端点」（尤其 --http 给终端客户端）与内核
+	// 管理面彻底分开——否则只想给 5 个业务工具，却把 apply/delete/run/invoke 一并交出去。
+	// 默认 false = 零破坏；开启时 instructions 也必须换成 guide/app-only.md，见 s.instructions()。
+	onlyExposed bool
 
 	// execSem 是**执行的有界并发闸门**（评审 I-1）：每条 gear_run / flow__ 执行占一个槽，
 	// 满了直接拒绝（背压）而不是排无限长的队——否则一个客户端能瞬间打满 goroutine。
@@ -124,14 +141,49 @@ func WithRegistryPath(p string) Option { return func(s *Server) { s.registryPath
 // WithAppsDir 指定应用台账目录（默认 <registry 同目录>/apps）。
 func WithAppsDir(d string) Option { return func(s *Server) { s.appsDir = d } }
 
-// WithExposeFlows 开启 Flow 反向暴露（flow__{id}）。
-func WithExposeFlows(b bool) Option { return func(s *Server) { s.exposeFlows = b } }
+// WithExpose 设置反向暴露面（CLI 的 `--expose {flows,tools,all}` 解析后传入）。
+func WithExpose(m ExposeMode) Option { return func(s *Server) { s.expose = m } }
+
+// WithScope 指定策展用的 App 作用域（CLI 的 `--scope <appId>`）。
+func WithScope(appID string) Option { return func(s *Server) { s.scope = appID } }
+
+// WithExposeFlows 是 WithExpose 的兼容别名（--expose-flows 已由 `--expose flows` 取代）。
+//
+// 只保留给仓内测试与 embedding 调用方；CLI 不再注册 --expose-flows flag。
+// 它是**别名而非第二份状态**：两个 Option 都只写 s.expose，不存在两套口径漂移。
+func WithExposeFlows(b bool) Option {
+	return func(s *Server) {
+		if b {
+			s.expose = ExposeFlows
+		} else {
+			s.expose = ExposeNone
+		}
+	}
+}
 
 // WithAllowRemote 允许 MCP 的 streamable HTTP transport 监听非回环地址。
 //
 // 默认 false：无鉴权地把写/删/执行能力绑到 0.0.0.0 是不负责任的默认项，
 // 需要远程接入时必须由使用者显式打开这层开关（并自行承担暴露面）。
 func WithAllowRemote(b bool) Option { return func(s *Server) { s.allowRemote = b } }
+
+// WithOnlyExposed 开启「应用专用面」：只挂 --expose 带进来的工具，不挂 15 个常驻 gear_*。
+//
+// 必须与 `--expose {flows,tools,all}` 同用——否则工具面为空，客户端连上来一个工具都没有，
+// 这比暴露多了更糟（静默空面）。New 里会 fail-closed 校验这一条。
+func WithOnlyExposed(b bool) Option { return func(s *Server) { s.onlyExposed = b } }
+
+// instructions 选择本端点该下发的心智模型。
+//
+// 两套 instructions 不能混：标准面的 summary.md 通篇教 AI 用 gear_validate / gear_apply /
+// gear_doctor，而 --only-exposed 面上这些工具**根本不存在**；照旧下发等于让 AI 反复调用
+// 不存在的工具。应用专用面用 app-only.md，明说「这里没有 gear_* 工具」。
+func (s *Server) instructions() string {
+	if s.onlyExposed {
+		return guide.AppOnly()
+	}
+	return guide.Summary()
+}
 
 // New 构造 MCP Server。registry 与引擎由调用方装配（CLI 用 cliEngine，
 // 与 REST 面同一套扩展加载），这里补上执行记录存储与运行期注销守卫。
@@ -164,6 +216,21 @@ func New(reg *registry.Registry, eng *engine.Engine, opts ...Option) (*Server, e
 	}
 	for _, o := range opts {
 		o(s)
+	}
+	// 应用专用面：没有 --expose 就一个工具都不剩（静默空面比多暴露更难排查），
+	// instructions 缺失也不能静默下发空文本——两条都在装配期硬失败。
+	if s.onlyExposed {
+		if !s.expose.wantsTools() && !s.expose.wantsFlows() {
+			// ⚠ 失败也要收掉已打开的执行记录库：New 返回 nil 时调用方无从 Close，
+			// 文件句柄会一直挂到进程退出（Windows 下就是 cleanup 报 Access is denied）。
+			_ = s.Close()
+			return nil, fmt.Errorf("--only-exposed 必须同时给 --expose {flows,tools,all}：" +
+				"关掉常驻 gear_* 工具面后若没有任何反向暴露，客户端会连上一个零工具的空端点")
+		}
+		if guide.AppOnly() == "" {
+			_ = s.Close()
+			return nil, fmt.Errorf("MCP Server 装配失败：guide/app-only.md 未嵌入（应用专用面 instructions 为空）")
+		}
 	}
 	// 执行进度改道 stderr —— **在这里做，不在 CLI**。
 	//
@@ -215,7 +282,7 @@ const supportedProtocolVersion = "2025-06-18"
 // instructions——否则「本地 stdio 能用、HTTP 接进来的智能体看不到手册」）。
 func (s *Server) newMCPServer() (*mcp.Server, error) {
 	ms := mcp.NewServer(&mcp.Implementation{Name: "gear", Version: Version}, &mcp.ServerOptions{
-		Instructions: guide.Summary(),
+		Instructions: s.instructions(),
 		// 协议版本显式收窄（评审 O-3）。
 		SupportedProtocolVersions: []string{supportedProtocolVersion},
 		// ★ capabilities 显式声明（评审 O-1 / O-2），不再吃 SDK 的两处默认：
@@ -234,7 +301,11 @@ func (s *Server) newMCPServer() (*mcp.Server, error) {
 	if err := s.register(ms); err != nil {
 		return nil, err
 	}
-	s.registerResources(ms)
+	// 应用专用面不挂 gear://guide/* 手册资源：那些是「怎么用内核写面」的说明书，
+	// 而这个端点刻意不带写面；下发只会与 app-only.md 的口径互相打架。
+	if !s.onlyExposed {
+		s.registerResources(ms)
+	}
 	return ms, nil
 }
 
@@ -277,8 +348,8 @@ func (s *Server) httpHandler() (http.Handler, error) {
 // 「写 registry / 删对象 / 执行编排」的能力暴露给局域网。此前代码注释写着「只应绑
 // 127.0.0.1」、文档给的示例却是 `--http :8788`（绑全网卡），而 ServeHTTP 从不校验——
 // 安全建议形同虚设（评审 B-2）。
-func checkBindAddr(addr string, allowRemote bool) error {
-	return httpsafe.CheckBindAddr("MCP", addr, "调用 gear_apply / gear_delete / gear_run", allowRemote)
+func checkBindAddr(addr string, allowRemote bool, exposedDesc string) error {
+	return httpsafe.CheckBindAddr("MCP", addr, exposedDesc, allowRemote)
 }
 
 // ServeHTTP 在 addr（host:port）以 streamable HTTP transport 暴露 MCP Server，
@@ -288,7 +359,13 @@ func checkBindAddr(addr string, allowRemote bool) error {
 // 并对带 Origin 的跨站请求做同源判定（见 httpHandler 的论证）。
 func (s *Server) ServeHTTP(ctx context.Context, addr string) error {
 	// 先挡住「绑全网卡」——这一步必须在 ListenAndServe 之前，否则等它监听上了再说就晚了。
-	if err := checkBindAddr(addr, s.allowRemote); err != nil {
+	// 告警里的「暴露了什么」要按本端点真实工具面说：--only-exposed 面根本没有
+	// gear_apply / gear_delete / gear_run，照旧文案会把排障引向不存在的工具。
+	exposedDesc := "调用 gear_apply / gear_delete / gear_run"
+	if s.onlyExposed {
+		exposedDesc = "调用应用策展工具（--only-exposed 面不含 gear_* 写工具）"
+	}
+	if err := checkBindAddr(addr, s.allowRemote, exposedDesc); err != nil {
 		return err
 	}
 	h, err := s.httpHandler()
@@ -380,19 +457,22 @@ func objectResult[T any](key string, v []T) map[string]any {
 	return map[string]any{key: v}
 }
 
-// register 把全部 MCP 工具挂到 server 上（13 个意图级工具，见包注释的工具表）。
+// register 把工具挂到 server 上：默认 15 个常驻 gear_* 意图级工具 + --expose 的反向暴露。
+// `--only-exposed` 时**只挂后者**——这一层开关就是「应用专用面」与「内核管理面」的分界。
 func (s *Server) register(ms *mcp.Server) error {
-	s.registerReadTools(ms)   // guide / catalog / describe / capabilities / doctor
-	s.registerWriteTools(ms)  // validate / apply / delete / promote
-	s.registerInvokeTools(ms) // invoke
-	s.registerRunTools(ms)    // run / execution
-	s.registerAppTools(ms)    // app
+	if !s.onlyExposed {
+		s.registerReadTools(ms)   // guide / catalog / describe / capabilities / doctor
+		s.registerWriteTools(ms)  // validate / apply / delete / promote
+		s.registerInvokeTools(ms) // invoke
+		s.registerRunTools(ms)    // run / execution
+		s.registerAppTools(ms)    // app
+	}
 
-	// 反向暴露：默认关闭（见 Server.exposeFlows 的说明），--expose-flows 显式开启。
+	// 反向暴露：默认关闭（见 Server.expose 的说明），--expose 显式开启。
 	// service 长驻 Flow 即使开启也不暴露（常驻不结束，会挂死调用方）——与
 	// REQ-FLOW-RUN-REJECTS-SERVICE 同口径。
-	if !s.exposeFlows {
-		return nil
+	if !s.expose.wantsFlows() {
+		return s.registerExposedTools(ms)
 	}
 	flows, err := s.reg.ListFlows()
 	if err != nil {
@@ -418,7 +498,8 @@ func (s *Server) register(ms *mcp.Server) error {
 			return nil, s.executionSnapshot(ctx, id, in.WaitSeconds), nil
 		})
 	}
-	return nil
+	// --expose all 时两套暴露面并存：flows 按快照，tools 按 App 清单白名单。
+	return s.registerExposedTools(ms)
 }
 
 // runningToolReason 报告 toolID 是否正被运行中的执行使用（与 server 包同款，

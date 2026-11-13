@@ -21,7 +21,7 @@
 > | `gear_catalog` 摘要化（不再吐全量 schema） | ✅ | `internal/mcp/tools_read.go`（`versions` 只给紧凑串；有机械守卫） |
 > | `gear_run` 带 `wait_seconds`（异步化） | ✅ | `internal/mcp/tools_run.go` |
 > | 结构化错误契约（附录 D）覆盖全部工具 | ✅ | `internal/mcp/common.go`（`toolError` / `toolErrorFrom`）、`mcp_errorpaths_test.go` |
-> | `flow__{id}` 默认关闭（保留 `--expose-flows`） | ✅ | `internal/mcp/mcp.go`（`WithExposeFlows`） |
+> | `flow__{id}` 默认关闭（`--expose flows`） | ✅ | `internal/mcp/mcp.go`（`WithExpose`） |
 > | 描述体量红线（单 ≤240 / 合计 ≤1,800 rune） | ✅ | `mcp_test.go`: `TestMCPToolDescriptionsStayLean` |
 > | 原语缺口上报契约（附录 G） | ✅ | `internal/mcp/guide/primitive-gap.md` + `UNKNOWN_CALL_TARGET` 诊断的 hint 直接指向它 |
 >
@@ -263,7 +263,9 @@ var files embed.FS
 | `run_tool` / `run_flow` | **`gear_run`**（`kind`: tool\|flow，**默认异步**，`wait_seconds` 可选短等） | 合并 + 改造 |
 | `get_execution_logs`（+ get/list） | **`gear_execution`**（`id`，`with_logs`/`tail`） | 合并 |
 | `capabilities` | **`gear_capabilities`** | 重命名 |
-| `flow__{id}` | **默认关闭**，`--expose-flows` 显式开启 | 降级为可选 |
+| `flow__{id}` | **默认关闭**，`--expose flows` 显式开启 | 降级为可选 |
+| App 清单 `mcp.tools` 策展工具 | **默认关闭**，`--expose tools --scope <appId>` 显式开启 | 白名单制：工具名/描述/固定参数由应用作者策展，工具数启动期确定 |
+| 应用专用面（`--only-exposed`） | **默认关闭** | 15 个常驻 `gear_*` 一个都不挂，只留 `--expose` 的工具；instructions 换成 `guide/app-only.md`、不挂手册资源，避免教 AI 调不存在的工具。给终端客户端 / url 型连接用 |
 | — | **`gear_guide`** | 新增（L1） |
 | — | **`gear_app`**（`action`: start\|stop\|status\|list）**默认开启**（v1.2 由「可选」升为「必需」，见 §6.2⑤） | 新增（C′） |
 | — | **`gear_doctor`** | 新增（问题 P7） |
@@ -384,7 +386,7 @@ gear_app(action: start|stop|status|list,
 
 智能体排障的第一站；`ext.serve` 起不来时，一次调用就能区分「YAML 写错」与「环境没准备好」。
 
-> **2026-10-03：判据本体已抽到 `internal/doctor`，CLI 侧 `gear doctor` 用的是同一份**（`Report.Map()` 保持上面这个形状逐字不变，`Report.Text()` 是 CLI 的渲染）。此前 doctor 只有 MCP 侧，于是「从命令行排查」的人看不到它，而能在 CLI 做的事（看路径、重建、改配置）偏偏都在 CLI 侧——一处真实的不对称。两份实现必然漂移，而 doctor 一旦漂移就再也不能被信任。
+> **2026-10-03：判据本体已抽到 `internal/doctor`，CLI 侧 `gear doctor` 用的是同一份**（`Report.Map()` 保持上面这个形状逐字不变，`Report.Text()` 是 CLI 的渲染）。2026-11-10 补：MCP `handleDoctor` 在 `Report.Map()` 之上另附一个 `mcp` 块（`expose` / `tools_enabled` / `flows_enabled` / `scope` / `curated_tools` / `hint`），回答「本会话的 `--expose` 开了没、装配了哪些策展工具」——CLI 侧没有这个概念，故不进 `internal/doctor`，`Report.Map()` 本体与 CLI 形状仍逐字不变。见 `internal/mcp/expose_status.go`。此前 doctor 只有 MCP 侧，于是「从命令行排查」的人看不到它，而能在 CLI 做的事（看路径、重建、改配置）偏偏都在 CLI 侧——一处真实的不对称。两份实现必然漂移，而 doctor 一旦漂移就再也不能被信任。
 
 **⑦ `gear_` 前缀与破坏性变更（已拍板：一次性全量统一）**
 MCP 无别名机制，一次性重命名。**Server `Version` 从 `0.1.0` 升到 `0.2.0`**，README §12 与 `REQUIREMENTS.md` 同步。
@@ -493,7 +495,7 @@ steps:
 
 | 类别 | 成员 | 是否受 capability 门禁 | 能否被 Flow step 直调 | 说明 |
 |---|---|---|---|---|
-| 受门禁原语 | `http` `call` `db` `secret` `event` `subscribe` `config`（7 个） | **是**（Tool 必须声明） | 能（如 `http.Request`） | 单一真相源 `internal/cap/cap.go` 的 `KnownPrimitives` |
+| 受门禁原语 | `http` `call` `db` `secret` `event` `subscribe` `config` `fs`（8 个） | **是**（Tool 必须声明） | 能（如 `http.Request`） | 单一真相源 `internal/cap/cap.go` 的 `KnownPrimitives` |
 | 纯函数原子 | `time` `template` `crypto` `id` `validate`（5 个） | **否**（始终可用，声明了反而被拒） | 能（如 `crypto.hash`、`id.uuid`、`validate.json_schema`） | 单具名 table 入参，`internal/engine/purefunc.go` |
 | Lua 便利绑定 | `json`（`ctx.json.encode/decode`） | — | **不能** | **不是能力**，不在能力目录；`ATOM_ROADMAP.md:21-27` 刻意如此 |
 | 可扩展原子 | `ext.email` `ext.serve` `ext.kafka` … | **是**（`ext.` 前缀 + 必须在 `extensions.yaml` 注册） | 能（如 `ext.ai.complete`） | 含 once 与 `service: true` 两种载体 |
@@ -619,7 +621,8 @@ steps:
 - `gear_catalog` 摘要化（P3 的根治）；`gear_run` 异步化（`wait_seconds`）。
 - `gear_doctor`（含台账/孤儿检查）。
 - resources（`gear://guide/*`、`gear://schema/*`）。
-- `flow__{id}` 默认关闭（保留 `--expose-flows`）。
+- `flow__{id}` 默认关闭（`--expose flows`）；`--expose {tools,all}` 按 `--scope` 指向的 App 清单 `mcp.tools` 白名单暴露注册 Tool，**没有作用域或没有策展区就拒绝装配**（见 `REQ-MCP-EXPOSE-TOOLS` / `REQ-APP-MCP-CURATE` 与 README §12）。
+- `--only-exposed` 把「应用专用端点」与「内核管理面」分开（见 `REQ-MCP-ONLY-EXPOSED`）：默认每个 MCP 实例都带 15 个常驻 `gear_*`，只想给客户端几个业务工具时那是多余且危险的暴露面（含 apply/delete/run/invoke）。开启后不挂常驻面、换 instructions、不挂手册资源；必须配 `--expose`，否则零工具空端点，装配期直接拒。默认关闭，标准面行为零变化。
 - 结构化错误契约（附录 D）覆盖全部工具。
 - 可选：`--apps <rest-addr>` 纯转发模式（供已有 `gear serve` 的场景）。
 
@@ -634,7 +637,7 @@ steps:
 
 | 文件 | 同步内容 |
 |---|---|
-| `README.md` §12 | 工具表（19 → 12）、instructions 说明、`gear_app` 与后台进程口径、`--expose-flows`、bundle 示例 |
+| `README.md` §12 | 工具表（19 → 12）、instructions 说明、`gear_app` 与后台进程口径、`--expose {flows,tools,all}`、`--only-exposed` 应用专用面、bundle 示例 |
 | `REQUIREMENTS.md` | 新增 `REQ-MCP-APP`（派生后台进程 + 台账 + 幂等）、`REQ-APP-LAUNCH`（detach 跨会话存活）、`REQ-MCP-APPLY` / `REQ-MCP-VALIDATE-YAML` / `REQ-MCP-INSTR` / `REQ-MCP-NAME` / `REQ-MCP-BUDGET`（描述体量红线：单 ≤240、合计 ≤1,800 字符）/ `REQ-MCP-ERR` / `REQ-MCP-DOCTOR` / `REQ-PRIMITIVE-GAP`（缺能力必须上报、禁止绕过），各带测试锚点 |
 | `internal/cli/root.go` / `scaffold.go` | `app` 子命令列表、service Flow 必须 `app run/start` 的提示口径 |
 | `internal/mcp/mcp_test.go` | 新工具全部登记进 `TestMCPAllToolsReturnObjectStructuredContent`（反查覆盖度，漏登记即红） |
@@ -712,7 +715,7 @@ Gear 是一个「机制内核」：只提供能力原语 + Tool（执行单元�
 一个「应用」= 一个含 mode: service 长驻 step 的 Flow，用 gear_app(start) 以后台进程方式运行。
 
 四层模型
-· 能力原语（底座，宿主提供）：受门禁 7 个 http/call/db/secret/event/subscribe/config（Tool 必须声明才可用）、
+· 能力原语（底座，宿主提供）：受门禁 8 个 http/call/db/secret/event/subscribe/config/fs（Tool 必须声明才可用）、
   免门禁 5 个纯函数 time/template/crypto/id/validate（始终可用，声明了反而被拒）、扩展原子 ext.*（须在 extensions.yaml 注册且必须声明）。
   json 不是能力（只是 Lua 里的 ctx.json 便利绑定，Flow 不能直调）。
 · Tool = 能力 + 业务逻辑，注册后可复用的执行单元。可复用的才建 Tool；一次性的直接在 step.call 写「能力.方法」。

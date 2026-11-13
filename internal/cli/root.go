@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/inconshreveable/mousetrap"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
@@ -110,7 +111,7 @@ func defaultAddr() string {
 // Execute 是 CLI 入口。
 func Execute() {
 	cmdStartedAt = time.Now()
-	err := newRootCmd().Execute()
+	err := executeRoot(os.Args[1:])
 	logCmdFinish(err)
 	// `gear doctor` 用哨兵 error 表达「自检跑完了、但有告警」：退出码仍要给 1
 	//（脚本要能判断），但不打印错误文案——告警已经写在报告里了，重复一遍只是噪声。
@@ -125,6 +126,41 @@ func Execute() {
 		}
 		os.Exit(1)
 	}
+}
+
+// executeRoot 构造根命令并执行；「资源管理器双击」的参数改写集中在这里（REQ-UI-LAUNCH-EXPLORER）。
+//
+// 改写必须在 cobra 解析参数**之前**完成，所以放在入口而不是某个子命令里；抽成独立函数是
+// 测试接缝——测试替换 startedByExplorer 后，与生产走同一条构造/执行路径。
+func executeRoot(rawArgs []string) error {
+	root := newRootCmd()
+	args, rewritten := explorerLaunchArgs(rawArgs, startedByExplorer())
+	if rewritten {
+		// mousetrap 的 preExecHook 在 ExecuteC 最前面运行：命中「资源管理器启动」时它会
+		// 先打印提示并 os.Exit(1)，此处不关掉，上面的参数改写根本没有生效的机会。
+		cobra.MousetrapHelpText = ""
+	}
+	// 始终显式 SetArgs（含空切片）：否则 cobra 会回退到 os.Args[1:]，测试进程里那串
+	// `-test.*` 参数会被当成 gear 的 flag 解析。
+	root.SetArgs(append([]string{}, args...))
+	return root.Execute()
+}
+
+// startedByExplorer 判定本进程是否由资源管理器（双击）启动，生产实现恒为 mousetrap 的同名函数。
+//
+// 抽成包级变量是为测试留接缝：真实判据看父进程是不是 explorer.exe，测试进程里构造不出来，
+// 而这条分支又必须能被断言（否则只能靠人肉双击验证）。
+var startedByExplorer = mousetrap.StartedByExplorer
+
+// explorerLaunchArgs 把「资源管理器双击、且没有任何参数」改写成 `gear ui`。
+//
+// 只认这一种情况：从终端（cmd/PowerShell/CI）无参启动仍打印帮助，带任何参数启动也保持
+// 原行为——不能把普通命令行调用悄悄变成起服务器。
+func explorerLaunchArgs(args []string, byExplorer bool) ([]string, bool) {
+	if !byExplorer || len(args) > 0 {
+		return args, false
+	}
+	return []string{"ui"}, true
 }
 
 // logCmdFinish 是命令收尾的档案行（成功/失败都记）。

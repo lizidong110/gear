@@ -20,8 +20,9 @@
 # 然后 Tool 声明 capabilities: [ext.tls]，Lua 里即可 local c = ctx.ext.tls.issue({ domain = "x.com" })。
 # 注意：ext.registry 是 gear 内建进程内扩展（读引擎 registry，供 agent 自我锚定），无需在此声明。
 #
-# 同理无需在此声明的是**内核原语**：受门禁的 7 个（http/call/db/secret/event/subscribe/config，
-# 由 Tool 的 capabilities 声明后使用）与始终可用的 3 个纯函数原子（time/template/crypto，
+# 同理无需在此声明的是**内核原语**：受门禁的 8 个（http/call/db/secret/event/subscribe/config/fs，
+# 由 Tool 的 capabilities 声明后使用；fs 为受安全目录收口的文件读写，默认根 GEAR_APP_DATA）与
+# 始终可用的 3 个纯函数原子（time/template/crypto，
 # 无需任何声明即可用，如 Flow 直调 call: crypto.hash、Lua 里 ctx.time.now({})）。
 # 它们不是 ext.*，不进本文件；能力目录见 `gear ai capabilities`。
 #

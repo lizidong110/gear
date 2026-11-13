@@ -17,6 +17,7 @@ gear 只提供**机制**，不提供**策略**：
 能力原语（底座）              →  执行单元            →  编排      →  切面
 http/call/db/secret/event/subscribe    Tool（可复用）        Flow         Hook
      /config（键值配置，落点由宿主决定）
+     /fs（文件读写，安全目录收口，默认 GEAR_APP_DATA）
 time/template/crypto/id/validate（免门禁纯函数，5 个）  ↳ 或 step 直调「能力.方法」
 ext.*（须注册 + 须声明）
 ```
@@ -58,6 +59,8 @@ ext.*（须注册 + 须声明）
 **注册时 App 是实体**：`kind: App` 清单经 `gear_apply` / `gear import` 落 registry 的 `apps` 表——它是命名空间
 户主（`App.id` 是所有 id 的前缀来源），`--scope` 守卫、列表分组、`app start` 端口回退、`gear export` 都读它。
 只注册 Flow 不注册 App，tools 会被算成「平台级」：任何 `--scope` 都能引用，守卫失效。
+清单里可选的 `mcp.tools` 还是 MCP 工具面的白名单：只有服务端以 `gear mcp --expose tools --scope <app-id>`
+启动才装配，不写就不暴露该应用的任何 Tool（写法见 `gear_guide("authoring")`）。
 
 一个真实的四步范式（仓库里的 `plugin/web_ui_flow.yaml`）：
 

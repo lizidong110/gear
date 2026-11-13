@@ -44,7 +44,7 @@
 | `MISSING_SERVE_HOLDER` | 这条 Flow 要用 `ext.serve` 侧车，却没有一条 `mode: service` 的 `ext.serve` 步持有它。**能写入、能 `gear_apply`，只在 `gear_app(start)` 时才炸 connection refused** | 加一条 `call: ext.serve` + `mode: service` 的步持有侧车；service step 不能作为依赖目标，故用一个 `mode: once` 的锚点把后续步推到下一层（见 `examples/agent-app/bundle.yaml`） |
 | `BAD_YAML` | 某份文档不是合法 YAML | 常见原因：缩进不一致、冒号后缺空格、字符串里的特殊字符没加引号 |
 | `UNKNOWN_KIND` | 某份文档的 `kind` 不是 App / Tool / Flow / Hook / Migrations | 第一份通常是 `kind: App` 清单，其余是 `kind: Tool` / `kind: Flow` / `kind: Hook`，还有可选的 `kind: Migrations`（库怎么演进，见 `gear_guide("authoring")` §4） |
-| `BAD_APP_MANIFEST` | App 清单缺 id / 缺 `entry_flow` / 出现多份 App | 一个 bundle 只放一份 `kind: App`，并给上 id 与 entry_flow |
+| `BAD_APP_MANIFEST` | App 清单缺 id / 缺 `entry_flow` / 出现多份 App / `mcp.tools` 策展规则非法（ref 不属于本 App 或 Tool 不存在、args 键不在 `input_schema.properties`、schema 顶层非 object） | 一个 bundle 只放一份 `kind: App`，并给上 id 与 entry_flow；策展规则的 ref 须以 `<app-id>__` 或 `<app-id>.` 开头且 Tool 已注册，args 键须是该 Tool 声明过的入参 |
 | `ID_NAMESPACE_VIOLATION` | bundle 里的 id 未带应用前缀 | 全部 id 以 `<app-id>__` 或 `<app-id>.` 开头 |
 | `SCOPE_VIOLATION` | 运行期命名空间守卫（`--scope`）拦下的跨应用引用：本进程 scope 只认自己名下的已注册对象（Tool / Flow / Hook 的 action） | 把被拒的 id 改成 `<app-id>__` 或 `<app-id>.` 开头；或去掉 `--scope` 关闭守卫。**平台级对象不会被此码拦**：cap 原语与无前缀注册 Tool（`ext.serve` / `static_site.serve` 这类共享基建）第一段不归属任何 App，照常可用——若被拦，说明它的第一段确实撞了某个已注册 App 的 id。**注意**：这一码只在 CLI / Flow 层能查到，经 `ctx.call` 触发时错误已被 Lua 边界拍成文本 |
 | `APPLY_CONFLICT` | 对象已存在且内容不同，而 `overwrite=false` | 确需覆盖就显式传 `overwrite=true`；否则换个 id（带应用前缀） |
@@ -54,6 +54,7 @@
 | `MISSING_FILE` | `layout.files` 声明了但文件不存在 | 用你自己的文件工具先落盘（这是 `warnings` 里的提示，不影响 `valid`） |
 | `MISSING_SECRET` | `${secrets.X}` 对应密钥未播种 | 请人在 CLI 播种（MCP 不写密钥）（`warnings` 里的提示，不影响 `valid`） |
 | `SIDECAR_NOT_BUILT` | 声明的侧车二进制缺失 | 先构建（`build/*-sidecar.exe`），`gear_doctor` 可见（`warnings` 里的提示） |
+| `MCP_CURATION_ABSENT` | bundle 里有 Tool，但 `kind: App` 清单没写 `mcp.tools` 策展区（默认白名单制，这些 Tool 不会进 `tools/list`） | **不用改 YAML**：不写策展区也完全合法，仍可用 `gear_run(kind=tool)`。若希望 MCP 客户端直接调用，补 `mcp.tools` 白名单并由**人**在 MCP 客户端配置 `gear mcp --expose tools --scope <appId>` 后重连（这是服务端启动参数，会话内改不了）。`gear_doctor` 的 `mcp` 块可查本会话装配状态（`warnings` 里的提示，不影响 `valid`） |
 
 ### 运行期
 
@@ -62,8 +63,8 @@
 | `SERVICE_FLOW_SYNC_RUN` | 对含 `mode: service` 的 Flow 用 `gear_run` | 改用 `gear_app(action=start)` |
 | `EXECUTION_BUSY` | MCP 面在途执行已达并发上限（默认 8），`gear_run` / `flow__` 被背压拒绝 | 稍后重试，或先用 `gear_execution` 看现有执行进展。**这不是 YAML 问题**，别去改定义 |
 | `FLOW_RUN_FAILED` | `gear_run(kind=flow)` 启动失败（非 service 拒绝类） | 读 `gear_execution` 定位；必要时 `gear_doctor` 看环境 |
-| `TOOL_RUN_FAILED` | `gear_run(kind=tool)` 同步执行单个 Tool 失败 | 看返回的 message；入参按 `gear_capabilities` 的 schema 核对 |
-| `INVOKE_FAILED` | `gear_invoke` 直调原子能力失败 | 方法名/参数以 `gear_capabilities` 的 schema 为准；`ext.*` 需已注册 |
+| `TOOL_RUN_FAILED` | `gear_run(kind=tool)` 同步执行单个 Tool 失败 | 看返回的 message；入参按 `gear_capabilities` 的 schema 核对。`ctx.fs.*` 的路径逃逸也走这里——message 带「路径逃出安全目录」，改用相对安全根的路径 |
+| `INVOKE_FAILED` | `gear_invoke` 直调原子能力失败 | 方法名/参数以 `gear_capabilities` 的 schema 为准；`ext.*` 需已注册。`fs.*` 直调越界（`..`/根外绝对路径）同样报「路径逃出安全目录」 |
 | `INVOKE_BLOCKED` | `gear_invoke` 调用被禁能力（`secret.*`） | **不许绕过**：密钥只在 Flow 内部用 `${secrets.NAME}` / `ctx.secret.get`；播种走 CLI |
 | `TX_BEGIN_FAILED` | `db.batch` 开启事务失败 | 同 `APP_START_FAILED` 的排查面：库不可写 / 连接被拒；先确认库路径可写再重试 |
 | `TX_BATCH_FAILED` | `db.batch` 某条语句失败（属业务结果，**不是**异常：整批已回滚） | 读 `results` 定位第几条、什么错；`committed=false` 意味着**这一次写入按未发生处理**，修正后整批重跑（batch 无跨调用状态） |

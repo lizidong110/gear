@@ -7,7 +7,7 @@ Gear 是「机制内核」：只给 能力原语 + Tool（执行单元）+ Flow�
 并附 warning——该进程会随**发起启动的那次会话**结束被回收。它是 running，但活不到会话之后。
 
 ## 四层模型
-- **能力原语（宿主提供）**：受门禁 7 个 `http/call/db/secret/event/subscribe/config`（须声明才可用）；
+- **能力原语（宿主提供）**：受门禁 8 个 `http/call/db/secret/event/subscribe/config/fs`（须声明才可用）；
   免门禁纯函数 5 个 `time/template/crypto/id/validate`（始终可用，**声明了反而被拒**）；`ext.*`（须注册且须声明）。
   `json` **不是能力**（只是 Lua 的 `ctx.json` 绑定，Flow 不能直调）。
 - **Tool** = 能力 + 业务逻辑，可复用。**可复用的才建 Tool；一次性的直接在 `step.call` 写「能力.方法」**。
@@ -22,6 +22,15 @@ Gear 是「机制内核」：只给 能力原语 + Tool（执行单元）+ Flow�
 → ⑦ `gear_app(status)` + 端口探活 + 日志行 → ⑧ 汇报并**告知如何停止**。
 
 做带 UI 的应用：前端**别手写裸 HTML+JS**，先 `gear_guide("frontend")` 用 petite-vue（下载到 `www/vendor/` 离线引入、保持模块化）。
+
+**要把应用的 Tool 暴露成 MCP 工具**：在 `kind: App` 清单写 `mcp.tools` 白名单（`gear_guide("authoring")`
+有写法、`args` 固定注入与护栏示例），再由**人在 MCP 客户端配置**把服务端启动成
+`gear mcp --expose tools --scope <app-id>`。`--expose` 是**服务端启动参数，不是你能调用的工具**，
+会话内改不了；没给 `--scope` / 没写策展区时服务端直接拒绝启动（不会退回裸暴露全量 Tool）。
+别为此另写 server.js。自查用 `gear_doctor` 返回体的 `mcp` 块：它报本会话的 expose / scope 与
+**实际装配**的策展工具名；显示未开启时按 hint 让**人**改配置并重连，别反复改本来正确的 YAML。
+给终端客户端的专用端点可由人再加 `--only-exposed`：那样只剩白名单工具，**本手册与 15 个 `gear_*`
+工具都不再下发**（那个端点会换一份应用专用说明，别照这份心智模型去找 gear_ 工具）。
 
 ## 八条铁律
 1. 写「能力.方法」前先 `gear_capabilities`，不许猜（`crypto/time/template` 免门禁、`json` 不是能力、`ext.*` 必须声明）。
@@ -40,6 +49,10 @@ Gear 是「机制内核」：只给 能力原语 + Tool（执行单元）+ Flow�
 · `gear_validate`(校验 YAML) · `gear_apply`(落库) · `gear_delete` · `gear_promote` · `gear_invoke`(能力直调)
 · `gear_run`(一次性编排) · `gear_execution`(执行记录/日志) · `gear_app`(起停查应用) · `gear_doctor`(环境自检)
 · `gear_export`(导出产物，可备份/换机器/交付) · `gear_import`(导回产物)
+
+**上面 15 个是常驻的 `gear_*` 意图级工具。** 服务端开了 `--expose` 时，`tools/list` 还会多出
+Flow 快照（`flow__{id}`）或 App 清单 `mcp.tools` 策展的工具（名字取清单的 alias / ref）——
+它们是普通 MCP 工具，按各自描述直接调用即可，不必再套一层 `gear_run`。
 
 **造完一个应用，就用 `gear_export` 把它导出一份**：只有 Tool/Flow 在 registry 里不算「你的产品」——
 静态资源不在库里、清单也带不走，换台机器就只剩一堆散落状态。产物是目录形态（可 git 版本化）或 `.gearapp` 包。

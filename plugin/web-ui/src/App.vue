@@ -33,7 +33,9 @@ const MENU = [
   { key: '/hooks', label: 'Hooks 切面', en: 'Hooks' },
   { key: '/executions', label: '执行记录', en: 'Executions' },
   { key: '/apps', label: 'Apps 长驻', en: 'Apps' },
+  { key: '/app-defs', label: 'App 清单', en: 'App Defs' },
   { key: '/secrets', label: '密钥', en: 'Secrets' },
+  { key: '/config', label: '配置', en: 'Config' },
 ]
 
 function renderLabel(item: { key: string; label: string; en: string }): ReturnType<typeof h> {

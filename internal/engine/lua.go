@@ -160,6 +160,16 @@ func luaConfigArgs(L *lua.LState) (map[string]interface{}, error) {
 	return m, nil
 }
 
+// luaFSArgs 从 Lua 第 1 个参数读取 fs 调用的具名 table（{path=...} / {path=,data=,append=}）。
+// 与 config 同款「单具名 table」形态；缺 path 由各方法在宿主侧收口时报错（空路径也是逃逸的一种）。
+func luaFSArgs(L *lua.LState) (map[string]interface{}, error) {
+	m, ok := fromLuaValue(L, L.Get(1)).(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("fs 调用需传入 table：{path=...} / {path=..., data=..., append=...}")
+	}
+	return m, nil
+}
+
 // subscriptionRequestFromMap 把 Lua table（JSON 兼容 map）塑形成 Subscribe.Start 的请求体。
 // 手动解析而非 JSON round-trip：保持与 stdio/HTTP 侧同一套字段语义，避开往返引入的键漂移。
 func subscriptionRequestFromMap(m map[string]interface{}) (cap.SubscriptionRequest, error) {
@@ -667,6 +677,118 @@ func setupLuaCapabilities(L *lua.LState, ctxTable *lua.LTable, host *cap.Context
 			return 1
 		}))
 		ctxTable.RawSetString("config", t)
+	}
+
+	// ctx.fs: read/write/list/mkdir/remove（受安全目录收口的文件读写；根由宿主装配，
+	// 默认 gearhome.AppDataDir()）。与 config 同理由：Lua 沙箱禁 io/os，应用拿不到
+	// GEAR_HOME，也无法把「路径只在安全根内」这条约束托付给脚本——收口在宿主侧，
+	// 脚本越界（../、根外绝对路径、符号链接逃逸）只会收到明确报错（REQ-FS-CONFINEMENT）。
+	if declared["fs"] {
+		t := L.NewTable()
+		t.RawSetString("read", L.NewFunction(func(L *lua.LState) int {
+			f, err := host.FS()
+			if err != nil {
+				L.RaiseError("fs.read 失败: %v", err)
+				return 0
+			}
+			m, err := luaFSArgs(L)
+			if err != nil {
+				L.RaiseError("fs.read 失败: %v", err)
+				return 0
+			}
+			path, _ := m["path"].(string)
+			content, err := f.Read(path)
+			if err != nil {
+				L.RaiseError("fs.read 失败: %v", err)
+				return 0
+			}
+			L.Push(lua.LString(string(content)))
+			return 1
+		}))
+		t.RawSetString("write", L.NewFunction(func(L *lua.LState) int {
+			f, err := host.FS()
+			if err != nil {
+				L.RaiseError("fs.write 失败: %v", err)
+				return 0
+			}
+			m, err := luaFSArgs(L)
+			if err != nil {
+				L.RaiseError("fs.write 失败: %v", err)
+				return 0
+			}
+			path, _ := m["path"].(string)
+			data, _ := m["data"].(string)
+			appendMode, _ := m["append"].(bool)
+			if err := f.Write(path, []byte(data), appendMode); err != nil {
+				L.RaiseError("fs.write 失败: %v", err)
+				return 0
+			}
+			L.Push(lua.LNumber(len(data)))
+			return 1
+		}))
+		t.RawSetString("list", L.NewFunction(func(L *lua.LState) int {
+			f, err := host.FS()
+			if err != nil {
+				L.RaiseError("fs.list 失败: %v", err)
+				return 0
+			}
+			m, err := luaFSArgs(L)
+			if err != nil {
+				L.RaiseError("fs.list 失败: %v", err)
+				return 0
+			}
+			path, _ := m["path"].(string)
+			entries, err := f.List(path)
+			if err != nil {
+				L.RaiseError("fs.list 失败: %v", err)
+				return 0
+			}
+			// FSEntry 是 struct，toLuaValue 只展开 slice/map——先转成 JSON 兼容 map
+			// （与 db 返回 []interface{} 同口径），键名用 json tag（name/size/is_dir）。
+			arr := make([]interface{}, 0, len(entries))
+			for _, e := range entries {
+				arr = append(arr, map[string]interface{}{"name": e.Name, "size": e.Size, "is_dir": e.IsDir})
+			}
+			L.Push(toLuaValue(L, arr))
+			return 1
+		}))
+		t.RawSetString("mkdir", L.NewFunction(func(L *lua.LState) int {
+			f, err := host.FS()
+			if err != nil {
+				L.RaiseError("fs.mkdir 失败: %v", err)
+				return 0
+			}
+			m, err := luaFSArgs(L)
+			if err != nil {
+				L.RaiseError("fs.mkdir 失败: %v", err)
+				return 0
+			}
+			path, _ := m["path"].(string)
+			if err := f.Mkdir(path); err != nil {
+				L.RaiseError("fs.mkdir 失败: %v", err)
+				return 0
+			}
+			return 0
+		}))
+		t.RawSetString("remove", L.NewFunction(func(L *lua.LState) int {
+			f, err := host.FS()
+			if err != nil {
+				L.RaiseError("fs.remove 失败: %v", err)
+				return 0
+			}
+			m, err := luaFSArgs(L)
+			if err != nil {
+				L.RaiseError("fs.remove 失败: %v", err)
+				return 0
+			}
+			path, _ := m["path"].(string)
+			if err := f.Remove(path); err != nil {
+				L.RaiseError("fs.remove 失败: %v", err)
+				return 0
+			}
+			return 0
+		}))
+		ctxTable.RawSetString("fs", t)
 	}
 
 	// 扩展原语（用户/插件注册）：遍历已声明且非内置的名字，查目录注入 ctx.<name>。

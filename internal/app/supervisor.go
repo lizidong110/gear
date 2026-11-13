@@ -96,6 +96,20 @@ type Supervisor struct {
 	// （2026-10-29 审出）。这里改为起新探针前先停掉同一 handle 的旧探针。
 	probeMu sync.Mutex
 	probes  map[*engine.ServiceHandle]*probeToken
+
+	// onRestart 是「发生了一次 service 重启」的观察口（SetOnRestart 注册）。
+	// 为什么需要它：REST 面（server.handleCreateApp）在局部 goroutine 里构造 Supervisor，
+	// 事后拿不到实例、读不到 RestartCount——崩溃重启对管理面完全不可见，
+	// 呈现出来就是 UI 假绿。回调参数是**累计**重启次数（与 RestartCount 同源）。
+	onRestart func(total int)
+}
+
+// SetOnRestart 注册重启观察回调（total = 累计重启次数）；传 nil 表示取消。
+// 回调在重启计数递增后异步上下文中触发，实现方自行保证并发安全。
+func (s *Supervisor) SetOnRestart(cb func(total int)) {
+	s.mu.Lock()
+	s.onRestart = cb
+	s.mu.Unlock()
 }
 
 // New 构造 Supervisor。maxConcurrent < 1 表示不限（由 Supervise 按 flow 数兜底）。
@@ -266,7 +280,12 @@ func (s *Supervisor) superviseOne(ctx context.Context, flowID string) error {
 		}
 		s.mu.Lock()
 		s.restarts++
+		cb := s.onRestart
+		total := s.restarts
 		s.mu.Unlock()
+		if cb != nil {
+			cb(total)
+		}
 		fmt.Printf("↻ step %s service 重启 (第 %d 次)\n", h.StepID, h.Restarts)
 		// 重启后该 handle 的进程已换柄：起新探针前先停掉同一 handle 的旧探针
 		//（旧探针只在 ctx 取消或 kill 后退出，放任不管会逐次累积）。

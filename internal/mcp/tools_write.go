@@ -190,6 +190,12 @@ func (s *Server) validateBundle(text string) *validateResult {
 	for _, a := range b.Apps {
 		res.Diags = append(res.Diags, s.checkAppManifest(a, b)...)
 		res.Warnings = append(res.Warnings, s.appManifestWarnings(a)...)
+		// 策展可发现性（REQ-MCP-EXPOSE-DISCOVER）：写了 Tool 却没写 mcp.tools 时，
+		// 光靠 instructions 仍可能让智能体以为「清单写完就该出现在 tools/list」。
+		// 给一条 advisory（不影响 valid），把「默认不暴露 + 由人改启动参数」讲清楚。
+		if len(b.Tools) > 0 && len(a.MCP.Tools) == 0 {
+			res.Warnings = append(res.Warnings, mcpCurationWarning(a, len(b.Tools)))
+		}
 	}
 	return res
 }
@@ -354,8 +360,21 @@ func checkMigrations(b *bundle) []engine.Diagnostic {
 	return out
 }
 
-// checkAppManifest 校验 App 清单的硬约束（入口 Flow 必须能解析）。
+// checkAppManifest 校验 App 清单：入口 Flow 可解析 + mcp.tools 策展区可装配。
+//
+// 「一次报全所有错」是编译器的红线（REQ-MCP-DIAGS）：入口 Flow 有问题时也要把策展区的
+// 错误一起报出来，别让第一条把其余全吞掉。没有 id 时例外——命名空间无从判定，
+// 归属诊断只会变成一串噪声。
 func (s *Server) checkAppManifest(a *appManifest, b *bundle) []engine.Diagnostic {
+	out := s.checkAppManifestCore(a, b)
+	if a.ID == "" {
+		return out
+	}
+	return append(out, s.checkAppMCP(a, b)...)
+}
+
+// checkAppManifestCore 校验 App 清单的硬约束（入口 Flow 必须能解析）。
+func (s *Server) checkAppManifestCore(a *appManifest, b *bundle) []engine.Diagnostic {
 	var out []engine.Diagnostic
 	if a.ID == "" {
 		out = append(out, engine.Diagnostic{

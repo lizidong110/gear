@@ -37,7 +37,7 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 | **Flow** | 编排多个 Tool 的声明式 DSL |
 | **Hook** | 在指定生命周期节点插入执行逻辑的「切面」 |
 | **Runtime** | Tool 的执行环境（process / lua / go-host / wasm） |
-| **Context** | 一次执行的共享数据空间（宿主原语：受门禁的 http/call/db/secret/event/subscribe/config + 始终可用的纯函数原子 time/template/crypto/id/validate） |
+| **Context** | 一次执行的共享数据空间（宿主原语：受门禁的 http/call/db/secret/event/subscribe/config/fs + 始终可用的纯函数原子 time/template/crypto/id/validate） |
 
 ---
 
@@ -58,8 +58,8 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 │                       runtime 分发 / 模板 / when 表达式 /    │
 │                       版本灰度 / AI 扩展装配 / 健康检查       │
 ├──────────────────────────────────────────────────────────┤
-│  internal/cap      —— 宿主能力：受门禁 7 个原语              │
-│                  http/call/db/secret/event/subscribe/config  │
+│  internal/cap      —— 宿主能力：受门禁 8 个原语              │
+│                  http/call/db/secret/event/subscribe/config/fs │
 │                       另有纯函数原子（5 个）                   │
 │                     time/template/crypto/id/validate           │
 │                       始终可用、无需声明 capabilities          │
@@ -79,11 +79,11 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 | `model` | 核心数据模型唯一真相源 + 校验规则 |
 | `registry` | SQLite 持久化 tool/flow/hook，含删除守卫与示例 YAML 多文档加载 |
 | `engine` | 编排内核：Flow 拓扑执行、Hook 装配、runtime 分发、表达式、版本灰度 |
-| `cap` | 宿主能力层：**7 个受 capability 门禁的原语**（http/call/db/secret/event/subscribe/config）的接口与内存实现（最小权限门禁、事件总线、订阅生命周期、键值配置库）。纯函数原子（time/template/crypto/id/validate）刻意不进此门禁，见 `internal/engine/purefunc.go` |
+| `cap` | 宿主能力层：**8 个受 capability 门禁的原语**（http/call/db/secret/event/subscribe/config/fs）的接口与内存实现（最小权限门禁、事件总线、订阅生命周期、键值配置库、安全目录文件读写）。纯函数原子（time/template/crypto/id/validate）刻意不进此门禁，见 `internal/engine/purefunc.go` |
 | `server` | REST 执行面：路由、并发闸门、执行记录持久化、受管 app 托管 |
 | `app` | `app run` 监管器：把一个 / 多个 Flow 变成受管进程 |
 | `cli` | CLI 管理面：cobra 命令树、`gear`/`exec`/`ai`/`mcp` 客户端、extensions 装配 |
-| `mcp` | MCP 执行面：13 个**意图级** `gear_*` 工具（手册 / 目录 / 校验 / 落库 / 能力直调 / 执行 / 应用生命周期 / 环境自检）+ 经 `ServerOptions.Instructions` 注入的心智模型；`--expose-flows` 才把已注册 Flow 反向暴露为 `flow__{id}` |
+| `mcp` | MCP 执行面：15 个**意图级** `gear_*` 工具（手册 / 目录 / 校验 / 落库 / 能力直调 / 执行 / 应用生命周期 / 环境自检 / 产物导出导入）+ 经 `ServerOptions.Instructions` 注入的心智模型；`--expose {flows,tools,all}` 才开启反向暴露（Flow 快照 / App 清单策展的 Tool）；`--only-exposed` 可关掉这 15 个常驻工具，只留反向暴露的应用专用面 |
 | `execstore` | 执行记录持久化（SQLite），REST 与 MCP 两执行面共用同一份执行历史与「运行中不可注销」判据 |
 | `gearhome` | **gear 自身落盘位置的单一真相源**：`GEAR_HOME` → `<HOME>/.gear` → `<exeDir>/.gear` 兜底，决定 registry.db / exec.db 路径与诊断时的产物搜索锚点（见 `internal/gearhome/gearhome.go`）。**默认路径一律不随 cwd 变化**——这是「同一份 gear 在不同工作目录下行为不一致」的根治点 |
 
@@ -225,6 +225,7 @@ type Hook struct {
 - **registry 沿进程树继承**：`openRegistry()` 会把本次生效的 registry **绝对化**后写进 `GEAR_REGISTRY`，派生的进程（`app start` 的监管进程、`app run` 里 engine 拉起的长驻 Tool 进程）自动读同一个库。所以应用内步骤**不该**写死 `--registry`——写了也仍以显式值为准，但会因「换个 cwd 就静默指向另一个库」在注册/校验期收到 warning。传**相对路径**的 `--registry` 会在 stderr 提示（相对值按调用时 cwd 解析，cwd 是调用方的属性、不是 gear 的属性）。
 - `app start | stop | status | list`：**后台**启动器 + 台账（见下方 `gear mcp` 一节的说明）。
 - `app delete <id>`：注销 App 清单。**刻意不做引用守卫**（App 只是聚合描述，它引用的 Tool/Flow 是独立实体，要求「先拆光 Tool 才能删清单」会堵死清理路径）。它存在是为了让上一条守卫的建议可执行：`flow delete` 会因「是某 App 的 entry_flow」拒绝并提示先注销该 App，而 CLI 面原本没有这个入口（只能走 Web UI / MCP）。
+  - `--cascade`：连根拔起——一并删该 App 拥有的全部 Tool/Flow/Hook（归属按 `model.App.Owns`：id 以 `<app>__` 或 `<app>.` 开头）。默认不带此 flag 仍只删清单（保持「删清单≠删应用」语义）。跨 App 引用与运行中守卫仍生效（避免误伤隔壁 / 删正在跑的），绕过的只是「同 App 内引用」与「entry_flow」两道（本就随 App 一起消失）。删前会打印将被删的子资源清单。删完后还会**一并清理磁盘残留**：`<apps-dir>/<app-id>/` 静态资源目录、`<apps-dir>` 下 FlowID 命中该 App 入口 Flow 的运行台账、`<AppDataDir>/<app-id>.db` 业务数据库（dsn 恰为 `<app-id>.db` 时）；以及把 App + 子资源在 `definition_history` 里的全部历史行也 purge 掉（否则 `gear history restore` 还能把已删对象写回）。这几项都是与 App 一一对应、专属于它的路径，不会误伤其它应用；删不动时打印 warning 但不让命令失败。
 - `app prune`：`--dry-run`（只汇报，不动磁盘）、`--flow <id>`（只清该 Flow）、`--apps-dir`（台账目录）。清理台账里**确定已终止**的记录——只清 `exited` / `stopped` / `startup_failed` 三种终态，`running` 与 `unknown` **一律保留**（unknown 的双判据自相矛盾，删掉可能把「还在跑却再无人可查」的进程变成真孤儿）。**只删记录，不杀进程、不碰端口**（要停进程用 `app stop`）。`start` 失败一次就落一条台账，调试一轮下来很容易堆十几条，prune 就是为「按应用批量清干净」准备的。与 MCP `gear_app(action=prune)`、REST `POST /api/apps/prune` 共用 `internal/app` 同一份实现。
 
 **`gear serve`**
@@ -232,7 +233,8 @@ type Hook struct {
   **非回环地址默认拒绝**（与 `gear mcp` 同一份判定；REST 面当前无鉴权，`0.0.0.0` 或空 host `:8787` 会把「读写 registry 与明文 secrets、执行编排」暴露给局域网），
   确有远程需求时显式加 `--allow-remote`（放行时 stderr 留警告）。
 - **`serve` 默认同源托管 Web 管理界面**（2026-10-21，M1）：`plugin/web-ui` 的前端产物被 `go:embed` 进二进制，
-  浏览器打开 `http://127.0.0.1:8787/` 即是管理界面（八页面：概览 / Tools / Flows / Hooks / 执行记录 / Apps / Secrets / 能力目录）。
+  浏览器打开 `http://127.0.0.1:8787/` 即是管理界面（十页面：概览 / Tools / Flows / Hooks / 执行记录 / Apps 长驻 / **App 清单** / Secrets / **配置** / 能力目录）。
+  「App 清单」管 registry 里的 `kind: App` 定义（含 YAML 导入导出），与「Apps 长驻」的内存态受管进程是两套模型；「配置」按内核目录渲染中文表单，免记 `ai.*` 键名。
   **同源 ⇒ 浏览器不跨域 ⇒ 内核不需要任何 CORS 头**（设计红线：内核不引 CORS）。用户也不用在页面里填 API 地址。
   - `--no-ui`：不托管界面（`GET /` 返回 404 指引，`/api/*` 不受影响——关界面不是关执行面）。
   - `--no-open`：不自动开浏览器（仍会打印地址）。
@@ -279,7 +281,10 @@ type Hook struct {
   显示 `dev` 表示构建时未注入版本号（**不是**发布构建，重建 `bash scripts/build.sh` 即可）。
 - `gear doctor`：环境自检——registry 计数、扩展声明与侧车是否就绪、AI 凭据有没有配（只看有无，
   不回显明文）、应用台账遗留进程与端口占用。**有告警时退出码为 1**（便于脚本判断）。
-  判据与 MCP 的 `gear_doctor` 是**同一份实现**（`internal/doctor`），两面结论必然一致。
+  判据与 MCP 的 `gear_doctor` 是**同一份实现**（`internal/doctor`），环境结论必然一致。
+  MCP 面另附一个 `mcp` 块（`expose` / `tools_enabled` / `flows_enabled` / `scope` / `curated_tools` / `hint`），
+  报**本会话**的反向暴露装配状态并给出可执行的下一步——CLI 侧没有 `--expose` 这个概念，故该键只在
+  MCP handler 附加，`Report.Map()` 本体与 CLI 形状不变（见 `internal/mcp/expose_status.go`）。
 - 出现「命令不存在 / 参数不认识」时先跑这两个：可区分「功能真的没有」与「二进制旧 / PATH 指错」。
 
 **`gear config`**（持久化键值配置，落点 `<GEAR_HOME>/config.db`，`GEAR_CONFIG_DB` 可覆盖）
@@ -358,8 +363,28 @@ type Hook struct {
   **非回环地址默认拒绝**（MCP 面当前无鉴权，绑全网卡会把「写 registry / 删对象 / 执行编排」暴露给局域网），
   确有远程需求时显式加 `--allow-remote`；带 Origin 的跨站请求一律按同源判定拒绝（与 REST 面同一判据）。
 - `gear mcp --registry <path> --apps-dir <dir>`：显式交给 MCP 面 registry 路径与台账目录。**`gear_app(start)` 依赖它**——派生出去的子进程要继承 `--registry`，否则会读默认库、可能启动另一个库里的同名 Flow（未配置时 start 直接拒绝执行，不「尽力而为」）。
-- `gear mcp --expose-flows`：把已注册 Flow 额外反向暴露为 `flow__{id}` 工具（**默认关闭**：工具数必须可预测；且是启动时快照，之后新建的 Flow 本次进程内不会出现；service 长驻 Flow 永不暴露）。
-- 暴露 **15** 个意图级工具（手册 / 目录 / 校验 / 落库 / 删除 / 晋升 / 能力直调 / 执行 / 执行记录 / 应用生命周期 / 环境自检 / **产物导出** / **产物导入**），工具名统一 `gear_` 前缀；心智模型（四层模型、八条铁律、工具选路）只写在 `ServerOptions.Instructions` 里**一次**，工具描述只留「做什么 + 何时用 + 歧义消解」（单条 ≤240 字符、合计 ≤1,800 字符，有机械守卫）。
+- `gear mcp --expose {flows,tools,all}`：反向暴露开关，**留空 = 全关**（默认）。`flows` 把已注册 Flow 额外暴露为 `flow__{id}` 工具（启动时快照，之后新建的 Flow 本次进程内不会出现；service 长驻 Flow 永不暴露）；`tools` 按 App 清单的 `mcp.tools` 白名单暴露注册 Tool；`all` 两者并存。旧 `--expose-flows` 已移除，改用 `--expose flows`。
+- `gear mcp --expose tools --scope <appId>`：暴露**该 App 策展过**的 Tool。工具名/描述/固定参数都写在 `kind: App` 清单里，工具数启动期即确定、按 App 隔离：
+
+  ```yaml
+  kind: App
+  id: study
+  entry_flow: study.up
+  mcp:
+    tools:
+      - ref: study__plan_propose                 # 直接暴露，工具名 = ref
+      - ref: study__plan_confirm
+        args: {session: parent}                 # 服务端固定注入，AI 看不到也改不掉
+      - ref: study__plan_preview
+        args: {session: parent}
+        alias: study_plan_preview               # 改个好名字
+        description: "三段式②：只预览。禁止自动 confirm，必须等家长确认。"  # 覆盖描述，护栏进清单
+  ```
+
+  `ref` 必须属于该 App 的命名空间且 Tool 已注册；`args` 的键必须出现在 Tool 的 `input_schema.properties` 里（会从对外 schema 删掉，调用时服务端无条件覆盖客户端传值）。**没有 `--scope`、App 未注册、或 App 没写 `mcp.tools` 时直接拒绝启动**（不退回裸暴露全量 Tool）。`15` 个常驻 `gear_*` 工具的预算/前缀/登记表守卫不受影响，策展工具另有独立断言。执行走 `engine.RunTool` 进程内路径，返回 `{"kind","id","output"}`。
+- `gear mcp --only-exposed`：**应用专用面**——不挂 15 个常驻 `gear_*` 工具，只留 `--expose` 带进来的白名单/快照工具。默认每个 MCP 实例都会带那 15 个（含 `gear_apply` / `gear_delete` / `gear_run` / `gear_invoke` 这套 registry 写面），只想给业务调用方 5 个工具时这就是多余的暴露面。**须配 `--expose`**（否则零工具，装配期直接拒），开启后 instructions 换成 `guide/app-only.md`（明说「本端点没有 gear_* 工具」），也不再挂 `gear://guide/*` 资源，避免教 AI 调用不存在的工具。默认关闭 = 现有行为零变化。
+- `gear mcp --http 127.0.0.1:8788 --expose tools --scope study --only-exposed`：**推荐给终端客户端的 HTTP 形态**，工具面只有该 App 策展过的那几个，WorkBuddy 用 url 型连接（端点 `/mcp`）。注意 `gear mcp` 是前台阻塞进程，需自行常驻托管；MCP 面无鉴权，非回环地址默认拒绝。要管理 registry / 校验 / 落库请另连一个标准 `gear mcp` 实例。
+- 暴露 **15** 个意图级工具（手册 / 目录 / 校验 / 落库 / 删除 / 晋升 / 能力直调 / 执行 / 执行记录 / 应用生命周期 / 环境自检 / **产物导出** / **产物导入**），工具名统一 `gear_` 前缀；心智模型（四层模型、八条铁律、工具选路）只写在 `ServerOptions.Instructions` 里**一次**，工具描述只留「做什么 + 何时用 + 歧义消解」（单条 ≤240 字符、合计 ≤1,800 字符，有机械守卫）。**`--only-exposed` 时这 15 个一个都不挂**，守卫本来也只统计这一层常驻面，不受动态工具影响。
 - `gear app start/stop/status/list/prune`：**后台**应用生命周期（与 MCP 的 `gear_app` 共用 `internal/app` 同一份实现）。`start` 派生后台进程后立即返回；`stop` 收不干净会如实报 `ORPHAN_APP` 而非谎报成功；台账落在 `<registry 同目录>/apps/`。`prune` 清理台账里**确定已终止**的记录（`running`/`unknown` 一律保留，只删记录不杀进程；`--dry-run` 先预览、`--flow` 限定单个 Flow）。
 
 > **`start` 的「跨会话存活」是有条件的，不承诺无条件成立（2026-09-21 修正）**
@@ -438,18 +463,41 @@ gear scaffold app --help
 | GET | `/api/secrets` | `handleListSecrets` | 列出密钥名（**只回名字，绝不回明文**） |
 | PUT | `/api/secrets/{name}` | `handleSetSecret` | 写入/覆盖密钥（body `{value}`；空值/非法名 400） |
 | DELETE | `/api/secrets/{name}` | `handleDeleteSecret` | 删除密钥（不存在 404） |
+| GET | `/api/config/catalog` | `handleConfigCatalog` | 内置关键配置键目录（中文名/说明/默认值/类型；目录由内核 `cap.ConfigCatalog()` 提供，UI 不硬编码 key） |
+| GET | `/api/config` | `handleGetConfig` | 逐项当前值 + 是否已配置 + 环境变量是否覆盖；**敏感键只回掩码**；目录外的自定义键一并列出 |
+| PUT | `/api/config/{key}` | `handleSetConfig` | 写入/覆盖一项配置（body `{value}`；空串合法＝显式置空；响应不回显 value） |
+| DELETE | `/api/config/{key}` | `handleDeleteConfig` | 删除一项配置，回退到环境变量/内置默认（不存在 404） |
+| GET | `/api/app-defs` | `handleListAppDefs` | 列出 registry 里的 **App 清单**（含组成统计）。⚠ 与 `/api/apps` 的内存态受管进程不是同一模型 |
+| GET | `/api/app-defs/{id}` | `handleGetAppDef` | 单查一份 App 清单（含完整组成；不存在 404） |
+| GET | `/api/app-defs/{id}/export` | `handleExportAppDef` | 导出为多文档 YAML 文本（attachment 下载）；内存生成、不读服务器文件；静态资源不含文件内容，需完整产物用 CLI `gear export` |
+| POST | `/api/app-defs/import` | `handleImportAppDef` | 从 bundle YAML 文本导入（body `{bundle, dry_run?, overwrite?}`）；写入口为 `artifact.ApplyBundle`，与 `gear_apply`/`gear_import` 同源；坏 YAML 回结构化诊断；声明 migrations 显式拒绝 |
+| DELETE | `/api/app-defs/{id}` | `handleDeleteAppDef` | 删除 App 清单（不存在 404 / 被引用 409） |
 | POST | `/api/executions` | `handleCreateExecution` | 触发异步执行（body `{flow_id}`，**202**；繁忙 429） |
 | GET | `/api/executions` | `handleListExecutions` | 列出执行记录 |
 | GET | `/api/executions/{id}` | `handleGetExecution` | 查询执行结果（404） |
 | GET | `/api/executions/{id}/logs` | `handleGetExecutionLogs` | 执行日志（stdout/stderr） |
+| GET | `/api/executions/{id}/logs/stream` | `handleStreamExecutionLogs` | 执行日志**实时流（SSE）**：仅推订阅后新产生的行，执行终态即发 `event: done` 并关闭；历史由上方 `/logs` 提供（职责分离）。`X-Accel-Buffering: no` 关反向代理缓冲。详见 REQ-API-LOGS-STREAM |
 | POST | `/api/apps` | `handleCreateApp` | 托管一个受管 Flow 进程（201 `AppInstance`） |
-| GET | `/api/apps` | `handleListApps` | 列出受管 app |
+| GET | `/api/apps` | `handleListApps` | 列出受管 app，**如实反映监管态**（REQ-APP-MANAGED-STATE）：`state`（running/exited，按监管 goroutine 的 done 是否关闭实时重算，监管自结束的条目不再顶着 running 假绿）、`restarts`（service 累计重启次数）、`exit_err`（监管结束原因，可空） |
 | POST | `/api/apps/prune` | `handlePruneApps` | 清理**落盘台账**里确定已终止的记录（body `{flow_id?, dry_run?}`，空 body=全量真删）。只清 `exited`/`stopped`/`startup_failed`；`running`/`unknown` 一律保留；**只删记录不杀进程**。⚠ 与同前缀的 `GET/POST/DELETE /api/apps` **不是同一个模型**：那三个管本进程内存里的 `AppInstance`（等价 `gear app run`，无台账无孤儿），本端点动的是 `gear app start` 落下的持久台账 |
 | DELETE | `/api/apps/{id}` | `handleDeleteApp` | 停止受管 app（404） |
+| GET | `/api/apps/records` | `handleListAppRecords` | 列出 `gear app start` / MCP `gear_app(start)` 的**落盘台账**应用（状态/PID/日志文件路径/`live_logs`）；⚠ 与 `/api/apps` 的内存态受管进程不是同一模型，只回状态投影、**不含日志内容** |
+| POST | `/api/apps/{id}/logs` | `handleIngestAppLogs` | detached App 子进程批量回推日志行（body `{token, lines[]}`）；token 常量时间比对 + 同源校验；未启用 403 / token 错 401 / 台账不存在 404 |
+| GET | `/api/apps/{id}/logs/stream` | `handleStreamAppLogs` | 台账应用**实时日志 SSE**：只推订阅后新产生的行，**不读 `<appID>.log`、不回放历史**；应用结案发 `event: done` 并关闭，15s `: ping` 保活 |
 | GET | `/api/capabilities` | `handleCapabilities` | 实时原子能力目录（内核 builtin+pure + 已注册 `ext.*`，与 `gear ai capabilities` 同源）。每个方法带 **`invoke_form`**（`positional`/`table`/`bare`）与 **`lua_call`**（可直接复制的完整调用）——Lua 侧入参形态是混合的，只给参数名会让人编出运行期才炸的调用 |
 | POST | `/api/capabilities/invoke` | `handleInvokeCapability` | 直接执行一次原子能力调用（body `{name, method, args}`，与 step 直调**共用**同一套校验）。**已收紧**：只接受本机 Origin，且 `secret.*` 一律 403（密钥明文不提供 HTTP 直读口） |
 | POST | `/api/capabilities/invoke/stream` | `handleInvokeCapabilityStream` | `invoke` 的 **SSE 流式版**：目前仅支持 `ext.ai.complete_stream`，以 `text/event-stream` 逐增量推送 `{delta, reasoning}`（结束 `data: {"done":true}`、出错 `event:error`）。同源与禁 secret 约束同上 |
 | DELETE | `/api/hooks/{id}` | `handleDeleteHook` | 注销 Hook（不存在 404） |
+
+**detached App 实时日志链路**（REQ-API-APP-LOGS）：`gear serve` 绑定成功后把 `{addr, token, pid}` 原子写入
+`<appsDir>/server.addr`（权限 0600、只放行回环地址、token 在重启时复用）；`gear app start` 派生前读它，
+把 `GEAR_APP_LOG_ID` / `GEAR_APP_LOG_URL` / `GEAR_APP_LOG_TOKEN` **追加到子进程环境**（不是全局
+`os.Setenv`——MCP Server 常驻，全局 env 会让后续每个 App 都带上上一个 App 的凭据）。子进程 `app run`
+的引擎日志经 `internal/applog` 批量 POST 回 `/api/apps/{id}/logs`，serve 校验后推到内存 LogBroker，
+UI 订阅 `/api/apps/{id}/logs/stream`。**两端都不读 `<appID>.log`、不回放历史**；回推失败静默降级，
+本地日志文件仍完整。台账字段 `live_logs` 如实标记是否接入：为 false 通常是「启动该应用时管理端没在监听」
+或「管理端重启换了地址」，重启该应用即可恢复；Web UI 对此显式提示，不给空白面板。
+这三个环境变量由 launcher 注入，**用户无需手工设置**。
 
 **错误响应是结构化的**（2026-10-03；此前只有 `{"error": 一整段文本}`，调用方只能正则剥）：
 
@@ -487,7 +535,7 @@ Gear 以「**能力原语**」为单位扩展：内核原语分两类（受门�
 
 | 类型 | kind / 标识 | 载体 | 调用协议 |
 |---|---|---|---|
-| 受门禁内核原语（builtin） | `http`/`call`/`db`/`secret`/`event`/`subscribe`/`config` | 硬编码 Go 闭包 | `http`/`call` 位置参数；`db`/`subscribe`/`config` 单 table `ctx.db.query({driver,dsn,sql,params})` / `ctx.subscribe.start({source,config,callback})` / `ctx.config.get({key})`（db 多后端 sqlite/mysql/postgres；config 落点由宿主决定）；`secret`/`event` 子表方法。**须声明 `capabilities` 才能用** |
+| 受门禁内核原语（builtin） | `http`/`call`/`db`/`secret`/`event`/`subscribe`/`config`/`fs` | 硬编码 Go 闭包 | `http`/`call` 位置参数；`db`/`subscribe`/`config`/`fs` 单 table `ctx.db.query({driver,dsn,sql,params})` / `ctx.subscribe.start({source,config,callback})` / `ctx.config.get({key})` / `ctx.fs.read({path})`（db 多后端 sqlite/mysql/postgres；config 落点由宿主决定；fs 受安全目录收口，默认 `GEAR_APP_DATA`）；`secret`/`event` 子表方法。**须声明 `capabilities` 才能用** |
 | 纯函数内核原语（pure） | `time`/`template`/`crypto`/`id`/`validate` | 硬编码 Go 闭包（`internal/engine/purefunc.go`） | 单具名 table，如 `ctx.time.now({format,tz})` / `ctx.crypto.hash({algo,data})` / `ctx.crypto.jwt_verify({token,alg,key})` / `ctx.id.uuid()` / `ctx.validate.json_schema({schema,data})` / `ctx.template.render({text,vars})`。**始终可用、无需声明 capabilities**；也可作 Flow step 直调目标（`call: crypto.hash`） |
 | sidecar 子进程 | `kind=sidecar`（默认 `""`） | `CommandTransport` 起子进程 | stdin `{method,args}` → stdout 末行 `{result}`/`{error}` |
 | 进程内 Go agent | `kind=agent`（目前仅 `ext.ai`） | `InProcessExtension` 闭包 | 直接 Go 函数调用 |
@@ -766,7 +814,7 @@ ctx.ext.redis.dequeue({key*, batch?, …})                                   →
 - **构建**：`npm run dev`（端口 5173，Vite 反代 `/api` → `GEAR_API` 或 `http://127.0.0.1:8787`）；`npm run build` → `dist/`。**发布路径**：仓库根 `bash scripts/build.sh` 会自动 `pnpm run build` 并把产物拷进 `internal/webui/public` 后再编 Go 二进制。
 - **托管**：`dist/` 也可由任意静态服务器 / 反向代理托管，并把 `/api` 转发到内核——这是**独立部署**路径（不想把界面编进二进制时用；默认路径已由内核同源托管）。
 - **用 Gear 自己的能力托管（静态 + 反代，推荐）**：`ext.serve`（类 nginx）既托管静态目录，也支持 `proxy` 规则把 `/api` 反代到内核——**静态与接口同源**，正是 dev 下 Vite 代理的生产等价物。仓库自带 Flow `web_ui.up`（`plugin/web_ui_tools.yaml` + `plugin/web_ui_flow.yaml`），用**一个 Flow 起两个长驻服务**（`ext.serve` 静态站 + `/api` 反代 + `process` 起 gear REST 后端）：`GEAR_EXT_CONFIG=plugin/extensions.yaml gear app run web_ui.up`（**在仓库根执行**；**不要**给应用自带的 REST 面写 `--registry`，见下）。详见 `plugin/web-ui/README.md`。**启动后 `web_ui.up` 会用收尾步把「打开地址」显式打印出来**（`app run` 实时进终端；`app start` 后台启动则经 launcher 在 `app start`/`app status` 输出里报「打开地址：…」），不再需要回看文档才知道端口。
-- **多站点（2026-09-24）**：`ext.serve` 侧车可同时托管多个网站（不同 `port`），这是多 app 共享同一侧车的直接收益——`web_ui.up` 托管 8080 的同时 `mindstorm.up` 托管 8090，互不干扰。幂等按「port + dir + host + proxy 全同」判定，同端口换配置 `start` 会 **fail-closed 报错**（绝不静默吞参数——旧单站点代码曾把第二个应用的 `/start` 静默吞掉，页面「成功」却 404）。`stop` 带 `port` 只停该站，省略则停全部（旧语义）。end-to-end 判据：`plugin/verify.py` P3「多站点」项。
+- **多站点（2026-09-24）**：`ext.serve` 侧车可同时托管多个网站（不同 `port`），这是多 app 共享同一侧车的直接收益——`web_ui.up` 托管 8080 的同时 `mindstorm.up` 托管 8090、`mindmap.up` 托管 8091，互不干扰。幂等按「port + dir + host + proxy 全同」判定，同端口换配置 `start` 会 **fail-closed 报错**（绝不静默吞参数——旧单站点代码曾把第二个应用的 `/start` 静默吞掉，页面「成功」却 404）。`stop` 带 `port` 只停该站，省略则停全部（旧语义）。end-to-end 判据：`plugin/verify.py` P3「多站点」项。
 
 > **应用自带的 REST 面为什么不写 `--registry`**（2026-09-22）：起服进程会把本次生效的 registry **绝对化**后写进环境变量 `GEAR_REGISTRY`，应用内步骤（含长驻 Tool 进程）直接继承——于是 UI 里的列表与你的 `gear flow list` **必然同源**。此前 `web_ui.api` 的 entry 写死了相对 `--registry ./ui-registry.db`，子进程按**自己的 cwd** 解析，读到另一次实验留下的空库：`http://127.0.0.1:8080/api/flows` 返回 `[]`、日志一个字都没有（同一个根因此前在 `gear app start` 的 launcher 上发作过一次）。两条配套护栏：`gear serve` 的 banner 现在带 **`flows=N, tools=N`**（指向空库一眼可见）；`--registry` 传相对路径会在 stderr 收到提示，entry 里的相对路径取值会在注册/校验期作为 warning 回报。显式 `--registry` **仍然优先**——机制只保证「没说的时候永远一致」，不替人翻案。
 
@@ -826,7 +874,7 @@ ctx.ext.redis.dequeue({key*, batch?, …})                                   →
 2. 原子能力直调「能力.方法」（如 `crypto.hash` / `http.Request` / `db.exec` / `db.query` / `ext.ai.complete` / `call.Call`）——免去为用一次原语先注册一层 Tool 包装；此时 `input` 即该方法的参数表，输出统一为 `{result: <返回值>}`。
 
    直调原子分三类（与方法级 schema 共用同一份静态校验，见 `builtinCapabilitySchemas`）：
-   - 受门禁内核原语（http/call/db/secret/event/subscribe/config）：须 Tool 声明 `capabilities` 才可用；
+   - 受门禁内核原语（http/call/db/secret/event/subscribe/config/fs）：须 Tool 声明 `capabilities` 才可用；
    - 纯函数原子（time/template/crypto/id/validate）：始终可用、无需声明；
    - 扩展原语 `ext.*`：须 `extensions.yaml` 登记，方法名/参数写错**注册期即拒**（不拖到运行期）。
 
@@ -1021,8 +1069,8 @@ gear mcp --http 127.0.0.1:8788
 | 读 | `gear_catalog` | `reg.List*` | **摘要**（id/name/description/runtime/版本状态/是否长驻），不返回 schema 与脚本源码——成熟目录一次能吃掉数万 token，其中 95% 当场无用。支持 `offset`/`limit` 翻页（`truncated` 为 true 时用 `next_offset` 续取） |
 | 读 | `gear_describe` | `reg.Get*`、`app.Status` | 单个对象的完整定义（按需取，替代旧 `list_*` 的批量吐全量） |
 | 读 | `gear_capabilities` | `agent.CapabilitiesMethod` | 能力目录（内核 **7** 个受门禁原语 + 5 个 pure 纯函数原子 + 已注册 `ext.*`），含方法级参数 schema；支持 `name`/`kind` 过滤以减小返回 |
-| 读 | `gear_doctor` | `app.List` + 侧车/扩展探测 | 环境自检：registry 计数、扩展与侧车就绪、台账与遗留应用、端口占用。用于区分「YAML 写错」与「环境没准备好」 |
-| 写 | `gear_validate` | `parseBundle` + `ValidateFlowStaticDiagsWith` | **不落库**的编译器：收 bundle YAML、一次报出**全部**字段级诊断（`code`/`step`/`field`/`hint`/`docs`），可无限次重试 |
+| 读 | `gear_doctor` | `app.List` + 侧车/扩展探测 | 环境自检：registry 计数、扩展与侧车就绪、台账与遗留应用、端口占用。用于区分「YAML 写错」与「环境没准备好」。**另附 `mcp` 块**：本会话 `--expose` / `--scope` 与实际装配的 `curated_tools`，用于自查「为什么策展工具没出现」 |
+| 写 | `gear_validate` | `parseBundle` + `ValidateFlowStaticDiagsWith` | **不落库**的编译器：收 bundle YAML、一次报出**全部**字段级诊断（`code`/`step`/`field`/`hint`/`docs`），可无限次重试。另有不影响 `valid` 的 advisory warnings（环境未就绪、`MCP_CURATION_ABSENT`：有 Tool 但 App 清单没写 `mcp.tools`） |
 | 写 | `gear_apply` | `reg.Upsert*`（Tool→Flow→Hook） | **唯一写入口**：原子（任一非法则一个字节都不写）、幂等（二次 apply 报 `updated`）、`dry_run`、`overwrite`（默认 false：已存在且内容不同即拒，防覆盖人工维护的定义）。**不支持密钥写入**（见 `gear_guide("security")`） |
 | 写 | `gear_delete` | `reg.Delete*` | 守卫语义与 REST/CLI 完全一致；`NOT_FOUND` 与 `IN_USE` 分码，错误信息指出被谁引用。**破坏性** |
 | 写 | `gear_promote` | `engine.PromoteTool` | 版本状态机（draft→testing→stable→deprecated），非法迁移被拒 |
@@ -1030,7 +1078,8 @@ gear mcp --http 127.0.0.1:8788
 | 跑 | `gear_run` | `engine.RunTool` / `RunFlowExecWithVars` | `kind=tool` 同步返回输出；`kind=flow` **异步**返回 `execution_id`（`wait_seconds` 短等）。service 长驻 Flow 一律拒（`SERVICE_FLOW_SYNC_RUN`），须走 `gear_app(start)` |
 | 跑 | `gear_execution` | `execstore` | 给 id 取单次执行（可带日志、`tail`）；不给 id 列出最近执行（默认最近 20 条，`limit` 可调）。**标出孤儿记录**（状态 running 但发起它的进程已不存在，见评审 I-1④） |
 | 跑 | `gear_app` | `internal/app` | 长驻应用生命周期：`start`（派生**独立后台进程**后立即返回，**是否跨会话存活看返回的 `escaped_job`**：true/false/null 三选一，false 时随本进程退出）/ `stop`（终止 + 端口复检，收不干净报 `ORPHAN_APP`）/ `status`（pid + 端口双判据）/ `list`（台账 + 遗留项）/ `prune`（清台账里确定已终止的项，`running`/`unknown` 一律保留、只删记录不杀进程）。含破坏性动作，故标 `DestructiveHint`。与 `gear app start\|stop\|status\|list\|prune` 同一份实现 |
-| 反向暴露 | `flow__{id}`（`--expose-flows`，service 长驻 Flow 不暴露） | `startFlowExec(id, vars)` | 等价于 `gear_run(kind=flow, id=…)` 的便捷入口，少一次参数拼装 |
+| 反向暴露（Flow） | `flow__{id}`（`--expose flows`，service 长驻 Flow 不暴露） | `startFlowExec(id, vars)` | 等价于 `gear_run(kind=flow, id=…)` 的便捷入口，少一次参数拼装 |
+| 反向暴露（Tool） | 清单 `mcp.tools` 的 alias / ref（`--expose tools --scope <appId>`） | `engine.RunTool(ref, input)` | 按 App 清单策展的白名单；入参由 `input_schema` 映射，`args` 服务端固定注入 |
 
 > **返回形态是硬约束，不是风格问题**：MCP 规范（2025-06-18）规定 `tools/call` 的
 > `structuredContent` **顶层必须是 JSON 对象**。Go SDK（v1.8.0）依 SEP-2106 草案也放行

@@ -605,7 +605,7 @@ type ExtSpec struct {
 
 // builtinCapabilitySchemas 是**内核原语**的「方法级参数 schema」硬编码单一来源。
 // 含两类（分类原则见 ATOM_ROADMAP.md §0）：
-//   - 受 capability 门禁的核心原语（http/call/db/secret/event/subscribe，即 cap.KnownPrimitives）；
+//   - 受 capability 门禁的核心原语（http/call/db/secret/event/subscribe/config/fs，即 cap.KnownPrimitives）；
 //   - 纯函数核心原子（time/template/crypto，见 purefunc.go，始终可用、不受门禁）。
 //
 // 它同时是「什么算合法的内核原语方法」的判定依据：checkCapabilityMethod / validatePrimitiveArgs
@@ -700,6 +700,28 @@ var builtinCapabilitySchemas = map[string]map[string]MethodSchema{
 		}},
 		"list": {Description: "列出某前缀下的全部配置（prefix 为空串 = 全部），返回 {key: value} map", Parameters: map[string]ParamSchema{
 			"prefix": {Type: "string", Description: "键前缀（如 ai. / app.mindstorm.；可空）"},
+		}},
+	},
+	// fs：受安全目录收口的文件读写（相对路径锚定主根，默认 GEAR_APP_DATA；附加根经
+	// 配置键 fs.roots 设置——config 原语可写，重启生效）。与 config 同理由：Lua 沙箱禁
+	// io/os，读不到 GEAR_HOME；路径解析与包含校验全在宿主侧。
+	"fs": {
+		"read": {Description: "读取安全目录内的文件，返回文本内容；越界（.. / 根外绝对路径 / 符号链接逃逸）报错", Parameters: map[string]ParamSchema{
+			"path": {Type: "string", Description: "文件路径（相对安全根，或根内绝对路径）", Required: true},
+		}},
+		"write": {Description: "写文件（父目录自动创建；append=true 追加，否则截断重写），返回写入字节数", Parameters: map[string]ParamSchema{
+			"path":   {Type: "string", Description: "文件路径（相对安全根）", Required: true},
+			"data":   {Type: "string", Description: "写入内容", Required: true},
+			"append": {Type: "boolean", Description: "是否追加（缺省 false = 截断重写）"},
+		}},
+		"list": {Description: "列出目录内容，返回 [{name, size, is_dir}] 数组", Parameters: map[string]ParamSchema{
+			"path": {Type: "string", Description: "目录路径（相对安全根，空串 = 根）", Required: true},
+		}},
+		"mkdir": {Description: "递归建目录（已存在不报错）", Parameters: map[string]ParamSchema{
+			"path": {Type: "string", Description: "目录路径（相对安全根）", Required: true},
+		}},
+		"remove": {Description: "删除文件或空目录（非递归）；不允许删除安全根本身", Parameters: map[string]ParamSchema{
+			"path": {Type: "string", Description: "文件/目录路径（相对安全根）", Required: true},
 		}},
 	},
 	// 纯函数核心原子（内核内建、始终可用、不受 capability 门禁）：schema 与实现同文件

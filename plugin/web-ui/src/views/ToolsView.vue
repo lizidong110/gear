@@ -45,6 +45,26 @@ const catalog = useCatalogStore()
 const { report, ok } = useApiError()
 const dialog = useDialog()
 
+/** 模糊过滤：id / 名称 / 描述 / entry / capabilities 任一包含即命中（大小写不敏感）。 */
+const toolFilter = ref('')
+const filteredTools = computed<ToolDTO[]>(() => {
+  const q = toolFilter.value.trim().toLowerCase()
+  if (!q) return catalog.tools
+  return catalog.tools.filter((t) => {
+    const hay = [
+      t.id,
+      t.name ?? '',
+      t.description ?? '',
+      t.runtime,
+      t.entry ?? '',
+      (t.capabilities ?? []).join(' '),
+    ]
+      .join(' ')
+      .toLowerCase()
+    return hay.includes(q)
+  })
+})
+
 const show = ref(false)
 const saving = ref(false)
 const errors = ref<string[]>([])
@@ -384,12 +404,18 @@ onMounted(async () => {
     <NSpace style="margin-bottom: 12px">
       <NButton type="primary" @click="openCreate">新建 Tool</NButton>
       <NButton @click="catalog.refreshTools()">刷新</NButton>
+      <NInput
+        v-model:value="toolFilter"
+        clearable
+        placeholder="模糊过滤：id / 名称 / 描述 / entry / 能力"
+        style="width: 320px"
+      />
     </NSpace>
 
     <NCard size="small">
       <NDataTable
         :columns="columns"
-        :data="catalog.tools"
+        :data="filteredTools"
         :loading="catalog.loading"
         :bordered="false"
         :single-line="false"

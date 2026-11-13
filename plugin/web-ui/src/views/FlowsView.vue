@@ -40,6 +40,18 @@ const { report, ok } = useApiError()
 const dialog = useDialog()
 const router = useRouter()
 
+/** 模糊过滤：id / 名称 / 描述 / 各 step 的 call 任一包含即命中（大小写不敏感）。 */
+const flowFilter = ref('')
+const filteredFlows = computed<FlowDTO[]>(() => {
+  const q = flowFilter.value.trim().toLowerCase()
+  if (!q) return catalog.flows
+  return catalog.flows.filter((f) => {
+    const calls = (f.steps ?? []).map((s) => s.call).join(' ')
+    const hay = [f.id, f.name ?? '', f.description ?? '', calls].join(' ').toLowerCase()
+    return hay.includes(q)
+  })
+})
+
 const show = ref(false)
 const saving = ref(false)
 const editingId = ref('')
@@ -462,6 +474,12 @@ onMounted(async () => {
     <NSpace style="margin-bottom: 12px">
       <NButton type="primary" @click="openCreate">新建 Flow</NButton>
       <NButton @click="catalog.refreshFlows()">刷新</NButton>
+      <NInput
+        v-model:value="flowFilter"
+        clearable
+        placeholder="模糊过滤：id / 名称 / 描述 / step.call"
+        style="width: 320px"
+      />
       <span class="text-3">
         注销在行的「操作」列。内核带引用守卫：被其它 Flow / Flow 级 Hook 引用或正在跑时会被拒绝，并说明是谁挡住的。
       </span>
@@ -470,7 +488,7 @@ onMounted(async () => {
     <NCard size="small">
       <NDataTable
         :columns="columns"
-        :data="catalog.flows"
+        :data="filteredFlows"
         :loading="catalog.loading"
         :bordered="false"
         :single-line="false"

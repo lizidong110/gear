@@ -31,11 +31,13 @@ import (
 // mcpHTTPAddr 是 `--http` 的目标地址（host:port）。留空 = 用 stdio transport。
 var mcpHTTPAddr string
 
-// mcpExposeFlows 控制是否把已注册 Flow 反向暴露为 flow__{id} 工具。
+// mcpExpose 是 `--expose {flows,tools,all}` 的原值，启动前经 ParseExposeMode 校验。
 //
-// 默认关闭（MCP_AGENT_DESIGN.md §6.1）：该暴露面是**启动时快照**（新建 Flow 本次不可用）、
-// 与 gear_run 语义重复、且让工具数不可预测——三者都损害工具选择准确率。
-var mcpExposeFlows bool
+// 默认空 = 两种反向暴露都关闭（MCP_AGENT_DESIGN.md §6.1）：flow__{id} 是**启动时快照**
+// （新建 Flow 本次不可用）、与 gear_run 语义重复、且让工具数不可预测——三者都损害工具
+// 选择准确率。tools 模式不同：它按 App 清单的 mcp.tools 白名单暴露，工具数启动期确定，
+// 但必须同时给 --scope <appId>。
+var mcpExpose string
 
 // mcpAppsDir 是应用台账目录（gear_app / gear app 共用）；留空 = <registry 同目录>/apps。
 var mcpAppsDir string
@@ -46,6 +48,10 @@ var mcpAppsDir string
 // 暴露给局域网。需要远程接入时必须显式打开这层开关（评审 B-2）。
 var mcpAllowRemote bool
 
+// mcpOnlyExposed = `--only-exposed`：只暴露策展/快照工具，不挂 15 个常驻 gear_*。
+// 用途是给终端客户端一个干净的应用专用面（否则 5 个业务工具会连同 registry 写面一起交出去）。
+var mcpOnlyExposed bool
+
 // mcpCmd 构造 `gear mcp` 子命令。
 func mcpCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -55,7 +61,10 @@ func mcpCmd() *cobra.Command {
 			"暴露给任何 MCP 客户端（智能体）。\n" +
 			"默认 stdio transport（客户端配置：{\"mcpServers\": {\"gear\": {\"command\": \"gear\", \"args\": [\"mcp\"]}}}）。\n" +
 			"加 --http 127.0.0.1:port 则改走 streamable HTTP transport（非回环地址默认拒绝，需 --allow-remote）。\n" +
-			"工具面共 12 个 gear_ 前缀工具，另通过 ServerOptions.Instructions 常驻下发心智模型。\n" +
+			"工具面共 15 个 gear_ 前缀工具，另通过 ServerOptions.Instructions 常驻下发心智模型。\n" +
+			"--expose {flows,tools,all} 开启反向暴露：flows=已注册 Flow 快照；" +
+			"tools=按 --scope 指向的 App 清单 mcp.tools 白名单暴露注册 Tool（须同时给 --scope，且该 App 必须写了策展区）。\n" +
+			"--only-exposed 关掉 15 个常驻 gear_* 工具，只留反向暴露的工具（应用专用面，须配 --expose）。\n" +
 			"执行进度与全部诊断一律走 stderr（stdio 下 stdout 只承载协议帧）。\n" +
 			"gear_app(action=start) 会**派生独立后台进程**监管应用；它是否跨会话存活**以返回的 escaped_job 为准**" +
 			"（false 时随本进程退出，不要向用户承诺长期可用），停止用 gear_app(action=stop)。",
@@ -66,8 +75,10 @@ func mcpCmd() *cobra.Command {
 		"以 streamable HTTP transport 暴露（格式 host:port，如 127.0.0.1:8788）；留空则用 stdio")
 	cmd.Flags().BoolVar(&mcpAllowRemote, "allow-remote", false,
 		"允许 --http 监听非回环地址（默认拒绝：MCP 面无鉴权，绑全网卡会暴露写/删/执行能力）")
-	cmd.Flags().BoolVar(&mcpExposeFlows, "expose-flows", false,
-		"把已注册 Flow 反向暴露为 flow__{id} 工具（默认关闭：启动时快照、工具数不可预测）")
+	cmd.Flags().StringVar(&mcpExpose, "expose", "",
+		"反向暴露面：flows=已注册 Flow 快照 | tools=App 清单 mcp.tools 策展工具（须配 --scope） | all=两者。留空=全关（默认）")
+	cmd.Flags().BoolVar(&mcpOnlyExposed, "only-exposed", false,
+		"只暴露 --expose 带进来的工具，不挂 15 个常驻 gear_*（应用专用面；须配 --expose，默认关闭）")
 	cmd.Flags().StringVar(&mcpAppsDir, "apps-dir", "",
 		"应用台账目录（默认 <registry 同目录>/apps）")
 	return cmd
@@ -85,6 +96,12 @@ func runMCP(_ *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	// 未知值必须在这里就失败：静默当成「不暴露」会让客户端看到一份缺工具的工具面，
+	// 却不知道自己拼错了开关（不静默降级）。
+	expose, err := gearmcp.ParseExposeMode(mcpExpose)
+	if err != nil {
+		return err
+	}
 
 	// 注意：执行进度改道（stdout → stderr）**不在这里做**，而在 gearmcp.New 内部。
 	// 「stdio 下 stdout 只承载协议帧」是 MCP 面的协议约束，须由 MCP 面自己保证
@@ -95,8 +112,10 @@ func runMCP(_ *cobra.Command, _ []string) error {
 	srv, err := gearmcp.New(reg, eng,
 		gearmcp.WithRegistryPath(registryPath),
 		gearmcp.WithAppsDir(mcpAppsDir),
-		gearmcp.WithExposeFlows(mcpExposeFlows),
-		gearmcp.WithAllowRemote(mcpAllowRemote))
+		gearmcp.WithExpose(expose),
+		gearmcp.WithScope(cliScope),
+		gearmcp.WithAllowRemote(mcpAllowRemote),
+		gearmcp.WithOnlyExposed(mcpOnlyExposed))
 	if err != nil {
 		return err
 	}

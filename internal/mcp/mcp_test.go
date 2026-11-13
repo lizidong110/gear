@@ -51,8 +51,8 @@ func newSmokeFixture(t *testing.T, opts ...Option) *smokeFixture {
 // newSmokeFixtureWith 同上，但允许在**启动 MCP Server 之前**先往 registry 里放数据。
 //
 // 为什么需要：反向暴露（`flow__{id}`）是**启动时快照**——工具面在 newMCPServer 那一刻固定，
-// 之后注册的 Flow 本次进程内不会被暴露（刻意的：工具数必须可预测，见 Server.exposeFlows）。
-// 所以「--expose-flows 生效」的场景必须在起服务之前就有 Flow 落库。
+// 之后注册的 Flow 本次进程内不会被暴露（刻意的：工具数必须可预测，见 Server.expose）。
+// 所以「--expose flows 生效」的场景必须在起服务之前就有 Flow 落库。
 func newSmokeFixtureWith(t *testing.T, prepopulate func(*registry.Registry), opts ...Option) *smokeFixture {
 	t.Helper()
 	// 执行记录库指向临时目录，避免测试污染 build/gear.db。
@@ -677,7 +677,7 @@ func TestMCPCapabilitiesTool(t *testing.T) {
 		names[n] = true
 		kinds[n] = k
 	}
-	for _, want := range []string{"http", "call", "db", "secret", "event", "subscribe"} {
+	for _, want := range []string{"http", "call", "db", "secret", "event", "subscribe", "config", "fs"} {
 		if !names[want] {
 			t.Fatalf("能力目录应含内核门禁原语 %s: %v", want, names)
 		}
@@ -902,7 +902,7 @@ func applySmokeBundle(t *testing.T, reg *registry.Registry) {
 	}
 }
 
-// 反向暴露默认关闭：flow__{id} 不出现；显式 WithExposeFlows(true) 才暴露。
+// 反向暴露默认关闭：flow__{id} 不出现；显式 WithExpose(ExposeFlows) 才暴露。
 //
 // 两者都要在**起服务之前**把 Flow 落库：工具面是启动时快照（见 newSmokeFixtureWith）。
 func TestMCPReverseExposeFlow(t *testing.T) {
@@ -927,7 +927,7 @@ func TestMCPReverseExposeFlow(t *testing.T) {
 	}
 
 	// 开启后：暴露，且可直接调用（等价于 gear_run，只是少一次参数拼装）。
-	fOn := newSmokeFixtureWith(t, func(reg *registry.Registry) { applySmokeBundle(t, reg) }, WithExposeFlows(true))
+	fOn := newSmokeFixtureWith(t, func(reg *registry.Registry) { applySmokeBundle(t, reg) }, WithExpose(ExposeFlows))
 	tools, err = fOn.session.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("ListTools 失败: %v", err)
@@ -937,7 +937,7 @@ func TestMCPReverseExposeFlow(t *testing.T) {
 		names[tt.Name] = true
 	}
 	if !names["flow__smoke.up"] {
-		t.Fatalf("--expose-flows 下应暴露 flow__smoke.up: %v", names)
+		t.Fatalf("--expose flows 下应暴露 flow__smoke.up: %v", names)
 	}
 	var exec map[string]any
 	callTool(t, fOn.session, "flow__smoke.up", map[string]any{
@@ -959,7 +959,7 @@ func TestMCPReverseExposeFlow(t *testing.T) {
 				t.Fatalf("预置 service Flow 失败: %v", err)
 			}
 		}
-	}, WithExposeFlows(true))
+	}, WithExpose(ExposeFlows))
 	tools, err = fSvc.session.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("ListTools 失败: %v", err)
@@ -1042,10 +1042,16 @@ func TestMCPNewRequiresExtensionsLoaded(t *testing.T) {
 // 语义与守卫完全不变：**任何新工具不登记即 FAIL**，并钉住工具数预算 `toolBudget`。
 var mcpToolRegistry = toolSurface
 
-// TestMCPToolSurfaceMatchesRegistry 工具面必须与登记表**完全一致**（不多不少）。
+// TestMCPToolSurfaceMatchesRegistry **常驻工具面**必须与登记表完全一致（不多不少）。
 //
-// 三条红线一次断言：① 新增工具必须登记（否则覆盖度反查失守）；② 工具数 ≤ toolBudget（13）的硬预算；
-// ③ 全部工具统一 gear_ 前缀（跨 MCP server 冲突的根治，§6.2⑦）。
+// 三条红线一次断言：① 新增常驻工具必须登记（否则覆盖度反查失守）；② 常驻工具数 ≤ toolBudget
+// 的硬预算；③ 常驻工具统一 gear_ 前缀（跨 MCP server 冲突的根治，§6.2⑦）。
+//
+// ⚠ 口径（REQ-MCP-EXPOSE-TOOLS）：预算、登记表、前缀这三条只管 **15 个常驻意图级工具**。
+// `--expose` 带进来的 flow__ / 策展工具是**按 App 白名单动态生成**的，名字由应用作者给
+// （alias 可能不带前缀）、数量由清单决定——把它们纳入 15 预算等于让「开一个可选开关」必然
+// 变红。它们另有独立断言（expose_tools_test.go：数量=清单条数、名字合法、schema 映射、
+// 输出线格式）。下面按 gear_ 前缀把常驻面单独筛出来断言，不降低常驻面的守卫强度。
 func TestMCPToolSurfaceMatchesRegistry(t *testing.T) {
 	session := newSmokeSession(t)
 	tools, err := session.ListTools(context.Background(), nil)
@@ -1054,10 +1060,10 @@ func TestMCPToolSurfaceMatchesRegistry(t *testing.T) {
 	}
 	got := map[string]bool{}
 	for _, tt := range tools.Tools {
-		got[tt.Name] = true
-		if !strings.HasPrefix(tt.Name, "gear_") && !strings.HasPrefix(tt.Name, "flow__") {
-			t.Fatalf("工具 %s 未统一 gear_ 前缀（跨 server 极易误选）", tt.Name)
+		if !strings.HasPrefix(tt.Name, "gear_") {
+			continue // 动态暴露工具不属于常驻面
 		}
+		got[tt.Name] = true
 		if _, ok := mcpToolRegistry[tt.Name]; !ok {
 			t.Fatalf("工具 %s 未登记进 tools_surface.go 的 toolSurface——新增工具必须登记，"+
 				"否则线格式覆盖度红线会静默失守；若有意新增，同时确认工具数预算（≤%d）", tt.Name, toolBudget)
@@ -1154,6 +1160,12 @@ func TestMCPToolDescriptionsStayLean(t *testing.T) {
 	}
 	total := 0
 	for _, tt := range tools.Tools {
+		// 与 TestMCPToolSurfaceMatchesRegistry 同口径：1,800 字符预算是**常驻齿轮面**
+		// 的上下文成本上限；App 策展工具的 description 是产品护栏载体（三段式红线、
+		// 禁止自动 confirm），由 model.AppMCP.Validate 单独限长 2,000 字符。
+		if !strings.HasPrefix(tt.Name, "gear_") {
+			continue
+		}
 		n := utf8.RuneCountInString(tt.Description)
 		total += n
 		if n > perToolLimit {

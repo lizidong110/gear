@@ -427,16 +427,16 @@ var defaultReactCapabilities = []string{
 	"ext.registry",
 }
 
-// BaseCapabilities 是「原子能力」组：引擎自带的 builtin 门禁原语（7 个）+
-// pure 纯函数（5 个），共 12 个能力。它们是 `--allow-base` / Lua allow 组的语义来源。
+// BaseCapabilities 是「原子能力」组：引擎自带的 builtin 门禁原语（8 个）+
+// pure 纯函数（5 个），共 13 个能力。它们是 `--allow-base` / Lua allow 组的语义来源。
 //
 // 与 defaultReactCapabilities 的区别：那是「没显式给 allow 时的精选默认集」
-// （刻意排除 event/subscribe/crypto 等与多数任务无关的重型能力）；这是原子能力
-// 全家桶——要「引擎自带的随便用」就开这一组，不用逐个列 12 个名字。
+// （刻意排除 event/subscribe/fs/crypto 等与多数任务无关的重型能力）；这是原子能力
+// 全家桶——要「引擎自带的随便用」就开这一组，不用逐个列 13 个名字。
 // 守卫测试 TestBaseCapabilitiesCoverAllBuiltinAndPure 钉住：目录里每个
 // builtin/pure 能力都必须在本组内（新增原子能力忘记进组会红）。
 var BaseCapabilities = []string{
-	"http", "call", "db", "secret", "event", "subscribe", "config",
+	"http", "call", "db", "secret", "event", "subscribe", "config", "fs",
 	"time", "template", "crypto", "id", "validate",
 }
 
@@ -1519,6 +1519,8 @@ var builtinParamOrder = map[string]map[string][]string{
 	"subscribe": {"start": {"table"}, "stop": {"handle"}},
 	// config 全部走单具名 table（与 db.* 同形态）：ctx.config.get({key=...})。
 	"config": {"get": {"table"}, "set": {"table"}, "delete": {"table"}, "list": {"table"}},
+	// fs 同 config：全部单具名 table：ctx.fs.read({path=...})。
+	"fs": {"read": {"table"}, "write": {"table"}, "list": {"table"}, "mkdir": {"table"}, "remove": {"table"}},
 }
 
 // buildActionEntry 把一次解析出的工具调用编成一段 Lua 入口（复用真实 Tool 的 ctx.* 通道）：
@@ -2186,7 +2188,7 @@ func (a *AIAgent) normalizeDef(kind string, def map[string]interface{}) {
 // 而 GrantsFromStrings 只认 cap.KnownPrimitives ∪ 已注册 ext.* → 生成出来的 Tool 会在
 // 「未知的 capability "time"」上校验失败（一句话：自动推导只登记真需要授权的原语）。
 var builtinCapabilityNames = map[string]bool{
-	"http": true, "call": true, "db": true, "secret": true, "event": true, "subscribe": true, "config": true,
+	"http": true, "call": true, "db": true, "secret": true, "event": true, "subscribe": true, "config": true, "fs": true,
 }
 
 var (

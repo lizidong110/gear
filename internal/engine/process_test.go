@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -78,6 +79,91 @@ func containsSubstr(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// REQ-API-LOGS-STREAM：一次 process 执行的 stdout/stderr 必须**逐行实时**经 sink 上报
+// （不再等命令结束才 flush 一次）。验证：多行输出按出现顺序、带正确 stream 标签送达 sink，
+// 且空行不污染（与旧 emitLogLines 口径一致）。
+func TestRunProcessStreamsLinesToSink(t *testing.T) {
+	var mu sync.Mutex
+	var got []struct {
+		stream, line string
+	}
+	sink := func(stepID, stream, line string) {
+		mu.Lock()
+		got = append(got, struct {
+			stream, line string
+		}{stream, line})
+		mu.Unlock()
+	}
+	_, err := runProcess(context.Background(),
+		`sh -c 'echo "L1"; echo ""; echo "L2" >&2; echo "{\"ok\":true}"'`,
+		map[string]interface{}{}, nil, "execX", "stepY", sink)
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// L1 / L2 / JSON 共 3 行（空行被 emit 跳过）。
+	if len(got) != 3 {
+		t.Fatalf("应恰好上报 3 行，实际 %d: %+v", len(got), got)
+	}
+	// 逐行带正确 stream 标签、空行被跳过（核心契约）。
+	// stdout 与 stderr 是两条独立 OS 管道，跨流到达顺序不保证（终端本就如此），
+	// 故按流内顺序分别校验，不跨流断言绝对位置。
+	var stdoutLines, stderrLines []string
+	for _, g := range got {
+		switch g.stream {
+		case "stdout":
+			stdoutLines = append(stdoutLines, g.line)
+		case "stderr":
+			stderrLines = append(stderrLines, g.line)
+		default:
+			t.Fatalf("未知 stream 标签: %+v", g)
+		}
+	}
+	// stdout：先 L1 后 JSON（末行结果）。
+	if len(stdoutLines) != 2 || stdoutLines[0] != "L1" || stdoutLines[1] != `{"ok":true}` {
+		t.Fatalf("stdout 应为 [L1, {\"ok\":true}]，实际 %+v", stdoutLines)
+	}
+	// stderr：仅 L2。
+	if len(stderrLines) != 1 || stderrLines[0] != "L2" {
+		t.Fatalf("stderr 应为 [L2]，实际 %+v", stderrLines)
+	}
+}
+
+// REQ-API-LOGS-STREAM：service 模式的长驻进程输出也要实时经 sink 上报
+// （stdout/stderr 在 startProcess 里合并到同一根管道，统一标 stdout）。
+func TestServiceProcessStreamsLinesToSink(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	sink := func(stepID, stream, line string) {
+		mu.Lock()
+		got = append(got, line)
+		mu.Unlock()
+	}
+	rt := processRuntime{sink: sink, stepID: "stepZ"}
+	p, err := rt.Start(context.Background(), `sh -c 'echo "svc-line"; sleep 0.3'`, map[string]interface{}{}, nil)
+	if err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	defer p.Kill()
+	// 等待首行送达（实时，不依赖进程退出）。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) < 1 || got[0] != "svc-line" {
+		t.Fatalf("service 输出应实时上报，实际 %+v", got)
+	}
 }
 
 // Fork3：service 子进程级联回收——杀掉 sh 时其孙进程（sleep）也必须被回收，

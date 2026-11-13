@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -133,22 +132,15 @@ func withConfig(fn func(*cap.ConfigStore) error) error {
 	return fn(s)
 }
 
-// looksSecretKey 判断键名是否像凭据（只按名字判断，不看值——避免把普通配置误当密钥脱敏）。
-func looksSecretKey(k string) bool {
-	low := strings.ToLower(k)
-	for _, s := range []string{"api_key", "apikey", "token", "password", "secret", "passwd"} {
-		if strings.HasSuffix(low, s) || strings.Contains(low, "."+s) {
-			return true
-		}
-	}
-	return false
-}
+// looksSecretKey / maskSecret 委托 cap 包的唯一实现（REQ-API-CONFIG-CATALOG）。
+// REST 管理面也要脱敏，两处各写一份必然漂移，且漂移方向总是「某一边漏脱敏」。
+// 这里只保留 CLI 特有的「怎么看清明文」提示尾巴；判定与掩码形态归 cap 管。
+func looksSecretKey(k string) bool { return cap.LooksSecretKey(k) }
 
-// maskSecret 把凭据压成「前 4 + … + 后 4」：既能确认配的是不是自己那把 key，又不必明文落在
-// 终端/截图里。短于 12 字符一律全遮（短串遮不住，遮了等于没遮）。
 func maskSecret(v string) string {
-	if len(v) < 12 {
-		return strings.Repeat("*", len(v))
+	m := cap.MaskSecret(v)
+	if m == "" || len(v) < 12 {
+		return m
 	}
-	return v[:4] + "…" + v[len(v)-4:] + "（用 config get 看明文）"
+	return m + "（用 config get 看明文）"
 }

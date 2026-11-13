@@ -36,14 +36,14 @@ const (
 // 「跨会话存活」这个承诺在退化时并不成立。静默退化会让人以为应用已经起稳了，
 // 直到会话结束才发现进程没了（2026-09-21 实测：本机 harness 的 Job 禁止 breakaway，
 // 派生出的应用在**当前命令返回时**就被回收，而 CLI 打印的是 running）。
-func launchDetached(self string, args []string, dir string, logOut *os.File) (*os.Process, bool, error) {
-	proc, err := startWithFlags(self, args, dir, logOut,
+func launchDetached(self string, args []string, dir string, logOut *os.File, env []string) (*os.Process, bool, error) {
+	proc, err := startWithFlags(self, args, dir, logOut, env,
 		detachedProcess|createNewProcessGroup|createBreakawayFromJob)
 	if err == nil {
 		return proc, true, nil
 	}
 	first := err
-	proc, err = startWithFlags(self, args, dir, logOut, detachedProcess|createNewProcessGroup)
+	proc, err = startWithFlags(self, args, dir, logOut, env, detachedProcess|createNewProcessGroup)
 	if err != nil {
 		return nil, false, fmt.Errorf("带 BREAKAWAY_FROM_JOB 尝试失败(%v)；退化尝试同样失败(%w)", first, err)
 	}
@@ -51,11 +51,19 @@ func launchDetached(self string, args []string, dir string, logOut *os.File) (*o
 }
 
 // startWithFlags 用给定的 CreationFlags 派生进程。
-func startWithFlags(self string, args []string, dir string, logOut *os.File, flags uint32) (*os.Process, error) {
+//
+// env 是**追加**到继承环境之上的键值对（实时日志回推三元组，见 discovery.go）。
+// 为空时完全不设 cmd.Env，保持「原样继承父进程环境」的既有行为——这不是洁癖：
+// MCP Server 是常驻进程，若用 os.Setenv 传参，后续派生出去的每个 App 都会带上
+// 上一个 App 的 id/token，日志会串到别人的面板里。
+func startWithFlags(self string, args []string, dir string, logOut *os.File, env []string, flags uint32) (*os.Process, error) {
 	cmd := exec.Command(self, args...)
 	cmd.Dir = dir
 	cmd.Stdout = logOut
 	cmd.Stderr = logOut
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: flags, HideWindow: true}
 	if err := cmd.Start(); err != nil {
 		return nil, err

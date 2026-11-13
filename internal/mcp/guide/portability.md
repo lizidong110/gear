@@ -9,6 +9,7 @@ ext.serve 的 dir），仓库拷到别的机器即跑不起来。
 | 字段 | 错误写法（机器相关） | 正确写法（相对锚点） | 实际落点 |
 |---|---|---|---|
 | `db` 的 dsn | `D:/gadern/gear/build/mindstorm.db` | `mindstorm.db` | `GEAR_APP_DATA`（默认 `<Home>/data`） |
+| `fs` 的 path | `D:/gadern/gear/build/logs/a.txt` | `logs/a.txt`（相对安全根；根内绝对路径也可） | 安全根 `GEAR_APP_DATA`（默认 `<Home>/data`，越界报「路径逃出安全目录」） |
 | process `entry` | `D:/gadern/gear/build/gear.exe serve ...` | `gear serve ...` | gear 可执行文件所在目录（`gearhome.ExeDir`） |
 | `ext.serve` 的 `dir` | `D:/gadern/gear/apps/mindstorm/www` | `apps/mindstorm/www` | 安装根 `InstallRoot`（剥掉 build/plugin 两层） |
 

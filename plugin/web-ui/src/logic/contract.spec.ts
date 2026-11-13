@@ -97,7 +97,7 @@ describe('生成枚举的结构不变量（防漂移，对应内核 TestRuntimeK
     // 刻意**不**再把完整清单写死在这里：清单由内核 cap.KnownPrimitives 生成，
     // 与内核的一致性由 scripts/check-contract.mjs 守（本文件写死只会每次加原语都红一次）。
     // 这里只断言「该有的都在」，真正要守的是下面那条——每个原语都得有中文标签。
-    for (const c of ['http', 'call', 'db', 'secret', 'event', 'subscribe', 'config']) {
+    for (const c of ['http', 'call', 'db', 'secret', 'event', 'subscribe', 'config', 'fs']) {
       expect([...BUILTIN_CAPABILITIES]).toContain(c)
     }
     // 新增原语而忘了补 CAPABILITY_LABEL，UI 上就是一片空白——这条替人拦住它。
@@ -130,7 +130,6 @@ describe('capabilityKnown', () => {
     expect(capabilityKnown('ext.db')).toBe(true)
   })
   it('其它一律拒（未知枚举即拒，红线 15）', () => {
-    expect(capabilityKnown('fs')).toBe(false)
     expect(capabilityKnown('ext')).toBe(false)
   })
 })
@@ -183,7 +182,8 @@ describe('toolErrors（镜像 model.Tool.Validate）', () => {
   })
 
   it('未知能力原语被拒', () => {
-    expect(toolErrors(baseTool({ capabilities: ['fs'] }))[0]).toMatch(/未知的能力原语/)
+    // fs 于 2026-11-11 转正为第 8 个内置原语，改用一个真未知的名字当反例。
+    expect(toolErrors(baseTool({ capabilities: ['nope'] }))[0]).toMatch(/未知的能力原语/)
   })
 
   it('health_probe：tcp 缺端口 / cmd 缺命令', () => {

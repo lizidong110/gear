@@ -17,7 +17,14 @@ const router = createRouter({
       meta: { title: '执行记录' },
     },
     { path: '/apps', name: 'apps', component: () => import('@/views/AppsView.vue'), meta: { title: 'Apps 长驻' } },
+    {
+      path: '/app-defs',
+      name: 'app-defs',
+      component: () => import('@/views/AppDefsView.vue'),
+      meta: { title: 'App 清单' },
+    },
     { path: '/secrets', name: 'secrets', component: () => import('@/views/SecretsView.vue'), meta: { title: '密钥' } },
+    { path: '/config', name: 'config', component: () => import('@/views/ConfigView.vue'), meta: { title: '配置' } },
     {
       path: '/capabilities',
       name: 'capabilities',

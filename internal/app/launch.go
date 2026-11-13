@@ -153,6 +153,10 @@ type StatusResult struct {
 	OpenURLs []string `json:"open_urls,omitempty"`
 	// EscapedJob 见 StartResult.EscapedJob：进程死因的事后归因依据之一。
 	EscapedJob *bool `json:"escaped_job,omitempty"`
+	// Restarts 是监管期间 service 的累计重启次数（台账回写，见 Record.Restarts）。
+	Restarts int `json:"restarts,omitempty"`
+	// LiveLogs 见 Record.LiveLogs：派生时是否注入了实时日志回推 env。
+	LiveLogs bool `json:"live_logs,omitempty"`
 }
 
 // ListResult 是全部台账 + 遗留项。
@@ -274,8 +278,17 @@ func Start(opts StartOptions) (*StartResult, error) {
 		}
 	}
 
+	// 实时日志回推（REQ-API-APP-LOGS）：serve 绑定成功后会在 <appsDir>/server.addr
+	// 留下「回推地址 + token」。派生前读出来以 env 注入子进程；读不到（serve 没起 /
+	// 地址已过期）就返回 nil，纯本地日志照旧完整，绝不因为日志功能不让应用启动。
+	// 台账记下到底有没有注入，UI 据此明说「未接入实时日志」，而不是给一个空白面板。
+	logEnv := LogIngestEnv(dir, appID)
+	// 台账身份 env（见 Record.Restarts）：把「我是哪条台账」传给被派生的监管进程，
+	// 它才有能力把 service 重启次数写回记录。没有这段 env 不影响启动——
+	// 重启次数只是「记不上」，而不是起不来。
+	env := append(logEnv, LedgerEnv(dir, appID)...)
 	args := deriveRunArgs(absReg, opts.FlowID, policy, opts.Scope)
-	proc, escaped, err := launchDetached(self, args, cwd, logFile)
+	proc, escaped, err := launchDetached(self, args, cwd, logFile, env)
 	if err != nil {
 		return nil, fmt.Errorf("派生后台进程失败: %w", err)
 	}
@@ -283,7 +296,7 @@ func Start(opts StartOptions) (*StartResult, error) {
 	rec := &Record{
 		AppID: appID, FlowID: opts.FlowID, Registry: absReg, PID: proc.Pid,
 		Restart: policy, StartedAt: now, CWD: cwd, LogPath: logPath, Ports: ports,
-		EscapedJob: &escaped,
+		EscapedJob: &escaped, LiveLogs: len(logEnv) > 0,
 	}
 	if err := SaveRecord(dir, rec); err != nil {
 		// 进程已经在跑，台账却写不下去：如实报错并给出 pid/日志，让人能手动收掉——
@@ -326,7 +339,6 @@ func Start(opts StartOptions) (*StartResult, error) {
 }
 
 // uniqueAppID 保证 app_id 在台账目录里唯一：重名时依次尝试 `-2` / `-3` … 后缀。
-//
 // 为什么需要：NewRecordID 的时间戳粒度是秒，而台账按 app_id 落文件；没有这层去重，
 // 「停掉后马上重启」（最常见的操作）会覆盖上一条记录，连带丢掉前一个进程的 pid。
 func uniqueAppID(dir, base string) string {
@@ -338,6 +350,39 @@ func uniqueAppID(dir, base string) string {
 		if _, err := os.Stat(recordPath(dir, cand)); err != nil {
 			return cand
 		}
+	}
+}
+
+// 注入给派生监管进程的台账身份 env（launcher → 子进程；RestartRecorderFromEnv 消费）。
+const (
+	EnvLedgerDir = "GEAR_APP_LEDGER_DIR"
+	EnvLedgerID  = "GEAR_APP_LEDGER_ID"
+)
+
+// LedgerEnv 生成台账身份 env：让被派生的监管进程知道自己对应哪条台账记录。
+func LedgerEnv(dir, appID string) []string {
+	return []string{EnvLedgerDir + "=" + dir, EnvLedgerID + "=" + appID}
+}
+
+// RestartRecorderFromEnv 返回「把累计重启次数写回台账」的回调（Supervisor.SetOnRestart 用）。
+//
+// 为什么是 env 而不是命令行 flag：台账身份对 `app run` 是**可选**信息——人前台跑
+// `app run` 时根本没有台账，用 flag 就得为「不存在的东西」留参数位；env 只在
+// Start 派生链路上存在，前台路径天然为零。台账读不到（已被 prune / stop）时静默跳过：
+// 重启照常进行，只是记不上，绝不因为记账失败把监管停了。
+func RestartRecorderFromEnv() func(total int) {
+	dir := strings.TrimSpace(os.Getenv(EnvLedgerDir))
+	id := strings.TrimSpace(os.Getenv(EnvLedgerID))
+	if dir == "" || id == "" {
+		return nil
+	}
+	return func(total int) {
+		rec, err := LoadRecord(dir, id)
+		if err != nil {
+			return
+		}
+		rec.Restarts = total
+		_ = SaveRecord(dir, rec)
 	}
 }
 
@@ -410,7 +455,9 @@ func Stop(opts StopOptions) (*StopResult, error) {
 	rec, err := LoadRecord(dir, opts.AppID)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("应用不存在: %s（先 gear_app(action=list) 看台账）", opts.AppID)
+			// %w 保留 ErrNotExist：REST 面（DELETE /api/apps/{id}）据此区分 404 与 500，
+			// 不必再自己读一遍台账做存在性预检。
+			return nil, fmt.Errorf("应用不存在: %s（先 gear_app(action=list) 看台账）: %w", opts.AppID, os.ErrNotExist)
 		}
 		return nil, err
 	}
@@ -510,7 +557,7 @@ func statusOf(rec *Record, tail int) *StatusResult {
 	res := &StatusResult{
 		AppID: rec.AppID, FlowID: rec.FlowID, PID: rec.PID, State: string(st),
 		StartedAt: rec.StartedAt, Ports: rec.PortStates(), LogPath: rec.LogPath,
-		EscapedJob: rec.EscapedJob,
+		EscapedJob: rec.EscapedJob, Restarts: rec.Restarts, LiveLogs: rec.LiveLogs,
 	}
 	if st == StateRunning {
 		res.UptimeS = int(time.Since(rec.StartedAt).Seconds())

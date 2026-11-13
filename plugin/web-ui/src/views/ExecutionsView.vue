@@ -269,11 +269,25 @@ onUnmounted(() => {
             </NTabPane>
 
             <NTabPane name="logs" tab="运行日志">
+              <NSpace align="center" style="margin-bottom: 8px">
+                <NSwitch
+                  :value="exec.realtime"
+                  size="small"
+                  @update:value="(v: boolean) => void exec.setRealtime(v)"
+                />
+                <span class="text-3">实时（SSE 流，只推订阅后的新行；历史仍先拉一次）</span>
+              </NSpace>
               <NAlert v-if="exec.logsError" type="error" :bordered="false" style="margin-bottom: 8px">{{
                 exec.logsError
               }}</NAlert>
               <NEmpty v-if="exec.logs.length === 0" description="暂无日志（仅 process runtime 的 stdout/stderr 会落这里）" />
-              <pre v-else class="logs">{{ exec.logs.join('\n') }}</pre>
+              <div v-else class="logs">
+                <div
+                  v-for="(l, i) in exec.logs"
+                  :key="i"
+                  :class="['log-line', l.stream === 'stderr' ? 'log-err' : 'log-out']"
+                >{{ l.step_id }} · {{ l.stream }}: {{ l.line }}</div>
+              </div>
             </NTabPane>
           </NTabs>
         </template>
@@ -313,7 +327,16 @@ onUnmounted(() => {
   color: var(--n-text-color-base);
   font-size: 12px;
   line-height: 1.7;
+}
+.log-line {
   white-space: pre-wrap;
   word-break: break-all;
+  font-family: var(--n-font-family-mono, ui-monospace, monospace);
+}
+.log-out {
+  color: var(--n-text-color-base);
+}
+.log-err {
+  color: var(--n-error-color, #e88080);
 }
 </style>

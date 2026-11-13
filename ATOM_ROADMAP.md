@@ -22,6 +22,11 @@
 > 应用想用 `db` 存配置只能把绝对路径硬编码进 YAML（mindstorm 曾有 18 处 `local DSN = "D:/…/mindstorm.db"`）。
 > 内核 AI 缺省配置（`ai.*`）也读同一个库，使「配一次、所有进程生效」成立。
 
+> **2026-11-11 新增 `fs`（第 8 个受门禁原语）**：宿主侧文件读写 `ctx.fs.read/write/list/mkdir/remove`。
+> 与「给 Lua 开原生 io + 配置安全目录」相对——REQ-LUA-SANDBOX 的 io/os 永不加载契约**一行未动**，
+> 文件能力做成宿主原语、路径收口在 Go 侧（相对路径锚定主根 `GEAR_APP_DATA`，逐段消解符号链接，
+> 越界一律拒），脚本只能拿到收口后的结果。见 REQ-FS-PRIM / REQ-FS-CONFINEMENT。
+
 > 红线（与 GEAR 工程方法一致）：每个 `ext.*` 必须 `ext.` 前缀、必声明 `schemas`、methods 与 schemas 一一对应，否则启动 fail-closed；调用遵循最小权限；未知枚举即拒（不静默）。
 
 > **口径澄清（`json` 与三个新纯函数原子的差异，别说成一样）**：

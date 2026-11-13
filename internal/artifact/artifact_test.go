@@ -611,6 +611,99 @@ func TestExportDirEntryRecurses(t *testing.T) {
 	}
 }
 
+// T-artifact-22b：dir 条目**恰好等于** workdir（如 study：Files=[{path: apps/study, dir: true}] 且
+// workdir=apps/study）——剥前缀后应为空串，产物内相对路径不带 apps/study 前缀；导入端
+// dst=appsDir/<app>/<rel> 才会干净落到 appsDir/<app>/<file>，而不是嵌套 appsDir/<app>/apps/study/…。
+// 回归：曾经漏剥相等情形，导致 static=21 落进双层 apps/study。
+func TestExportDirEntryEqualsWorkdir(t *testing.T) {
+	reg := mustReg(t)
+	root := t.TempDir()
+	a := &model.App{
+		ID: "study", Name: "study", EntryFlow: "study.up",
+		Layout: model.AppLayout{
+			Workdir: "apps/study",
+			Files:   []model.AppFile{{Path: "apps/study", Dir: true, Required: false}},
+		},
+		Start: model.AppStart{Restart: "always", Ports: []int{8080}},
+	}
+	base := filepath.Join(root, "apps/study")
+	if err := os.MkdirAll(filepath.Join(base, "css"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "index.html"), []byte("<html>study</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "css", "app.css"), []byte("body{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b := &Bundle{
+		Apps:  []*model.App{a},
+		Tools: []*model.Tool{fxTool("study__hello")},
+		Flows: []*model.Flow{fxFlow("study.up", "study__hello")},
+	}
+	if _, _, _, err := ApplyBundle(reg, b, nil, true); err != nil {
+		t.Fatalf("ApplyBundle 失败: %v", err)
+	}
+
+	out := filepath.Join(t.TempDir(), "artifact")
+	if _, err := Export(reg, ExportOptions{AppID: "study", Out: out, StaticRoot: root}); err != nil {
+		t.Fatalf("Export 失败: %v", err)
+	}
+	// 产物内的相对路径必须不带 apps/study 前缀。
+	if _, err := os.Stat(filepath.Join(out, "index.html")); err != nil {
+		t.Fatalf("产物缺 index.html（前缀未剥？）: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "css", "app.css")); err != nil {
+		t.Fatalf("产物缺 css/app.css（前缀未剥？）: %v", err)
+	}
+	// 组成清单的 static_files 也必须是相对路径（不带 apps/study 前缀）。
+	metaRaw, err := os.ReadFile(filepath.Join(out, MetaFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(metaRaw), "apps/study/index.html") {
+		t.Fatalf("static_files 仍带 apps/study 前缀：%s", string(metaRaw))
+	}
+
+	// 导入到 appsDir：必须落进 appsDir/study/ 根，而不是 appsDir/study/apps/study/。
+	dst := mustReg(t)
+	appsDir := t.TempDir()
+	imp, err := Import(dst, ImportOptions{Source: out, AppsDir: appsDir})
+	if err != nil {
+		t.Fatalf("Import 失败: %v", err)
+	}
+	if len(imp.StaticLanded) != 2 {
+		t.Fatalf("应落地 2 个文件，实际 %v", imp.StaticLanded)
+	}
+	if _, err := os.Stat(filepath.Join(appsDir, "study", "index.html")); err != nil {
+		t.Fatalf("未落在 study/index.html（嵌套了？）: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(appsDir, "study", "css", "app.css")); err != nil {
+		t.Fatalf("未落在 study/css/app.css（嵌套了？）: %v", err)
+	}
+	got, err := dst.GetApp("study")
+	if err != nil || got == nil {
+		t.Fatalf("导入后 App 不在库里: %v", err)
+	}
+	want := filepath.ToSlash(filepath.Join(appsDir, "study")) + "/index.html"
+	found := false
+	for _, f := range got.Layout.Files {
+		if f.Path == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("layout 未重写为展开文件：%v", got.Layout.Files)
+	}
+	if got.Layout.Workdir != filepath.ToSlash(filepath.Join(appsDir, "study")) {
+		t.Fatalf("workdir 未重写：%q", got.Layout.Workdir)
+	}
+	// 关键：落地文件必须位于 workdir 之内（而非 workdir/apps/study/ 嵌套）。
+	if _, err := os.Stat(filepath.Join(got.Layout.Workdir, "index.html")); err != nil {
+		t.Fatalf("落地文件不在 workdir 内（嵌套 bug 未修？）: %v", err)
+	}
+}
+
 // T-artifact-22：dir 声明的静态资源导入后整树落地，且 layout 重写为展开的逐文件路径。
 func TestImportLandsDirAndRewritesLayout(t *testing.T) {
 	reg := mustReg(t)

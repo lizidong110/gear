@@ -69,6 +69,10 @@ type Engine struct {
 	// Tool 运行期收到 ErrCapabilityUnavailable（fail-closed，不静默退化成「内存里存一下」），
 	// 且 AI 缺省配置不生效（回退链退化为 env + 内置默认）。
 	config cap.Config
+	// fs 是宿主注入的文件读写原语（WithFS），安全根由装配方决定。nil = New 时回退
+	// 默认根 gearhome.AppDataDir()（<GEAR_HOME>/data，与 db 相对 dsn 同口径）；
+	// 构造失败留 nil → 声明了 fs 的 Tool 运行期收到 ErrCapabilityUnavailable（fail-closed）。
+	fs cap.FS
 	// progressOut 是执行进度（step 通过/跳过/service 启动）的输出目标；nil = os.Stdout。
 	//
 	// 为什么可替换：MCP 的 **stdio transport 下 stdout 只能承载协议帧**——一行 `✓ step …`
@@ -115,6 +119,21 @@ func New(reg *registry.Registry, opts ...func(*Engine)) *Engine {
 	// 配置库注入（config 原语）：同上口径，显式 WithHost 自带的 Config 优先。
 	if e.config != nil && e.host.Config == nil {
 		e.host.Config = e.config
+	}
+	// 文件原语注入（fs）：显式 WithHost 自带 / WithFS 提供的优先；都没有时回退默认根
+	// gearhome.AppDataDir()（<GEAR_HOME>/data，与 db 相对 dsn 同理由），并合并配置库里的
+	// 附加根 fs.roots（与 AI 缺省配置 ai.* 同通道：内核自身也读配置库，配一次处处生效）。
+	// 构造失败留 nil → 声明了 fs 的 Tool 运行期收到 ErrCapabilityUnavailable（fail-closed）。
+	if e.host.FS == nil {
+		if e.fs != nil {
+			e.host.FS = e.fs
+		} else {
+			roots := []string{gearhome.AppDataDir()}
+			roots = append(roots, fsRootsFromConfig(e.config)...)
+			if rooted, err := cap.NewRootedFS(roots); err == nil {
+				e.host.FS = rooted
+			}
+		}
 	}
 	// 默认扩展目录（无扩展能力时仅内核原语可用，行为与历史一致）。
 	if e.capReg == nil {
@@ -299,6 +318,35 @@ func WithSecret(s cap.Secret) func(*Engine) {
 // ErrCapabilityUnavailable，而不是静默退化成「内存里存一下、重启就丢」。
 func WithConfigStore(c cap.Config) func(*Engine) {
 	return func(e *Engine) { e.config = c }
+}
+
+// WithFS 注入文件读写原语（安全根由调用方决定，见 cap.NewRootedFS）。nil 表示不提供。
+func WithFS(f cap.FS) func(*Engine) {
+	return func(e *Engine) { e.fs = f }
+}
+
+// fsRootsFromConfig 读配置键 `fs.roots`，返回 fs 原语的**附加安全根**列表。
+//
+// 与 AI 缺省配置（ai.*）同通道：内核自身读配置库，「配一次、处处生效」——前端/CLI 用
+// config 原语即可配（`gear config set fs.roots "D:/shared/docs"` 或 Config 页），**重启生效**
+// （根集合在 New 装配期固定，运行期不热更，避免已放行路径中途失效）。
+// 值格式：`;` 或换行分隔的多个目录。主根恒为 gearhome.AppDataDir()，不受此键影响；
+// 未配置 / 空值 / 读失败 → nil（仅默认根，fail-safe 不放大权限）。
+func fsRootsFromConfig(c cap.Config) []string {
+	if c == nil {
+		return nil
+	}
+	v, err := c.Get("fs.roots")
+	if err != nil || strings.TrimSpace(v) == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.FieldsFunc(v, func(r rune) bool { return r == ';' || r == '\n' || r == '\r' }) {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // NewDefaultConfigStore 返回落点为 gearhome.ConfigDBPath() 的配置库（宿主默认装配件）。

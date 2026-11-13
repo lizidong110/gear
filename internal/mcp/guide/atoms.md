@@ -4,7 +4,7 @@
 
 | 类别 | 成员 | 受 capability 门禁 | Flow 能直调 | 说明 |
 |---|---|---|---|---|
-| **受门禁原语** | `http` `call` `db` `secret` `event` `subscribe` `config`（7） | **是**（Tool 必须声明） | 能（如 `http.Request`） | 单一真相源 `internal/cap/cap.go` |
+| **受门禁原语** | `http` `call` `db` `secret` `event` `subscribe` `config` `fs`（8） | **是**（Tool 必须声明） | 能（如 `http.Request`） | 单一真相源 `internal/cap/cap.go` |
 | **纯函数原子** | `time` `template` `crypto`（3） | **否**（始终可用，**声明了反而被拒**） | 能（如 `crypto.hash`） | 无 IO、确定性、单具名 table 入参 |
 | **Lua 便利绑定** | `json`（`ctx.json.encode/decode`） | — | **不能** | **不是能力**，不在能力目录 |
 | **调用上下文** | `caller`（`ctx.caller.subject/app_id/via`） | — | **不能** | **不是能力**，内核无条件注入（2026-09-26 补） |
@@ -27,7 +27,7 @@
 |---|---|---|
 | `positional` | `http.Request` `secret.get` `event.notify` `event.wait` `subscribe.stop` | `ctx.http.Request(method, url, body, headers)` |
 | `bare` | **`call`** | `ctx.call(target, input)`——**没有 `.Call` 这一段** |
-| `table` | `db.*` `config.*` `subscribe.start` 全部纯函数原子 全部 `ext.*` | `ctx.db.query({ driver=…, sql=…, params={…} })` |
+| `table` | `db.*` `config.*` `fs.*` `subscribe.start` 全部纯函数原子 全部 `ext.*` | `ctx.db.query({ driver=…, sql=…, params={…} })` |
 
 三类典型误用（都会在 Lua 运行期才炸，报错还看不出病因）：
 
@@ -57,6 +57,11 @@
 | `config.set` | table | key*, value* | nil（已存在则覆盖；要清除用 `delete`，不是写空串） |
 | `config.delete` | table | key* | nil（不存在即报错） |
 | `config.list` | table | prefix（空串 = 全部） | `{key: value}` map |
+| `fs.read` | table | path* | 文件内容字符串（path 相对安全根，默认 `GEAR_APP_DATA`） |
+| `fs.write` | table | path*, data*, append | 写入字节数（append=true 追加，否则截断重写；父目录自动创建） |
+| `fs.list` | table | path*（空串 = 根） | `[{name, size, is_dir}]` 数组 |
+| `fs.mkdir` | table | path* | nil（递归建目录，已存在不报错） |
+| `fs.remove` | table | path* | nil（只删文件/空目录；**不允许删安全根本身**） |
 
 「形态」列不是装饰——它就是 Lua 侧真实收参的方式，写错要到运行期才炸（见 §1.1）。
 
@@ -118,6 +123,13 @@ migrations:
 会锚到 `GEAR_APP_DATA`（默认 `<Home>/data`），无需绝对路径；但**应用设置**仍建议用 `config`
 （list 前缀、敏感键脱敏；Go 侧 `Get` 保留 `ErrConfigNotFound` 以区分「没配」与「配了空串」，
 供回退链用；Lua 侧 `ctx.config.get` 为取值方便，不存在时平返回空串），别再去 `db` 建一张 settings 表。
+
+**`fs` 是「文件读写」的唯一正道**（2026-11-11 新增，第 8 个受门禁原语）：Lua 沙箱**仍禁 io/os**（不变），
+文件能力走宿主侧原语 `ctx.fs.read/write/list/mkdir/remove`。路径全部收口在安全根内：相对路径锚定主根
+（默认 `GEAR_APP_DATA`，与 db 相对 dsn 同口径），越界（`..`、根外绝对路径、符号链接/junction 逃逸、删根）
+一律报「路径逃出安全目录」——收口在宿主侧每次调用都走，脚本无从绕过。
+需要读写默认根之外的业务目录时，用 config 原语配附加根：`fs.roots`（`;` 或换行分隔多个目录，
+`gear config set fs.roots "D:/shared/docs"` 或 Config 页配置），**重启生效**——根集合在引擎装配期固定。
 
 **「对外是 REST」靠 Tool 的 `api:` 声明，不靠新建 MCP 工具**（2026-09-28，FR-3）：
 Tool YAML 里写 `api: {method: GET, path: /api/nodes/{id}}`，引擎就给它**额外**挂一条资源路由，

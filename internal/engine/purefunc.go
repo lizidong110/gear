@@ -78,13 +78,13 @@ var pureFuncPrimitives = map[string]bool{
 
 // gatedPrimitiveOrder 是**受 capability 门禁**的内核原语（内容与 cap.KnownPrimitives 一一对应，
 // 由 TestGatedPrimitiveOrderMatchesCapEnums 守着不漂移），顺序即能力目录/提示词里的展示顺序。
-var gatedPrimitiveOrder = []string{"http", "call", "db", "secret", "event", "subscribe", "config"}
+var gatedPrimitiveOrder = []string{"http", "call", "db", "secret", "event", "subscribe", "config", "fs"}
 
 // purePrimitiveOrder 是纯函数核心原子的展示顺序（不受门禁）。
 var purePrimitiveOrder = []string{"time", "template", "crypto", "id", "validate"}
 
-// allBuiltinPrimitives 返回内核原语的**单一来源**清单（门禁 7 个 + 纯函数 5 个）。
-// （门禁 7 个 = http/call/db/secret/event/subscribe/config，与 cap.KnownPrimitives 一一对应。）
+// allBuiltinPrimitives 返回内核原语的**单一来源**清单（门禁 8 个 + 纯函数 5 个）。
+// （门禁 8 个 = http/call/db/secret/event/subscribe/config/fs，与 cap.KnownPrimitives 一一对应。）
 // 能力目录（ext.registry.capabilities / ext.ai.capabilities / REST / MCP）与给 LLM 的
 // capabilitiesText / flowCapabilitiesText 全部从这里取，不再各写一份字面量列表。
 func allBuiltinPrimitives() []string {

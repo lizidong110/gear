@@ -21,7 +21,7 @@
 ### 1.1 现状
 
 - Gear 当前是**控制台（CLI）+ REST** 形态。`gear serve` 只暴露 `/api`，没有任何界面。
-- `plugin/web-ui/`（Vue 3 + Naive UI）已经是一个**功能较完整的管理台**：概览、Tools、Flows、Hooks、Executions、Apps、Secrets、Capabilities 八个页面，契约守卫（枚举漂移 / 类型 / 单测）全绿，真机联调已跑通。
+- `plugin/web-ui/`（Vue 3 + Naive UI）已经是一个**功能较完整的管理台**：概览、Tools、Flows、Hooks、Executions、Apps、Secrets、Capabilities 八个页面，契约守卫（枚举漂移 / 类型 / 单测）全绿，真机联调已跑通。2026-11-11 扩至十页：新增「配置」（REQ-UI-RES-CONFIG）与「App 清单」（REQ-UI-RES-APPDEFS）。
 - 但「用界面」的门槛很高：必须手动 `npm run build` → 再起一个静态服务器（nginx 或 `ext.serve` 的 `web_ui.up` Flow）→ 自己记住端口 → 自己保证 `/api` 反代同源。普通用户根本走不到最后一步。
 
 ### 1.2 痛点（用户视角）
@@ -76,6 +76,7 @@
 ### 2.3 启动与接入（REQ-UI-LAUNCH-*）
 
 - 新增 `gear ui [--open] [--addr :8787]`：等价于「确保目标 `gear serve` 在跑 + 打开浏览器」。若本机没 serve 则**先拉起一个本机 serve 再开浏览器**（用户完全无感）。
+- 在资源管理器里**双击 `gear.exe`**（零参数）等价于 `gear ui`；从终端启动（含带任意参数）行为不变，不会把命令行调用变成起服务器。
 - `gear serve` 增加：
   - `--ui` / `--no-ui`（默认 `--ui` 开）；
   - 启动后打印 `GEAR_OPEN_URL=http://127.0.0.1:<port>/` 到首行（复用现有 `servePortLine` 机器可读机制 + 人类可读 banner）；
@@ -105,6 +106,7 @@
 | REQ-UI-LAUNCH-OPENURL | 启动后 banner + 首行机器可读行均含 `GEAR_OPEN_URL=http://.../` | P0 | `internal/cli/ui_test.go`：TestServePrintsOpenURL（复用 `serveOnListen`，与真实 serve 同一段打印逻辑） | **implemented**（2026-10-21，见 `REQUIREMENTS.md`） |
 | REQ-UI-LAUNCH-AUTOOPEN | 非 CI 且有桌面时自动打开浏览器；`--no-open` 可关 | P1 | `internal/cli/openbrowser_test.go`：TestOpenBrowserSkippedInCI、TestAutoOpenDisabledHonorsCIEnv、TestOpenBrowserDoesNotFailServer | **implemented**（2026-10-21，见 `REQUIREMENTS.md`） |
 | REQ-UI-LAUNCH-CMD | 新增 `gear ui`：未起 serve 则先起本机 serve 再开浏览器 | P1 | `internal/cli/ui_test.go`：TestUICmdOpensExistingServe、TestUICmdPortProbe | **implemented**（2026-10-21，见 `REQUIREMENTS.md`） |
+| REQ-UI-LAUNCH-EXPLORER | 资源管理器双击 `gear.exe`（零参数）等价于 `gear ui`；终端启动与带参启动行为不变 | P1 | `internal/cli/ui_test.go`：TestExplorerLaunchRewritesToUI、TestExplorerLaunchRunsUICmd、TestExplorerLaunchTerminalNoArgsKeepsHelp | **implemented**（2026-11-11，见 `REQUIREMENTS.md`） |
 | REQ-UI-LAUNCH-MISSING | 二进制未嵌入 dist 时 `GET /` 返回 503 + 明确指引，不空白 | P0 | `internal/server/serve_ui_test.go`：TestServeUIMissingDistReturnsGuidance；`internal/webui/ui_test.go`：TestUIHandlerMissingMode、TestHandlerEmbeddedFollowsBuildState、TestUIHandlerExternalMissingAssets | **implemented**（2026-10-21，见 `REQUIREMENTS.md`） |
 | REQ-UI-LAUNCH-UIOVERRIDE | `GEAR_UI_DIR=<dir>` 指向外部 dist 目录（开发热更新），覆盖内嵌 | P2 | `internal/webui/ui_test.go`：TestUIHandlerExternalReal、TestUIHandlerExternalMissingAssets | **implemented**（2026-10-21，见 `REQUIREMENTS.md`） |
 | REQ-UI-LAUNCH-BACKGROUND | `gear app start <flow> --ui` 在 `app status` 回显打开地址 | P2 | 复用 openurl_test 扩展 | deferred |
@@ -129,7 +131,9 @@
 | REQ-UI-RES-FLOWS | Flows 列表/创建/删除/校验；单 Flow 详情（DAG 分层图 + 步骤参数预览） | P0 | TestFlowsViewCRUD、TestFlowValidateFeedback | partial |
 | REQ-UI-RES-HOOKS | Hooks 列表/创建/删除；创建表单按 stage/target/criticality 引导 | P1 | TestHooksViewCRUD | partial |
 | REQ-UI-RES-SECRETS | Secrets 列表（只名）/ 写入 / 删除；**写入后绝不回显明文**，列表掩码 `••••` | P0 | TestSecretsViewMasked、TestSecretWriteNoEcho | partial |
+| REQ-UI-RES-CONFIG | 配置页按内核 `/api/config/catalog` 渲染中文表单（不硬编码 `ai.*` key）：显示说明/默认值/是否已配置/环境变量覆盖；敏感项只显掩码且**留空保存＝不修改**；支持保存与恢复默认 | P0 | TestConfigCatalogEndpoint、TestConfigSecretNeverLeaks、TestConfigEnvOverrideReported | **implemented**（2026-11-11，见 `REQUIREMENTS.md` REQ-API-CONFIG-CATALOG） |
 | REQ-UI-RES-APPS | Apps（长驻进程）列表/启动/停止/清理台账（prune）；状态实时刷新 | P1 | TestAppsViewLifecycle | partial |
+| REQ-UI-RES-APPDEFS | **App 清单定义**管理页：列出 registry 里的 `kind: App`（含 Flow/Tool/Hook 组成）、查看详情；**导出**为 YAML 文本下载、**导入**从粘贴/上传的 bundle YAML（先 `dry_run` 预检再写，冲突需显式 `overwrite`）；删除走确认；页面须讲清「清单定义 ≠ 受管进程」，并如实说明静态资源不在文本导出内 | P0 | TestAppDefImportRoundTrip、TestAppDefDryRunWritesNothing、TestAppDefConflictRequiresOverwrite、TestAppDefRejectsBadBundle、TestAppDefDelete | **implemented**（2026-11-11，`AppDefsView.vue`；内核 REST 见 REQ-API-APP-DEFS） |
 | REQ-UI-RES-CREATE-WIZARD | 创建 Tool/Flow 用**向导 + YAML 编辑器双模式**：向导出结构、高级切 YAML；提交前跑前端静态预检（复用 `template.ts`/`tool.ts`） | P1 | TestCreateWizardPrecheck、TestYAMLEditorRoundTrip | deferred |
 | REQ-UI-RES-IMPORT | 粘贴/上传 YAML 直接注册（对应 CLI `register`），错误定位到行 | P1 | TestImportYAMLErrorLine | deferred |
 | REQ-UI-RES-SEARCH | 所有列表支持名称/标签搜索 + 状态筛选（不依赖后端新端点，本地索引） | P1 | TestListSearchFilter | deferred |
@@ -139,12 +143,13 @@
 | 需求 ID | 行为 | 优先级 | 断言测试 | 状态 |
 |---------|------|--------|---------|------|
 | REQ-UI-EXEC-RUN | 任意 Flow/Tool 一键运行；入参表单由 schema 动态生成（必填校验、类型提示） | P0 | TestRunFormSchemaDriven、TestRunFormRequiredValidation | partial |
-| REQ-UI-EXEC-LIVE | 运行中实时刷新状态；running 时日志 1s 轮询（仅 visible），终态自动停 | P0 | TestExecLivePollingStopsOnTerminal | partial |
+| REQ-UI-EXEC-LIVE | 运行中实时刷新状态；running 时详情 1s 轮询（仅 visible），终态自动停。「运行日志」tab 另提供「实时」开关：开启走 SSE 流（GET /api/executions/{id}/logs/stream，只推订阅后新行，历史仍先拉一次），取代 1s 日志轮询 | P0 | TestExecLivePollingStopsOnTerminal | partial |
 | REQ-UI-EXEC-LOGS | 执行日志页：按行展示、自动滚底、可搜关键词、可下载 | P1 | TestExecLogsDownload | partial |
 | REQ-UI-EXEC-GRAPH | 编排图（FlowGraph）可读：节点状态着色（待执行/执行中/成功/跳过/失败）、点节点看 input/output | P0 | TestFlowGraphNodeStates | partial |
 | REQ-UI-EXEC-HISTORY | 执行历史列表（时间/流/状态/耗时/用到的 Tool），可重跑/查看 | P1 | TestExecHistoryRerun | partial |
 | REQ-UI-EXEC-RETRY | 失败执行一键重跑（同入参） | P2 | TestExecRetrySameInput | deferred |
 | REQ-UI-EXEC-EXPORT | 执行结果/日志导出 JSON 或复制为可分享文本 | P2 | TestExecExportJSON | deferred |
+| REQ-UI-APP-LOGS | Apps 页新增「后台应用 · 台账」区块（`gear app start` / MCP `gear_app(start)` 的独立进程，与内存态受管进程分栏）；每条可打开**实时日志**抽屉，开关默认开、可随时断开；只显示订阅后新产生的 process/service 输出，**不读日志文件、不回放历史**；`live_logs=false` 时显式提示未接入及恢复办法（重启该应用） | P0 | TestStreamAppLogsReceivesLines、TestListAppRecordsReportsLiveLogs、TestIngestAppLogsRequiresTokenAndKnownApp | **implemented**（2026-11-11，见 REQ-API-APP-LOGS） |
 
 ### 3.5 能力目录与调用
 
@@ -268,8 +273,17 @@
 | `/flows/{id}/validate` | POST | 静态校验 | REQ-UI-RES-FLOWS |
 | `/hooks` | GET/POST/DELETE | 钩子管理 | REQ-UI-RES-HOOKS |
 | `/executions` `/executions/{id}` | GET/POST | 执行与历史 | REQ-UI-EXEC-* |
-| `/executions/{id}/logs` | GET | 日志 | REQ-UI-EXEC-LOGS |
+| `/executions/{id}/logs` | GET | 日志（历史） | REQ-UI-EXEC-LOGS |
+| `/executions/{id}/logs/stream` | GET(SSE) | 实时日志（只推订阅后新行） | REQ-API-LOGS-STREAM |
 | `/events/{handle}` | POST | 订阅回推 | （内核机制，UI 一般不直接调） |
-| `/apps` `/apps/{id}` `/apps/prune` | GET/POST/DELETE/POST | 长驻进程 | REQ-UI-RES-APPS |
+| `/apps` `/apps/{id}` `/apps/prune` | GET/POST/DELETE/POST | 长驻进程（内存态） | REQ-UI-RES-APPS |
+| `/apps/records` | GET | 后台应用落盘台账（选订阅对象） | REQ-UI-APP-LOGS |
+| `/apps/{id}/logs` | POST | 子进程批量回推日志行（token） | REQ-API-APP-LOGS |
+| `/apps/{id}/logs/stream` | GET(SSE) | 台账应用实时日志（不读文件） | REQ-UI-APP-LOGS |
+| `/app-defs` `/app-defs/{id}` | GET/DELETE | App 清单定义 | REQ-UI-RES-APPDEFS |
+| `/app-defs/{id}/export` | GET | 导出多文档 YAML 文本 | REQ-UI-RES-APPDEFS |
+| `/app-defs/import` | POST | 导入（`dry_run` / `overwrite`） | REQ-UI-RES-APPDEFS |
+| `/config/catalog` `/config` | GET | 配置键目录与当前值 | REQ-UI-RES-CONFIG |
+| `/config/{key}` | PUT/DELETE | 写入 / 恢复默认 | REQ-UI-RES-CONFIG |
 
 > 内核路由表是单一真相源；UI 的 `endpoints.ts` 与本文附录须与其逐条对齐，漂移由 `check:contract` 兜底。

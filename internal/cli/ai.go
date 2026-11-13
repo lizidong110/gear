@@ -21,7 +21,7 @@ func aiCmd() *cobra.Command {
 	c.AddCommand(&cobra.Command{
 		Use:   "capabilities",
 		Short: "列出当前所有原子能力（内核 builtin + pure 原语 + 已注册 ext.*）及其方法参数 schema",
-		Long: "打印引擎当前装配的宿主能力目录：内核门禁原语（http/call/db/secret/event/subscribe/config）+ " +
+		Long: "打印引擎当前装配的宿主能力目录：内核门禁原语（http/call/db/secret/event/subscribe/config/fs）+ " +
 			"纯函数原子（time/template/crypto/id/validate，始终可用、无需声明）+ 所有已注册 " +
 			"ext.* 扩展，每条带方法名、参数类型与必填标记。\n" +
 			"这是 agent 生成 Tool 时锚定的同一份目录（ext.registry.capabilities() / ext.ai.capabilities()），" +

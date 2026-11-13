@@ -45,6 +45,19 @@ type AppInstance struct {
 	// 与 CLI `app start` 走日志扫描 GEAR_OPEN_URL= 是两条互补通道（REST 监管是进程内、无日志文件）。
 	OpenURLs []string `json:"open_urls"`
 
+	// State 是监管态：running（监管 goroutine 在跑）/ exited（已真正退出）。
+	// 创建时置 running，handleListApps 按 done 是否关闭重算——它是「这个 app 是否
+	// 还真的在长驻」的唯一可靠判据。没有它，监管自己结束的 app（restart=never 退出、
+	// once Flow 跑完、启动即失败）仍被列成长驻中，UI 假绿（2026-11-13 审出）。
+	State string `json:"state"`
+
+	// Restarts 是监管期间 service 的累计重启次数（sup.SetOnRestart 回填）。
+	// 与 State 一起构成 /api/apps 的真实健康画像；0 表示从未重启。
+	Restarts int `json:"restarts"`
+
+	// ExitErr 是监管结束的原因（Supervise 返回的 error）；正常收敛为空。
+	ExitErr string `json:"exit_err,omitempty"`
+
 	cancel context.CancelFunc
 	// done 在该 app 的监管 goroutine 真正退出时关闭。
 	//
@@ -63,6 +76,10 @@ type Server struct {
 	engine *engine.Engine
 	mux    *http.ServeMux
 
+	// logBroker 是执行日志的**内存**实时发布/订阅中心（REQ-API-LOGS-STREAM）。
+	// 引擎 LogSink 每行产生时 Publish，SSE 端点 Subscribe 后实时取走；不回放持久化日志。
+	logBroker *LogBroker
+
 	// uiHandler 托管编译进二进制的 Web 管理界面（REQ-UI-LAUNCH-*）。
 	// 非 nil 时在 / 与 /assets/* 注册静态路由；nil 表示 --no-ui（不托管 UI）。
 	uiHandler http.Handler
@@ -74,6 +91,11 @@ type Server struct {
 	// secretsPath 是 secrets.db 落点（默认 gearhome.SecretsDBPath）；CLI 经 WithSecretsDBPath
 	// 注入，供测试隔离，避免读写真实 <GEAR_HOME>/secrets.db。
 	secretsPath string
+
+	// config 是配置库（REQ-API-CONFIG-CATALOG）：与引擎**同一个实例**，保证「UI 写进去、
+	// AI 下一次调用立刻读到」是同一份数据，不会出现两个连接各看各的库。
+	// 默认落 gearhome.ConfigDBPath()；测试经 WithConfigStore 注入临时库。
+	config cap.Config
 
 	appMu  sync.Mutex
 	apps   map[string]*AppInstance
@@ -159,13 +181,25 @@ func WithAppsDir(d string) ServerOption { return func(s *Server) { s.appsDir = d
 // CLI `gear serve` 默认用 gearhome；测试注入临时库以保证密闭，避免污染真实密钥库。
 func WithSecretsDBPath(p string) ServerOption { return func(s *Server) { s.secretsPath = p } }
 
-// Close 释放 Server 持有的外部资源（目前仅 secrets.db 连接）；应在进程退出/测试清理时调用，
+// WithConfigStore 注入配置库（默认 engine.NewDefaultConfigStore()）。测试用它指向临时库，
+// 避免读写真实 <GEAR_HOME>/config.db；也供「配置页与引擎读同一份」的断言注入探针。
+func WithConfigStore(c cap.Config) ServerOption { return func(s *Server) { s.config = c } }
+
+// Close 释放 Server 持有的外部资源（secrets.db / config.db 连接）；应在进程退出/测试清理时调用，
 // 否则 SQLite 连接持有的文件锁会让临时目录无法删除（Windows 上表现为 cleanup 失败）。
 func (s *Server) Close() error {
+	var first error
 	if s.secrets != nil {
-		return s.secrets.Close()
+		first = s.secrets.Close()
 	}
-	return nil
+	// ConfigStore 实现了 Close，但 cap.Config 接口不含它（Lua 侧的 config 原语只需增删改查）。
+	// 用接口断言而不是把具体类型塞进 Server：测试注入的假实现没有 Close 也不该 panic。
+	if c, ok := s.config.(interface{ Close() error }); ok {
+		if err := c.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // WithOnListen 注册「监听绑定成功」回调，参数是**真实**绑定地址（含内核分配的端口号）。
@@ -204,6 +238,7 @@ func New(reg *registry.Registry, opts ...ServerOption) (*Server, error) {
 		reg:             reg,
 		execs:           NewExecStore(),
 		mux:             http.NewServeMux(),
+		logBroker:       NewLogBroker(),
 		apps:            map[string]*AppInstance{},
 		maxConcurrent:   defaultMaxConcurrent,
 		execQueueSize:   defaultQueueSize,
@@ -252,9 +287,21 @@ func New(reg *registry.Registry, opts ...ServerOption) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("初始化扩展失败: %w", err)
 	}
-	s.engine = engine.New(reg, engine.WithLogSink(s.execs.LogSink()), engine.WithCapabilities(capReg), engine.WithAIAgent(agent), engine.WithSecret(s.secrets),
-		// 配置库（config 原语 + AI 缺省配置）：与 CLI 同一个库（gearhome.ConfigDBPath()）。
-		engine.WithConfigStore(engine.NewDefaultConfigStore()))
+	// 日志采集（REQ-API-LOGS / #71 + REQ-API-LOGS-STREAM）：组合 sink 同时做两件事——
+	// 持久化到 ExecStore（供 GET /executions/{id}/logs 历史查询）与实时推送给 logBroker
+	//（供 GET /executions/{id}/logs/stream SSE 实时订阅）。两路职责分离，互不影响。
+	logSink := func(execID, stepID, stream, line string) {
+		s.execs.Log(execID, stepID, stream, line)
+		s.logBroker.Publish(execID, stepID, stream, line)
+	}
+	// 配置库（config 原语 + AI 缺省配置）：与 CLI 同一个库（gearhome.ConfigDBPath()）。
+	// 同一实例同时交给引擎与 Server.config —— 配置页写入后 AI 下一次调用立刻读到（同一连接），
+	// 而不是「UI 写一份、引擎另开一个连接看另一份」。
+	if s.config == nil {
+		s.config = engine.NewDefaultConfigStore()
+	}
+	s.engine = engine.New(reg, engine.WithLogSink(logSink), engine.WithCapabilities(capReg), engine.WithAIAgent(agent), engine.WithSecret(s.secrets),
+		engine.WithConfigStore(s.config))
 	// §8.2 第三条守卫需要「运行期引用」，而运行期状态在 Server 手里 —— 由这里注入，
 	// registry 不反向依赖执行状态。
 	reg.SetRunningChecker(s.runningToolReason)
@@ -331,6 +378,9 @@ func (s *Server) ListenAndServe(addr string) error {
 	// subscribe 机制的回推回调 URL 由 gear 自身**真实**监听地址派生（每个 gear 实例独立），
 	// 而非经 env 传给 sidecar（多 gear 并行时单一 env 会串扰）。
 	s.engine.SetSubscribeCallbackBase(serverBaseURL(realAddr))
+	// 实时日志地址发现（REQ-API-APP-LOGS）：把真实回推地址 + token 写进 <appsDir>/server.addr，
+	// 供之后/此时启动的 detached App 读取。必须放在 onListen 之前（CLI 打印后立即有人访问 UI）。
+	s.publishAppLogEndpoint(realAddr)
 	if s.onListen != nil {
 		s.onListen(realAddr)
 	}
@@ -506,6 +556,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/secrets/{name}", s.handleSetSecret)
 	s.mux.HandleFunc("DELETE /api/secrets/{name}", s.handleDeleteSecret)
 
+	// App 清单管理面（REQ-API-APP-DEFS）：与 /api/apps（内存态受管进程）不是同一个模型。
+	s.mux.HandleFunc("GET /api/app-defs", s.handleListAppDefs)
+	s.mux.HandleFunc("GET /api/app-defs/{id}", s.handleGetAppDef)
+	s.mux.HandleFunc("GET /api/app-defs/{id}/export", s.handleExportAppDef)
+	s.mux.HandleFunc("POST /api/app-defs/import", s.handleImportAppDef)
+	s.mux.HandleFunc("DELETE /api/app-defs/{id}", s.handleDeleteAppDef)
+
+	// 配置键管理面（REQ-API-CONFIG-CATALOG）：目录驱动 UI，用户不必记 ai.* 这类 key 名。
+	s.mux.HandleFunc("GET /api/config/catalog", s.handleConfigCatalog)
+	s.mux.HandleFunc("GET /api/config", s.handleGetConfig)
+	s.mux.HandleFunc("PUT /api/config/{key}", s.handleSetConfig)
+	s.mux.HandleFunc("DELETE /api/config/{key}", s.handleDeleteConfig)
+
 	s.mux.HandleFunc("GET /api/tools", s.handleListTools)
 	s.mux.HandleFunc("GET /api/tools/{id}", s.handleGetTool)
 	s.mux.HandleFunc("POST /api/tools", s.handleCreateTool)
@@ -526,6 +589,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/executions", s.handleListExecutions)
 	s.mux.HandleFunc("GET /api/executions/{id}", s.handleGetExecution)
 	s.mux.HandleFunc("GET /api/executions/{id}/logs", s.handleGetExecutionLogs)
+	// 实时日志流（REQ-API-LOGS-STREAM）：SSE 推送订阅后新产生的行，不回放历史。
+	s.mux.HandleFunc("GET /api/executions/{id}/logs/stream", s.handleStreamExecutionLogs)
 
 	s.mux.HandleFunc("POST /api/events/{handle}", s.handleSubscriptionEvent)
 
@@ -533,6 +598,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/apps", s.handleListApps)
 	s.mux.HandleFunc("POST /api/apps/prune", s.handlePruneApps)
 	s.mux.HandleFunc("DELETE /api/apps/{id}", s.handleDeleteApp)
+	// detached 台账侧应用（REQ-API-APP-LOGS）：列台账 / 子进程回推 / UI 实时订阅。
+	// 与上面四条同名前缀但不是同一模型；{id}/logs* 段数更长，ServeMux 按特异性匹配，不冲突。
+	s.mux.HandleFunc("GET /api/apps/records", s.handleListAppRecords)
+	s.mux.HandleFunc("POST /api/apps/{id}/logs", s.handleIngestAppLogs)
+	s.mux.HandleFunc("GET /api/apps/{id}/logs/stream", s.handleStreamAppLogs)
 
 	// 声明式资源路由（FR-3）：Tool YAML 里写了 `api:` 的就在这几个挂载点上生效，
 	// 由 handleToolAPIAny 在**请求期**按 registry 当前的声明匹配到具体 Tool。
@@ -1206,7 +1276,79 @@ func (s *Server) handleGetExecutionLogs(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, s.execs.Logs(id))
 }
 
-// handleListExecutions 返回全部执行记录（持久化于 SQLite，重启可恢复；见 ExecStore）。
+// handleStreamExecutionLogs 以 SSE 实时推送某次执行的 step 运行日志（stdout/stderr 行）。
+//
+// 与 handleGetExecutionLogs 职责分离：本端点**只推订阅后新产生的行**，不回放历史
+// （历史由 GET /executions/{id}/logs 提供）。这是「实时、不读文件」语义的落地——
+// 数据完全来自内存 broker，不经 SQLite。
+//
+// 行为：
+//   - 执行记录不存在 → 404；
+//   - 订阅后，引擎每行日志即时经 broker 推到本连接（非阻塞，慢客户端丢弃不反压引擎）；
+//   - 每 15s 发一个 `: ping` 保活注释帧，避免中间代理掐掉空闲长连接；
+//   - 每轮也检查执行是否已终态（非 running），终态即发 `event: done` 并关闭——客户端据此
+//     知道「实时阶段结束」，可无缝切回历史日志视图；
+//   - 客户端断开（r.Context().Done()）立即退出并退订。
+func (s *Server) handleStreamExecutionLogs(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rec, ok := s.execs.Get(id)
+	if !ok {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("执行记录不存在: %s: %w", id, registry.ErrNotFound))
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("当前传输层不支持流式响应"))
+		return
+	}
+	// 已终态：立即发 done 并关闭，避免客户端空等 15s 保活帧后才得知「实时阶段已结束」。
+	// 历史行仍由 GET /executions/{id}/logs 提供，二者职责分离（REQ-API-LOGS-STREAM）。
+	if rec.Status != StatusRunning {
+		fmt.Fprint(w, "event: done\ndata: {\"status\":")
+		fmt.Fprintf(w, "%q}\n\n", rec.Status)
+		flusher.Flush()
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no") // 反向代理（如 nginx）默认缓冲，关掉才真·流式。
+
+	ch, unsub := s.logBroker.Subscribe(id)
+	defer unsub()
+
+	tick := time.NewTicker(15 * time.Second)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case ll, ok := <-ch:
+			if !ok {
+				return
+			}
+			b, err := json.Marshal(ll)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
+		case <-tick.C:
+			// 保活帧：SSE 中以冒号开头的行是注释，客户端忽略但不关闭连接。
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+			// 顺带检查执行是否已终态：终态即发 done 并关闭（实时阶段结束）。
+			if rec, ok := s.execs.Get(id); ok && rec.Status != StatusRunning {
+				fmt.Fprint(w, "event: done\ndata: {\"status\":")
+				fmt.Fprintf(w, "%q}\n\n", rec.Status)
+				flusher.Flush()
+				return
+			}
+		}
+	}
+}
 func (s *Server) handleListExecutions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.execs.List())
 }
@@ -1252,6 +1394,7 @@ func (s *Server) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 	inst := &AppInstance{
 		ID: newID("app_"), FlowID: req.FlowID,
 		Restart: string(policy), StartedAt: time.Now(), cancel: cancel, done: make(chan struct{}),
+		State: "running",
 	}
 	s.appMu.Lock()
 	s.apps[inst.ID] = inst
@@ -1267,7 +1410,19 @@ func (s *Server) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		// 复用已装配的 s.engine：service step 同样需要扩展目录 / 密钥源 / 宿主原语，
 		// 新建一次性 engine 会让「经 Apps 拉起的 Flow」比「经 /api/executions 跑的同一个 Flow」能力更弱。
 		sup := app.New(s.engine, policy, 0)
+		// 重启观察：supervisor 是局部创建的，事后读不到 RestartCount——
+		// 用回调把累计重启次数回填进 AppInstance，/api/apps 才有真实健康画像。
+		sup.SetOnRestart(func(total int) {
+			s.appMu.Lock()
+			inst.Restarts = total
+			s.appMu.Unlock()
+		})
 		if err := sup.Supervise(ctx, []string{req.FlowID}); err != nil {
+			// 必须在 close(done) 之前落账：list 侧以 done 关闭判定 exited，
+			// 此刻起 ExitErr 必须已经可见，否则「退出原因」会先丢一手。
+			s.appMu.Lock()
+			inst.ExitErr = err.Error()
+			s.appMu.Unlock()
 			fmt.Fprintf(os.Stderr, "app %s(%s) 结束: %v\n", inst.ID, req.FlowID, err)
 		}
 	}()
@@ -1286,6 +1441,14 @@ func (s *Server) handleListApps(w http.ResponseWriter, r *http.Request) {
 		// 复制一份再回填打开地址：避免并发读写共享的 *AppInstance（其 cancel 也随之复制，
 		// 但副本不调用 cancel，无副作用）。OpenURLs 来自引擎按 flowID 聚合的收尾步输出。
 		c := *a
+		// 监管态按「done 是否已关闭」实时重算（REQ-APP-MANAGED-STATE）：监管 goroutine
+		// 自己结束的 app（restart=never 退出 / once Flow 跑完 / 启动即失败）不会从
+		// appSeq 里消失，若不重算就会永远顶着创建时的 running——UI 假绿的根源。
+		select {
+		case <-a.done:
+			c.State = "exited"
+		default:
+		}
 		if s.engine != nil {
 			c.OpenURLs = s.engine.OpenURLs(a.FlowID)
 		}

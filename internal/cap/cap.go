@@ -1,7 +1,7 @@
 // Package cap 实现 Gear 的宿主能力层（PRD §6 宿主能力原语）。
 //
-// 宿主（Runtime）只向 Tool 暴露 7 个受 capability 门禁的跨边界通信原语：
-// http / call / db / secret / event / subscribe / config。
+// 宿主（Runtime）只向 Tool 暴露 8 个受 capability 门禁的跨边界通信原语：
+// http / call / db / secret / event / subscribe / config / fs。
 // 另有 time / template / crypto 三个**纯函数原子**（内核内建、始终可用、纯计算无外部依赖）——
 // 它们刻意**不进**本门禁（见 internal/engine/purefunc.go 与 ATOM_ROADMAP.md §0）。
 // 它们处于同一抽象层级——都是「插件与外界交换数据的通道」，不混杂业务。
@@ -40,6 +40,7 @@ const (
 	PrimEvent     Primitive = "event"
 	PrimSubscribe Primitive = "subscribe"
 	PrimConfig    Primitive = "config"
+	PrimFS        Primitive = "fs"
 )
 
 // KnownPrimitives 是所有合法 capability 枚举值（单一来源，供校验与文档共用）。
@@ -51,9 +52,10 @@ var KnownPrimitives = map[Primitive]bool{
 	PrimEvent:     true,
 	PrimSubscribe: true,
 	PrimConfig:    true,
+	PrimFS:        true,
 }
 
-// extensionNames 是用户/插件在启动期注册的「扩展原语」名集合（区别于上面 7 个受门禁的内核原语）。
+// extensionNames 是用户/插件在启动期注册的「扩展原语」名集合（区别于上面 8 个受门禁的内核原语）。
 // 仅启动期写入（RegisterExtensionName），运行期只读，无并发；加锁仅为防御性。
 var extensionNames = map[Primitive]bool{}
 
@@ -103,7 +105,7 @@ func GrantsFromStrings(ss []string) (Grants, error) {
 	for _, s := range ss {
 		p := Primitive(s)
 		if !p.Known() {
-			return nil, fmt.Errorf("未知的 capability %q（合法值：内核受门禁原语 http/call/db/secret/event/subscribe/config，或已注册的 ext.* 扩展名；time/template/crypto/id/validate 是纯函数原子，始终可用、无需声明）", s)
+			return nil, fmt.Errorf("未知的 capability %q（合法值：内核受门禁原语 http/call/db/secret/event/subscribe/config/fs，或已注册的 ext.* 扩展名；time/template/crypto/id/validate 是纯函数原子，始终可用、无需声明）", s)
 		}
 		g[p] = true
 	}
@@ -244,6 +246,9 @@ type Providers struct {
 	// 内核自身也读它：AI 的 provider/model/base_url/api_key 缺省时回退到这里
 	// （见 internal/engine/ai_llm.go 的 resolveLLMConfig），故「配一次、处处生效」。
 	Config Config
+	// FS 是受安全目录收口的文件读写原语实现（引擎装配，默认根 gearhome.AppDataDir()）。
+	// nil 表示未提供，声明了 fs 的 Tool 运行期收到 ErrCapabilityUnavailable（fail-closed）。
+	FS FS
 }
 
 // Context 是一次 Tool 执行可见的宿主能力视图。它持有该 Tool 的 Grants，
@@ -443,6 +448,17 @@ func (c *Context) DB() (DB, error) {
 		return nil, ErrCapabilityUnavailable
 	}
 	return c.prov.DB, nil
+}
+
+// FS 返回文件读写原语；未授权则 ErrCapabilityDenied；未提供实现则 ErrCapabilityUnavailable。
+func (c *Context) FS() (FS, error) {
+	if !c.grants.Has(PrimFS) {
+		return nil, ErrCapabilityDenied
+	}
+	if c.prov == nil || c.prov.FS == nil {
+		return nil, ErrCapabilityUnavailable
+	}
+	return c.prov.FS, nil
 }
 
 // ---- 具体实现 ----

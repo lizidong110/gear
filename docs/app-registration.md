@@ -97,6 +97,13 @@ requires:                      # 可选。依赖声明
   secrets: [MY_KEY]            # 需要人在 CLI 播种的密钥名（MCP 不写密钥）
   sidecars: [serve]            # 依赖的侧车（build/serve-sidecar.exe）
   capabilities: [ext.serve]    # 依赖的扩展能力
+mcp:                           # 可选。MCP 策展区：--expose tools 时只暴露这份白名单
+  tools:
+    - ref: myapp__plan_propose
+    - ref: myapp__plan_preview
+      alias: myapp_plan_preview
+      args: {session: parent}  # 服务端固定注入；从对外 schema 删掉，AI 改不了
+      description: "只预览，禁止自动确认。"
 ```
 
 ## 5. 规则与坑
@@ -113,6 +120,11 @@ requires:                      # 可选。依赖声明
    stderr 会显式告警并点名字 + 说清后果——守卫将把非平台级对象（包括你本想保护的
    本应用定义）判为「别人的应用」误拦，仅无主 id 照常放行。只告警不拒绝：
    「先用起来、App 清单后补」是合法用法。运行期与 `list` 目录面共用同一份判定。
+7. **`mcp.tools` 是白名单，不是自动发现**：`ref` 须属于本 App 且 Tool 已注册；`args` 的键须出现在
+   该 Tool 的 `input_schema.properties` 里。没写策展区时 `gear mcp --expose tools --scope myapp`
+   **直接拒绝启动**（不退回裸暴露全量 Tool）。见 README §12 与 `gear_guide("authoring")`。
+   若这个端点只给业务调用方用，建议再加 `--only-exposed`：那样连 15 个常驻 `gear_*` 管理工具
+   都不挂（须配 `--expose`），instructions 也会换成应用专用说明；排障需另连标准 `gear mcp` 实例。
 
 ## 6. 验证注册成功
 

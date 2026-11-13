@@ -404,5 +404,9 @@ func (s *Server) handleDoctor(ctx context.Context, _ *mcp.CallToolRequest, _ str
 	if err != nil {
 		return toolErrorFrom("DOCTOR_FAILED", err), nil, nil
 	}
-	return nil, rep.Map(), nil
+	out := rep.Map()
+	// 附加「本会话的 MCP 装配元数据」。判据本体仍只有 internal/doctor 一份（CLI 同源），
+	// 这里补的是 CLI 侧不存在的 `--expose` 状态，详见 expose_status.go 的包注释。
+	out["mcp"] = s.mcpExposureStatus()
+	return nil, out, nil
 }

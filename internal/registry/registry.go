@@ -774,3 +774,132 @@ func validateBlob(kind, data string) error {
 func (r *Registry) DeleteApp(id string, opts ...UpsertOption) error {
 	return r.deleteWithSnapshot("apps", id, withOpts(opts))
 }
+
+// DeleteAppCascade 级联注销 App：删 App 清单 + 其拥有的全部 Tool/Flow/Hook（连根拔起）。
+//
+// 与 DeleteApp（只删清单、刻意不级联）相对，这是 CLI `gear app delete --cascade` 的落地。
+// 归属沿用 model.App.Owns 这一份唯一规则（id 以 `<app>__` 或 `<app>.` 开头）。
+//
+// 守卫取舍（2026-11-11）：
+//   - 保留「运行中」守卫（runningReason）：正跑的不许删，与单次删除一致。
+//   - 保留「被**其它** App 引用」守卫：删 Tool 走 DeleteTool，它查全部 Flow/Hook 引用，
+//     跨 App 的引用仍会拒删——避免误删别人正在用的工具。
+//   - 绕过 entry_flow 守卫（DeleteFlow 第 4 条）：级联删 App 时 entry_flow 悬空本就是预期，
+//     没必要拦。
+//   - 绕过「同 App 内引用」守卫：同 App 的 Flow/Tool 随 App 一起删，内部引用不构成悬空。
+//
+// 顺序：Flow → Hook → Tool → App → 历史。
+//
+//	Flow 先删（清掉它们对 Tool/Hook 的引用），再 Hook（无守卫），最后 Tool（DeleteTool 此时
+//	只剩跨 App 引用会被拦），最后删 App 清单本身，最后把这一切在 definition_history 里的
+//	历史一并清掉（见下方段落）。
+//
+// 历史清理（2026-11-12，修复「连根拔起」名不副实）：级联删把对象从各表物理删除后，
+// 若留下 definition_history 行，`gear history restore` 仍能按 seq 把已删对象原样写回——
+// 等于没删干净；且 `gear history list` 里满屏已不存在的对象，排障时误导。所以末一步把
+// App + 全部子资源的 history 一并 purge（含 deleteWithSnapshot 本次写的 note=delete 留痕）。
+//
+// 任一子资源删除被守卫拒绝即整批失败（fail-closed，与 deleteAll 语义一致）；已删部分不回滚，
+// 但本函数会在返回错误前把已删部分的 history 也清掉，避免「registry 没了、history 还能还原」。
+// 返回被删 id 列表（含 App 自身，末位）。
+func (r *Registry) DeleteAppCascade(id string, opts ...UpsertOption) ([]string, error) {
+	app, err := r.GetApp(id)
+	if err != nil {
+		return nil, err
+	}
+	if app == nil {
+		return nil, fmt.Errorf("App 不存在: %s: %w", id, ErrNotFound)
+	}
+
+	tools, err := r.ListTools()
+	if err != nil {
+		return nil, err
+	}
+	flows, err := r.ListFlows()
+	if err != nil {
+		return nil, err
+	}
+	hooks, err := r.ListHooks()
+	if err != nil {
+		return nil, err
+	}
+
+	var removed []string
+
+	// abort 在任一步失败时调用：deleteWithSnapshot / DeleteTool 各自提交，已删部分的
+	// registry 行已落盘；这里把它们的历史也清掉，避免「registry 没了但 history 还能还原」的幽灵态。
+	abort := func(e error) ([]string, error) {
+		_ = r.purgeHistory(removed)
+		return removed, e
+	}
+
+	// 1) Flow：绕过 entry_flow 守卫（App 即将被删），保留运行中守卫。
+	for _, f := range flows {
+		if !app.Owns(f.ID) {
+			continue
+		}
+		if reason := r.runningReason(f.ID); reason != "" {
+			return abort(fmt.Errorf("Flow %s %s，无法级联注销: %w", f.ID, reason, ErrInUse))
+		}
+		if err := r.deleteWithSnapshot("flows", f.ID, withOpts(opts)); err != nil {
+			return abort(err)
+		}
+		removed = append(removed, f.ID)
+	}
+
+	// 2) Hook：无引用守卫（与 DeleteHook 一致），保留运行中守卫。
+	for _, h := range hooks {
+		if !app.Owns(h.ID) {
+			continue
+		}
+		if reason := r.runningReason(h.ID); reason != "" {
+			return abort(fmt.Errorf("Hook %s %s，无法级联注销: %w", h.ID, reason, ErrInUse))
+		}
+		if err := r.deleteWithSnapshot("hooks", h.ID, withOpts(opts)); err != nil {
+			return abort(err)
+		}
+		removed = append(removed, h.ID)
+	}
+
+	// 3) Tool：走 DeleteTool，跨 App 引用与运行中守卫照常生效；同 App 内引用已随 Flow/Hook 删掉。
+	for _, t := range tools {
+		if !app.Owns(t.ID) {
+			continue
+		}
+		if err := r.DeleteTool(t.ID, opts...); err != nil {
+			return abort(err)
+		}
+		removed = append(removed, t.ID)
+	}
+
+	// 4) App 清单本身。
+	if err := r.DeleteApp(id, opts...); err != nil {
+		return abort(err)
+	}
+	removed = append(removed, id)
+
+	// 5) 历史：App + 全部子资源的 definition_history 一并清掉（连根拔起）。
+	if err := r.purgeHistory(removed); err != nil {
+		return removed, err
+	}
+	return removed, nil
+}
+
+// purgeHistory 删除 definition_history 中 id 命中给定列表的全部历史行。
+//
+// 仅由 DeleteAppCascade 在「对象已从各表物理删除」之后调用——否则历史会与存活对象脱节，
+// 且 note=delete 这类留痕行不该孤立存在。入参为空直接返回，避免拼出 `IN ()` 这种非法 SQL。
+func (r *Registry) purgeHistory(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err := r.db.Exec("DELETE FROM definition_history WHERE id IN ("+ph+")", args...)
+	return err
+}

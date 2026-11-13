@@ -422,6 +422,13 @@ func (e *Engine) startServiceStep(ctx context.Context, rc *runContext, hooks []m
 	}
 	host := e.hostFor(tool, rc)
 
+	// 日志采集（REQ-API-LOGS-STREAM）：与 once step 同口径，把 service 子进程输出关联到本执行+本 step。
+	// 此前 service 路径漏设 sink，导致长驻进程输出既不落盘也不实时可见——只在崩溃退出时由
+	// serviceTail 兜底到监管日志。这里补上后，service 实时输出经组合 sink 同时落盘 + 推 broker。
+	if pr, ok := rt.(*processRuntime); ok && rc.logSink != nil {
+		pr.execID, pr.stepID, pr.sink = rc.execID, step.ID, rc.logSink
+	}
+
 	// 关键：service 进程是**长驻**的，不能绑在层级的 ctx 上——
 	// execLevel 在层结束时会 cancel()，若沿用该 ctx，刚拉起的 service 会被立刻杀掉。
 	// 因此：启动前先响应取消（fail-fast），真正拉起时用不受层级取消影响的上下文。

@@ -184,6 +184,16 @@ func (e *Engine) Supervise(ctx context.Context, flowID string) (*SuperviseResult
 		secretGet: e.secretResolver(),
 		flowID:    flowID,
 	}
+	// 实时日志挂点（REQ-API-APP-LOGS）：`app run` / REST 受管 App 走的是 Supervise，
+	// 而不是 run()，没有 REST 执行记录 id。但阶段 1 的 logTee（once process）与
+	// drainServiceTail（长驻 service）都挂在 rc.logSink 上 —— 这里不注入，就会变成
+	// 「台账标着已接入实时日志、UI 却一行都收不到」的纯静默失效。
+	// 用一个稳定的伪 execID 关联来源；前缀刻意与 broker 的 app:<appID> 命名空间隔开，
+	// 免得两条不同的 App 模型把日志串到同一个订阅 key 上。回推器只消费 stepID/stream/line。
+	if e.logSink != nil {
+		rc.execID = "supervise:" + flowID
+		rc.logSink = e.logSinkFor(rc.execID)
+	}
 	res := &SuperviseResult{FlowID: flowID}
 	var svcMu sync.Mutex // 并行 goroutine 都会追加 service 句柄
 

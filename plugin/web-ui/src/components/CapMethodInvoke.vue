@@ -272,7 +272,9 @@ async function copy(text: string, what: string) {
       <NAlert type="warning" :bordered="false" style="margin-top: 16px" title="执行权限">
         与 <code>react</code> 一致：全量宿主授权 + Lua 沙箱。<code>db</code>
         为内存态（重启即失）、<code>secret</code> 需内核已注入密钥源、<code>http</code>
-        可访问任意 URL。未知能力 / 方法直接报错，不会静默执行。
+        可访问任意 URL、<code>fs</code> 路径收口在安全根内（主根 <code>GEAR_APP_DATA</code>，
+        附加根经 <code>config set fs.roots</code> 配置、重启生效，越界报「路径逃出安全目录」）。
+        未知能力 / 方法直接报错，不会静默执行。
       </NAlert>
     </NDrawerContent>
   </NDrawer>

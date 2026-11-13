@@ -4,10 +4,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
 	"gear/internal/app"
+	"gear/internal/applog"
+	"gear/internal/engine"
+	"gear/internal/gearhome"
 )
 
 // appCmd 构造 `gear app` 命令组：run 是**前台**监管器（人/CI 持有），
@@ -74,11 +78,31 @@ func appRunCmd() *cobra.Command {
 
 			fmt.Printf("[app run] 监管 %d 个 Flow，restart=%s，maxConcurrent=%d（Ctrl+C 停止）\n",
 				len(args), policy, maxConc)
-			eng, err := cliEngine(reg)
+			// 实时日志回推（REQ-API-APP-LOGS）：只有 `app start` 派生出来的子进程会带
+			// GEAR_APP_LOG_* 三个 env；人直接跑前台 `app run` 时 reporter=nil，行为零变化。
+			// 挂点选 engine.LogSink（阶段 1 已让 process / service 输出逐行走这里），
+			// 而不是 tail <appID>.log —— 后者正是用户拒绝的「从日志文件拉取」。
+			reporter, err := applog.FromEnv()
+			if err != nil {
+				return err
+			}
+			var engOpts []func(*engine.Engine)
+			if reporter != nil {
+				defer reporter.Close()
+				engOpts = append(engOpts, engine.WithLogSink(reporter.Sink))
+				fmt.Printf("[app run] 实时日志回推已启用（app=%s）\n", reporter.AppID())
+			}
+			eng, err := cliEngine(reg, engOpts...)
 			if err != nil {
 				return err
 			}
 			sup := app.New(eng, policy, maxConc)
+			// 台账身份 env（GEAR_APP_LEDGER_*）只存在于 `app start` 的派生链路上：
+			// 有则把 service 重启次数回写台账记录（UI / CLI 才能看到真实重启数），
+			// 前台 `app run` 没有 env，回调为 nil，行为零变化。
+			if cb := app.RestartRecorderFromEnv(); cb != nil {
+				sup.SetOnRestart(cb)
+			}
 			if err := sup.Supervise(ctx, args); err != nil {
 				return err
 			}
@@ -309,10 +333,17 @@ func appPruneCmd() *cobra.Command {
 //
 // 与 §8.2 的其它注销不同，这里**不做引用守卫**（见 registry.DeleteApp 的注释）：App 只是
 // 聚合描述，它引用的 Tool/Flow 是独立实体，要求「先拆掉所有 Tool 才能删清单」会堵死清理路径。
+//
+// `--cascade`（2026-11-11）：默认只删清单（保持「删清单≠删应用」语义）；加 `--cascade`
+// 则连根拔起——一并删 App 拥有的全部 Tool/Flow/Hook（见 registry.DeleteAppCascade），
+// 并清理磁盘残留（静态资源目录、应用数据库、运行台账）。这是给「删一个应用要手动逐个清工具、
+// 还得手动清库清文件」的清理痛点的一刀切入口，跨 App 引用与运行中守卫仍生效。
 func appDeleteCmd() *cobra.Command {
-	return &cobra.Command{
+	var cascade bool
+	var appsDir string
+	cmd := &cobra.Command{
 		Use:   "delete <id>",
-		Short: "注销 App 清单（不做引用守卫：删清单不等于删应用；删除留痕可回滚）",
+		Short: "注销 App 清单（--cascade 时一并删其拥有的 Tool/Flow/Hook 并清磁盘）",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			reg, err := openRegistry()
@@ -320,6 +351,28 @@ func appDeleteCmd() *cobra.Command {
 				return err
 			}
 			defer reg.Close()
+			if cascade {
+				// 先取 App 拿到入口 Flow，稍后用于精确匹配运行台账记录（cascade 会删掉 App 本身）。
+				appObj, gerr := reg.GetApp(args[0])
+				if gerr != nil {
+					return gerr
+				}
+				entryFlow := ""
+				if appObj != nil {
+					entryFlow = appObj.EntryFlow
+				}
+				removed, err := reg.DeleteAppCascade(args[0], act())
+				if err != nil {
+					return err
+				}
+				fmt.Printf("✓ 已级联注销 App %s 及其 %d 个子资源:\n", args[0], len(removed)-1)
+				for _, id := range removed {
+					fmt.Printf("  - %s\n", id)
+				}
+				fmt.Println("正在清理磁盘残留（静态资源 / 台账 / 数据库）…")
+				cleanupAppDisk(registryPath, appsDir, args[0], entryFlow)
+				return nil
+			}
 			if err := reg.DeleteApp(args[0], act()); err != nil {
 				return err
 			}
@@ -327,6 +380,67 @@ func appDeleteCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&cascade, "cascade", false, "一并删掉该 App 拥有的 Tool/Flow/Hook（连根拔起）")
+	cmd.Flags().StringVar(&appsDir, "apps-dir", "", "应用台账目录（默认 <registry 同目录>/apps；用于定位静态资源与台账）")
+	return cmd
+}
+
+// cleanupAppDisk 在级联注销 registry 成功后，清掉该 App 在磁盘上的残留：
+//   - <appsDir>/<appId>/        ：import 落地的静态资源（前端 dist 等），以 App id 命名、专属本应用
+//   - <appsDir>/*.json 台账中 FlowID 命中该 App 入口 Flow 的记录：本应用的运行台账
+//   - <AppDataDir>/<appId>.db   ：该 App 默认可持久化数据库（dsn 恰好等于 <appId> 时）
+//
+// 这些都是「与 App 一一对应、专属于它」的路径，删它们不会误伤其它应用。
+// 磁盘清理是 best-effort：registry 已删，即使某个路径删不掉也不该让命令失败，
+// 但每个动作都要如实打印，让人知道还留了什么、为什么。
+func cleanupAppDisk(registryPath, appsDir, appID, entryFlow string) {
+	if dir, err := app.ResolveAppsDir(registryPath, appsDir); err == nil {
+		// 1) 静态资源目录（以 App id 命名）
+		staticDir := filepath.Join(dir, appID)
+		if removeIfExists(staticDir) {
+			fmt.Printf("  ✓ 已删静态资源目录: %s\n", staticDir)
+		} else {
+			fmt.Fprintf(os.Stderr, "⚠ 未发现静态资源目录 %s（应用若从未 import 静态资源则正常）\n", staticDir)
+		}
+		// 2) 运行台账：删 FlowID 命中入口 Flow 的记录（精确匹配，不靠猜文件名）
+		if recs, rerr := app.ListRecords(dir); rerr == nil {
+			for _, rec := range recs {
+				if rec.FlowID == entryFlow {
+					p := filepath.Join(dir, rec.AppID+".json")
+					if removeIfExists(p) {
+						fmt.Printf("  ✓ 已删台账记录: %s\n", p)
+					}
+				}
+			}
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "⚠ 无法解析应用目录，跳过静态资源与台账清理: %v\n", err)
+	}
+
+	// 3) 业务数据库（相对 dsn 锚定到 AppDataDir；只有 dsn 恰为 <appId>.db 时才命中）
+	dataDB := filepath.Join(gearhome.AppDataDir(), appID+".db")
+	if removeIfExists(dataDB) {
+		fmt.Printf("  ✓ 已删应用数据库: %s\n", dataDB)
+	} else {
+		fmt.Fprintf(os.Stderr, "⚠ 未找到 %s（若工具用了其它 dsn 名，请手动清理 %s 下相关 .db）\n",
+			dataDB, gearhome.AppDataDir())
+	}
+}
+
+// removeIfExists 删除一个文件或目录（递归）；不存在返回 false，访问/删除出错打印到 stderr 仍返回 false。
+func removeIfExists(path string) bool {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false
+		}
+		fmt.Fprintf(os.Stderr, "⚠ 无法访问 %s（跳过）: %v\n", path, err)
+		return false
+	}
+	if err := os.RemoveAll(path); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠ 删除 %s 失败: %v\n", path, err)
+		return false
+	}
+	return true
 }
 
 // printAppStatus 以统一格式打印一条状态（status 与 list 共用，避免两处格式漂移）。

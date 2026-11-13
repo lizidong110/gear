@@ -543,7 +543,7 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 | GET | `/api/executions/:id/logs` | 查看日志 ✅ #71（processRuntime 把 step stdout/stderr 经 `WithLogSink` 落 `ExecStore`；红线：只含运行期输出、绝不落 input/secret 明文） |
 | GET / POST | `/api/hooks` | 列出 / 添加 Hook |
 | POST | `/api/apps` | 启动 Flow 为受管进程（对应 `app run`） |
-| GET | `/api/apps` | 列出运行中的 Flow 进程 |
+| GET | `/api/apps` | 列出受管 Flow 进程（含真实监管态 `state`/重启次数 `restarts`/结束原因 `exit_err`） |
 | DELETE | `/api/apps/{id}` | 停止 Flow 进程（cancel ⇒ 杀掉 service 子进程） |
 | POST | `/api/tools/{id}/versions/{v}/promote` | 用户显式晋升 ✅ S5（CLI `gear tool promote <id> <v> <target>` 与 REST `POST /api/tools/{id}/versions/{v}/promote` 均已实现，均走 `engine.PromoteTool` + before_promote 门禁） |
 

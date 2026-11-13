@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -779,6 +781,143 @@ func TestExecutionLogs(t *testing.T) {
 	// 不存在的执行 → 404。
 	if rec3, _ := do(t, h, "GET", "/api/executions/exec_nope/logs", nil); rec3.Code != http.StatusNotFound {
 		t.Fatalf("不存在执行日志期望 404，实际 %d", rec3.Code)
+	}
+}
+
+// A-13b（REQ-API-LOGS-STREAM）：SSE 实时日志端点——
+// 不存在的执行 → 404（在 Flusher 判定之前返回，故 httptest.ResponseRecorder 也成立）。
+func TestStreamExecutionLogsNotFound(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec, _ := do(t, s.Handler(), "GET", "/api/executions/nope/logs/stream", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("不存在执行的流端点期望 404，实际 %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A-13c（REQ-API-LOGS-STREAM）：订阅后能实时收到执行新产生的日志行，
+// 且 Content-Type 为 text/event-stream。已终态的执行立即发 event: done 并关闭。
+func TestStreamExecutionLogsReceivesLines(t *testing.T) {
+	s, reg := newTestServer(t)
+	h := s.Handler()
+
+	// 慢工具：先留 0.3s 引导窗口（确保订阅先于首行建立），再边睡边打印多行，
+	// 给「订阅 → 收行」留下可观测窗口。
+	if err := reg.UpsertTool(&model.Tool{
+		ID: "slowlog", Name: "L", Runtime: model.RuntimeProcess,
+		Entry:        `sh -c 'sleep 0.3; echo "stream-A"; sleep 0.6; echo "stream-B"; sleep 0.6; echo "{\"ok\":true}"'`,
+		InputSchema:  map[string]interface{}{"type": "object"},
+		OutputSchema: map[string]interface{}{"type": "object"},
+		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
+	}); err != nil {
+		t.Fatalf("注册 Tool 失败: %v", err)
+	}
+	if err := reg.UpsertFlow(&model.Flow{ID: "fslow", Steps: []model.Step{{ID: "s1", Call: "slowlog"}}}); err != nil {
+		t.Fatalf("注册 Flow 失败: %v", err)
+	}
+
+	_, out := do(t, h, "POST", "/api/executions", map[string]interface{}{"flow_id": "fslow"})
+	id, _ := out["id"].(string)
+	if id == "" {
+		t.Fatal("应返回 execution id")
+	}
+
+	// 真·流式连接（httptest.Server + http.Get 支持 Flusher 与增量读）。
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/api/executions/" + id + "/logs/stream")
+	if err != nil {
+		t.Fatalf("建流失败: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("流端点期望 200，实际 %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type 应为 text/event-stream，实际 %q", ct)
+	}
+
+	// 增量读取，直到收集到 stream-A 与 stream-B，或 5s 超时。
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	deadline := time.Now().Add(5 * time.Second)
+	seen := map[string]bool{}
+	for time.Now().Before(deadline) {
+		type res struct {
+			line string
+			ok   bool
+		}
+		ch := make(chan res, 1)
+		go func() {
+			if sc.Scan() {
+				ch <- res{sc.Text(), true}
+			} else {
+				ch <- res{"", false}
+			}
+		}()
+		select {
+		case r := <-ch:
+			if !r.ok {
+				goto collected
+			}
+			if strings.HasPrefix(r.line, "data: ") {
+				var ll LiveLog
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(r.line, "data: ")), &ll); err == nil {
+					if ll.Line == "stream-A" {
+						seen["A"] = true
+					}
+					if ll.Line == "stream-B" {
+						seen["B"] = true
+					}
+				}
+			}
+		case <-time.After(time.Until(deadline)):
+			goto collected
+		}
+		if seen["A"] && seen["B"] {
+			break
+		}
+	}
+collected:
+	if !seen["A"] || !seen["B"] {
+		t.Fatalf("SSE 应实时收到 stream-A 与 stream-B，实际 seen=%v", seen)
+	}
+	// 主动断开：客户端关闭后 handler 应随 context 退出（不泄漏 goroutine）。
+}
+
+// A-13d（REQ-API-LOGS-STREAM）：已终态的执行订阅后应立即收到 event: done 并关闭，
+// 而非空等 15s 保活帧。
+func TestStreamExecutionLogsClosesOnTerminal(t *testing.T) {
+	s, reg := newTestServer(t)
+	h := s.Handler()
+
+	if err := reg.UpsertTool(&model.Tool{
+		ID: "quicklog", Name: "Q", Runtime: model.RuntimeProcess,
+		Entry:        `sh -c 'echo "q-line"; echo "{\"ok\":true}"'`,
+		InputSchema:  map[string]interface{}{"type": "object"},
+		OutputSchema: map[string]interface{}{"type": "object"},
+		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
+	}); err != nil {
+		t.Fatalf("注册 Tool 失败: %v", err)
+	}
+	if err := reg.UpsertFlow(&model.Flow{ID: "fquick", Steps: []model.Step{{ID: "s1", Call: "quicklog"}}}); err != nil {
+		t.Fatalf("注册 Flow 失败: %v", err)
+	}
+
+	_, out := do(t, h, "POST", "/api/executions", map[string]interface{}{"flow_id": "fquick"})
+	id, _ := out["id"].(string)
+	waitStatus(t, h, id, StatusSucceeded) // 等它终态
+
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/api/executions/" + id + "/logs/stream")
+	if err != nil {
+		t.Fatalf("建流失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if !strings.Contains(string(body), "event: done") {
+		t.Fatalf("已终态的流应立即发 event: done，实际: %q", string(body))
 	}
 }
 

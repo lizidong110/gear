@@ -108,6 +108,12 @@ export interface AppDTO {
   flow_id: string
   restart: string
   started_at: string
+  /** 监管态：running（监管 goroutine 在跑）/ exited（已真正退出）。以 done 是否关闭实时重算。 */
+  state: 'running' | 'exited'
+  /** 监管期间 service 累计重启次数（0 = 从未重启）。 */
+  restarts: number
+  /** 监管结束原因（Supervise 返回的 error）；正常收敛为空。 */
+  exit_err?: string
   /** 收尾步带回的「打开地址」（如 web_ui.done），前端直接渲染成可点击链接。 */
   open_urls?: string[]
 }
@@ -210,4 +216,146 @@ export interface PruneAppsRespDTO {
 /** POST /api/events/{handle} 的回推体（subscribe 机制：sidecar 收到消息后 POST 到这里）。 */
 export interface SubscriptionEventReqDTO {
   payload: unknown
+}
+
+// ---- 配置键管理面（REQ-API-CONFIG-CATALOG）----
+// 目录由内核 cap.ConfigCatalog() 提供，前端不硬编码 key 清单：新增键只需改内核。
+
+/** 内置关键配置键的展示元数据（GET /api/config/catalog）。 */
+export interface ConfigKeySpec {
+  key: string
+  label: string
+  group: string
+  description: string
+  default: string
+  default_note?: string
+  env?: string
+  sensitive: boolean
+  options?: string[]
+  value_type: 'string' | 'number' | 'enum' | 'secret'
+}
+
+export interface ConfigCatalogDTO {
+  items: ConfigKeySpec[]
+  groups: string[]
+  priority: string
+}
+
+/** GET /api/config 的单项当前状态。敏感项 value 是掩码，不是明文。 */
+export interface ConfigItemDTO {
+  spec: ConfigKeySpec
+  value: string
+  set: boolean
+  masked: boolean
+  env_override: boolean
+  env_name?: string
+  known: boolean
+}
+
+export interface ConfigListDTO {
+  items: ConfigItemDTO[]
+}
+
+/** PUT /api/config/{key} 的响应（不回显 value，敏感项尤其不能回）。 */
+export interface ConfigSetRespDTO {
+  ok: boolean
+  key: string
+  known: boolean
+}
+
+// ---- App 清单管理面（REQ-API-APP-DEFS）----
+// ⚠ 与上面的 AppDTO（/api/apps 的**内存态受管进程**）不是同一模型：
+//    这里是 registry 里 `kind: App` 的清单定义，即「这个应用由什么组成」。
+
+/** App 清单的 MCP 策展区（model.AppMCP）；一条规则 = 一个对外工具。 */
+export interface AppDefMCPDTO {
+  tools: { ref: string; alias?: string; description?: string; args?: JsonObject }[] | null
+}
+
+/** App 清单本体（model.App 的 TS 投影）。UI 只展示头部字段，其余区段用宽松类型兜住。 */
+export interface AppDefBodyDTO {
+  id: string
+  name: string
+  description: string
+  entry_flow: string
+  layout?: JsonObject | null
+  start?: JsonObject | null
+  requires?: JsonObject | null
+  mcp?: AppDefMCPDTO | null
+}
+
+/** 组成清单（artifact.Components）：导出时会按这些 id 收集定义文档。 */
+export interface AppDefComponentsDTO {
+  entry_flow: string
+  tools: string[] | null
+  flows: string[] | null
+  hooks: string[] | null
+  static_files: string[] | null
+}
+
+/** GET /api/app-defs 与 GET /api/app-defs/{id} 的单项。 */
+export interface AppDefDTO {
+  app: AppDefBodyDTO
+  components: AppDefComponentsDTO | null
+  counts: Record<string, number>
+  synth_note?: string
+}
+
+export interface AppDefListDTO {
+  items: AppDefDTO[]
+}
+
+/** POST /api/app-defs/import 的请求体：bundle 是多文档 YAML **文本**（不是服务器路径）。 */
+export interface AppDefImportReqDTO {
+  bundle: string
+  dry_run?: boolean
+  overwrite?: boolean
+}
+
+/** bundle 解析诊断（engine.Diagnostic），含「怎么修」的 hint。 */
+export interface BundleDiagnosticDTO {
+  code: string
+  message: string
+  step?: string
+  field?: string
+  hint?: string
+}
+
+/** POST /api/app-defs/import 的响应。dry_run=true 时额外给 conflicts（冲突上界预告）。 */
+export interface AppDefImportRespDTO {
+  dry_run: boolean
+  created?: string[]
+  updated?: string[]
+  conflicts?: string[]
+  migrations_applied?: number[]
+}
+
+/** 坏 bundle 的 400 响应体（HTTP 错误，经 ApiError.body 解析后展示结构化诊断）。 */
+export interface BadBundleRespDTO {
+  code: string
+  message: string
+  diagnostics: BundleDiagnosticDTO[]
+}
+
+// ---- detached 台账侧 App（REQ-API-APP-LOGS）----
+// ⚠ 与 AppDTO（/api/apps 内存态受管进程）不是同一模型：这是 `gear app start` /
+//    MCP gear_app(start) 留下的**落盘台账**，跨会话存活，UI 靠它选实时日志订阅对象。
+
+/** GET /api/apps/records 的单条台账。字段是**状态投影**，不含任何日志内容。 */
+export interface AppRecordDTO {
+  app_id: string
+  flow_id: string
+  pid: number
+  restart: string
+  started_at: string
+  state: string
+  log_path: string
+  /** 派生时是否注入了实时日志回推 env；false = 面板不会有数据（不是「暂时没日志」）。 */
+  live_logs: boolean
+  ports?: { port: number; listening: boolean }[]
+  final_state?: string
+}
+
+export interface AppRecordListDTO {
+  items: AppRecordDTO[]
 }

@@ -90,6 +90,46 @@ func TestSuperviseRestartAlways(t *testing.T) {
 	}
 }
 
+// REQ-APP-MANAGED-STATE：SetOnRestart 重启观察回调——每次重启后收到累计次数。
+// REST 面靠它把重启计数回填进 /api/apps（supervisor 在 server 侧是局部创建的，
+// 事后读不到 RestartCount，没有回调则崩溃重启对管理面不可见 → UI 假绿）。
+func TestSupervisorOnRestartCallback(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	if err := reg.UpsertTool(svcTool("sleep 0.2")); err != nil {
+		t.Fatalf("注册 Tool 失败: %v", err)
+	}
+	registerSvcFlow(t, reg, "cb")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sup := New(engine.New(reg), RestartAlways, 0)
+	totals := make(chan int, 64)
+	sup.SetOnRestart(func(total int) { totals <- total })
+	done := make(chan error, 1)
+	go func() { done <- sup.Supervise(ctx, []string{"cb"}) }()
+
+	// 等「回调已触发」这一**事件**，而不是固定窗口（红线 13）。
+	deadline := time.Now().Add(15 * time.Second)
+	last := 0
+	for last < 1 && time.Now().Before(deadline) {
+		select {
+		case last = <-totals:
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Supervise 失败: %v", err)
+	}
+	if last < 1 {
+		t.Fatal("restart=always 下重启回调应至少触发一次")
+	}
+	if n := sup.RestartCount(); n < last {
+		t.Fatalf("回调累计(%d) 不应超过 RestartCount(%d)", last, n)
+	}
+}
+
 // S2-stays-alive：长驻 service 在 ctx 取消前不退出、不重启，取消后监管结束。
 func TestSuperviseStaysAliveThenCancel(t *testing.T) {
 	reg := newTestRegistry(t)

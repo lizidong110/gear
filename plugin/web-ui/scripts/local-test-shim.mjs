@@ -59,6 +59,13 @@ class Assertion {
     this.#check(Object.is(this.actual, expected), `期望 ${show(expected)}，实际 ${show(this.actual)}`)
   }
 
+  // vitest 的原生断言；此前 shim 漏了它，导致「枚举与内核一致」这条防漂移断言在
+  // gate:local 里报 `toBeTruthy is not a function`，而 vitest 下却是绿的——
+  // 两条闸门口径不一致会让「本地全绿」变成假象，故补齐并保留 #check 的 not 语义。
+  toBeTruthy() {
+    this.#check(Boolean(this.actual), `期望为真值，实际 ${show(this.actual)}`)
+  }
+
   toEqual(expected) {
     this.#check(deepEqual(this.actual, expected), `期望 ${show(expected)}，实际 ${show(this.actual)}`)
   }

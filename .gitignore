@@ -49,3 +49,4 @@ examples/*
 !examples/*.yaml
 !examples/*.md
 **/__pycache__
+plugin/web-ui/.vitest-tmp/

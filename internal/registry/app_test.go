@@ -243,3 +243,132 @@ func TestAppTableIsolate(t *testing.T) {
 		t.Fatalf("GetTool 取到了非 Tool 数据: %+v", tl)
 	}
 }
+
+// T-reg-app-06：DeleteAppCascade 连根拔起——删 App + 其拥有的 Tool/Flow/Hook，
+// 但**不**碰归属其它 App 的实体（连根≠误伤隔壁）。
+func TestAppDeleteCascade(t *testing.T) {
+	reg := mustOpen(t)
+	defer reg.Close()
+
+	if err := reg.UpsertApp(validApp("demo")); err != nil {
+		t.Fatalf("UpsertApp 失败: %v", err)
+	}
+	// 拥有的 Flow（entry_flow，demo. 前缀）
+	if err := reg.UpsertFlow(&model.Flow{ID: "demo.up", Steps: []model.Step{{ID: "s1", Call: "noop"}}}); err != nil {
+		t.Fatalf("UpsertFlow demo.up 失败: %v", err)
+	}
+	// 拥有的 Tool（demo__ 前缀）
+	if err := reg.UpsertTool(validTool("demo__t1")); err != nil {
+		t.Fatalf("UpsertTool demo__t1 失败: %v", err)
+	}
+	// 拥有的 Hook（demo__ 前缀）
+	if err := reg.UpsertHook(&model.Hook{ID: "demo__h1", Stage: "before_flow", Action: "noop", Target: "*"}); err != nil {
+		t.Fatalf("UpsertHook demo__h1 失败: %v", err)
+	}
+	// 隔壁 App 的实体——必须原样保留。
+	if err := reg.UpsertTool(validTool("other__x")); err != nil {
+		t.Fatalf("UpsertTool other__x 失败: %v", err)
+	}
+	if err := reg.UpsertFlow(&model.Flow{ID: "other.up", Steps: []model.Step{{ID: "s1", Call: "noop"}}}); err != nil {
+		t.Fatalf("UpsertFlow other.up 失败: %v", err)
+	}
+
+	removed, err := reg.DeleteAppCascade("demo")
+	if err != nil {
+		t.Fatalf("DeleteAppCascade 失败: %v", err)
+	}
+	// App + 1 Flow + 1 Tool + 1 Hook = 4
+	if len(removed) != 4 {
+		t.Fatalf("应删 4 个，实际 %d: %v", len(removed), removed)
+	}
+	// 拥有的实体全部消失。
+	if a, _ := reg.GetApp("demo"); a != nil {
+		t.Fatalf("App 应已删，却仍在: %+v", a)
+	}
+	if f, _ := reg.GetFlow("demo.up"); f != nil {
+		t.Fatalf("Flow demo.up 应已删，却仍在")
+	}
+	if tl, _ := reg.GetTool("demo__t1"); tl != nil {
+		t.Fatalf("Tool demo__t1 应已删，却仍在")
+	}
+	if h, _ := reg.GetHook("demo__h1"); h != nil {
+		t.Fatalf("Hook demo__h1 应已删，却仍在")
+	}
+	// 隔壁实体必须幸存。
+	if tl, _ := reg.GetTool("other__x"); tl == nil {
+		t.Fatalf("隔壁 Tool other__x 被误删")
+	}
+	if fl, _ := reg.GetFlow("other.up"); fl == nil {
+		t.Fatalf("隔壁 Flow other.up 被误删")
+	}
+	// 连根拔起必须包含历史：definition_history 里这些 id 的行应一并消失，
+	// 否则 `gear history restore` 还能把已删对象写回（"连根"名不副实）。
+	for _, id := range []string{"demo", "demo.up", "demo__t1", "demo__h1"} {
+		rows, herr := reg.ListHistory("", id, 100)
+		if herr != nil {
+			t.Fatalf("ListHistory(%s) 失败: %v", id, herr)
+		}
+		if len(rows) != 0 {
+			t.Fatalf("级联删后 definition_history 仍残留 id=%s 共 %d 行: %+v", id, len(rows), rows)
+		}
+	}
+}
+
+// T-reg-app-07：跨 App 引用守卫仍生效——隔壁 Flow 引用了本 App 的 Tool 时，级联必须
+// fail-closed：被引用 Tool 与 App 本身都保留。已删的 Flow 不回滚（gear 既有语义：快照留痕可找回）。
+func TestAppDeleteCascadeBlocksCrossAppRef(t *testing.T) {
+	reg := mustOpen(t)
+	defer reg.Close()
+
+	if err := reg.UpsertApp(validApp("demo")); err != nil {
+		t.Fatalf("UpsertApp 失败: %v", err)
+	}
+	if err := reg.UpsertFlow(&model.Flow{ID: "demo.up", Steps: []model.Step{{ID: "s1", Call: "noop"}}}); err != nil {
+		t.Fatalf("UpsertFlow demo.up 失败: %v", err)
+	}
+	if err := reg.UpsertTool(validTool("demo__t1")); err != nil {
+		t.Fatalf("UpsertTool demo__t1 失败: %v", err)
+	}
+	// 隔壁 Flow 引用了 demo__t1 —— 跨 App 引用，必须拦。
+	if err := reg.UpsertFlow(&model.Flow{ID: "other.up", Steps: []model.Step{{ID: "s1", Call: "demo__t1"}}}); err != nil {
+		t.Fatalf("UpsertFlow other.up 失败: %v", err)
+	}
+
+	_, err := reg.DeleteAppCascade("demo")
+	if err == nil {
+		t.Fatal("跨 App 引用应阻止级联，实际成功")
+	}
+	if !strings.Contains(err.Error(), "other.up") {
+		t.Fatalf("错误应点明引用者 other.up，实际: %v", err)
+	}
+	// 被引用的 Tool 与 App 必须保留（级联在删 Tool 阶段中止，未触达 App 删除）。
+	if tl, _ := reg.GetTool("demo__t1"); tl == nil {
+		t.Fatalf("被引用的 demo__t1 不应被删")
+	}
+	if a, _ := reg.GetApp("demo"); a == nil {
+		t.Fatalf("App 不应被删（级联中止）")
+	}
+	// 已删的 demo.up（Flow 阶段先删）保持已删——不回滚，符合既有语义。
+	if f, _ := reg.GetFlow("demo.up"); f != nil {
+		t.Fatalf("demo.up 应已在 Flow 阶段被删: %+v", f)
+	}
+	// 中止分支也要清已删部分的历史：demo.up 的 history 应被 purge（含本次 delete 留痕），
+	// 否则 registry 没了但 history 还能还原，正是要修的缺陷。
+	if rows, herr := reg.ListHistory("", "demo.up", 100); herr != nil || len(rows) != 0 {
+		t.Fatalf("中止后 demo.up 的 history 应被 purge，实际 herr=%v rows=%d", herr, len(rows))
+	}
+	// 未删的 demo__t1 / demo 的历史应保留（它们还在 registry 里）。
+	if rows, _ := reg.ListHistory("", "demo__t1", 100); len(rows) == 0 {
+		t.Fatalf("未删的 demo__t1 历史不应被清")
+	}
+}
+
+// T-reg-app-08：级联删不存在的 App 报 ErrNotFound（与 DeleteApp 一致），不留痕、不误伤。
+func TestAppDeleteCascadeNotFound(t *testing.T) {
+	reg := mustOpen(t)
+	defer reg.Close()
+	_, err := reg.DeleteAppCascade("nope")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("应报 ErrNotFound，实际: %v", err)
+	}
+}
