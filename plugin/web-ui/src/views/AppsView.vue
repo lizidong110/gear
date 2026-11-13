@@ -19,7 +19,7 @@ import { useAppsStore } from '@/stores/apps'
 import { useCatalogStore } from '@/stores/catalog'
 import { useApiError } from '@/composables/useApiError'
 import { endpoints, streamAppLogs, type LiveLog } from '@/api/endpoints'
-import type { AppDTO, AppRecordDTO, PruneAppsRespDTO } from '@/api/types'
+import type { AppDTO, PruneAppsRespDTO } from '@/api/types'
 
 const apps = useAppsStore()
 const catalog = useCatalogStore()
@@ -65,8 +65,8 @@ async function start() {
     await apps.start(flowId.value, restart.value)
     ok(`已托管 ${flowId.value}（restart=${restart.value}）`)
     // 启动后从刷新后的列表里取该 App 的打开地址，直接呈现可点击跳转链接
-    // （收尾步可能稍晚才回传地址，列表每 5s 轮询会自然补全；此处先尽量即时给出）。
-    const a = apps.apps.find((x) => x.flow_id === flowId.value)
+    // （收尾步可能稍晚才在日志里打 GEAR_OPEN_URL 标记，列表每 5s 轮询会自然补全）。
+    const a = apps.apps.find((x) => x.flow_id === flowId.value && x.state === 'running')
     startedLinks.value = a?.open_urls ?? []
   } catch (e) {
     report(e, '启动 App')
@@ -78,13 +78,13 @@ async function start() {
 function confirmStop(a: AppDTO) {
   dialog.warning({
     title: '停止受管 App',
-    content: `取消 ${a.id}（${a.flow_id}）的 ctx ⇒ Supervisor 会停止并杀掉它的所有 service 子进程。`,
+    content: `按台账停止 ${a.app_id}（${a.flow_id}）：杀掉整个进程树并复检端口。收不干净会如实报错。`,
     positiveText: '停止',
     negativeText: '取消',
     onPositiveClick: async () => {
       try {
-        await apps.stop(a.id)
-        ok(`已停止 ${a.id}`)
+        await apps.stop(a.app_id)
+        ok(`已停止 ${a.app_id}`)
       } catch (e) {
         report(e, '停止 App')
       }
@@ -92,8 +92,7 @@ function confirmStop(a: AppDTO) {
   })
 }
 
-// ---- 清理应用台账（POST /api/apps/prune）：与内存侧 /api/apps 不是同一模型，
-//      动的是 `gear app start` 落下的持久台账。只删确定已终止的记录，不杀进程、不碰端口。 ----
+// ---- 清理应用台账（POST /api/apps/prune）：只删确定已终止的记录，不杀进程、不碰端口。 ----
 const pruning = ref(false)
 const pruneResult = ref<PruneAppsRespDTO | null>(null)
 
@@ -120,29 +119,37 @@ function confirmPrune() {
   })
 }
 
+// 状态 → 标签颜色：running 绿；unknown 黄（双判据矛盾，不猜）；exited / startup_failed /
+// restart_exhausted 红（后者是「被反复弄死到放弃重启」，必须与正常退出区分开）；
+// stopped / starting 灰（终态 / 还没起完）。
+function stateTagType(state: string): 'success' | 'warning' | 'error' | 'default' {
+  if (state === 'running') return 'success'
+  if (state === 'unknown') return 'warning'
+  if (state === 'exited' || state === 'startup_failed' || state === 'restart_exhausted') return 'error'
+  return 'default'
+}
+
 const columns = computed<DataTableColumns<AppDTO>>(() => [
-  { title: 'app id', key: 'id', width: 200, render: (row) => h('span', { class: 'text-mono' }, row.id) },
-  { title: 'Flow', key: 'flow_id', width: 200, render: (row) => h('span', { class: 'text-mono' }, row.flow_id) },
-  // 真实监管态（REQ-APP-MANAGED-STATE）：以服务端 done 是否关闭实时重算，
-  // 防「监管已死、列表仍 running」的假绿（gear UI 显示正常但 app 实际没工作）。
+  { title: 'app id', key: 'app_id', width: 200, render: (row) => h('span', { class: 'text-mono' }, row.app_id) },
+  { title: 'Flow', key: 'flow_id', width: 180, render: (row) => h('span', { class: 'text-mono' }, row.flow_id) },
+  // 台账双判据（pid 存活 + 端口探活）实时算出的状态，服务端每轮刷新都重算，不缓存不假绿。
   {
     title: '状态',
     key: 'state',
     width: 110,
-    render: (row) => {
-      const exited = row.state === 'exited'
-      return h(
+    render: (row) =>
+      h(
         NTag,
-        { size: 'small', type: exited ? 'error' : 'success', bordered: false, title: exited ? row.exit_err || '监管已结束' : '监管运行中' },
-        () => (exited ? 'exited' : 'running'),
-      )
-    },
+        { size: 'small', type: stateTagType(row.state), bordered: false, title: `PID ${row.pid}` },
+        () => row.state,
+      ),
   },
+  { title: 'PID', key: 'pid', width: 80, render: (row) => String(row.pid) },
   {
     title: 'restart',
     key: 'restart',
-    width: 120,
-    render: (row) => h(NTag, { size: 'small', type: 'info', bordered: false }, () => row.restart),
+    width: 100,
+    render: (row) => h(NTag, { size: 'small', type: 'info', bordered: false }, () => row.restart ?? '—'),
   },
   {
     title: '重启次数',
@@ -158,22 +165,33 @@ const columns = computed<DataTableColumns<AppDTO>>(() => [
     },
   },
   {
+    title: '实时日志',
+    key: 'live_logs',
+    width: 100,
+    render: (row) =>
+      h(
+        NTag,
+        { size: 'small', type: row.live_logs ? 'success' : 'warning', bordered: false },
+        () => (row.live_logs ? '已接入' : '未接入'),
+      ),
+  },
+  {
     title: '启动时刻',
     key: 'started_at',
-    width: 200,
+    width: 170,
     render: (row) => new Date(row.started_at).toLocaleString(),
   },
   {
     title: '已运行',
     key: 'uptime',
-    width: 100,
-    // exited 后没有退出时刻可算，显示 — 而不是继续走表（会误读成还在跑）。
-    render: (row) => (row.state === 'exited' ? h('span', { class: 'text-3' }, '—') : uptime(row)),
+    width: 90,
+    // 已退出 / 已停止的没有「正在运行多久」可算，显示 —（继续走表会误读成还在跑）。
+    render: (row) => (row.state === 'running' ? uptime(row) : h('span', { class: 'text-3' }, '—')),
   },
   {
     title: '打开地址',
     key: 'open_urls',
-    width: 260,
+    width: 220,
     render: (row) => {
       const urls = row.open_urls ?? []
       if (urls.length === 0) return h('span', { class: 'text-3' }, '—')
@@ -190,36 +208,85 @@ const columns = computed<DataTableColumns<AppDTO>>(() => [
     title: '操作',
     key: 'actions',
     fixed: 'right' as const,
-    width: 160,
-    render: (row) => h(NButton, { size: 'small', type: 'error', quaternary: true, onClick: () => confirmStop(row) }, () => '停止'),
+    width: 170,
+    render: (row) =>
+      h('div', { style: 'display:flex;gap:4px' }, [
+        h(NButton, { size: 'small', quaternary: true, onClick: () => openLogDrawer(row) }, () => '实时日志'),
+        h(
+          NButton,
+          { size: 'small', type: 'error', quaternary: true, disabled: row.state === 'stopped' || row.state === 'startup_failed' || row.state === 'restart_exhausted', onClick: () => confirmStop(row) },
+          () => '停止',
+        ),
+      ]),
   },
 ])
 
-// ---- 后台应用台账 + 实时日志（REQ-API-APP-LOGS）----
-// 上方列表是 /api/apps 的**内存态受管进程**；这里是 gear app start / MCP gear_app(start)
-// 派生的独立后台进程（落盘台账）。两者同名前缀，页面必须讲清，否则用户会盯着空列表问
-// 「我跑着的应用呢」。实时日志走 SSE：只显示订阅后新产生的行，绝不读 <appID>.log。
+// ---- 实时日志（REQ-API-APP-LOGS）----
+// 订阅对象即上面台账表的行。SSE 只推订阅后新产生的行，绝不读 <appID>.log 回放历史。
 const MAX_LOG_LINES = 500
-const records = ref<AppRecordDTO[]>([])
-const recordsLoading = ref(false)
 const showLogs = ref(false)
-const logApp = ref<AppRecordDTO | null>(null)
+const logApp = ref<AppDTO | null>(null)
 const liveOn = ref(false)
 const logLines = ref<LiveLog[]>([])
 const logError = ref('')
 const logClosed = ref(false)
 let logAbort: AbortController | null = null
 
-async function loadRecords() {
-  recordsLoading.value = true
+// ---- 调用详情展开（REQ-APP-LOGS-DIRECT-TOOL 的 GEAR_TOOL_CALL 详情标记）----
+// serve 在回推上下文里给 ✓/✗ Tool 行尾附加单行 JSON（入参 + 返回 + 错误）。
+// UI 把行拆成「摘要文本 + 详情」，点击行切换展开/折叠；解析失败按普通行渲染。
+interface ToolCallDetail {
+  kind?: string
+  id?: string
+  ok?: boolean
+  ms?: number
+  input?: unknown
+  output?: unknown
+  error?: string
+}
+const TOOL_CALL_MARKER = '\tGEAR_TOOL_CALL='
+const expandedLogRows = ref(new Set<number>())
+
+function splitToolCallDetail(line: string): { text: string; detail: ToolCallDetail | null } {
+  const idx = line.indexOf(TOOL_CALL_MARKER)
+  if (idx < 0) return { text: line, detail: null }
   try {
-    const res = await endpoints.listAppRecords()
-    records.value = res.items ?? []
-  } catch (e) {
-    report(e, '加载后台应用台账')
-  } finally {
-    recordsLoading.value = false
+    return {
+      text: line.slice(0, idx),
+      detail: JSON.parse(line.slice(idx + TOOL_CALL_MARKER.length)) as ToolCallDetail,
+    }
+  } catch {
+    return { text: line, detail: null } // 残缺标记（如被截断）按普通行渲染
   }
+}
+
+// 渲染视图：解析一次，模板不重复 split。
+const renderedLogLines = computed(() =>
+  logLines.value.map((l, i) => {
+    const { text, detail } = splitToolCallDetail(l.line)
+    return { ...l, index: i, text, detail }
+  }),
+)
+
+function toggleLogRow(i: number) {
+  const next = new Set(expandedLogRows.value)
+  if (next.has(i)) next.delete(i)
+  else next.add(i)
+  expandedLogRows.value = next
+}
+
+function prettyJSON(v: unknown): string {
+  if (v === null || v === undefined) return '—'
+  try {
+    return JSON.stringify(v, null, 2)
+  } catch {
+    return String(v)
+  }
+}
+
+function clearLogs() {
+  logLines.value = []
+  expandedLogRows.value = new Set<number>()
 }
 
 function stopAppLogStream() {
@@ -230,20 +297,21 @@ function stopAppLogStream() {
 }
 
 function startAppLogStream() {
-  const app = logApp.value
-  if (!app) return
+  const a = logApp.value
+  if (!a) return
   stopAppLogStream()
   logError.value = ''
   logClosed.value = false
   const ctrl = new AbortController()
   logAbort = ctrl
   void streamAppLogs(
-    app.app_id,
+    a.app_id,
     ctrl.signal,
     (l: LiveLog) => {
       logLines.value.push(l)
       if (logLines.value.length > MAX_LOG_LINES) {
         logLines.value.splice(0, logLines.value.length - MAX_LOG_LINES)
+        expandedLogRows.value = new Set<number>() // 行号整体前移，展开状态不再可靠，统一收起
       }
     },
     () => {
@@ -263,10 +331,11 @@ function toggleLive(on: boolean) {
   else stopAppLogStream()
 }
 
-function openLogDrawer(row: AppRecordDTO) {
+function openLogDrawer(row: AppDTO) {
   stopAppLogStream()
   logApp.value = row
   logLines.value = []
+  expandedLogRows.value = new Set<number>()
   logError.value = ''
   logClosed.value = false
   showLogs.value = true
@@ -274,57 +343,9 @@ function openLogDrawer(row: AppRecordDTO) {
   startAppLogStream()
 }
 
-const recordColumns = computed<DataTableColumns<AppRecordDTO>>(() => [
-  {
-    title: 'app id',
-    key: 'app_id',
-    width: 210,
-    render: (row) => h('span', { class: 'text-mono' }, row.app_id),
-  },
-  {
-    title: 'Flow',
-    key: 'flow_id',
-    width: 180,
-    render: (row) => h('span', { class: 'text-mono' }, row.flow_id),
-  },
-  {
-    title: '状态',
-    key: 'state',
-    width: 120,
-    render: (row) =>
-      h(
-        NTag,
-        {
-          size: 'small',
-          type: row.state === 'running' ? 'success' : row.state === 'unknown' ? 'warning' : 'default',
-          bordered: false,
-        },
-        () => row.state,
-      ),
-  },
-  { title: 'PID', key: 'pid', width: 90, render: (row) => String(row.pid) },
-  {
-    title: '实时日志',
-    key: 'live_logs',
-    width: 120,
-    render: (row) =>
-      h(NTag, { size: 'small', type: row.live_logs ? 'success' : 'warning', bordered: false }, () =>
-        row.live_logs ? '已接入' : '未接入',
-      ),
-  },
-  {
-    title: '操作',
-    key: 'actions',
-    fixed: 'right' as const,
-    width: 140,
-    render: (row) =>
-      h(NButton, { size: 'small', quaternary: true, onClick: () => openLogDrawer(row) }, () => '实时日志'),
-  },
-])
-
 onMounted(async () => {
   try {
-    await Promise.all([catalog.loadAll(), apps.loadList(), loadRecords()])
+    await Promise.all([catalog.loadAll(), apps.loadList()])
   } catch (e) {
     report(e, '加载 App 列表')
   }
@@ -341,14 +362,10 @@ onUnmounted(() => {
   <div>
     <h2 class="page-title">Apps · 长驻</h2>
     <p class="page-desc">
-      <code>POST /api/apps</code> 等价于 CLI <code>app run</code>：把一条含 <b>service</b> step 的 Flow
-      变成受管进程，Supervisor 负责拉起、健康探针、崩溃退避重启；停止即取消 ctx，连带杀掉所有 service 子进程。
+      <code>POST /api/apps</code> 是 CLI <code>gear app start</code> 的 REST 包装：把一条含
+      <b>service</b> step 的 Flow 派生为<b>独立后台进程</b>（脱离 serve 进程树），监管由它自己持有，
+      台账落盘、跨会话存活；「停止」按台账杀整个进程树并复检端口。重启 <code>gear serve</code> 不会带走应用。
     </p>
-
-    <NAlert type="warning" :bordered="false" style="margin-bottom: 12px">
-      <b>状态持久性</b>：App 列表是内核的<b>内存态</b>（<code>server.apps</code> 这个 map）。
-      重启 <code>gear serve</code> 后列表会清空、子进程也不会自动恢复 —— 这与执行记录（SQLite 持久）不同，是内核的既定设计。
-    </NAlert>
 
     <NSpace style="margin-bottom: 12px" align="center">
       <NSelect
@@ -383,7 +400,13 @@ onUnmounted(() => {
       >
     </NAlert>
 
-    <NCard size="small">
+    <NCard size="small" title="应用台账">
+      <p class="text-3" style="margin-top: 0">
+        这些是落盘台账的应用（含 CLI <code>gear app start</code> / MCP <code>gear_app(start)</code> /
+        本页托管启动的所有来源）。状态由服务端按 <b>pid 存活 + 端口探活</b> 实时算出；
+        点「实时日志」订阅该应用<b>订阅之后新产生</b>的 process / service 输出——
+        <b>不读取日志文件、不回放历史</b>。
+      </p>
       <NDataTable
         v-if="apps.apps.length > 0"
         :columns="columns"
@@ -392,11 +415,14 @@ onUnmounted(() => {
         :bordered="false"
         :single-line="false"
         size="small"
-        :scroll-x="980"
+        :scroll-x="1220"
         :pagination="false"
-        :row-key="(row: AppDTO) => row.id"
+        :row-key="(row: AppDTO) => row.app_id"
       />
-      <NEmpty v-else description="当前没有受管的长驻 App" />
+      <NEmpty
+        v-else
+        description="台账里没有应用（托管启动或 gear app start 之后会出现在这里）"
+      />
     </NCard>
 
     <NCard v-if="pruneResult" size="small" title="清理结果" style="margin-top: 12px">
@@ -410,41 +436,12 @@ onUnmounted(() => {
       <p v-if="pruneResult.hint" class="text-3">{{ pruneResult.hint }}</p>
     </NCard>
 
-    <!-- 后台应用台账：用户真正跑着的 detached App 在这一列，不在上面的内存态列表里 -->
-    <NCard size="small" title="后台应用 · 台账（gear app start / MCP gear_app(start)）" style="margin-top: 12px">
-      <p class="text-3" style="margin-top: 0">
-        这些是 <b>独立后台进程</b>的落盘台账，跨会话存活；与上方「受管 App」的内存态列表不是同一模型。
-        点「实时日志」订阅该应用 <b>订阅之后新产生</b> 的 process / service 输出——
-        <b>不读取日志文件、不回放历史</b>。
-      </p>
-      <NSpace style="margin-bottom: 10px" align="center">
-        <NButton size="small" :loading="recordsLoading" @click="loadRecords">刷新台账</NButton>
-        <span class="text-3">共 {{ records.length }} 条</span>
-      </NSpace>
-      <NDataTable
-        v-if="records.length > 0"
-        :columns="recordColumns"
-        :data="records"
-        :loading="recordsLoading"
-        :bordered="false"
-        :single-line="false"
-        size="small"
-        :scroll-x="900"
-        :pagination="false"
-        :row-key="(row: AppRecordDTO) => row.app_id"
-      />
-      <NEmpty
-        v-else
-        description="没有后台应用台账（用 gear app start 或 MCP gear_app(start) 启动后会出现在这里）"
-      />
-    </NCard>
-
     <NDrawer v-model:show="showLogs" :width="720" placement="right">
       <NDrawerContent :title="`实时日志 · ${logApp?.app_id ?? ''}`" closable>
         <NSpace align="center" :size="8" style="margin-bottom: 10px">
           <NSwitch v-model:value="liveOn" @update:value="(v: boolean) => toggleLive(v)" />
           <span>实时（关掉即断开 SSE，不清空已收到的行）</span>
-          <NButton size="small" quaternary @click="logLines = []">清空</NButton>
+          <NButton size="small" quaternary @click="clearLogs">清空</NButton>
         </NSpace>
 
         <NAlert
@@ -466,11 +463,31 @@ onUnmounted(() => {
 
         <p class="text-3" style="margin: 0 0 6px">
           只显示订阅后新产生的行（process / service 的 stdout / stderr），不读日志文件、不回放历史。
+          带 ▸ 的 ✓/✗ Tool 行<b>可点击展开</b>入参与返回结果，再点折叠。
         </p>
         <div class="log-view">
-          <div v-for="(l, i) in logLines" :key="i" :class="l.stream === 'stderr' ? 'log-err' : ''">
-            <span class="text-3">{{ l.step_id ? l.step_id + ' · ' : '' }}</span>{{ l.line }}
-          </div>
+          <template v-for="l in renderedLogLines" :key="l.index">
+            <div
+              v-if="l.detail"
+              class="log-row"
+              :title="l.detail.error ? '点击展开完整错误' : '点击展开入参与返回'"
+              @click="toggleLogRow(l.index)"
+            >
+              <span class="chev">{{ expandedLogRows.has(l.index) ? '▾' : '▸' }}</span>
+              <span :class="l.stream === 'stderr' ? 'log-err' : ''"
+                ><span class="text-3">{{ l.step_id ? l.step_id + ' · ' : '' }}</span
+                >{{ l.text }}</span
+              >
+            </div>
+            <div v-else :class="l.stream === 'stderr' ? 'log-err' : ''">
+              <span class="text-3">{{ l.step_id ? l.step_id + ' · ' : '' }}</span>{{ l.line }}
+            </div>
+            <template v-if="l.detail && expandedLogRows.has(l.index)">
+              <pre v-if="l.detail.input != null" class="log-detail">入参：{{ prettyJSON(l.detail.input) }}</pre>
+              <pre v-if="l.detail.output != null" class="log-detail">返回：{{ prettyJSON(l.detail.output) }}</pre>
+              <pre v-if="l.detail.error" class="log-detail log-err">错误：{{ l.detail.error }}</pre>
+            </template>
+          </template>
           <span v-if="logLines.length === 0" class="text-3">
             {{ liveOn ? '已连接，等待新日志…（Tool / Flow 产生输出时才会出现）' : '实时开关已关闭' }}
           </span>
@@ -497,6 +514,30 @@ onUnmounted(() => {
 }
 .log-err {
   color: #f2777a;
+}
+/* ✓/✗ Tool 行可点击展开（GEAR_TOOL_CALL 详情标记） */
+.log-row {
+  cursor: pointer;
+  border-radius: 3px;
+}
+.log-row:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.chev {
+  display: inline-block;
+  width: 13px;
+  color: var(--text-color-3, #999);
+  user-select: none;
+}
+.log-detail {
+  margin: 2px 0 6px 13px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 </style>
 

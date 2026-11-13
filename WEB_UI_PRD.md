@@ -149,7 +149,7 @@
 | REQ-UI-EXEC-HISTORY | 执行历史列表（时间/流/状态/耗时/用到的 Tool），可重跑/查看 | P1 | TestExecHistoryRerun | partial |
 | REQ-UI-EXEC-RETRY | 失败执行一键重跑（同入参） | P2 | TestExecRetrySameInput | deferred |
 | REQ-UI-EXEC-EXPORT | 执行结果/日志导出 JSON 或复制为可分享文本 | P2 | TestExecExportJSON | deferred |
-| REQ-UI-APP-LOGS | Apps 页新增「后台应用 · 台账」区块（`gear app start` / MCP `gear_app(start)` 的独立进程，与内存态受管进程分栏）；每条可打开**实时日志**抽屉，开关默认开、可随时断开；只显示订阅后新产生的 process/service 输出，**不读日志文件、不回放历史**；`live_logs=false` 时显式提示未接入及恢复办法（重启该应用） | P0 | TestStreamAppLogsReceivesLines、TestListAppRecordsReportsLiveLogs、TestIngestAppLogsRequiresTokenAndKnownApp | **implemented**（2026-11-11，见 REQ-API-APP-LOGS） |
+| REQ-UI-APP-LOGS | Apps 页实时日志抽屉（台账应用，REQ-APP-MANAGED-DETACHED 后与托管启动同表）：每条可打开**实时日志**抽屉，开关默认开、可随时断开；只显示订阅后新产生的 process/service 输出，**不读日志文件、不回放历史**；`live_logs=false` 时显式提示未接入及恢复办法（重启该应用） | P0 | TestStreamAppLogsReceivesLines、TestListAppRecordsReportsLiveLogs、TestIngestAppLogsRequiresTokenAndKnownApp | **implemented**（2026-11-11 见 REQ-API-APP-LOGS；2026-11-13 两表合一，`GET /api/apps/records` 移除） |
 
 ### 3.5 能力目录与调用
 

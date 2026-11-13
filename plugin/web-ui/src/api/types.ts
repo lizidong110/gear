@@ -1,6 +1,6 @@
 // REST 契约的 TS 投影 —— 形状必须与 Go 的 json tag 一致（内核是唯一真相源）。
 // 对应实现：internal/model/model.go、internal/engine/engine.go:RunResult、
-//          internal/server/execstore.go:Execution、internal/server/server.go:AppInstance。
+//          internal/server/execstore.go:Execution、internal/app/record.go:Record（App 台账）。
 //
 // 凡标 `| null` 的字段，对应 Go 侧是无 omitempty 的切片/map（nil 会序列化成 null），
 // 表单里必须容忍 null，否则 `.map` 会炸。
@@ -102,19 +102,25 @@ export interface ExecutionDTO {
   finished_at?: string | null
 }
 
-/** 受管长驻进程（server.AppInstance）。 */
+/** 受管长驻 App：`gear app start` 落盘台账的实时探活投影（server 端 app.StatusResult；REQ-APP-MANAGED-DETACHED）。 */
 export interface AppDTO {
-  id: string
+  app_id: string
   flow_id: string
-  restart: string
+  pid: number
+  /** 双判据（pid 存活 + 端口探活）实时算出：running / exited / starting / unknown / stopped / startup_failed；
+   *  restart_exhausted = 重启预算耗尽（窗口内被反复弄死到放弃重启，监管进程已退出）。 */
+  state: string
   started_at: string
-  /** 监管态：running（监管 goroutine 在跑）/ exited（已真正退出）。以 done 是否关闭实时重算。 */
-  state: 'running' | 'exited'
-  /** 监管期间 service 累计重启次数（0 = 从未重启）。 */
-  restarts: number
-  /** 监管结束原因（Supervise 返回的 error）；正常收敛为空。 */
-  exit_err?: string
-  /** 收尾步带回的「打开地址」（如 web_ui.done），前端直接渲染成可点击链接。 */
+  /** 已运行秒数（仅 running 时非零）。 */
+  uptime_s?: number
+  restart?: string
+  /** 监管期间 service 累计重启次数（由被派生的监管进程回写台账；0 = 从未重启）。 */
+  restarts?: number
+  /** 派生时是否注入了实时日志回推 env；false = 面板不会有数据（不是「暂时没日志」）。 */
+  live_logs?: boolean
+  ports?: { port: number; listening: boolean }[]
+  log_path: string
+  /** 日志里捞出的「打开地址」（GEAR_OPEN_URL= 标记，如 web_ui.done 收尾步），前端渲染成可点击链接。 */
   open_urls?: string[]
 }
 
@@ -264,7 +270,7 @@ export interface ConfigSetRespDTO {
 }
 
 // ---- App 清单管理面（REQ-API-APP-DEFS）----
-// ⚠ 与上面的 AppDTO（/api/apps 的**内存态受管进程**）不是同一模型：
+// ⚠ 与上面的 AppDTO（/api/apps 的**运行中进程台账**）不是同一层：
 //    这里是 registry 里 `kind: App` 的清单定义，即「这个应用由什么组成」。
 
 /** App 清单的 MCP 策展区（model.AppMCP）；一条规则 = 一个对外工具。 */
@@ -337,25 +343,4 @@ export interface BadBundleRespDTO {
   diagnostics: BundleDiagnosticDTO[]
 }
 
-// ---- detached 台账侧 App（REQ-API-APP-LOGS）----
-// ⚠ 与 AppDTO（/api/apps 内存态受管进程）不是同一模型：这是 `gear app start` /
-//    MCP gear_app(start) 留下的**落盘台账**，跨会话存活，UI 靠它选实时日志订阅对象。
-
-/** GET /api/apps/records 的单条台账。字段是**状态投影**，不含任何日志内容。 */
-export interface AppRecordDTO {
-  app_id: string
-  flow_id: string
-  pid: number
-  restart: string
-  started_at: string
-  state: string
-  log_path: string
-  /** 派生时是否注入了实时日志回推 env；false = 面板不会有数据（不是「暂时没日志」）。 */
-  live_logs: boolean
-  ports?: { port: number; listening: boolean }[]
-  final_state?: string
-}
-
-export interface AppRecordListDTO {
-  items: AppRecordDTO[]
-}
+// （GET /api/apps/records 已移除：REQ-APP-MANAGED-DETACHED 后 AppDTO 即台账投影，一张表。）

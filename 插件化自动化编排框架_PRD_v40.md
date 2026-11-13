@@ -542,9 +542,9 @@ UI / 调度等服务是长驻 Flow（`app run` 启动的进程），通过 REST 
 | GET | `/api/executions/:id` | 查询执行状态（running / succeeded / failed + RunResult） |
 | GET | `/api/executions/:id/logs` | 查看日志 ✅ #71（processRuntime 把 step stdout/stderr 经 `WithLogSink` 落 `ExecStore`；红线：只含运行期输出、绝不落 input/secret 明文） |
 | GET / POST | `/api/hooks` | 列出 / 添加 Hook |
-| POST | `/api/apps` | 启动 Flow 为受管进程（对应 `app run`） |
-| GET | `/api/apps` | 列出受管 Flow 进程（含真实监管态 `state`/重启次数 `restarts`/结束原因 `exit_err`） |
-| DELETE | `/api/apps/{id}` | 停止 Flow 进程（cancel ⇒ 杀掉 service 子进程） |
+| POST | `/api/apps` | 托管启动 = `gear app start` 的 REST 包装（REQ-APP-MANAGED-DETACHED）：detached 派生独立 `app run` + 落台账（201 starting/running、200 already_running 幂等、502 startup_failed 含根因） |
+| GET | `/api/apps` | 列出**落盘台账**应用（跨 serve 重启存活）：状态由 pid+端口双判据实时探活，含重启次数 `restarts`、`live_logs`、`open_urls` |
+| DELETE | `/api/apps/{id}` | 停止应用 = 杀整个进程树 + 端口复检，收不干净如实 502、不存在 404 |
 | POST | `/api/tools/{id}/versions/{v}/promote` | 用户显式晋升 ✅ S5（CLI `gear tool promote <id> <v> <target>` 与 REST `POST /api/tools/{id}/versions/{v}/promote` 均已实现，均走 `engine.PromoteTool` + before_promote 门禁） |
 
 > **实现状态（S6a+S5；AI 改 `ext.ai` 扩展，2026-09-14）**：**均已实现**（含 `GET /api/executions/{id}/logs` #71；晋升经 CLI `tool promote` 与 REST promote 端点均可触发），端到端可用（`gear serve --addr`）。另见 §11 末尾「第四种执行面：MCP」。**注意**：AI 已去内置化——不再是引擎内建原语，而是 `ext.ai` 扩展（sidecar 载体，`examples/gear-ai-sidecar`，结构化多阶段 agent）；REST 端点 `/api/ai/infer` 仍不存在（AI 不经独立端点），改由 `gear ai gen` 薄壳命令或 Flow 内 `ctx.ext.ai.*` 调用（见 §9）。`internal/ai` 旧包已删除。

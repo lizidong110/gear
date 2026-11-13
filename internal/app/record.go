@@ -45,6 +45,10 @@ const (
 	StateStartupFailed AppState = "startup_failed"
 	// StateAlreadyRunning 同 flow 已有活跃实例，未重复拉起（幂等）。
 	StateAlreadyRunning AppState = "already_running"
+	// StateRestartExhausted 重启预算耗尽：窗口内退出次数超限，监管已放弃重启并退出
+	// （REQ-APP-RESTART-LIMIT）。它与 exited 的区别是**有原因**——不是碰巧没了，
+	// 而是「被反复弄死/持续崩溃到不值得再拉」，UI 与排障要看得出这一步。
+	StateRestartExhausted AppState = "restart_exhausted"
 )
 
 // PortState 是单个声明端口的探活结果。

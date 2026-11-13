@@ -4,8 +4,8 @@ import { endpoints } from '@/api/endpoints'
 import type { AppDTO } from '@/api/types'
 
 /**
- * 受管长驻进程（POST /api/apps ⇒ 等价于 CLI `app run`，由 Supervisor 监管 service step）。
- * 注意：app 状态是内核**内存态**（server.apps map），重启 gear serve 后列表会空 —— 见 README 的状态持久性说明。
+ * 受管长驻 App（POST /api/apps ⇒ `gear app start` 的 REST 包装，REQ-APP-MANAGED-DETACHED）。
+ * 列表是落盘台账的实时探活投影：app 是 detached 独立进程，重启 gear serve 不带走应用。
  */
 export const useAppsStore = defineStore('apps', () => {
   const apps = ref<AppDTO[]>([])

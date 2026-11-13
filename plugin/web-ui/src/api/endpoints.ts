@@ -16,7 +16,6 @@ import type {
   AppDefImportReqDTO,
   AppDefImportRespDTO,
   AppDefListDTO,
-  AppRecordListDTO,
   CapabilityDTO,
   CapabilityInvokeReq,
   CapabilityInvokeResp,
@@ -121,14 +120,12 @@ export const endpoints = {
 
   // ---- 受管长驻进程 ----
   listApps: (signal?: AbortSignal) => api.get<AppDTO[]>('/apps', signal),
+  /** 托管启动 = `gear app start` 的 REST 包装（REQ-APP-MANAGED-DETACHED）：detached 派生 + 落台账。 */
   createApp: (flowId: string, restart: string) => api.post<AppDTO>('/apps', { flow_id: flowId, restart }),
   deleteApp: (id: string) => api.del<DeletedDTO>(`/apps/${encodeURIComponent(id)}`),
-  /** 清理落盘台账里确定已终止的应用记录（POST /api/apps/prune；与内存侧 /api/apps 不是同一模型）。
+  /** 清理落盘台账里确定已终止的应用记录（POST /api/apps/prune）。
    *  body 空 = 全量、非 dry-run；只删 exited/stopped/startup_failed 的记录，不杀进程、不碰端口。 */
   pruneApps: (req: PruneAppsReqDTO = {}) => api.post<PruneAppsRespDTO>('/apps/prune', req),
-  /** detached 台账侧应用（REQ-API-APP-LOGS）：列 `gear app start` 的落盘台账。
-   *  ⚠ 与 listApps 不是同一模型；UI 靠它选择「订阅哪个 App 的实时日志」。 */
-  listAppRecords: (signal?: AbortSignal) => api.get<AppRecordListDTO>('/apps/records', signal),
   /** SSE 实时日志流（薄封装；实际调用请用导出的 streamAppLogs 以传回调）。 */
   streamAppLogs: (id: string, signal?: AbortSignal) => streamAppLogs(id, signal),
 

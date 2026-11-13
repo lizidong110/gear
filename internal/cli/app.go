@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -52,6 +53,8 @@ func appCmd() *cobra.Command {
 func appRunCmd() *cobra.Command {
 	var restart string
 	var maxConc int
+	var maxRestarts int
+	var restartWindow time.Duration
 	c := &cobra.Command{
 		Use:   "run <flow-id>...",
 		Short: "前台监管 Flow 进程（长驻 step + restart 策略；Ctrl+C 停止）",
@@ -76,6 +79,14 @@ func appRunCmd() *cobra.Command {
 			ctx, stop := app.ContextWithSignals(context.Background())
 			defer stop()
 
+			// 硬杀连坐（REQ-APP-JOB-KILLONCLOSE）：把本进程与其后派生的整棵子进程树
+			// 放进 kill-on-close Job——监管进程被硬杀（taskkill /F）时子进程自动连坐，
+			// 不再「手动杀 sidecar 又被 --restart always 拉回」。失败降级为警告：
+			// 监管功能不依赖 Job，只是少一层保障（如 harness 的 Job 禁 breakaway 时）。
+			if err := app.InitJobKillOnClose(); err != nil {
+				fmt.Fprintf(os.Stderr, "⚠ %v\n", err)
+			}
+
 			fmt.Printf("[app run] 监管 %d 个 Flow，restart=%s，maxConcurrent=%d（Ctrl+C 停止）\n",
 				len(args), policy, maxConc)
 			// 实时日志回推（REQ-API-APP-LOGS）：只有 `app start` 派生出来的子进程会带
@@ -97,11 +108,19 @@ func appRunCmd() *cobra.Command {
 				return err
 			}
 			sup := app.New(eng, policy, maxConc)
+			// 重启预算（REQ-APP-RESTART-LIMIT）：窗口内同一 service 退出超限即放弃重启。
+			// 默认 5 次/10 分钟——此前只有退避没有上限，手动 kill 掉的 service 会被
+			// 无限拉回，「杀几次起几次」。--max-restarts 0 可恢复旧的无上限行为。
+			sup.SetRestartLimit(maxRestarts, restartWindow)
 			// 台账身份 env（GEAR_APP_LEDGER_*）只存在于 `app start` 的派生链路上：
 			// 有则把 service 重启次数回写台账记录（UI / CLI 才能看到真实重启数），
 			// 前台 `app run` 没有 env，回调为 nil，行为零变化。
 			if cb := app.RestartRecorderFromEnv(); cb != nil {
 				sup.SetOnRestart(cb)
+			}
+			// 预算耗尽时要让台账记住「为什么收工」，否则 UI 只能显示笼统的 exited。
+			if cb := app.ExhaustedRecorderFromEnv(); cb != nil {
+				sup.SetOnExhausted(cb)
 			}
 			if err := sup.Supervise(ctx, args); err != nil {
 				return err
@@ -112,6 +131,10 @@ func appRunCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&restart, "restart", "always", "service 退出后的重启策略：always / never")
 	c.Flags().IntVar(&maxConc, "max", 0, "同时启动的 Flow 上限（0=不限；S2 并发闸门，进程池留 S4）")
+	c.Flags().IntVar(&maxRestarts, "max-restarts", app.DefaultRestartLimit(),
+		"重启预算：窗口内同一 service 退出超过该次数即放弃重启（0=不限，恢复旧行为）")
+	c.Flags().DurationVar(&restartWindow, "restart-window", app.DefaultRestartWindow(),
+		"重启预算的统计窗口（与 --max-restarts 配合）")
 	return c
 }
 

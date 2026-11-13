@@ -1,126 +1,102 @@
 package server
 
-// apps_state_test.go：锁住 GET /api/apps 的**真实监管态**（REQ-APP-MANAGED-STATE）。
+// apps_state_test.go：锁住 /api/apps 的 **detached 台账语义**（REQ-APP-MANAGED-DETACHED）。
 //
-// 背景（2026-11-13 审出）：监管 goroutine 自己结束的 app（restart=never 退出 / once Flow
-// 跑完 / 启动即失败）不会从内存列表消失，旧实现永远顶着创建时的 running——
-// gear UI 长驻页显示正常，实际 app 已停止工作（假绿）。
-// 这里锁定三件事：state 随 done 关闭实时重算、重启次数经回调透出、exited 后仍在列表中。
+// 背景（2026-11-13 方案 A）：POST /api/apps 从「进程内 Supervise」改为 `gear app start`
+// 的 REST 包装——app 是脱离 serve 进程树的独立进程，列表 / 状态全部以落盘台账为唯一真相源。
+// 这里锁定三件事：列表空台账为空数组、未知 Flow 404、台账里的 restarts / live_logs /
+// state 原样透出（重启次数由被派生的监管进程经 GEAR_APP_LEDGER_* env 回写，见 app.RestartRecorderFromEnv）。
 
 import (
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"gear/internal/model"
+	"gear/internal/app"
 	"gear/internal/registry"
 )
 
-// onceEchoBundle 的最小 Lua Tool + 纯 once Flow：跑完监管即结束，是最典型的「假绿」输入。
-func registerOnceEcho(t *testing.T, reg *registry.Registry) {
+// newAppsServer 造一套隔离的 registry + 台账目录并注入 Server（/api/apps 依赖两者定位台账）。
+func newAppsServer(t *testing.T) (s *Server, reg *registry.Registry, appsDir string) {
 	t.Helper()
-	if err := reg.UpsertTool(&model.Tool{
-		ID: "stateecho", Name: "stateecho", Runtime: model.RuntimeLua, Entry: "return {}",
-		InputSchema:  map[string]interface{}{"type": "object"},
-		OutputSchema: map[string]interface{}{"type": "object"},
-		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
-	}); err != nil {
-		t.Fatalf("注册 Tool 失败: %v", err)
+	regPath := filepath.Join(t.TempDir(), "registry.db")
+	reg, err := registry.Open(regPath)
+	if err != nil {
+		t.Fatalf("打开 registry 失败: %v", err)
 	}
-	if err := reg.UpsertFlow(&model.Flow{ID: "stateonce", Steps: []model.Step{
-		{ID: "s1", Call: "stateecho", Input: map[string]interface{}{}},
-	}}); err != nil {
-		t.Fatalf("注册 Flow 失败: %v", err)
+	t.Cleanup(func() { _ = reg.Close() })
+	appsDir = filepath.Join(t.TempDir(), "apps")
+	if err := os.MkdirAll(appsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(reg,
+		WithSecretsDBPath(filepath.Join(t.TempDir(), "secrets.db")),
+		WithRegistryPath(regPath), WithAppsDir(appsDir))
+	if err != nil {
+		t.Fatalf("构造 Server 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	return srv, reg, appsDir
+}
+
+// TestAppsListEmptyWithoutLedger：没有台账时列表必须是**空数组**而不是 null。
+func TestAppsListEmptyWithoutLedger(t *testing.T) {
+	s, _, _ := newAppsServer(t)
+	items := doArray(t, s.Handler(), "GET", "/api/apps")
+	if len(items) != 0 {
+		t.Fatalf("空台账应返回空数组，实际 %d 条", len(items))
 	}
 }
 
-// TestAppsListReportsExitedAfterSupervisionEnds：once Flow 跑完后，列表里的该 app
-// 必须从 running 变 exited（而不是永远 running 的假绿），且条目仍在列表中可查。
-func TestAppsListReportsExitedAfterSupervisionEnds(t *testing.T) {
-	s, reg := newTestServer(t)
-	registerOnceEcho(t, reg)
-	h := s.Handler()
-
-	rec, out := do(t, h, "POST", "/api/apps", map[string]interface{}{"flow_id": "stateonce", "restart": "never"})
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("启动 app 期望 201，实际 %d %s", rec.Code, rec.Body.String())
-	}
-	if out["state"] != "running" {
-		t.Fatalf("创建响应应报 running，实际 %v", out["state"])
-	}
-	if _, ok := out["restarts"]; !ok {
-		t.Fatal("创建响应应含 restarts 字段")
-	}
-
-	// 事件驱动轮询（红线 13）：等监管 goroutine 真正退出（done 关闭 → state=exited）。
-	deadline := time.Now().Add(15 * time.Second)
-	items := doArray(t, h, "GET", "/api/apps")
-	for time.Now().Before(deadline) {
-		items = doArray(t, h, "GET", "/api/apps")
-		if len(items) > 0 && items[0]["state"] == "exited" {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if len(items) != 1 {
-		t.Fatalf("监管自结束的 app 仍应留在列表（这正是假绿场景的输入），实际 %d 条", len(items))
-	}
-	if items[0]["state"] != "exited" {
-		t.Fatalf("监管结束后应报 exited，实际 %v", items[0]["state"])
-	}
-	if got := items[0]["restarts"]; got != float64(0) {
-		t.Fatalf("once Flow 不应有重启，restarts=%v", got)
+// TestAppsCreateUnknownFlow404：Flow 存在性预检必须在派生**之前**给出 404。
+func TestAppsCreateUnknownFlow404(t *testing.T) {
+	s, _, _ := newAppsServer(t)
+	rec, _ := do(t, s.Handler(), "POST", "/api/apps", map[string]interface{}{"flow_id": "nope"})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("未知 Flow 期望 404，实际 %d %s", rec.Code, rec.Body.String())
 	}
 }
 
-// TestAppsListReportsRestartCount：restart=always 的崩溃循环里，/api/apps 应透出
-// 累计重启次数（回调回填），且监管仍在跑 → state 保持 running。
-func TestAppsListReportsRestartCount(t *testing.T) {
-	s, reg := newTestServer(t)
-	if err := reg.UpsertTool(&model.Tool{
-		ID: "quitter", Name: "Q", Runtime: model.RuntimeProcess, Entry: "sleep 0.2",
-		InputSchema:  map[string]interface{}{"type": "object"},
-		OutputSchema: map[string]interface{}{"type": "object"},
-		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
-	}); err != nil {
-		t.Fatalf("注册 Tool 失败: %v", err)
+// seedLedgerRecord 直接种一条台账（含日志文件），绕开真实派生进程，专注列表投影逻辑。
+func seedLedgerRecord(t *testing.T, dir, appID, flowID string, restarts int, liveLogs bool) *app.Record {
+	t.Helper()
+	logPath := filepath.Join(dir, appID+".log")
+	if err := os.WriteFile(logPath, []byte("[app run] 监管 1 个 Flow\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if err := reg.UpsertFlow(&model.Flow{ID: "crashf", Steps: []model.Step{
-		{ID: "keep", Call: "quitter", Mode: "service", Input: map[string]interface{}{}},
-	}}); err != nil {
-		t.Fatalf("注册 Flow 失败: %v", err)
+	rec := &app.Record{
+		AppID: appID, FlowID: flowID, Registry: dir, PID: os.Getpid(), // 本测试进程必然存活 ⇒ 探活 running
+		Restart: "always", StartedAt: time.Now(), CWD: ".", LogPath: logPath, LiveLogs: liveLogs, Restarts: restarts,
 	}
-	h := s.Handler()
+	if err := app.SaveRecord(dir, rec); err != nil {
+		t.Fatalf("写台账失败: %v", err)
+	}
+	return rec
+}
 
-	rec, out := do(t, h, "POST", "/api/apps", map[string]interface{}{"flow_id": "crashf"})
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("启动 app 期望 201，实际 %d %s", rec.Code, rec.Body.String())
-	}
+// TestAppsListProjectsLedgerFields：GET /api/apps 必须把台账的 restarts / live_logs /
+// state（双判据实时探活）透出——重启次数只存在于台账（由监管进程回写），不透出就是假健康。
+func TestAppsListProjectsLedgerFields(t *testing.T) {
+	s, _, dir := newAppsServer(t)
+	seedLedgerRecord(t, dir, "app_e2e.up-x", "e2e.up", 3, true)
 
-	// 事件驱动轮询：等 restarts ≥ 1（而非固定时长窗口，红线 13）。
-	deadline := time.Now().Add(15 * time.Second)
-	items := doArray(t, h, "GET", "/api/apps")
-	for time.Now().Before(deadline) {
-		items = doArray(t, h, "GET", "/api/apps")
-		if len(items) > 0 && items[0]["restarts"] != nil && items[0]["restarts"].(float64) >= 1 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	items := doArray(t, s.Handler(), "GET", "/api/apps")
 	if len(items) != 1 {
-		t.Fatalf("app 列表应为 1，实际 %d", len(items))
+		t.Fatalf("列表应为 1 条，实际 %d", len(items))
 	}
-	if n, ok := items[0]["restarts"].(float64); !ok || n < 1 {
-		t.Fatalf("崩溃循环应透出 restarts ≥ 1，实际 %v", items[0]["restarts"])
+	it := items[0]
+	if it["app_id"] != "app_e2e.up-x" {
+		t.Fatalf("app_id 不符: %v", it["app_id"])
 	}
-	if items[0]["state"] != "running" {
-		t.Fatalf("崩溃循环中监管仍在跑，应报 running，实际 %v", items[0]["state"])
+	if n, ok := it["restarts"].(float64); !ok || n != 3 {
+		t.Fatalf("restarts 应为 3（台账回写值），实际 %v", it["restarts"])
 	}
-
-	// 收尾：停止 app，避免泄漏 service 子进程。
-	if id, _ := out["id"].(string); id != "" {
-		if rec, _ := do(t, h, "DELETE", "/api/apps/"+id, nil); rec.Code != http.StatusOK {
-			t.Fatalf("停止 app 期望 200，实际 %d", rec.Code)
-		}
+	if v, ok := it["live_logs"].(bool); !ok || !v {
+		t.Fatalf("live_logs 应为 true，实际 %v", it["live_logs"])
+	}
+	if it["state"] != "running" {
+		t.Fatalf("pid 存活且未声明端口应判 running，实际 %v", it["state"])
 	}
 }

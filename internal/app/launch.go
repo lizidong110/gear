@@ -14,6 +14,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -153,6 +154,8 @@ type StatusResult struct {
 	OpenURLs []string `json:"open_urls,omitempty"`
 	// EscapedJob 见 StartResult.EscapedJob：进程死因的事后归因依据之一。
 	EscapedJob *bool `json:"escaped_job,omitempty"`
+	// Restart 是该实例的重启策略（always / never）。
+	Restart string `json:"restart,omitempty"`
 	// Restarts 是监管期间 service 的累计重启次数（台账回写，见 Record.Restarts）。
 	Restarts int `json:"restarts,omitempty"`
 	// LiveLogs 见 Record.LiveLogs：派生时是否注入了实时日志回推 env。
@@ -386,6 +389,33 @@ func RestartRecorderFromEnv() func(total int) {
 	}
 }
 
+// ExhaustedRecorderFromEnv 返回「重启预算耗尽时把终态写回台账」的回调
+// （Supervisor.SetOnExhausted 用，REQ-APP-RESTART-LIMIT）。
+//
+// 为什么需要它：预算耗尽时监管进程会**自行退出**，此后 pid 消失、端口释放，
+// 台账若只留一条 running 记录，UI 就只能显示「exited」——把「被反复弄死到放弃重启」
+// 和「正常退出」混为一谈。写成 final_state=restart_exhausted 才能让 UI / app list
+// 直接看出原因。与 RestartRecorderFromEnv 同口径：读不到台账就静默跳过，
+// 绝不因为记账失败影响停机。
+func ExhaustedRecorderFromEnv() func(total int, reason string) {
+	dir := strings.TrimSpace(os.Getenv(EnvLedgerDir))
+	id := strings.TrimSpace(os.Getenv(EnvLedgerID))
+	if dir == "" || id == "" {
+		return nil
+	}
+	return func(total int, _ string) {
+		rec, err := LoadRecord(dir, id)
+		if err != nil {
+			return
+		}
+		now := time.Now()
+		rec.Restarts = total
+		rec.StoppedAt = &now
+		rec.FinalState = string(StateRestartExhausted)
+		_ = SaveRecord(dir, rec)
+	}
+}
+
 // waitReady 在 waitSeconds 窗口内轮询启动结果。
 //
 // 三种收敛：running（起来了）/ startup_failed（进程已退出，附日志尾部）/ starting（窗口内
@@ -557,7 +587,8 @@ func statusOf(rec *Record, tail int) *StatusResult {
 	res := &StatusResult{
 		AppID: rec.AppID, FlowID: rec.FlowID, PID: rec.PID, State: string(st),
 		StartedAt: rec.StartedAt, Ports: rec.PortStates(), LogPath: rec.LogPath,
-		EscapedJob: rec.EscapedJob, Restarts: rec.Restarts, LiveLogs: rec.LiveLogs,
+		EscapedJob: rec.EscapedJob, Restart: rec.Restart,
+		Restarts: rec.Restarts, LiveLogs: rec.LiveLogs,
 	}
 	if st == StateRunning {
 		res.UptimeS = int(time.Since(rec.StartedAt).Seconds())
@@ -636,7 +667,7 @@ func scanOpenURLs(logPath string) []string {
 		if !strings.HasPrefix(line, prefix) {
 			continue
 		}
-		u := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		u := normalizeOpenURL(strings.TrimSpace(strings.TrimPrefix(line, prefix)))
 		if u == "" || seen[u] {
 			continue
 		}
@@ -644,4 +675,38 @@ func scanOpenURLs(logPath string) []string {
 		out = append(out, u)
 	}
 	return out
+}
+
+// normalizeOpenURL 把「不可访问的绑定地址」归一化成可访问地址后再进台账。
+//
+// 为什么在**消费端**再兜一次（侧车已修，见 serve-sidecar siteURL）：台账是追加日志的
+// 投影，`<appID>.log` 里已经躺着旧版本打出来的 `GEAR_OPEN_URL=http://0.0.0.0:8080/`。
+// 只修生产端的话，同一个应用重启后旧行仍在，面板会同时显示一个坏链接——「修了但还是
+// 打不开」比没修更难解释。这里只处理通配主机（0.0.0.0 / :: / 空），具体地址一律原样。
+func normalizeOpenURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := neturl.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	var repl string
+	switch u.Hostname() {
+	case "", "0.0.0.0":
+		repl = "127.0.0.1"
+	case "::":
+		repl = "::1"
+	default:
+		return raw
+	}
+	host := repl
+	if strings.Contains(repl, ":") {
+		host = "[" + repl + "]" // IPv6 字面量必须带方括号
+	}
+	if p := u.Port(); p != "" {
+		host += ":" + p
+	}
+	u.Host = host
+	return u.String()
 }

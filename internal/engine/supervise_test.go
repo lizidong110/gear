@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -15,6 +16,34 @@ func svcTool(entry string) *model.Tool {
 		InputSchema:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
 		OutputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
 		Versions:     []model.ToolVersion{{Version: "1.0.0", State: model.StateStable}},
+	}
+}
+
+// GEAR_OPEN_URL 约定：once 步 output 带回的「打开地址」打印成行首标记行，
+// 供 detached 启动的日志扫描通道（app.scanOpenURLs）透出（2026-11-13 实测：
+// 引擎不打印 → 托管启动后 UI 永远没有可访问网址）。
+func TestPrintStepOpenURLs(t *testing.T) {
+	var buf bytes.Buffer
+	e := &Engine{progressOut: &buf}
+	printStepOpenURLs(e, map[string]interface{}{
+		"url":       " http://0.0.0.0:8080/ ",
+		"open_urls": []interface{}{"http://a.example/", "", 42},
+		// lan_urls 是「手机/其它设备打开」的地址，必须一并进台账（REQ-EXT-SERVE-URL）——
+		// 只打 url 时通配绑定降级成 127.0.0.1，手机拿到等于没有地址。
+		"lan_urls": []interface{}{"http://192.168.1.23:8080/"},
+	})
+	if got, want := buf.String(),
+		"GEAR_OPEN_URL=http://0.0.0.0:8080/\nGEAR_OPEN_URL=http://a.example/\nGEAR_OPEN_URL=http://192.168.1.23:8080/\n"; got != want {
+		t.Fatalf("标记行不符:\n got: %q\nwant: %q", got, want)
+	}
+
+	// 负向：nil output / 无关字段 / 空白 url 都不产生任何输出。
+	buf.Reset()
+	printStepOpenURLs(e, nil)
+	printStepOpenURLs(e, map[string]interface{}{})
+	printStepOpenURLs(e, map[string]interface{}{"url": "   ", "open_urls": []interface{}{1, nil}})
+	if buf.Len() != 0 {
+		t.Fatalf("无地址时不应有输出，实际 %q", buf.String())
 	}
 }
 

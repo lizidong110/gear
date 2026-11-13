@@ -37,6 +37,7 @@ func Command(ctx context.Context, line string) (*exec.Cmd, error) {
 		}
 		cmd := exec.CommandContext(ctx, sh.Path, append(append([]string{}, sh.Args...), line)...)
 		cmd.Env = childEnv(nil, sh)
+		applyNoConsole(cmd)
 		return cmd, nil
 	}
 
@@ -49,6 +50,7 @@ func Command(ctx context.Context, line string) (*exec.Cmd, error) {
 	}
 	cmd := exec.CommandContext(ctx, path, spec.Argv[1:]...)
 	cmd.Env = childEnv(spec.Env, sh)
+	applyNoConsole(cmd)
 	return cmd, nil
 }
 

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -150,6 +151,47 @@ func TestSuperviseStaysAliveThenCancel(t *testing.T) {
 	}
 }
 
+// 回归（2026-11-13 实测复现）：a9c1cff 把正常监管路径的「等到底」换成了有界
+// waitGroup(superviseGrace)，长驻 app run 启动 15s 后被误判「未收敛」而整体退出、
+// service 子进程连坐（托管启动的 study「起一会儿就退出」的元凶）。
+// 双段等待语义：ctx 未取消 → supervise 必须阻塞到底，哪怕远超 superviseGrace。
+func TestSuperviseKeepsRunningBeyondGrace(t *testing.T) {
+	oldGrace := superviseGrace
+	superviseGrace = 150 * time.Millisecond
+	defer func() { superviseGrace = oldGrace }()
+
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	if err := reg.UpsertTool(svcTool("sleep 30")); err != nil {
+		t.Fatalf("注册 Tool 失败: %v", err)
+	}
+	registerSvcFlow(t, reg, "stay")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sup := New(engine.New(reg), RestartAlways, 0)
+	done := make(chan error, 1)
+	go func() { done <- sup.Supervise(ctx, []string{"stay"}) }()
+
+	// 核心断言：远超 superviseGrace 后监管仍未返回（旧实现在此早已「自杀」）。
+	select {
+	case err := <-done:
+		t.Fatalf("ctx 取消前 Supervise 提前返回（15 秒自杀回归）: %v", err)
+	case <-time.After(2 * time.Second):
+	}
+
+	// 停机段仍有效：取消后有界收敛、无错返回。
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Supervise 失败: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("取消后 30s 未收敛，停机路径挂死")
+	}
+}
+
 // S2-maxconcurrent：maxConcurrent=1 时两个 Flow 串行监管，峰值并发为 1。
 func TestSuperviseMaxConcurrent(t *testing.T) {
 	reg := newTestRegistry(t)
@@ -226,5 +268,72 @@ func TestProbeNoRestartWhenHealthyNoProbe(t *testing.T) {
 	}
 	if sup.RestartCount() != 0 {
 		t.Fatalf("无探针长驻期间不应重启，实际 %d", sup.RestartCount())
+	}
+}
+
+// TestSuperviseRestartBudgetStopsRestarting：重启预算耗尽后必须**停手**，不再无限复活。
+//
+// 这条修的是 2026-11-13 实测的行为：手动 kill 掉 service 子进程（如 study.api 的
+// `gear.exe serve --no-ui`），监管器按 restart=always 每 5s 拉回一个，杀几次起几次，
+// 台账 restarts 一路涨，永不停止——旧实现只有退避、没有上限。
+func TestSuperviseRestartBudgetStopsRestarting(t *testing.T) {
+	reg := newTestRegistry(t)
+	defer reg.Close()
+	if err := reg.UpsertTool(svcTool("exit 0")); err != nil {
+		t.Fatalf("注册 Tool 失败: %v", err)
+	}
+	registerSvcFlow(t, reg, "crash")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sup := New(engine.New(reg), RestartAlways, 0)
+	sup.SetRestartLimit(2, time.Minute)
+
+	done := make(chan error, 1)
+	go func() { done <- sup.Supervise(ctx, []string{"crash"}) }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrRestartExhausted) {
+			t.Fatalf("预算耗尽应返回 ErrRestartExhausted，实际 %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("预算耗尽后 Supervise 仍未返回（仍在无限重启）")
+	}
+	if n := sup.RestartCount(); n != 2 {
+		t.Fatalf("limit=2 时应恰好重启 2 次后停手，实际 %d", n)
+	}
+}
+
+// TestRestartBudgetWindowSlides：预算按滑动窗口统计，不累计——稳定运行的服务偶发崩几次
+// 不能被永久判死（这条是「加预算」这个改动本身最容易引入的回归）。
+func TestRestartBudgetWindowSlides(t *testing.T) {
+	sup := New(nil, RestartAlways, 0)
+	sup.SetRestartLimit(2, 80*time.Millisecond)
+	h := &engine.ServiceHandle{StepID: "s"}
+
+	for i := 1; i <= 2; i++ {
+		if over, _, _ := sup.overRestartLimit(h); over {
+			t.Fatalf("窗口内第 %d 次退出不应超限", i)
+		}
+	}
+	if over, _, _ := sup.overRestartLimit(h); !over {
+		t.Fatal("窗口内第 3 次退出应超限")
+	}
+	time.Sleep(120 * time.Millisecond)
+	if over, _, _ := sup.overRestartLimit(h); over {
+		t.Fatal("窗口滑走后不应继续判超限（长期稳定服务不能被累计惩罚）")
+	}
+}
+
+// TestRestartBudgetDisabled：limit<=0 = 旧的无上限行为，仅供兼容开关使用。
+func TestRestartBudgetDisabled(t *testing.T) {
+	sup := New(nil, RestartAlways, 0)
+	sup.SetRestartLimit(0, time.Minute)
+	h := &engine.ServiceHandle{StepID: "s"}
+	for i := 0; i < 50; i++ {
+		if over, _, _ := sup.overRestartLimit(h); over {
+			t.Fatalf("limit=0 时第 %d 次退出不应超限（应保持无上限）", i+1)
+		}
 	}
 }

@@ -51,6 +51,25 @@ func publishEndpoint(t *testing.T, dir string) string {
 	return token
 }
 
+// REQ-API-APP-LOGS（--no-ui 不写发现文件）：server.addr 是「最后一个绑定的 gear serve 说了算」
+// 的单文件，而托管应用的后端（如 study.api = gear serve --no-ui）也是一个 gear serve——
+// 若它也写，就把之后启动的所有 app 的日志回推目标毒化成这个无人订阅的后端
+// （2026-11-13 实测：study.api 绑定 8081 后覆写 server.addr）。--no-ui 声明自己不是管理面，
+// publishAppLogEndpoint 必须跳过；带 UI 的 serve 照常写。
+func TestNoUIDoesNotPublishServerEndpoint(t *testing.T) {
+	s, dir := newAppLogServer(t) // 测试 Server 默认无 UI（uiHandler == nil）
+	s.publishAppLogEndpoint("127.0.0.1:8787")
+	if _, err := app.ReadServerEndpoint(dir); !os.IsNotExist(err) {
+		t.Fatalf("--no-ui 不应写 server.addr，实际 err=%v", err)
+	}
+
+	s.uiHandler = http.NotFoundHandler() // 模拟带 UI 的 serve
+	s.publishAppLogEndpoint("127.0.0.1:8787")
+	if _, err := app.ReadServerEndpoint(dir); err != nil {
+		t.Fatalf("带 UI 的 serve 应照常写 server.addr: %v", err)
+	}
+}
+
 func ingestBody(token string, lines ...string) map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(lines))
 	for _, l := range lines {
@@ -62,7 +81,8 @@ func ingestBody(token string, lines ...string) map[string]interface{} {
 func TestAppLogRoutesCoexist(t *testing.T) {
 	s, dir := newAppLogServer(t)
 	// Go 1.22+ ServeMux：同名 pattern 二次注册会 panic，能构造成功本身就是一条断言。
-	if rec, _ := do(t, s.Handler(), "GET", "/api/apps/records", nil); rec.Code != http.StatusOK {
+	// （GET /api/apps 自 REQ-APP-MANAGED-DETACHED 起即台账列表，/api/apps/records 已移除。）
+	if rec, _ := do(t, s.Handler(), "GET", "/api/apps", nil); rec.Code != http.StatusOK {
 		t.Fatalf("台账列表端点异常: %d", rec.Code)
 	}
 	if rec, _ := do(t, s.Handler(), "GET", "/api/apps/nope/logs/stream", nil); rec.Code != http.StatusNotFound {
@@ -79,20 +99,25 @@ func TestListAppRecordsReportsLiveLogs(t *testing.T) {
 	writeAppLogRecord(t, dir, "app-live", true)
 	writeAppLogRecord(t, dir, "app-offline", false)
 
-	rec, out := do(t, s.Handler(), "GET", "/api/apps/records", nil)
+	rec, _ := do(t, s.Handler(), "GET", "/api/apps", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("列表失败: %d %s", rec.Code, rec.Body.String())
 	}
-	items, ok := out["items"].([]interface{})
-	if !ok || len(items) != 2 {
-		t.Fatalf("应列 2 条台账，实际 %v", out)
+	// GET /api/apps 直接返回台账投影数组（不再是 {items} 包裹）。
+	items := doArray(t, s.Handler(), "GET", "/api/apps")
+	if len(items) != 2 {
+		t.Fatalf("应列 2 条台账，实际 %d", len(items))
 	}
 	byID := map[string]map[string]interface{}{}
-	for _, raw := range items {
-		m := raw.(map[string]interface{})
+	for _, m := range items {
 		byID[m["app_id"].(string)] = m
 	}
-	if byID["app-live"]["live_logs"] != true || byID["app-offline"]["live_logs"] != false {
+	// live_logs=false 会被 omitempty 省略字段——「缺席」与 false 语义相同（UI 侧 undefined 也是 falsy）。
+	liveOf := func(m map[string]interface{}) bool {
+		b, _ := m["live_logs"].(bool)
+		return b
+	}
+	if !liveOf(byID["app-live"]) || liveOf(byID["app-offline"]) {
 		t.Fatalf("live_logs 必须如实反映派生时是否注入回推 env: %v", byID)
 	}
 	if byID["app-live"]["flow_id"] != "demo.up" || byID["app-live"]["state"] == "" {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -259,9 +260,9 @@ func (e *Engine) Supervise(ctx context.Context, flowID string) (*SuperviseResult
 				return err
 			}
 			rc.setStep(step.ID, input, output)
-			// 收尾步（如 web_ui.done）带回的「打开地址」顺手收集，供 REST 监管 / 进程内 app run
-			// 透出（与 CLI `app start` 的日志扫描通道互补，见 openurl.go）。
-			collectStepOpenURLs(e, flowID, output)
+			// 收尾步（如站点/serve 类 once 步）带回的「打开地址」顺手打印成标记行，
+			// 供 detached 启动的日志扫描通道（app.scanOpenURLs）透出到台账与 UI。
+			printStepOpenURLs(e, output)
 			e.progressf("✓ step %s (%s) -> %v\n", step.ID, step.Call, output)
 			return nil
 		})
@@ -282,6 +283,44 @@ func (e *Engine) Supervise(ctx context.Context, flowID string) (*SuperviseResult
 		e.progressf("✓ Flow %s 执行完成（纯 once），共 %d 步\n", flowID, len(flow.Steps))
 	}
 	return res, nil
+}
+
+// printStepOpenURLs 把一次 once 步 output 里的「打开地址」打印成 `GEAR_OPEN_URL=<url>` 标记行。
+// 约定：step 返回 `{url: ...}`、`{open_urls: [...]}` 或 `{lan_urls: [...]}`（可兼有），空串跳过。
+//
+// 为什么 `lan_urls` 也要打（2026-11-13）：ext.serve 会把「绑定地址」与「访问地址」分开——
+// url 是通配绑定降级后的回环地址（本机点得开），lan_urls 是局域网地址（手机/平板用）。
+// 只打 url 的话，手机用户拿到的是 127.0.0.1，等于没有地址；两者都进台账，
+// 面板才能同时给出「本机打开」与「手机打开」两个入口。
+//
+// 为什么走 progressf 打印而不是内存聚合：a9c1cff 删掉了引擎侧 openurl.go 后，
+// 唯一的消费方是 `gear app start` launcher 的日志扫描（app.scanOpenURLs）——它读的是
+// app run 进程 stdout 落成的 <appID>.log，只认行首前缀。引擎不打印，serve 类 step 又都带
+// `--no-ui`（自己不发 GEAR_OPEN_URL），托管启动后 UI 就永远没有可访问网址
+// （2026-11-13 实测复现）。这里只做纯读取 + 打印，不触碰 output，也不因缺少字段报错；
+// progressf 默认指 os.Stdout（app run 的 stdout），前台 `app run` 同样看得到，无害且有用。
+func printStepOpenURLs(e *Engine, output map[string]interface{}) {
+	if output == nil {
+		return
+	}
+	urls := []string{}
+	if u, ok := output["url"].(string); ok {
+		urls = append(urls, u)
+	}
+	for _, key := range []string{"open_urls", "lan_urls"} {
+		if arr, ok := output[key].([]interface{}); ok {
+			for _, v := range arr {
+				if s, ok := v.(string); ok {
+					urls = append(urls, s)
+				}
+			}
+		}
+	}
+	for _, u := range urls {
+		if u = strings.TrimSpace(u); u != "" {
+			e.progressf("GEAR_OPEN_URL=%s\n", u)
+		}
+	}
 }
 
 // stopStartedServices 回收本次 Supervise 已拉起的全部 service 子进程（Flow 执行失败时调用，

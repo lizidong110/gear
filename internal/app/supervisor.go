@@ -10,6 +10,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -41,13 +42,42 @@ const (
 	stableWindow = time.Second
 )
 
-// superviseGrace 是收到停止信号后等待各 Flow 监管 goroutine 收敛的上限。
+// 重启预算（REQ-APP-RESTART-LIMIT，2026-11-13）。
+//
+// 为什么必须有它：此前 restart=always 只有退避、**没有上限**——有人手动杀掉
+// service 子进程（如 `gear.exe serve --no-ui`、`serve-sidecar.exe`），监管器就每
+// 5 秒拉回一个，杀几次起几次，永远打不完（2026-11-13 实测：台账 restarts=3 全是
+// 手动 kill 触发的）。退避解决的是「崩溃循环把 CPU 打满」，不是「无限复活」。
+//
+// 判据用**滑动窗口**而不是累计次数：累计上限会误伤「跑一年偶发崩几次」的长期服务；
+// 窗口内集中退出才是真异常（崩溃循环 / 被反复外部终止）。
+//
+// 语义边界：超限后**停止监管**（不再重启），而不是「停止应用」——收应用的唯一入口
+// 仍是 `gear app stop`。超限是「如实停手 + 点名」，不是静默降级。
+const (
+	defaultRestartLimit  = 5
+	defaultRestartWindow = 10 * time.Minute
+)
+
+// ErrRestartExhausted 表示某个 service 在重启窗口内的退出次数超过预算，监管已放弃重启。
+// 调用方（app run）据它给出非零退出码；台账侧写 final_state=restart_exhausted。
+var ErrRestartExhausted = errors.New("连续重启超出预算，已放弃重启")
+
+// DefaultRestartLimit / DefaultRestartWindow 暴露默认预算，供 CLI flag 默认值与文档引用
+// （两处各写一个字面量必然漂移——这正是「默认值改了一处、帮助里还是旧数」的成因）。
+func DefaultRestartLimit() int            { return defaultRestartLimit }
+func DefaultRestartWindow() time.Duration { return defaultRestartWindow }
+
+// superviseGrace 是**停机路径**（ctx 取消后）等待各 Flow 监管 goroutine 收敛的上限。
 //
 // 为什么必须有界：superviseOne 已在所有阻塞点响应 ctx，但「响应」不等于「立刻返回」——
 // 重启退避最多再睡 5s、ProcKill 要跑 taskkill、once step 要等子进程被杀收尸。
 // 没有上限时，一个卡在启动阶段的 Flow 能把整个 `app run` / `Server.Shutdown()`
 // 永久挂住（2026-10-29 审出，属停机挂死类缺陷）。
 // 超时**绝不静默**：未收敛的 Flow 逐个点名打印，把「谁没停干净」暴露出来。
+//
+// ⚠ 它**只属于停机路径**。正常监管路径（ctx 未取消）必须等到底——长驻服务本该永不返回；
+// a9c1cff 曾把两类等待合并，结果长驻 app run 启动 15s 后「自杀」（2026-11-13 实测复现）。
 // 设为变量便于测试注入短时限。
 var superviseGrace = 15 * time.Second
 
@@ -102,6 +132,20 @@ type Supervisor struct {
 	// 事后拿不到实例、读不到 RestartCount——崩溃重启对管理面完全不可见，
 	// 呈现出来就是 UI 假绿。回调参数是**累计**重启次数（与 RestartCount 同源）。
 	onRestart func(total int)
+
+	// restartLimit / restartWindow 是重启预算（见 defaultRestartLimit）。
+	// restartLimit <= 0 表示不限（旧行为，仅为兼容保留；CLI 默认 5）。
+	restartLimit  int
+	restartWindow time.Duration
+	// restartAt 记录每个 service 在窗口内的退出时间戳（判预算用）。
+	// 与 h.Restarts 的分工：那是「连续崩溃」计数且会被 stableWindow 归零，用于退避；
+	// 这是「窗口内次数」，用于是否还要继续重启。kill 间隔超过 stableWindow 时只有它
+	// 仍能看清「这已经是第 N 次被弄死」。
+	restartAt map[*engine.ServiceHandle][]time.Time
+
+	// onExhausted 是「预算耗尽、监管放弃重启」的观察口（SetOnExhausted 注册），
+	// 让台账把 final_state 写成 restart_exhausted，而不是在 UI 上笼统显示退出。
+	onExhausted func(total int, reason string)
 }
 
 // SetOnRestart 注册重启观察回调（total = 累计重启次数）；传 nil 表示取消。
@@ -112,9 +156,63 @@ func (s *Supervisor) SetOnRestart(cb func(total int)) {
 	s.mu.Unlock()
 }
 
+// SetOnExhausted 注册「重启预算耗尽」观察回调（total = 累计重启次数，reason = 一句话原因）。
+// 传 nil 表示取消。回调在放弃重启前触发，实现方自行保证并发安全。
+func (s *Supervisor) SetOnExhausted(cb func(total int, reason string)) {
+	s.mu.Lock()
+	s.onExhausted = cb
+	s.mu.Unlock()
+}
+
+// SetRestartLimit 设置重启预算：window 内同一 service 退出超过 limit 次即放弃重启。
+// limit <= 0 表示不限（保持旧行为，仅兼容用）。window <= 0 时用默认窗口。
+// 只应在 Supervise 之前调用（不保证运行期修改的可见性）。
+func (s *Supervisor) SetRestartLimit(limit int, window time.Duration) {
+	if window <= 0 {
+		window = defaultRestartWindow
+	}
+	s.mu.Lock()
+	s.restartLimit = limit
+	s.restartWindow = window
+	s.mu.Unlock()
+}
+
+// overRestartLimit 记一次退出并判断是否已超出重启预算，同时回传生效的预算参数
+// （回传是为了在锁内读配置，避免与 SetRestartLimit 并发时 -race 报数据竞争）。
+//
+// 实现要点：每次判定先剔除窗口外的旧时间戳再追加本次——这样「稳定运行很久后偶发崩溃」
+// 永远不会累积到上限，而「10 分钟内被弄死 6 次」会立刻命中。窗口按调用时刻滚动，
+// 不需要后台清理 goroutine。
+func (s *Supervisor) overRestartLimit(h *engine.ServiceHandle) (bool, int, time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	limit, window := s.restartLimit, s.restartWindow
+	if limit <= 0 {
+		return false, limit, window
+	}
+	now := time.Now()
+	cutoff := now.Add(-window)
+	hist := s.restartAt[h]
+	kept := hist[:0]
+	for _, t := range hist {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	kept = append(kept, now)
+	s.restartAt[h] = kept
+	return len(kept) > limit, limit, window
+}
+
 // New 构造 Supervisor。maxConcurrent < 1 表示不限（由 Supervise 按 flow 数兜底）。
 func New(eng *engine.Engine, policy RestartPolicy, maxConcurrent int) *Supervisor {
-	return &Supervisor{eng: eng, policy: policy, maxConcurrent: maxConcurrent, probes: map[*engine.ServiceHandle]*probeToken{}}
+	return &Supervisor{
+		eng: eng, policy: policy, maxConcurrent: maxConcurrent,
+		probes:        map[*engine.ServiceHandle]*probeToken{},
+		restartLimit:  defaultRestartLimit,
+		restartWindow: defaultRestartWindow,
+		restartAt:     map[*engine.ServiceHandle][]time.Time{},
+	}
 }
 
 // MaxObserved 返回监管期间同时运行的 Flow 数的峰值（测试并发闸门用）。
@@ -183,18 +281,36 @@ func (s *Supervisor) Supervise(ctx context.Context, flowIDs []string) error {
 		}(fid)
 	}
 done:
-	if !waitGroup(&wg, superviseGrace) {
-		mu.Lock()
-		pending := make([]string, 0, len(running))
-		for fid := range running {
-			pending = append(pending, fid)
+	// 双段等待（2026-11-13 实测复现「15 秒自杀」后修复，回归出自 a9c1cff）：
+	//   正常段：ctx 未取消 → **等到底**。长驻 service 使 superviseOne 只在 ctx 取消或
+	//   （restart=never）全部 service 退出后返回，这正是「阻塞直到…」的语义。此前把
+	//   两类等待合并成有界 waitGroup(superviseGrace)，长驻 app run 启动 15s 后被误判
+	//   「未收敛」而整体退出、service 子进程被连坐——「study 起一会儿就退出」的元凶。
+	//   停机段：ctx 已取消 → 有界等待收敛，超时逐个点名（绝不静默吞掉「谁没停干净」，
+	//   2026-10-29 停机挂死类教训在此仍然成立）。
+	// WaitGroup.Wait 允许并发调用，等待 goroutine 与 waitGroup 共享同一个 wg 是安全的。
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		wg.Wait()
+	}()
+	select {
+	case <-stopped:
+		return firstErr
+	case <-ctx.Done():
+		if !waitGroup(&wg, superviseGrace) {
+			mu.Lock()
+			pending := make([]string, 0, len(running))
+			for fid := range running {
+				pending = append(pending, fid)
+			}
+			mu.Unlock()
+			sort.Strings(pending)
+			fmt.Printf("! 停止信号已发出 %s，以下 Flow 仍未收敛（其 service 子进程可能仍在运行）: %s\n",
+				superviseGrace, strings.Join(pending, ", "))
 		}
-		mu.Unlock()
-		sort.Strings(pending)
-		fmt.Printf("! 停止信号已发出 %s，以下 Flow 仍未收敛（其 service 子进程可能仍在运行）: %s\n",
-			superviseGrace, strings.Join(pending, ", "))
+		return firstErr
 	}
-	return firstErr
 }
 
 // waitGroup 有界等待一组 goroutine 结束；超时返回 false（不等到底，不留死等）。
@@ -267,6 +383,22 @@ func (s *Supervisor) superviseOne(ctx context.Context, flowID string) error {
 		if s.policy == RestartNever {
 			s.stopAll(res.Services)
 			return nil
+		}
+		// 重启预算（REQ-APP-RESTART-LIMIT，2026-11-13）：窗口内退出次数超限即放弃重启。
+		// 放在退避之前——继续等 5s 再拉一个注定被打死的进程只是浪费。
+		// 这条不是「停止应用」的替代品（收应用仍是 `gear app stop`），而是「停止无限复活」。
+		if exhausted, limit, window := s.overRestartLimit(h); exhausted {
+			reason := fmt.Sprintf("step %s 在 %s 内退出超过 %d 次，已停止重启", h.StepID, window, limit)
+			s.mu.Lock()
+			total := s.restarts
+			cb := s.onExhausted
+			s.mu.Unlock()
+			if cb != nil {
+				cb(total, reason)
+			}
+			s.stopAll(res.Services)
+			return fmt.Errorf("%w：%s（监管进程退出；要停应用用 gear app stop，"+
+				"要恢复用 gear app start / gear_app(action=start)）", ErrRestartExhausted, reason)
 		}
 		// 崩溃循环退避：本次存活足够久 → 视为稳定，退避计数归零。
 		time.Sleep(nextBackoff(h))

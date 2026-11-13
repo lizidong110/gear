@@ -37,6 +37,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -142,9 +143,7 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		if old, ok := s.sites[port]; ok {
 			if old.dir == dir && old.host == host && mustJSON(proxyRulesJSON(old.proxy)) == proxyJSON {
 				s.mu.Unlock()
-				writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
-					"url": siteURL(host, port), "port": port, "dir": dir, "serving": true, "proxy": proxyEcho,
-				}})
+				writeJSON(w, map[string]interface{}{"result": siteResult(host, port, dir, proxyEcho)})
 				return
 			}
 			conflict := fmt.Sprintf("端口 %d 已被另一站点占用（配置不同）: 当前 dir=%s host=%s proxy=%s；同端口换配置请先 /stop 该端口",
@@ -176,17 +175,97 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	writeJSON(w, map[string]interface{}{"result": map[string]interface{}{
-		"url":     siteURL(host, realPort),
-		"port":    realPort,
-		"dir":     dir,
-		"serving": true,
-		"proxy":   proxyEcho,
-	}})
+	writeJSON(w, map[string]interface{}{"result": siteResult(host, realPort, dir, proxyEcho)})
 }
 
+// siteURL 返回**可访问地址**——即浏览器/UI 该点的那个 url。
+//
+// ⚠ host 是「绑定地址」，不是「访问地址」。0.0.0.0 / :: 是 INADDR_ANY（监听所有网卡），
+// 不是可路由的目的地址：study 绑 0.0.0.0:8080 时，旧实现返回 http://0.0.0.0:8080/，
+// 管理面板把它当链接渲染，点过去打不开（2026-11-13 实测）。通配绑定一律降级为回环；
+// 显式写的具体地址（如 192.168.1.23）原样保留——那是用户主动声明的访问入口。
 func siteURL(host string, port int) string {
-	return fmt.Sprintf("http://%s:%d/", host, port)
+	return fmt.Sprintf("http://%s:%d/", accessHost(host), port)
+}
+
+// accessHost 把绑定地址映射为可访问主机名（仅处理通配形态，其余原样返回）。
+func accessHost(host string) string {
+	switch strings.TrimSpace(host) {
+	case "", "0.0.0.0":
+		return "127.0.0.1"
+	case "::", "[::]":
+		return "[::1]"
+	}
+	return strings.TrimSpace(host)
+}
+
+// listenAddr 返回真实绑定地址（如 0.0.0.0:8080），只作展示——它本身不可点。
+// 它与 url 必须分开报：合成一个字段就只能二选一（可点 vs 真实监听），
+// 而排障与「手机要连」两个场景都要。
+func listenAddr(host string, port int) string {
+	h := strings.TrimSpace(host)
+	if h == "" {
+		h = "0.0.0.0"
+	}
+	if strings.Contains(h, ":") && !strings.HasPrefix(h, "[") {
+		h = "[" + h + "]" // IPv6 字面量
+	}
+	return fmt.Sprintf("%s:%d", h, port)
+}
+
+// lanURLs 返回局域网内其它设备（手机）可访问的地址。
+//
+// 只收私有网段 IPv4：169.254 是链路本地自配（连不上）、公网地址不该暴露、
+// 虚拟网卡（VMware/Hyper-V）会列出一串点了没用的假地址。结果去重并排序，
+// 多网卡时顺序稳定（面板刷新不会跳来跳去）。拿不到网卡不算错误：返回空，
+// 调用方至少还有回环 url 可用。
+func lanURLs(port int) []string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return []string{}
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, ifi := range ifaces {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipnet.IP.To4()
+			if ip == nil || !ip.IsPrivate() {
+				continue
+			}
+			u := fmt.Sprintf("http://%s:%d/", ip.String(), port)
+			if seen[u] {
+				continue
+			}
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// siteResult 组装 /start 的返回体（幂等分支与新建分支共用，防两处漂移）。
+func siteResult(host string, port int, dir string, proxy interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"url":      siteURL(host, port),    // 可访问（通配降级回环）
+		"listen":   listenAddr(host, port), // 真实绑定，仅展示
+		"lan_urls": lanURLs(port),          // 局域网设备用
+		"port":     port,
+		"dir":      dir,
+		"serving":  true,
+		"proxy":    proxy,
+	}
 }
 
 // mustJSON 序列化为稳定字符串（仅用于「幂等/冲突判定」的比较与展示，失败返回 "null"）。

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"gear/internal/engine"
 	"gear/internal/model"
@@ -161,7 +162,9 @@ func (s *Server) handleToolAPI(w http.ResponseWriter, r *http.Request, toolID st
 		input[k] = v
 	}
 	ctx := engine.WithCaller(r.Context(), callerOf(r))
+	start := time.Now()
 	out, err := s.engine.RunToolExec(ctx, toolID, input, "")
+	s.progressToolDone("tool", toolID, start, err, input, out) // 声明资源路由同属直接调用，也要可见（见 progressToolDone）
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return

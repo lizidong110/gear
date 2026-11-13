@@ -66,8 +66,8 @@ REST 只有异步入口，前端想复用 Tool 只能把它包成 Flow 再轮询
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST / GET / DELETE | `/api/apps` | 托管长驻 Flow 进程（等价 `gear app run`，**本进程内存态**，进程一退即消失）。GET 列表含真实监管态：`state`（running/exited）、`restarts`（累计重启次数）、`exit_err`（结束原因，可空）——监管已结束的条目报 `exited`，不会假绿 |
-| POST | `/api/apps/prune` | 清理**落盘台账**里确定已终止的记录（body `{flow_id?, dry_run?}`，空 body=全量真删）。等价 `gear_app(action=prune)`；只清 `exited`/`stopped`/`startup_failed`，`running`/`unknown` 保留，**只删记录不杀进程**。⚠ 它动的是 `gear app start` 的持久台账，与上面那行的内存 `AppInstance` **不是同一个模型**，别混用 |
+| POST / GET / DELETE | `/api/apps` | `gear app start` 的 REST 包装（REQ-APP-MANAGED-DETACHED）：POST **detached 派生**独立 `app run` + 落台账（201 starting/running、200 already_running 幂等、502 startup_failed 含根因）；GET 列台账（跨 serve 重启存活），状态由 pid+端口双判据实时探活，含 `restarts` / `live_logs` / `open_urls`；DELETE 杀整个进程树 + 端口复检，收不干净如实 502、不存在 404 |
+| POST | `/api/apps/prune` | 清理**落盘台账**里确定已终止的记录（body `{flow_id?, dry_run?}`，空 body=全量真删）。等价 `gear_app(action=prune)`；只清 `exited`/`stopped`/`startup_failed`，`running`/`unknown` 保留，**只删记录不杀进程** |
 | GET / PUT / DELETE | `/api/secrets`、`/api/secrets/{name}` | **只回名字，绝不回明文**；写入 body `{value}` |
 | POST | `/api/events/{handle}` | 长驻订阅的事件回推入口（侧车/外部源用） |
 

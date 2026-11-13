@@ -47,6 +47,21 @@ func TestScanOpenURLs(t *testing.T) {
 			body: "GEAR_OPEN_URL=\nGEAR_OPEN_URL=http://x/\n",
 			want: []string{"http://x/"},
 		},
+		{
+			// 台账是追加日志的投影：旧版本把绑定地址（0.0.0.0/::）当访问地址打进了日志，
+			// 只修生产端的话这些历史行仍会以坏链接出现在面板上（REQ-EXT-SERVE-URL）。
+			name: "通配绑定归一化为回环（兼容旧日志）",
+			body: "GEAR_OPEN_URL=http://0.0.0.0:8080/\n" +
+				"GEAR_OPEN_URL=http://[::]:8090/\n" +
+				"GEAR_OPEN_URL=http://127.0.0.1:8080/\n",
+			want: []string{"http://127.0.0.1:8080/", "http://[::1]:8090/"},
+		},
+		{
+			// 负向：显式声明的具体地址是用户主动给的访问入口，不得改写。
+			name: "具体地址保持原样",
+			body: "GEAR_OPEN_URL=http://192.168.1.23:8080/\n",
+			want: []string{"http://192.168.1.23:8080/"},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

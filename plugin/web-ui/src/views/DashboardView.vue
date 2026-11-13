@@ -126,11 +126,10 @@ function gotoExecutions() {
           </template>
           <NEmpty v-if="apps.apps.length === 0" size="small" description="没有在跑的长驻 Flow" />
           <NSpace v-else vertical :size="10">
-            <NThing v-for="a in apps.apps" :key="a.id" :title="a.flow_id">
+            <NThing v-for="a in apps.apps" :key="a.app_id" :title="a.flow_id">
               <template #description>
                 <NSpace :size="8" align="center">
-                  <NTag size="small" :bordered="false">{{ a.id }}</NTag>
-                  <NTag size="small" type="info" :bordered="false">restart: {{ a.restart }}</NTag>
+                  <NTag size="small" :bordered="false" :type="a.state === 'running' ? 'success' : 'default'">{{ a.state }}</NTag>
                   <span class="text-3">起于 {{ new Date(a.started_at).toLocaleTimeString() }}</span>
                 </NSpace>
               </template>

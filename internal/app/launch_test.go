@@ -26,6 +26,68 @@ func newTempAppsDir(t *testing.T) string {
 	return filepath.Join(t.TempDir(), "apps")
 }
 
+// TestRestartRecorderFromEnv：台账身份 env 存在时回调把累计重启次数写回记录；
+// env 缺失（前台 `app run`）时返回 nil；台账已被删时静默跳过（重启照常，只是记不上）。
+func TestRestartRecorderFromEnv(t *testing.T) {
+	dir := newTempAppsDir(t)
+	if cb := RestartRecorderFromEnv(); cb != nil {
+		t.Fatal("无 env 时应返回 nil 回调")
+	}
+
+	id := "app_env_test"
+	writeRecord(t, dir, &Record{AppID: id, FlowID: "f", Registry: dir})
+	t.Setenv(EnvLedgerDir, dir)
+	t.Setenv(EnvLedgerID, id)
+
+	cb := RestartRecorderFromEnv()
+	if cb == nil {
+		t.Fatal("有 env 时应返回回调")
+	}
+	cb(3)
+	rec, err := LoadRecord(dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Restarts != 3 {
+		t.Fatalf("重启次数应回写为 3，实际 %d", rec.Restarts)
+	}
+}
+
+// TestExhaustedRecorderFromEnv：重启预算耗尽时把终态写回台账（REQ-APP-RESTART-LIMIT）。
+//
+// 为什么需要这条：预算耗尽后监管进程自行退出，pid 消失、端口释放，若台账仍停在
+// running/exited，UI 就把「被反复弄死到放弃重启」显示成普通退出——原因彻底丢失。
+func TestExhaustedRecorderFromEnv(t *testing.T) {
+	dir := newTempAppsDir(t)
+	if cb := ExhaustedRecorderFromEnv(); cb != nil {
+		t.Fatal("无 env 时应返回 nil 回调")
+	}
+
+	id := "app_exhausted_test"
+	writeRecord(t, dir, &Record{AppID: id, FlowID: "f", Registry: dir})
+	t.Setenv(EnvLedgerDir, dir)
+	t.Setenv(EnvLedgerID, id)
+
+	cb := ExhaustedRecorderFromEnv()
+	if cb == nil {
+		t.Fatal("有 env 时应返回回调")
+	}
+	cb(7, "step api 在 10m0s 内退出超过 5 次，已停止重启")
+	rec, err := LoadRecord(dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Restarts != 7 {
+		t.Fatalf("重启次数应回写为 7，实际 %d", rec.Restarts)
+	}
+	if rec.FinalState != string(StateRestartExhausted) {
+		t.Fatalf("终态应为 restart_exhausted，实际 %q", rec.FinalState)
+	}
+	if rec.StoppedAt == nil {
+		t.Fatal("耗尽即结案，StoppedAt 必须非空（否则会永远挂在 orphan 列表）")
+	}
+}
+
 // writeRecord 落一条台账（直接写，不经 Start——用于构造「已存在」的各种形态）。
 func writeRecord(t *testing.T, dir string, r *Record) {
 	t.Helper()

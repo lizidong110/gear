@@ -80,7 +80,7 @@ Gear 的魔法是「**机制与策略分离**」：框架提供原语 / 生命�
 | `registry` | SQLite 持久化 tool/flow/hook，含删除守卫与示例 YAML 多文档加载 |
 | `engine` | 编排内核：Flow 拓扑执行、Hook 装配、runtime 分发、表达式、版本灰度 |
 | `cap` | 宿主能力层：**8 个受 capability 门禁的原语**（http/call/db/secret/event/subscribe/config/fs）的接口与内存实现（最小权限门禁、事件总线、订阅生命周期、键值配置库、安全目录文件读写）。纯函数原子（time/template/crypto/id/validate）刻意不进此门禁，见 `internal/engine/purefunc.go` |
-| `server` | REST 执行面：路由、并发闸门、执行记录持久化、受管 app 托管 |
+| `server` | REST 执行面：路由、并发闸门、执行记录持久化、受管 app（detached 台账）的启动/列表/停止 |
 | `app` | `app run` 监管器：把一个 / 多个 Flow 变成受管进程 |
 | `cli` | CLI 管理面：cobra 命令树、`gear`/`exec`/`ai`/`mcp` 客户端、extensions 装配 |
 | `mcp` | MCP 执行面：15 个**意图级** `gear_*` 工具（手册 / 目录 / 校验 / 落库 / 能力直调 / 执行 / 应用生命周期 / 环境自检 / 产物导出导入）+ 经 `ServerOptions.Instructions` 注入的心智模型；`--expose {flows,tools,all}` 才开启反向暴露（Flow 快照 / App 清单策展的 Tool）；`--only-exposed` 可关掉这 15 个常驻工具，只留反向暴露的应用专用面 |
@@ -234,7 +234,7 @@ type Hook struct {
   确有远程需求时显式加 `--allow-remote`（放行时 stderr 留警告）。
 - **`serve` 默认同源托管 Web 管理界面**（2026-10-21，M1）：`plugin/web-ui` 的前端产物被 `go:embed` 进二进制，
   浏览器打开 `http://127.0.0.1:8787/` 即是管理界面（十页面：概览 / Tools / Flows / Hooks / 执行记录 / Apps 长驻 / **App 清单** / Secrets / **配置** / 能力目录）。
-  「App 清单」管 registry 里的 `kind: App` 定义（含 YAML 导入导出），与「Apps 长驻」的内存态受管进程是两套模型；「配置」按内核目录渲染中文表单，免记 `ai.*` 键名。
+  「App 清单」管 registry 里的 `kind: App` 定义（含 YAML 导入导出），与「Apps 长驻」的运行中进程台账是两层；「配置」按内核目录渲染中文表单，免记 `ai.*` 键名。
   **同源 ⇒ 浏览器不跨域 ⇒ 内核不需要任何 CORS 头**（设计红线：内核不引 CORS）。用户也不用在页面里填 API 地址。
   - `--no-ui`：不托管界面（`GET /` 返回 404 指引，`/api/*` 不受影响——关界面不是关执行面）。
   - `--no-open`：不自动开浏览器（仍会打印地址）。
@@ -467,7 +467,7 @@ gear scaffold app --help
 | GET | `/api/config` | `handleGetConfig` | 逐项当前值 + 是否已配置 + 环境变量是否覆盖；**敏感键只回掩码**；目录外的自定义键一并列出 |
 | PUT | `/api/config/{key}` | `handleSetConfig` | 写入/覆盖一项配置（body `{value}`；空串合法＝显式置空；响应不回显 value） |
 | DELETE | `/api/config/{key}` | `handleDeleteConfig` | 删除一项配置，回退到环境变量/内置默认（不存在 404） |
-| GET | `/api/app-defs` | `handleListAppDefs` | 列出 registry 里的 **App 清单**（含组成统计）。⚠ 与 `/api/apps` 的内存态受管进程不是同一模型 |
+| GET | `/api/app-defs` | `handleListAppDefs` | 列出 registry 里的 **App 清单**（含组成统计）。⚠ 与 `/api/apps` 的运行中进程台账不是同一层 |
 | GET | `/api/app-defs/{id}` | `handleGetAppDef` | 单查一份 App 清单（含完整组成；不存在 404） |
 | GET | `/api/app-defs/{id}/export` | `handleExportAppDef` | 导出为多文档 YAML 文本（attachment 下载）；内存生成、不读服务器文件；静态资源不含文件内容，需完整产物用 CLI `gear export` |
 | POST | `/api/app-defs/import` | `handleImportAppDef` | 从 bundle YAML 文本导入（body `{bundle, dry_run?, overwrite?}`）；写入口为 `artifact.ApplyBundle`，与 `gear_apply`/`gear_import` 同源；坏 YAML 回结构化诊断；声明 migrations 显式拒绝 |
@@ -477,11 +477,10 @@ gear scaffold app --help
 | GET | `/api/executions/{id}` | `handleGetExecution` | 查询执行结果（404） |
 | GET | `/api/executions/{id}/logs` | `handleGetExecutionLogs` | 执行日志（stdout/stderr） |
 | GET | `/api/executions/{id}/logs/stream` | `handleStreamExecutionLogs` | 执行日志**实时流（SSE）**：仅推订阅后新产生的行，执行终态即发 `event: done` 并关闭；历史由上方 `/logs` 提供（职责分离）。`X-Accel-Buffering: no` 关反向代理缓冲。详见 REQ-API-LOGS-STREAM |
-| POST | `/api/apps` | `handleCreateApp` | 托管一个受管 Flow 进程（201 `AppInstance`） |
-| GET | `/api/apps` | `handleListApps` | 列出受管 app，**如实反映监管态**（REQ-APP-MANAGED-STATE）：`state`（running/exited，按监管 goroutine 的 done 是否关闭实时重算，监管自结束的条目不再顶着 running 假绿）、`restarts`（service 累计重启次数）、`exit_err`（监管结束原因，可空） |
-| POST | `/api/apps/prune` | `handlePruneApps` | 清理**落盘台账**里确定已终止的记录（body `{flow_id?, dry_run?}`，空 body=全量真删）。只清 `exited`/`stopped`/`startup_failed`；`running`/`unknown` 一律保留；**只删记录不杀进程**。⚠ 与同前缀的 `GET/POST/DELETE /api/apps` **不是同一个模型**：那三个管本进程内存里的 `AppInstance`（等价 `gear app run`，无台账无孤儿），本端点动的是 `gear app start` 落下的持久台账 |
-| DELETE | `/api/apps/{id}` | `handleDeleteApp` | 停止受管 app（404） |
-| GET | `/api/apps/records` | `handleListAppRecords` | 列出 `gear app start` / MCP `gear_app(start)` 的**落盘台账**应用（状态/PID/日志文件路径/`live_logs`）；⚠ 与 `/api/apps` 的内存态受管进程不是同一模型，只回状态投影、**不含日志内容** |
+| POST | `/api/apps` | `handleCreateApp` | 托管启动 = `gear app start` 的 REST 包装（REQ-APP-MANAGED-DETACHED）：**detached 派生**独立 `app run`（脱离 serve 进程树）+ 落台账 + 注入实时日志回推 env；`wait` 默认 8s 确认结果（body 可带 `wait`/`replace` 覆盖）。201 starting/running、200 already_running（同 Flow 幂等）、502 startup_failed（含根因）、Flow 不存在 404 |
+| GET | `/api/apps` | `handleListApps` | 列出**落盘台账**应用（`gear app start` / MCP `gear_app(start)` / 本端点托管启动，同一份台账；REQ-APP-MANAGED-DETACHED）：状态由双判据（pid 存活 + 端口探活）**实时探活**算出，`restarts`（监管进程经 env 回写台账）、`live_logs`、`open_urls`、`log_path` 随条目透出。跨 serve 重启存活 |
+| POST | `/api/apps/prune` | `handlePruneApps` | 清理台账里确定已终止的记录（body `{flow_id?, dry_run?}`，空 body=全量真删）。只清 `exited`/`stopped`/`startup_failed`；`running`/`unknown` 一律保留；**只删记录不杀进程** |
+| DELETE | `/api/apps/{id}` | `handleDeleteApp` | 停止应用 = `app.Stop`：杀**整个进程树** + 端口复检；收不干净如实 502（绝不谎报 stopped），台账不存在 404 |
 | POST | `/api/apps/{id}/logs` | `handleIngestAppLogs` | detached App 子进程批量回推日志行（body `{token, lines[]}`）；token 常量时间比对 + 同源校验；未启用 403 / token 错 401 / 台账不存在 404 |
 | GET | `/api/apps/{id}/logs/stream` | `handleStreamAppLogs` | 台账应用**实时日志 SSE**：只推订阅后新产生的行，**不读 `<appID>.log`、不回放历史**；应用结案发 `event: done` 并关闭，15s `: ping` 保活 |
 | GET | `/api/capabilities` | `handleCapabilities` | 实时原子能力目录（内核 builtin+pure + 已注册 `ext.*`，与 `gear ai capabilities` 同源）。每个方法带 **`invoke_form`**（`positional`/`table`/`bare`）与 **`lua_call`**（可直接复制的完整调用）——Lua 侧入参形态是混合的，只给参数名会让人编出运行期才炸的调用 |

@@ -921,9 +921,12 @@ func TestStreamExecutionLogsClosesOnTerminal(t *testing.T) {
 	}
 }
 
-// A-11：apps 生命周期——启动 service Flow、列出、停止。
+// A-11：apps 生命周期（REQ-APP-MANAGED-DETACHED）——detached 启动落台账、列表可见、停止、重复停止 404。
+//
+// 派生进程 = 测试二进制自身（认不得 `--registry … app run` 参数，立即退出），
+// 短等窗口内即判 startup_failed——这恰好覆盖「启动即退出也要在台账留痕」的分支。
 func TestAppsLifecycle(t *testing.T) {
-	s, reg := newTestServer(t)
+	s, reg, _ := newAppsServer(t)
 	if err := reg.UpsertTool(&model.Tool{
 		ID: "sleepy", Name: "S", Runtime: model.RuntimeProcess, Entry: "sleep 3",
 		InputSchema:  map[string]interface{}{"type": "object"},
@@ -939,27 +942,39 @@ func TestAppsLifecycle(t *testing.T) {
 	}
 
 	h := s.Handler()
-	rec, out := do(t, h, "POST", "/api/apps", map[string]interface{}{"flow_id": "svcf"})
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("启动 app 期望 201，实际 %d %s", rec.Code, rec.Body.String())
+	rec, out := do(t, h, "POST", "/api/apps", map[string]interface{}{"flow_id": "svcf", "wait": 1})
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("派生进程立即退出应报 502 startup_failed，实际 %d %s", rec.Code, rec.Body.String())
 	}
-	id, _ := out["id"].(string)
+	if out["state"] != "startup_failed" {
+		t.Fatalf("state 应为 startup_failed，实际 %v", out["state"])
+	}
+	id, _ := out["app_id"].(string)
 	if id == "" {
-		t.Fatal("应返回 app id")
+		t.Fatalf("应返回 app_id: %s", rec.Body.String())
 	}
-	if got := len(doArray(t, h, "GET", "/api/apps")); got != 1 {
-		t.Fatalf("app 列表应为 1，实际 %d", got)
+
+	// 启动即退出的 app 仍要留在台账里（结案原因 startup_failed，而不是从列表消失）。
+	items := doArray(t, h, "GET", "/api/apps")
+	if len(items) != 1 || items[0]["app_id"] != id {
+		t.Fatalf("列表应含该 app，实际 %v", items)
 	}
+	if items[0]["state"] != "startup_failed" {
+		t.Fatalf("台账结案原因应为 startup_failed，实际 %v", items[0]["state"])
+	}
+
 	if rec, _ := do(t, h, "DELETE", "/api/apps/"+id, nil); rec.Code != http.StatusOK {
 		t.Fatalf("停止 app 期望 200，实际 %d", rec.Code)
 	}
-	_ = s.Shutdown()
-	if got := len(doArray(t, h, "GET", "/api/apps")); got != 0 {
-		t.Fatalf("停止后 app 列表应为 0，实际 %d", got)
+	// 重复停止 → 404（台账记录已按 stop 结案，但记录仍在；stop 幂等报 404 由「记录存在性」决定——
+	// 这里记录仍存在，故期望仍是 200；只有从未存在的 id 才 404）。
+	rec2, _ := do(t, h, "DELETE", "/api/apps/"+id, nil)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("重复停止已停记录幂等返回 200，实际 %d", rec2.Code)
 	}
-	// 重复停止 → 404
-	if rec, _ := do(t, h, "DELETE", "/api/apps/"+id, nil); rec.Code != http.StatusNotFound {
-		t.Fatalf("停止不存在的 app 期望 404，实际 %d", rec.Code)
+	rec3, _ := do(t, h, "DELETE", "/api/apps/app_never_existed", nil)
+	if rec3.Code != http.StatusNotFound {
+		t.Fatalf("停止不存在的 app 期望 404，实际 %d", rec3.Code)
 	}
 }
 

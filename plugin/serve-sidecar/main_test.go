@@ -107,8 +107,17 @@ func TestStartAutoAssignsPort(t *testing.T) {
 				t.Fatalf("自动分配必须带回真实非零端口，实际 %v", res["port"])
 			}
 			// url 与 port 必须同源于同一个真实端口，否则调用方照 url 访问会打空。
-			if want := fmt.Sprintf("http://0.0.0.0:%d/", int(realPort)); res["url"] != want {
-				t.Fatalf("url 与 port 字段不一致: url=%v want=%s", res["url"], want)
+			// 且 url 必须是**可访问地址**：这里没传 host → 绑定 0.0.0.0（通配），
+			// 旧实现直接把绑定地址拼进 url，面板给出 http://0.0.0.0:port/ 点不开
+			// （2026-11-13 实测）。通配绑定必须降级为回环，绑定地址由 listen 字段如实报出。
+			if want := fmt.Sprintf("http://127.0.0.1:%d/", int(realPort)); res["url"] != want {
+				t.Fatalf("url 必须是可访问地址: url=%v want=%s", res["url"], want)
+			}
+			if want := fmt.Sprintf("0.0.0.0:%d", int(realPort)); res["listen"] != want {
+				t.Fatalf("listen 必须是真实绑定地址: listen=%v want=%s", res["listen"], want)
+			}
+			if _, ok := res["lan_urls"].([]interface{}); !ok {
+				t.Fatalf("lan_urls 必须是数组（无私有网卡时为空数组，不能是 null）: %v", res["lan_urls"])
 			}
 			resp, err := http.Get("http://127.0.0.1:" + strconv.Itoa(int(realPort)) + "/index.html")
 			if err != nil {
@@ -396,4 +405,62 @@ func TestResolveSiteDir(t *testing.T) {
 			t.Fatalf("应优先 installRoot 的 %s，实际 %s", conflict, got)
 		}
 	})
+}
+
+// TestSiteURLSplitsBindFromAccess：绑定地址 ≠ 访问地址（REQ-EXT-SERVE-URL）。
+//
+// 靶心是「把 0.0.0.0 当主机名发给用户」：监听必须绑通配（手机要连），但 url 必须
+// 是可路由的访问地址。两个字段分工：
+//
+//	listen = 真实绑定（0.0.0.0:8080），只展示；
+//	url    = 可访问（通配降级回环；显式地址原样）。
+func TestSiteURLSplitsBindFromAccess(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		host                string
+		wantURL, wantListen string
+	}{
+		{"通配 0.0.0.0", "0.0.0.0", "http://127.0.0.1:8080/", "0.0.0.0:8080"},
+		{"空 host 默认通配", "", "http://127.0.0.1:8080/", "0.0.0.0:8080"},
+		{"IPv6 通配", "::", "http://[::1]:8080/", "[::]:8080"},
+		{"显式回环原样", "127.0.0.1", "http://127.0.0.1:8080/", "127.0.0.1:8080"},
+		{"显式局域网地址原样", "192.168.1.23", "http://192.168.1.23:8080/", "192.168.1.23:8080"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := siteURL(tc.host, 8080); got != tc.wantURL {
+				t.Fatalf("siteURL(%q) = %q，期望 %q", tc.host, got, tc.wantURL)
+			}
+			if got := listenAddr(tc.host, 8080); got != tc.wantListen {
+				t.Fatalf("listenAddr(%q) = %q，期望 %q", tc.host, got, tc.wantListen)
+			}
+		})
+	}
+}
+
+// TestSiteURLNeverUnroutable：负向验证——任何通配写法都不得出现在 url 里。
+func TestSiteURLNeverUnroutable(t *testing.T) {
+	for _, host := range []string{"0.0.0.0", "", "::", "[::]"} {
+		u := siteURL(host, 1234)
+		if strings.Contains(u, "0.0.0.0") || strings.Contains(u, "://[::]") || strings.Contains(u, "://::") {
+			t.Fatalf("host=%q 的 url 仍是不可路由地址: %s", host, u)
+		}
+	}
+}
+
+// TestLanURLsOnlyPrivateIPv4：lan_urls 只收私有网段 IPv4——链路本地（169.254）、
+// 回环、公网地址都会给用户一个点了没用的链接。没有私有网卡时必须是空数组而不是 nil
+// （nil 会序列化成 null，Lua 侧按表遍历会炸）。
+func TestLanURLsOnlyPrivateIPv4(t *testing.T) {
+	got := lanURLs(18080)
+	if got == nil {
+		t.Fatal("lanURLs 必须返回空切片而非 nil（序列化成 [] 而不是 null）")
+	}
+	for _, u := range got {
+		if strings.Contains(u, "169.254.") || strings.Contains(u, "127.0.0.1") || strings.Contains(u, "0.0.0.0") {
+			t.Fatalf("lan_urls 不应包含不可访问地址: %s", u)
+		}
+		if !strings.HasSuffix(u, ":18080/") {
+			t.Fatalf("lan_urls 端口必须与站点端口一致: %s", u)
+		}
+	}
 }

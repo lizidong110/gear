@@ -5,7 +5,8 @@
 //     内核要能单二进制分发、依赖最小（与方法论 §5 的取向一致）。
 //   - 执行是**异步**的：POST 立即返回 202 + execution id，结果经 GET 查询——
 //     这与 PRD §11「触发执行 / 查询执行状态」两个端点的分工一致。
-//   - 内存态：ExecStore / AppStore 都是进程内状态（持久性见各自注释的显式声明）。
+//   - 内存态：ExecStore 是进程内状态（持久性见各自注释的显式声明）；
+//     受管 app（/api/apps）是**落盘台账**（detached 独立进程，见 app.Record）。
 package server
 
 import (
@@ -34,41 +35,6 @@ import (
 	"gear/internal/registry"
 )
 
-// AppInstance 是一个由 REST 层托管的受管 Flow 进程（对应 CLI 的 `app run`）。
-type AppInstance struct {
-	ID        string    `json:"id"`
-	FlowID    string    `json:"flow_id"`
-	Restart   string    `json:"restart"`
-	StartedAt time.Time `json:"started_at"`
-	// OpenURLs 是该 Flow 收尾步（如 web_ui.done）带回的「打开地址」，由引擎在跑 once 步时收集
-	// （见 engine.OpenURLs）。前端据此把可点击链接直接呈现，用户启动后即可一键跳转。
-	// 与 CLI `app start` 走日志扫描 GEAR_OPEN_URL= 是两条互补通道（REST 监管是进程内、无日志文件）。
-	OpenURLs []string `json:"open_urls"`
-
-	// State 是监管态：running（监管 goroutine 在跑）/ exited（已真正退出）。
-	// 创建时置 running，handleListApps 按 done 是否关闭重算——它是「这个 app 是否
-	// 还真的在长驻」的唯一可靠判据。没有它，监管自己结束的 app（restart=never 退出、
-	// once Flow 跑完、启动即失败）仍被列成长驻中，UI 假绿（2026-11-13 审出）。
-	State string `json:"state"`
-
-	// Restarts 是监管期间 service 的累计重启次数（sup.SetOnRestart 回填）。
-	// 与 State 一起构成 /api/apps 的真实健康画像；0 表示从未重启。
-	Restarts int `json:"restarts"`
-
-	// ExitErr 是监管结束的原因（Supervise 返回的 error）；正常收敛为空。
-	ExitErr string `json:"exit_err,omitempty"`
-
-	cancel context.CancelFunc
-	// done 在该 app 的监管 goroutine 真正退出时关闭。
-	//
-	// 为什么需要它：`cancel()` 只是「发出停止信号」，stopAll（杀进程树）在 goroutine 里
-	// 异步执行。此前 DELETE /api/apps/{id} 一 cancel 就回 200 stopped，
-	// 于是「端口还没释放 / 进程还没死」被当成成功上报——与 `gear app stop`
-	// 「收不干净如实报 ORPHAN_APP」是两套口径（2026-10-29 审出）。
-	// 有了 done，停应用可以等到真收敛，等不到就如实说等不到。
-	done chan struct{}
-}
-
 // Server 是 REST 执行面。
 type Server struct {
 	reg    *registry.Registry
@@ -84,6 +50,11 @@ type Server struct {
 	// 非 nil 时在 / 与 /assets/* 注册静态路由；nil 表示 --no-ui（不托管 UI）。
 	uiHandler http.Handler
 
+	// out 是 serve 进度行的输出目标（直接 Tool/能力调用的可见性，见 progressToolDone）。
+	// nil = os.Stdout，**调用时解析**——与 engine.progressOut 同一口径，
+	// 测试里临时替换 os.Stdout 的老办法照旧有效。
+	out io.Writer
+
 	// secrets 是密钥源（REQ-API-SECRETS，2026-10-02 改为持久化到 secrets.db）：管理面经
 	// REST /api/secrets 或 CLI `gear secret` 写入 secrets.db，启动期经 GEAR_SECRET_* 环境变量
 	// 播种（仅内存）；注入引擎后运行期只读（ctx.secret.get）。
@@ -97,13 +68,8 @@ type Server struct {
 	// 默认落 gearhome.ConfigDBPath()；测试经 WithConfigStore 注入临时库。
 	config cap.Config
 
-	appMu  sync.Mutex
-	apps   map[string]*AppInstance
-	appSeq []string
-	appWG  sync.WaitGroup // 受管 app 的 goroutine 计数（Shutdown 需等其收敛）
-
-	// registryPath / appsDir 是**落盘台账**（`gear app start` 那套）的定位依据，
-	// 供 POST /api/apps/prune 使用。构造期由 CLI 经 WithRegistryPath 注入。
+	// registryPath / appsDir 是**落盘台账**（`gear app start` 那套）的定位依据。
+	// POST /api/apps 三兄弟（创建 / 列表 / 停止）与 prune 都靠它定位台账；
 	//
 	// 为什么要显式注入而不是各自取默认值：默认值（gearhome）只是「没配时的兜底」，
 	// 而 `gear serve --registry /x` 起服时真正在用的是 /x——若 prune 内部再取一次默认值，
@@ -169,9 +135,9 @@ func WithExecQueueSize(n int) ServerOption { return func(s *Server) { s.execQueu
 
 // WithRegistryPath 告诉 Server「本进程实际在用的 registry 路径」。
 //
-// 只有需要触碰**落盘台账**的端点（POST /api/apps/prune）才用得到它；
+// 只有需要触碰**落盘台账**的端点（POST/GET/DELETE /api/apps、POST /api/apps/prune）才用得到它；
 // 不传则回退到 gearhome 默认值。CLI 起服必须显式传——否则 `gear serve --registry /x`
-// 下的 prune 会去清默认库的台账。
+// 下的 /api/apps 会去开默认库的台账（管错对象比管不到更难排查）。同一教训见 mcp.Server.registryPath。
 func WithRegistryPath(p string) ServerOption { return func(s *Server) { s.registryPath = p } }
 
 // WithAppsDir 显式指定应用台账目录（覆盖 <registry 同目录>/apps 的推导）。
@@ -239,7 +205,6 @@ func New(reg *registry.Registry, opts ...ServerOption) (*Server, error) {
 		execs:           NewExecStore(),
 		mux:             http.NewServeMux(),
 		logBroker:       NewLogBroker(),
-		apps:            map[string]*AppInstance{},
 		maxConcurrent:   defaultMaxConcurrent,
 		execQueueSize:   defaultQueueSize,
 		shutdownTimeout: defaultShutdownTimeout,
@@ -406,16 +371,18 @@ func (s *Server) ListenAndServe(addr string) error {
 	return serveErr
 }
 
-// Shutdown 停止监听、取消在途执行、停止所有受管 app，并**有界等待其收敛**。
+// Shutdown 停止监听、取消在途执行，并**有界等待其收敛**。
 //
-// 必须先等 goroutine 退出再让调用方关闭 registry：否则 Supervisor 可能还在读库，
+// 必须先等 goroutine 退出再让调用方关闭 registry：否则在途执行可能还在读库，
 // 导致 `sql: database is closed` 这类停机竞态。
 //
 // 等待**有界**（shutdownTimeout，默认 defaultShutdownTimeout），超时不再等：
-// 此前 gate.Stop() 与 appWG.Wait() 都是无限等待，一个长跑 Flow 或一个卡在启动阶段的
-// 监管 goroutine 就能让停机永不返回——用户看到的是「Ctrl+C 之后进程卡住」
-// （2026-10-29 审出）。有界之后最坏情况是「等满超时 → 打印未收敛清单 → 退出」，
-// 而不是无限期挂起。
+// 此前 gate.Stop() 是无限等待，一个长跑 Flow 就能让停机永不返回——用户看到的是
+// 「Ctrl+C 之后进程卡住」（2026-10-29 审出）。有界之后最坏情况是
+// 「等满超时 → 打印未收敛清单 → 退出」，而不是无限期挂起。
+//
+// 受管 app（/api/apps）**不在**停机清单里：它们是 `app start` 语义的 detached 独立进程
+// （REQ-APP-MANAGED-DETACHED），归属自己，serve 重启不带走应用——要停走 DELETE /api/apps/{id}。
 //
 // 返回值：全部收敛为 nil；有未收敛项时返回描述它们的 error（已打印，交给调用方决定
 // 是否当作失败）。**绝不因为没收敛就跳过收尾**——execs / secrets 句柄照常释放。
@@ -429,47 +396,22 @@ func (s *Server) Shutdown() error {
 		s.liveCancel()
 	}
 
-	// ③ 取消受管 app 的监管 ctx，并留一份引用用于事后点名「谁没停干净」。
-	s.appMu.Lock()
-	insts := make([]*AppInstance, 0, len(s.apps))
-	for _, id := range s.appSeq {
-		if a := s.apps[id]; a != nil {
-			insts = append(insts, a)
-		}
-	}
-	for _, a := range insts {
-		a.cancel()
-	}
-	s.apps = map[string]*AppInstance{}
-	s.appSeq = nil
-	s.appMu.Unlock()
-
 	deadline := time.Now().Add(s.shutdownTimeout)
 	var pending []string
 
-	// ④ 收敛执行入口闸门（等 worker / 在途执行退出）。
+	// ③ 收敛执行入口闸门（等 worker / 在途执行退出）。
 	if s.gate != nil {
 		if !s.gate.StopWithTimeout(time.Until(deadline)) {
 			pending = append(pending, s.pendingExecutionSummary())
 		}
 	}
-	// ⑤ 收敛受管 app 的监管 goroutine。
-	if !waitWGDeadline(&s.appWG, deadline) {
-		for _, a := range insts {
-			select {
-			case <-a.done:
-			default:
-				pending = append(pending, fmt.Sprintf("app %s（flow=%s）未收敛", a.ID, a.FlowID))
-			}
-		}
-		if len(pending) == 0 {
-			pending = append(pending, "受管 app 未收敛")
-		}
-	}
+	// 注：受管 app 不在这里收——/api/apps 改为 `app start` 的 REST 包装（REQ-APP-MANAGED-DETACHED）
+	// 后，app 是 detached 独立进程、持有者是它自己，serve 停机**不应该**带走它（这正是改造目标：
+	// 重启 serve 不再连坐应用）。
 
-	// ⑥ 释放执行记录库句柄（#70 SQLite 持久化）：停机后不再查询，关闭以解锁 WAL 侧车文件。
+	// ④ 释放执行记录库句柄（#70 SQLite 持久化）：停机后不再查询，关闭以解锁 WAL 侧车文件。
 	_ = s.execs.Close()
-	// ⑦ 释放 secrets.db 句柄：本方法常在测试 cleanup / 优雅退出末尾被调用，
+	// ⑤ 释放 secrets.db 句柄：本方法常在测试 cleanup / 优雅退出末尾被调用，
 	// 若只关 execs 不关 secrets，SQLite 持有的文件锁会让临时目录无法删除（Windows cleanup 失败）。
 	_ = s.Close()
 
@@ -521,30 +463,6 @@ func (s *Server) pendingExecutionSummary() string {
 	return fmt.Sprintf("在途执行未收敛: %s", strings.Join(running, ", "))
 }
 
-// waitWGDeadline 有界等待一组 goroutine 结束；到 deadline 仍未结束返回 false。
-//
-// 超时后等待用的那一个 goroutine 仍在 wg.Wait() 上——每次调用至多一个，
-// 且此刻进程正要退出，不像「每轮泄漏 N 个」那样会随时间累积。
-func waitWGDeadline(wg *sync.WaitGroup, deadline time.Time) bool {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		wg.Wait()
-	}()
-	d := time.Until(deadline)
-	if d <= 0 {
-		d = 0
-	}
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-done:
-		return true
-	case <-t.C:
-		return false
-	}
-}
-
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /api/news", s.handleNews)
@@ -556,7 +474,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/secrets/{name}", s.handleSetSecret)
 	s.mux.HandleFunc("DELETE /api/secrets/{name}", s.handleDeleteSecret)
 
-	// App 清单管理面（REQ-API-APP-DEFS）：与 /api/apps（内存态受管进程）不是同一个模型。
+	// App 清单管理面（REQ-API-APP-DEFS）：管 registry 里 kind:App 的**清单定义**，
+	// 与 /api/apps（运行中的 detached 进程台账）不是同一层。
 	s.mux.HandleFunc("GET /api/app-defs", s.handleListAppDefs)
 	s.mux.HandleFunc("GET /api/app-defs/{id}", s.handleGetAppDef)
 	s.mux.HandleFunc("GET /api/app-defs/{id}/export", s.handleExportAppDef)
@@ -594,13 +513,14 @@ func (s *Server) routes() {
 
 	s.mux.HandleFunc("POST /api/events/{handle}", s.handleSubscriptionEvent)
 
+	// 受管 app 三兄弟（REQ-APP-MANAGED-DETACHED）：全部走 `gear app start` 的落盘台账——
+	// 创建 = app.Start（detached 派生）、列表 = 台账 + 实时探活、停止 = app.Stop（杀进程树）。
 	s.mux.HandleFunc("POST /api/apps", s.handleCreateApp)
 	s.mux.HandleFunc("GET /api/apps", s.handleListApps)
 	s.mux.HandleFunc("POST /api/apps/prune", s.handlePruneApps)
 	s.mux.HandleFunc("DELETE /api/apps/{id}", s.handleDeleteApp)
-	// detached 台账侧应用（REQ-API-APP-LOGS）：列台账 / 子进程回推 / UI 实时订阅。
-	// 与上面四条同名前缀但不是同一模型；{id}/logs* 段数更长，ServeMux 按特异性匹配，不冲突。
-	s.mux.HandleFunc("GET /api/apps/records", s.handleListAppRecords)
+	// 实时日志链路（REQ-API-APP-LOGS）：子进程回推 / UI 实时订阅。
+	// {id}/logs* 段数更长，ServeMux 按特异性匹配，与上面四条不冲突。
 	s.mux.HandleFunc("POST /api/apps/{id}/logs", s.handleIngestAppLogs)
 	s.mux.HandleFunc("GET /api/apps/{id}/logs/stream", s.handleStreamAppLogs)
 
@@ -832,7 +752,9 @@ func (s *Server) handleInvokeCapability(w http.ResponseWriter, r *http.Request) 
 				"密钥请用 `gear secret` 管理面或 GEAR_SECRET_* 播种", req.Name))
 		return
 	}
+	start := time.Now()
 	res, err := s.engine.InvokeCapability(req.Name, req.Method, req.Args)
+	s.progressToolDone("capability", req.Name+"."+req.Method, start, err, req.Args, res)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -892,14 +814,62 @@ func (s *Server) handleInvokeCapabilityStream(w http.ResponseWriter, r *http.Req
 		flusher.Flush()
 	}
 
+	// AI 流可能持续几十秒：起流先打一行 ▶（否则盯着 app 日志的人对「在跑」全程盲等），
+	// 收完再补完行（耗时含整个流）。
+	s.progressf("▶ ai stream %s.%s", req.Name, req.Method)
+	start := time.Now()
 	if err := agent.CompleteStream(req.Args, func(content, reasoning string) error {
 		send("", map[string]interface{}{"delta": content, "reasoning": reasoning})
 		return nil
 	}); err != nil {
+		// 输出是流式增量拿不到整体，output 如实传 nil。
+		s.progressToolDone("ai stream", req.Name+"."+req.Method, start, err, req.Args, nil)
 		send("error", map[string]string{"error": err.Error()})
 		return
 	}
+	s.progressToolDone("ai stream", req.Name+"."+req.Method, start, nil, req.Args, nil)
 	send("", map[string]interface{}{"done": true})
+}
+
+// progressf 输出一行 serve 进度（目标见 Server.out；nil = os.Stdout，调用时解析）。
+func (s *Server) progressf(format string, args ...any) {
+	w := s.out
+	if w == nil {
+		w = os.Stdout
+	}
+	fmt.Fprintf(w, format+"\n", args...)
+}
+
+// progressToolDone 给一次直接 Tool/能力调用补完行：✓/✗ + 耗时 + 调用详情标记。
+//
+// 为什么必须存在（2026-11-13 实测：托管启动 study 后实时日志面板空白）：app run 的实时日志
+// 通道只收「once 步输出 + service 子进程 stdout 行」（engine 进度行 + drainServiceTail 抽干）。
+// Flow 执行有 ✓ step 行自然到 stdout；但前端**直接**调 Tool / 能力（POST /api/tools/{id}/run、
+// 声明资源路由、/api/capabilities/invoke[/stream]）此前全程静默——托管启动（serve 是 service
+// 子进程）时 app 实时日志只有启动段、之后永远没有内容。补上后：这行被 app run 的
+// drainServiceTail 抽干转发进 app 日志通道（UI 实时可见）；前台 serve 用户也直接看得到
+// 谁在调、耗时多少。kind 如 "tool" / "capability" / "ai stream"。
+//
+// 回推上下文（GEAR_APP_LOG_ID 已注入）下行尾追加 GEAR_TOOL_CALL 详情 JSON（见
+// applogs.go toolCallDetailMarker）：UI 点击展开入参与返回结果；控制台不带，保持可读。
+// input/output 走 any：ai stream 的输出是流式增量拿不到整体，传 nil 如实留空。
+func (s *Server) progressToolDone(kind, id string, start time.Time, err error, input, output any) {
+	ms := time.Since(start).Milliseconds()
+	line := fmt.Sprintf("✓ %s %s (%dms)", kind, id, ms)
+	detail := map[string]any{"kind": kind, "id": id, "ok": err == nil, "ms": ms, "input": input, "output": output}
+	if err != nil {
+		line = fmt.Sprintf("✗ %s %s (%dms): %v", kind, id, ms, err)
+		detail["error"] = err.Error()
+	}
+	// 整行作为 %s 一次输出：err 消息里可能含 %，逐段拼 format 会把它当动词解析。
+	if b, ok := marshalToolCallDetail(detail); ok {
+		// 回推通道逐行抽干：错误体里的换行（如 lua traceback）会切断「标记+JSON 必须同处
+		// 一个物理行」的约定——折叠成 ⏎；完整 traceback 已转义进详情 JSON 的 error 字段，
+		// UI 展开可见。控制台（非回推上下文）不打标记，多行原样保留。
+		line = strings.ReplaceAll(line, "\n", " ⏎ ")
+		line += toolCallDetailMarker + string(b)
+	}
+	s.progressf("%s", line)
 }
 
 // handleRunTool 同步执行单个 Tool 并直接返回输出：`POST /api/tools/{id}/run`。
@@ -938,7 +908,9 @@ func (s *Server) handleRunTool(w http.ResponseWriter, r *http.Request) {
 	// 身份链路（IDENTITY_CONTEXT_DESIGN.md §3.5）：REST 是**真身份面**，在引擎边界把
 	// 调用主体注入执行上下文，此后 Hook 与 ctx.caller 都能看到。
 	ctx := engine.WithCaller(r.Context(), callerOf(r))
+	start := time.Now()
 	out, err := s.engine.RunToolExec(ctx, id, input, "")
+	s.progressToolDone("tool", id, start, err, input, out) // 直接调用也要在 app 日志通道可见（见 progressToolDone）
 	if err != nil {
 		// 请求体多包了一层 `{"input":{...}}` 是实测里最常见的一类误用，而它的报错
 		// （schema missing properties）看着像「字段没传」——所以在这里点名。
@@ -1356,8 +1328,27 @@ func (s *Server) handleListExecutions(w http.ResponseWriter, r *http.Request) {
 type createAppReq struct {
 	FlowID  string `json:"flow_id"`
 	Restart string `json:"restart"` // always（默认）/ never
+	// Wait 是确认启动结果的短等秒数；0 取默认（defaultAppStartWait）。
+	Wait int `json:"wait,omitempty"`
+	// Replace 为 true 时同 Flow 已有活跃实例先停再启；默认幂等返回 already_running。
+	Replace bool `json:"replace,omitempty"`
 }
 
+// defaultAppStartWait 是 POST /api/apps 的默认短等窗口（秒）：足够 service 起来，
+// 又不至于让 HTTP 请求拖太久。请求体 wait 可覆盖。
+const defaultAppStartWait = 8
+
+// handleCreateApp 托管启动一个应用——`gear app start` 的 REST 包装（REQ-APP-MANAGED-DETACHED）。
+//
+// 为什么改为 detached 派生而不是进程内 Supervise（2026-11-13 方案 A）：
+//   - 旧实现（进程内 AppInstance + Supervisor goroutine）把 app 绑死在 serve 进程上：
+//     serve 重启即带走应用、UI 列表与 `gear app start` 的台账是两套互不相认的模型、
+//     实时日志也无法接入（进程内监管没有日志文件可回推）。
+//   - 现在统一走 app.Start：派生独立 `app run`（脱离本进程树）、落台账、
+//     注入实时日志回推 env——serve 重启不影响应用，且 UI / CLI / MCP 看到同一份台账。
+//
+// 响应码：201 创建成功（starting/running）；200 already_running（幂等，未重复拉起）；
+// 502 startup_failed（派生进程短等窗口内退出，body 含 last_logs 与根因 reason）。
 func (s *Server) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 	var req createAppReq
 	if err := decodeJSON(r, &req); err != nil {
@@ -1368,6 +1359,8 @@ func (s *Server) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("flow_id 不能为空"))
 		return
 	}
+	// Flow 存在性预检：让 404 在派生**之前**给出，而不是等监管进程起来才发现
+	// Flow 不存在、以 startup_failed 收场（那要等满短等窗口才知道原因）。
 	f, err := s.reg.GetFlow(req.FlowID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -1377,132 +1370,80 @@ func (s *Server) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, fmt.Errorf("Flow 不存在: %s: %w", req.FlowID, registry.ErrNotFound))
 		return
 	}
-	policy := app.RestartAlways
-	switch app.RestartPolicy(req.Restart) {
-	case app.RestartNever:
-		policy = app.RestartNever
-	case app.RestartAlways, "":
-		policy = app.RestartAlways
-	default:
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("非法的 restart=%q（应为 always 或 never）", req.Restart))
+	wait := req.Wait
+	if wait <= 0 {
+		wait = defaultAppStartWait
+	}
+	res, err := app.Start(app.StartOptions{
+		RegistryPath: s.registryPath,
+		AppsDir:      s.appsDir,
+		FlowID:       req.FlowID,
+		Restart:      req.Restart,
+		WaitSeconds:  wait,
+		Replace:      req.Replace,
+		// 入参没显式声明端口时回退 App 清单的 start.ports（REQ-MCP-PORTS-ONE-TRUTH）；
+		// 生效来源见 res.PortsSource。launch 层不直接读 registry，由这里注入查询。
+		AppLookup: func(flowID string) ([]int, bool, error) {
+			return app.AppPortsFromRegistry(s.registryPath, flowID)
+		},
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("启动应用失败: %w", err))
 		return
 	}
-
-	// 父 ctx 取 s.liveCtx：停机时先取消它，监管循环（以及它拉起的 service 子进程）
-	// 随之中断，不必等 Server.Shutdown 逐个 cancel 才收敛。
-	ctx, cancel := context.WithCancel(s.liveCtx)
-	inst := &AppInstance{
-		ID: newID("app_"), FlowID: req.FlowID,
-		Restart: string(policy), StartedAt: time.Now(), cancel: cancel, done: make(chan struct{}),
-		State: "running",
+	switch res.State {
+	case string(app.StateStartupFailed):
+		writeJSON(w, http.StatusBadGateway, res)
+	case string(app.StateAlreadyRunning):
+		writeJSON(w, http.StatusOK, res)
+	default:
+		writeJSON(w, http.StatusCreated, res)
 	}
-	s.appMu.Lock()
-	s.apps[inst.ID] = inst
-	s.appSeq = append(s.appSeq, inst.ID)
-	s.appMu.Unlock()
-
-	s.appWG.Add(1)
-	go func() {
-		defer s.appWG.Done()
-		// 监管 goroutine 真正退出时才关 done：它是「这个 app 是否真的停干净了」的
-		// 唯一可靠判据（cancel 只是发信号，杀进程树的活儿在 Supervisor 里异步做）。
-		defer close(inst.done)
-		// 复用已装配的 s.engine：service step 同样需要扩展目录 / 密钥源 / 宿主原语，
-		// 新建一次性 engine 会让「经 Apps 拉起的 Flow」比「经 /api/executions 跑的同一个 Flow」能力更弱。
-		sup := app.New(s.engine, policy, 0)
-		// 重启观察：supervisor 是局部创建的，事后读不到 RestartCount——
-		// 用回调把累计重启次数回填进 AppInstance，/api/apps 才有真实健康画像。
-		sup.SetOnRestart(func(total int) {
-			s.appMu.Lock()
-			inst.Restarts = total
-			s.appMu.Unlock()
-		})
-		if err := sup.Supervise(ctx, []string{req.FlowID}); err != nil {
-			// 必须在 close(done) 之前落账：list 侧以 done 关闭判定 exited，
-			// 此刻起 ExitErr 必须已经可见，否则「退出原因」会先丢一手。
-			s.appMu.Lock()
-			inst.ExitErr = err.Error()
-			s.appMu.Unlock()
-			fmt.Fprintf(os.Stderr, "app %s(%s) 结束: %v\n", inst.ID, req.FlowID, err)
-		}
-	}()
-
-	writeJSON(w, http.StatusCreated, inst)
 }
 
-func (s *Server) handleListApps(w http.ResponseWriter, r *http.Request) {
-	s.appMu.Lock()
-	out := make([]*AppInstance, 0, len(s.appSeq))
-	for _, id := range s.appSeq {
-		a, ok := s.apps[id]
-		if !ok {
-			continue
-		}
-		// 复制一份再回填打开地址：避免并发读写共享的 *AppInstance（其 cancel 也随之复制，
-		// 但副本不调用 cancel，无副作用）。OpenURLs 来自引擎按 flowID 聚合的收尾步输出。
-		c := *a
-		// 监管态按「done 是否已关闭」实时重算（REQ-APP-MANAGED-STATE）：监管 goroutine
-		// 自己结束的 app（restart=never 退出 / once Flow 跑完 / 启动即失败）不会从
-		// appSeq 里消失，若不重算就会永远顶着创建时的 running——UI 假绿的根源。
-		select {
-		case <-a.done:
-			c.State = "exited"
-		default:
-		}
-		if s.engine != nil {
-			c.OpenURLs = s.engine.OpenURLs(a.FlowID)
-		}
-		out = append(out, &c)
-	}
-	s.appMu.Unlock()
-	writeJSON(w, http.StatusOK, out)
-}
-
-// appStopTimeout 是 DELETE /api/apps/{id} 等待「真的停干净」的上限。
+// handleListApps 列出受管应用：读**落盘台账**并对每条做实时探活（app.List）。
 //
-// cancel() 只是发出停止信号，杀进程树（Windows 上走 taskkill /T）在 Supervisor 里异步执行。
-// 此前这里一 cancel 就回 200 stopped，于是「进程还没死 / 端口还没释放」被当成成功——
-// 与 `gear app stop`「收不干净如实报 ORPHAN_APP」是两套口径（2026-10-29 审出）。
-// 现在是：等到真收敛（inst.done）才报成功；等不到就如实报 504 并说明还在跑。
-const appStopTimeout = 10 * time.Second
+// 台账是唯一真相源：detached app 归它自己持有，serve 内存里没有任何 app 状态——
+// 因此列表天然跨 serve 重启存活，state 由 pid + 端口双判据实时算出（不缓存、不假绿）。
+func (s *Server) handleListApps(w http.ResponseWriter, r *http.Request) {
+	dir, err := s.appsDirOf()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf(
+			"无法定位应用台账（本进程未配置 registry 路径）: %w", err))
+		return
+	}
+	res, err := app.List(s.registryPath, s.appsDir)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("读取应用台账失败（目录 %s）: %w", dir, err))
+		return
+	}
+	writeJSON(w, http.StatusOK, res.Items)
+}
 
+// handleDeleteApp 停止一个受管应用——`gear app stop` 的 REST 包装。
+//
+// 复用台账 stop 而不是进程内 cancel：杀的是**整个进程树**并复检端口，
+// 收不干净如实报 502（ORPHAN_APP），绝不把「发了信号」谎报成「已停干净」。
 func (s *Server) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	s.appMu.Lock()
-	a, ok := s.apps[id]
-	if ok {
-		delete(s.apps, id)
-	}
-	s.appMu.Unlock()
-	if !ok {
-		writeErr(w, http.StatusNotFound, fmt.Errorf("app 不存在: %s: %w", id, registry.ErrNotFound))
+	res, err := app.Stop(app.StopOptions{RegistryPath: s.registryPath, AppsDir: s.appsDir, AppID: id})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeErr(w, http.StatusNotFound, fmt.Errorf("app 不存在: %s: %w", id, registry.ErrNotFound))
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("停止应用失败: %w", err))
 		return
 	}
-	a.cancel() // 取消 ctx ⇒ Supervisor 停止并杀掉所有 service 子进程
-
-	// 等真的停干净：done 关闭 = 监管 goroutine 已退出 = stopAll 已跑完。
-	// 请求 ctx 也一并听：客户端断开不必继续等。
-	select {
-	case <-a.done:
-	case <-r.Context().Done():
-		writeErr(w, http.StatusGatewayTimeout, fmt.Errorf("等待 app %s 停止时被客户端中断", id))
-		return
-	case <-time.After(appStopTimeout):
-		// 如实上报：绝不说「stopped」——说了就等于告诉调用方端口已释放，而它可能还占着。
-		writeJSON(w, http.StatusGatewayTimeout, map[string]interface{}{
-			"id":      id,
-			"stopped": false,
-			"error":   fmt.Sprintf("已发出停止信号，但 %s 内未收敛：service 子进程可能仍存活，端口可能仍被占用", appStopTimeout),
-			"hint":    "用 gear app list 复核进程与端口；必要时 gear app stop <id> 再收一次",
+	if res.State != string(app.StateStopped) {
+		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"stopped": false, "state": res.State, "code": res.Code,
+			"result": res,
+			"hint":   res.Hint,
 		})
 		return
 	}
-
-	// 清理该 Flow 的打开地址缓存，避免留下过期链接（同名 Flow 再次受管时会被重新收集）。
-	if s.engine != nil {
-		s.engine.ClearOpenURLs(a.FlowID)
-	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"stopped": id, "converged": true})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"stopped": id, "converged": true, "result": res})
 }
 
 type pruneAppsReq struct {
@@ -1510,12 +1451,10 @@ type pruneAppsReq struct {
 	DryRun bool   `json:"dry_run,omitempty"`
 }
 
-// handlePruneApps 清理**落盘台账**里确定已终止的应用记录（body 空 = 全量、非 dry-run）。
+// handlePruneApps 清理台账里确定已终止的应用记录（body 空 = 全量、非 dry-run）。
 //
-// ⚠ 与同前缀的 GET/POST/DELETE /api/apps **不是同一个模型**：那三个管的是**本进程内存里**的
-// AppInstance（等价 `gear app run`，进程一退即消失，既没有台账也没有孤儿）；本端点动的是
-// `gear app start` 落下的**持久台账**（等价 MCP `gear_app(action=prune)`）。
-// 沿用同一前缀是因为「应用」归这里管；而「批量清理」这件事只有台账侧存在——内存侧无物可清。
+// 与同前缀的 GET/POST/DELETE /api/apps 是**同一个模型**（都是 `gear app start` 的落盘台账，
+// REQ-APP-MANAGED-DETACHED）；本端点等价 MCP `gear_app(action=prune)`，批量清终态记录。
 //
 // 边界（保守优先，宁可少删）：只清 exited / stopped / startup_failed；running / starting / unknown
 // 一律保留，且**只删记录、不杀进程、不碰端口**（要停进程走 DELETE /api/apps/{id}）。

@@ -9,9 +9,9 @@ package server
 //
 // 端点：
 //
-//	GET  /api/apps/records             列出落盘台账 App（供 UI 选订阅对象）
 //	POST /api/apps/{id}/logs           子进程批量回推日志行（token 校验）
 //	GET  /api/apps/{id}/logs/stream    SSE，只推订阅后新产生的行，不回放历史
+//	（列台账走 GET /api/apps：REQ-APP-MANAGED-DETACHED 后与受管 app 是同一份台账。）
 //
 // 安全口径：执行面整体无鉴权（既定设计，只绑回环），但 ingest 是**写**入口且能往任意
 // App 的面板注入内容，所以比读端点多两道：token 常量时间比对 + OriginAllowed（浏览器
@@ -58,9 +58,18 @@ func loopbackBaseURL(realAddr string) (string, error) {
 
 // publishAppLogEndpoint 在监听绑定成功（拿到真实端口）后写 <appsDir>/server.addr。
 //
+// --no-ui 的 serve **不写**（2026-11-13 实测缺口）：server.addr 的语义是「管理面的日志
+// 回推地址」，但它是「最后一个绑定的 gear serve 说了算」的单文件——而托管应用的后端
+// （如 study.api = `gear serve --addr 127.0.0.1:8081 --no-ui`）也是一个 gear serve，
+// 绑定后会覆写它，把之后启动的所有 app 的日志回推目标毒化成这个无人订阅的应用后端
+// （面板静默空白，live_logs 却仍显示已接入）。--no-ui 明确声明自己不是管理面，理应回避。
+//
 // best-effort：写失败只告警、绝不阻断起服。实时日志是排障增强，不该让「日志目录不可写」
 // 变成「REST 面起不来」；台账里的 live_logs=false 会让 UI 如实说明未接入。
 func (s *Server) publishAppLogEndpoint(realAddr string) {
+	if s.uiHandler == nil {
+		return
+	}
 	dir, err := s.appsDirOf()
 	if err != nil {
 		gearlog.L().Warn("实时日志地址发现未启用：定位台账目录失败", slog.String("err", fmt.Sprint(err)))
@@ -76,55 +85,52 @@ func (s *Server) publishAppLogEndpoint(realAddr string) {
 	}
 }
 
-// appRecordDTO 是台账记录在 UI 侧的投影。刻意**不返回日志内容**：
-// 页面要的是「实时」，历史在文件里但本端点不读、不回放（用户的硬要求）。
-type appRecordDTO struct {
-	AppID      string          `json:"app_id"`
-	FlowID     string          `json:"flow_id"`
-	PID        int             `json:"pid"`
-	Restart    string          `json:"restart"`
-	StartedAt  time.Time       `json:"started_at"`
-	State      string          `json:"state"`
-	LogPath    string          `json:"log_path"`
-	LiveLogs   bool            `json:"live_logs"`
-	Ports      []app.PortState `json:"ports,omitempty"`
-	FinalState string          `json:"final_state,omitempty"`
-}
-
-// handleListAppRecords 列出 `gear app start` / MCP gear_app(start) 留下的台账应用。
-//
-// ⚠ 与 GET /api/apps（内存态受管进程）不是同一模型：那一列只活在本进程里，
-// 本端点读的是跨会话存活的落盘台账。UI 的「Apps 长驻」页此前只有前者，
-// 所以用户真正跑着的后台应用一个都看不到 —— 这是「日志在 UI 上没看见」的根因之一。
-func (s *Server) handleListAppRecords(w http.ResponseWriter, r *http.Request) {
-	dir, err := s.appsDirOf()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	recs, err := app.ListRecords(dir)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	out := make([]appRecordDTO, 0, len(recs))
-	for _, rec := range recs {
-		out = append(out, appRecordDTO{
-			AppID: rec.AppID, FlowID: rec.FlowID, PID: rec.PID,
-			Restart: rec.Restart, StartedAt: rec.StartedAt,
-			State: string(rec.Probe()), LogPath: rec.LogPath,
-			LiveLogs: rec.LiveLogs, Ports: rec.PortStates(),
-			FinalState: rec.FinalState,
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"items": out})
-}
-
 type appLogIngestLine struct {
 	StepID string `json:"step_id,omitempty"`
 	Stream string `json:"stream"`
 	Line   string `json:"line"`
 	TS     int64  `json:"ts"`
+}
+
+// toolCallDetailMarker 是「直接调用详情」的行内标记：后接**单行** JSON
+// （{"kind","id","ok","ms","input","output"[,"error"]}）。UI 解析它把日志行变成
+// 可点击展开的调用详情（入参 + 返回结果）；控制台人看的行不带，保持干净。
+//
+// json.Marshal 的输出不含字面制表符（控制字符一律转义），所以用 \t 作分隔不会撞上内容。
+const toolCallDetailMarker = "\tGEAR_TOOL_CALL="
+
+// maxToolCallDetailBytes 限制单条详情 JSON 的体积：ingest 批量请求体上限 1MB，
+// 一条超大输出（如整棵知识图谱）不该把整批日志挤爆。
+const maxToolCallDetailBytes = 8192
+
+// marshalToolCallDetail 编码调用详情 JSON。
+//
+// 只在「回推上下文」启用（GEAR_APP_LOG_ID 已注入 = 这份 stdout 正被 app run 抽干进
+// app 日志通道）；前台 serve 的 stdout 是人看的控制台，不带详情。
+// 超限时把 input/output 降级为截断字符串预览再试一次，仍超限则放弃详情——
+// 宁可少一条详情，不能让一条详情把整个 ingest 批次顶爆（ingest 失败 = 整批静默丢）。
+func marshalToolCallDetail(detail map[string]any) ([]byte, bool) {
+	if os.Getenv(app.EnvAppLogID) == "" {
+		return nil, false // 非回推上下文：控制台行不带 JSON
+	}
+	b, err := json.Marshal(detail)
+	if err != nil {
+		return nil, false
+	}
+	if len(b) <= maxToolCallDetailBytes {
+		return b, true
+	}
+	for _, k := range []string{"input", "output"} {
+		if v, ok := detail[k]; ok && v != nil {
+			if vb, merr := json.Marshal(v); merr == nil && len(vb) > 2048 {
+				detail[k] = string(vb[:2048]) + "…(已截断，原始共 " + fmt.Sprint(len(vb)) + " 字节)"
+			}
+		}
+	}
+	if b, err := json.Marshal(detail); err == nil && len(b) <= maxToolCallDetailBytes {
+		return b, true
+	}
+	return nil, false
 }
 
 type appLogIngestReq struct {
